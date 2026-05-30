@@ -70,6 +70,55 @@ export class Producer {
 		}
 	}
 
+	/**
+	 * Adaptive farming — work tracks activity instead of running flat-out.
+	 *
+	 *  - BUSY: while the ledger has writes the chain hasn't yet finalized, farm
+	 *    back-to-back (paced only by the VDF) to bury them to finality.
+	 *  - IDLE: once everything that has happened is finalized, drop to a slow
+	 *    HEARTBEAT — one anchor every `heartbeatMs` — so a trickle of weight keeps
+	 *    accruing (fresh-node bootstrap safety) without burning compute on empty
+	 *    anchors. A new action makes the ledger heads advance → back to BUSY.
+	 *
+	 * `finalityDepth` is the depth at which we consider activity buried (matches the
+	 * chain's sticky-finality lock). Online nodes are already safe via that lock;
+	 * the heartbeat is purely for long-range/bootstrap weight.
+	 */
+	async runAdaptive(opts: { until: () => boolean; finalityDepth: number; busyPaceMs?: number; heartbeatMs?: number }): Promise<void> {
+		this.active = true;
+		const heartbeatMs = opts.heartbeatMs ?? 120_000;
+		let lastAnchorAt = 0;
+		while (this.active && !opts.until()) {
+			const chain = this.node.anchors;
+			const heads = this.node.ledger.heads();
+			const caughtUp = chain ? chain.headsCovered(heads, opts.finalityDepth) : true;
+
+			if (!caughtUp) {
+				// Busy: bury outstanding writes as fast as the cooldown allows.
+				await this.produceOne();
+				lastAnchorAt = this.tick();
+				if (opts.busyPaceMs) await this.sleep(opts.busyPaceMs);
+			} else {
+				// Idle: only mine when a heartbeat interval has elapsed.
+				const due = this.tick() - lastAnchorAt >= heartbeatMs;
+				if (due) {
+					await this.produceOne();
+					lastAnchorAt = this.tick();
+				} else {
+					await this.sleep(Math.min(1000, heartbeatMs));
+				}
+			}
+			await new Promise((r) => setImmediate(r));
+		}
+	}
+
+	private tick(): number {
+		return Number(process.hrtime.bigint() / 1_000_000n);
+	}
+	private sleep(ms: number): Promise<void> {
+		return new Promise((r) => setTimeout(r, ms));
+	}
+
 	stop(): void {
 		this.active = false;
 	}

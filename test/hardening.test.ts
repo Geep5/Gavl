@@ -17,9 +17,13 @@ import { generateKeyPair } from "../src/det/ed25519.ts";
 import { mineAnchor } from "../src/consensus/anchor.ts";
 import type { Anchor } from "../src/consensus/anchor.ts";
 import { AnchorChain } from "../src/consensus/chain.ts";
+import { Producer } from "../src/consensus/producer.ts";
 import { nextDifficulty } from "../src/consensus/difficulty.ts";
 import type { RetargetSchedule } from "../src/consensus/difficulty.ts";
-import { PARAMS, standinProver, STANDIN_VERIFIER } from "./helpers.ts";
+import { Ledger } from "../src/ledger/ledger.ts";
+import { GavlNode } from "../src/sync/node.ts";
+import { Account } from "../src/auction/account.ts";
+import { PARAMS, K, standinProver, STANDIN_VERIFIER } from "./helpers.ts";
 
 function miner() {
 	const keypair = generateKeyPair();
@@ -123,3 +127,68 @@ test("without a finality lock, the heavier fork still wins (pure heaviest-chain)
 	assert.equal(chain.tip()!.id, tail.id, "heaviest fork wins when nothing is locked");
 	assert.equal(chain.tip()!.height, 8);
 });
+
+// ── adaptive farming: work tracks activity ───────────────────────
+
+test("headsCovered: false with outstanding writes, true once finalized", async () => {
+	const FD = 1;
+	const chain = new AnchorChain(PARAMS, STANDIN_VERIFIER, { finalityDepth: FD });
+	const m = miner();
+
+	// No writes yet → trivially covered (nothing to bury) → producer would idle.
+	assert.equal(chain.headsCovered({}, FD), true, "empty ledger is caught up");
+
+	// A writer now has a tip at seq 2 that no anchor certifies yet.
+	const target = { w: { id: "x", seq: 2 } };
+	assert.equal(chain.headsCovered(target, FD), false, "outstanding writes are NOT covered");
+
+	// Mine anchors that certify those heads, buried to depth FD.
+	let prev = await grow(chain, m, 1, null); // genesis certifying {}
+	// Anchor committing the target heads:
+	const a = (await mineAnchor({ prev, producer: m.keypair, prover: m.prover, heads: target, params: PARAMS, difficulty: chain.difficultyFor(prev) }))!;
+	await chain.add(a);
+	prev = chain.get(a.id)!;
+	// Bury it FD deep with follow-on anchors (which re-commit the same heads).
+	for (let i = 0; i < FD; i++) {
+		const b = (await mineAnchor({ prev, producer: m.keypair, prover: m.prover, heads: target, params: PARAMS, difficulty: chain.difficultyFor(prev) }))!;
+		await chain.add(b);
+		prev = chain.get(b.id)!;
+	}
+	assert.equal(chain.headsCovered(target, FD), true, "covered once an anchor FD-deep certifies the heads");
+});
+
+test("adaptive producer idles when caught up, bursts after an action", async () => {
+	const node = new GavlNode(new Ledger(PARAMS), new AnchorChain(PARAMS, STANDIN_VERIFIER, { finalityDepth: 1 }));
+	const m = miner();
+	const producer = new Producer({ node, keypair: m.keypair, prover: m.prover, params: PARAMS });
+
+	// Run adaptively with a long heartbeat so idle produces ~nothing.
+	let stop = false;
+	const loop = producer.runAdaptive({ until: () => stop, finalityDepth: 1, busyPaceMs: 0, heartbeatMs: 60_000 });
+
+	// Phase 1: empty ledger → producer settles to "caught up" and idles. Let it
+	// fully quiesce, then record the idle height.
+	await new Promise((r) => setTimeout(r, 400));
+	const idleHeight = node.anchorTip()?.height ?? -1;
+	assert.equal(node.anchors.headsCovered({}, 1), true, "empty ledger is caught up → producer idle");
+	// Confirm it's genuinely idle: height does not grow over a quiet interval.
+	await new Promise((r) => setTimeout(r, 300));
+	assert.equal(node.anchorTip()?.height ?? -1, idleHeight, "no new anchors while idle (heartbeat far off)");
+
+	// Phase 2: an action lands a write → producer must burst to finalize it.
+	let t = 0;
+	const actor = new Account({ node, params: PARAMS, k: K, now: () => ++t });
+	await actor.deployCoin("Gold", "GLD", 1000n); // new write → ledger heads advance
+	assert.equal(node.anchors.headsCovered(node.ledger.heads(), 1), false, "fresh write is not yet finalized");
+	// Wait until the burst buries it (or time out).
+	for (let i = 0; i < 100 && !node.anchors.headsCovered(node.ledger.heads(), 1); i++) {
+		await new Promise((r) => setTimeout(r, 50));
+	}
+
+	stop = true;
+	await loop;
+
+	const afterHeight = node.anchorTip()?.height ?? -1;
+	assert.ok(afterHeight > idleHeight, `chain burst after the action (idle ${idleHeight} → ${afterHeight})`);
+	assert.equal(node.anchors.headsCovered(node.ledger.heads(), 1), true, "the action's write got buried to finality");
+}, { timeout: 20_000 });

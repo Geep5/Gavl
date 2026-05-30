@@ -148,4 +148,19 @@ export class AnchorChain {
 	finalizedHeads(k: number): Heads {
 		return this.finalized(k)?.heads ?? {};
 	}
+
+	/**
+	 * True if the anchor `k` deep already certifies every writer's tip in `target`
+	 * (the current ledger heads). When true, all activity that has happened is
+	 * finalized — there's nothing left worth farming for, so a quiescent producer
+	 * can idle. When false (new/unfinalized writes exist), keep farming to bury them.
+	 */
+	headsCovered(target: Heads, k: number): boolean {
+		const fin = this.finalizedHeads(k);
+		for (const writer of Object.keys(target)) {
+			const have = fin[writer];
+			if (!have || have.seq < target[writer].seq) return false;
+		}
+		return true;
+	}
 }

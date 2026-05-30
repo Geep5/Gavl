@@ -55,6 +55,8 @@ export interface DaemonOptions {
 	schedule?: RetargetSchedule;
 	/** Plot directory for chiapos (default ~/.gavl/plots). */
 	plotDir?: string;
+	/** Idle heartbeat: when caught up, mine one anchor every this many ms (default 120s). */
+	heartbeatMs?: number;
 }
 
 export interface ConsensusStatus {
@@ -84,11 +86,13 @@ export class Daemon {
 	private producer?: Producer;
 	private network: string | null = null;
 	private farming = false;
+	private readonly heartbeatMs: number;
 
 	constructor(opts: DaemonOptions = {}) {
 		this.params = opts.params ?? defaultParams();
 		this.k = opts.k ?? 11;
 		this.finalityDepth = opts.finalityDepth ?? 1;
+		this.heartbeatMs = opts.heartbeatMs ?? 120_000;
 		this.spaceMode = opts.space ?? "standin";
 		this.plotDir = opts.plotDir ?? join(homedir(), ".gavl", "plots");
 		// Verifier must match the space backend producers use, or anchors are rejected.
@@ -179,9 +183,15 @@ export class Daemon {
 			}
 			this.producer = new Producer({ node: this.node, keypair: farmer, prover, params: this.params });
 			this.farming = true;
-			// Fire-and-forget farming loop; paced so the event loop (HTTP, gossip) stays responsive.
-			// With a difficulty schedule the VDF cost is the real pace; paceMs is just a yield.
-			void this.producer.run({ until: () => !this.farming, paceMs: 1500 });
+			// Adaptive: farm hard while there are unfinalized writes to bury, then drop
+			// to a slow heartbeat when idle — work tracks activity instead of running
+			// flat-out. busyPaceMs keeps the event loop (HTTP, gossip) responsive.
+			void this.producer.runAdaptive({
+				until: () => !this.farming,
+				finalityDepth: this.finalityDepth,
+				busyPaceMs: 250,
+				heartbeatMs: this.heartbeatMs,
+			});
 		}
 	}
 
