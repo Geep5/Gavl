@@ -79,9 +79,11 @@ test("a settled auction finalizes from gossiped anchors on the other node", asyn
 	const seller = new Account({ node: A, params: PARAMS, k: K, now });
 	const bidder = new Account({ node: B, params: PARAMS, k: K, now });
 
-	const id = await seller.createAuction("Codex", null);
+	const coin = await bidder.deployCoin("Coin", "CN", 1_000n);
 	await net.idle();
-	const ref = await bidder.bid(id, 500n);
+	const id = await seller.createItemAuction("Codex", null);
+	await net.idle();
+	const ref = await bidder.bid(id, coin, 500n);
 	await net.idle();
 	await seller.settle(id, ref);
 	await net.idle();

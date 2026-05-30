@@ -58,9 +58,13 @@ src/sync/node.ts       gossip protocol: writes (hello/want/writes/announce) + an
 src/sync/messages.ts   wire message shapes
 src/sync/memory.ts     in-memory transport (deterministic, offline tests)
 src/sync/swarm.ts      real Hyperswarm transport — the Holepunch mesh
-src/auction/ops.ts     auction-house op types (transfer / create / bid / settle / cancel)
-src/auction/state.ts   pure view: writes → balances + items + auctions, with conservation
-src/auction/account.ts wallet + auctioneer: produce op-writes, query the view
+src/auction/ops.ts     op types: coin.deploy / transfer / auction.create|bid|settle|cancel
+src/auction/state.ts   pure view: writes → coins + (token,pubkey) balances + items + auctions
+src/auction/account.ts wallet + auctioneer: deploy coins, produce op-writes, query the view
+src/wallet.ts          multi-identity keystore (~/.gavl/wallet.json)
+src/daemon.ts          boots Ledger + node + one Account per identity (shared clock)
+src/server.ts          localhost JSON API the web UI drives
+web/                   Vite + Svelte SPA (wallet, listings, deploy-coin, create-listing)
 src/consensus/anchor.ts   PoST-proven anchor certifying a snapshot of writer-heads
 src/consensus/chain.ts    heaviest-weight fork choice + depth finality
 src/consensus/order.ts    anchor-bound canonical order → finalized (ts-attack-proof) view
@@ -118,22 +122,51 @@ each pulls what it lacks (`want` → `writes`), and new writes spread by `announ
 protocol runs over an in-memory link (tests) or real Hyperswarm sockets; peers find each
 other on `sha256(networkName)` — the topic string *is* the network identity.
 
-### The auction house (P3)
+### The auction house (P3) — coin-agnostic
 
-The app rides on top as op payloads: `transfer`, `auction.create / bid / settle / cancel`.
-The view is a pure replay of all writes → balances + items + auctions:
+The app rides on top as op payloads: `coin.deploy`, `transfer`, `auction.create / bid /
+settle / cancel`. The view is a pure replay of all writes → coins + balances + items +
+auctions. **No token is privileged** — the protocol mints nothing on its own; the cooldown
+only rate-limits writes.
 
-- **Native token (GAV).** No mint authority — every write earns its writer a farming
-  reward, so issuance is proportional to space via the cooldown (Chia-style). You earn GAV
-  by participating and spend it in auctions.
-- **Authorization is free.** Each op is already signed by its write, so the op's actor *is*
-  `write.writer`; only the seller can settle their own auction.
-- **Escrow + conservation.** A bid locks the bidder's GAV; settle pays the seller, hands the
-  item to the winner, and refunds the losers; invalid ops (overspend, self-bid, non-seller
-  settle) are deterministically skipped. GAV is never created or destroyed outside the reward.
+- **Coins are user-deployed.** Anyone runs `coin.deploy {name, symbol, supply}`; the coin's
+  id is the deploy-write's content-address, and the full supply is minted to the deployer.
+  Balances are keyed by `(token, pubkey)` and no code path special-cases any id.
+- **List an item *or* an amount of a coin.** An auction's `give` is either a fresh unique
+  item or a fungible `{token, amount}`. The `ask` (optional) and every `bid` name their coin
+  explicitly, so you can list in one coin and be paid in another.
+- **Authorization is free.** Each op is signed by its write, so the op's actor *is*
+  `write.writer`; only the seller can settle or cancel their own auction.
+- **Escrow + per-token conservation.** Creating a coin-auction escrows the give out of the
+  seller's balance; a bid locks the bidder's coins. Settle pays the seller in the winning
+  bid's coin, hands the give to the winner, and refunds losers; cancel returns everything.
+  Invalid ops (overspend, self-bid, non-seller settle) are deterministically skipped, and no
+  coin is created or destroyed outside its own `coin.deploy`.
 
 Two views coexist: `computeView` is the optimistic tip (provisional `ts` order), and
 `finalizedView` is the safe state behind the consensus layer (below).
+
+### Web UI + daemon
+
+A Svelte SPA (`web/`) drives a localhost daemon (`src/daemon.ts` + `src/server.ts`) that
+holds the wallet and produces writes — the VDF cooldown must run server-side, so the browser
+is a thin control panel over a JSON API. The daemon holds multiple identities with an in-UI
+switcher (so you can list as one account and bid as another locally). Run it:
+
+```bash
+npm run daemon     # JSON API on :6440, real chiavdf + live mesh + anchor farming
+npm run web:dev    # Vite SPA on :5180, proxying /api → the daemon
+```
+
+By default the daemon runs **real consensus**: it joins the live hyperswarm/hyperdht mesh
+(gossiping writes *and* anchors) and farms anchors over the heaviest tip with the real chiavdf
+cooldown. The UI's Consensus panel shows it advancing — anchor height, chain weight, finalized
+depth, peer count — and a settled auction gains a **✓ final** badge once an anchor certifies it.
+Env knobs: `GAVL_VDF=hash` (fast stand-in VDF), `GAVL_MESH=0` (local only), `GAVL_FARM=0`
+(don't produce anchors), `GAVL_NETWORK=<topic>` (the topic string *is* the network identity).
+
+The UI: deploy a coin, see per-coin balances, list a unique item or an amount of a coin
+(priced in any coin or open-to-bids), browse/filter listings, bid, and settle/cancel your own.
 
 ### Consensus (P2)
 
@@ -195,7 +228,8 @@ npm run demo:consensus  # two nodes farm + gossip anchors, finalize the same set
 - **P0 — cooldown primitive** ✅ per-writer PoST chain, Chia-style quality→cooldown coupling, infusion, trunk/foliage split, weight, self-verifying writes, fork proofs
 - **P1 — RAM state + gossip** ✅ multi-writer RAM ledger; `stateRoot` compare + diff pull ("are we in sync?"); epidemic announce; real hyperswarm/hyperdht mesh (topic = network identity)
 - **P2 — consensus** ✅ anchor chain (PoST-proven head certificates); heaviest-weight fork choice + depth finality; anchor-epoch canonical order (neutralizes the `ts` attack); difficulty retargeting; weight-trusted checkpoints for cold-start bootstrap
-- **P3 — the auction house** ✅ native token (GAV) as a per-write farming reward; `transfer` + `auction.create/bid/settle/cancel` with escrow, conservation, and seller-authority; runs live across the mesh
+- **P3 — the auction house** ✅ coin-agnostic: user-deployed coins (`coin.deploy`), `transfer`, and `auction.create/bid/settle/cancel` selling items *or* coin amounts, priced in any coin; escrow + per-token conservation + seller-authority; runs live across the mesh
+- **Web UI** ✅ Svelte SPA + localhost daemon/API: deploy coins, multi-account wallet, create listings, bid, settle (`npm run daemon` + `npm run web:dev`)
 - **Consensus is live** ✅ anchors gossip over the mesh + a producer farms them (`demo:consensus`)
 - **Real proofs by default** ✅ chiavdf (proof of time) is the **default** cooldown via `defaultParams()` (async eval so gossip never blocks); chiapos (proof of space) secures anchors; both run live in `demo:consensus`
 - **P4 — hardening** eclipse-resistant peer sampling; log/anchor pruning + snapshots; incremental (non-replay) view computation

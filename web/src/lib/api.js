@@ -1,0 +1,25 @@
+// Thin client for the daemon's JSON API. All amounts are strings (BigInt-safe).
+
+async function req(path, method = "GET", body) {
+	const res = await fetch(`/api${path}`, {
+		method,
+		headers: body ? { "content-type": "application/json" } : undefined,
+		body: body ? JSON.stringify(body) : undefined,
+	});
+	const data = await res.json().catch(() => ({}));
+	if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+	return data;
+}
+
+export const api = {
+	state: () => req("/state"),
+	createAccount: (label) => req("/accounts", "POST", { label }),
+	setActive: (pubHex) => req("/accounts/active", "POST", { pubHex }),
+	deployCoin: (name, symbol, supply) => req("/coins", "POST", { name, symbol, supply }),
+	transfer: (token, to, amount) => req("/transfer", "POST", { token, to, amount }),
+	createItemAuction: (name, ask) => req("/auctions", "POST", { give: { kind: "item", name }, ask }),
+	createCoinAuction: (token, amount, ask) => req("/auctions", "POST", { give: { kind: "coin", token, amount }, ask }),
+	bid: (id, token, amount) => req(`/auctions/${id}/bid`, "POST", { token, amount }),
+	settle: (id, winner) => req(`/auctions/${id}/settle`, "POST", { winner }),
+	cancel: (id) => req(`/auctions/${id}/cancel`, "POST", {}),
+};

@@ -11,9 +11,9 @@ import { Writer } from "../chain/writer.ts";
 import type { ChainParams, Write } from "../chain/writer.ts";
 import type { KeyPair } from "../det/ed25519.ts";
 import type { GavlNode } from "../sync/node.ts";
-import { computeView } from "./state.ts";
+import { computeView, balanceOf } from "./state.ts";
 import type { View, Auction } from "./state.ts";
-import type { Op } from "./ops.ts";
+import type { Op, Give, Price } from "./ops.ts";
 import { finalizedView } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 
@@ -21,6 +21,11 @@ function amountStr(a: bigint | number | string): string {
 	if (typeof a === "string") return a;
 	if (typeof a === "bigint") return a.toString();
 	return Math.trunc(a).toString();
+}
+
+function priceOf(ask: Price | { token: string; amount: bigint | number | string } | null): Price | null {
+	if (!ask) return null;
+	return { token: ask.token, amount: amountStr(ask.amount) };
 }
 
 export interface AccountOptions {
@@ -47,7 +52,7 @@ export class Account {
 		return this.writer.pubHex;
 	}
 
-	/** Produce the next write in this identity's chain carrying `op` (or null = pure farming). */
+	/** Produce the next write in this identity's chain carrying `op` (or null = no-op). */
 	private async produce(op: Op | null): Promise<Write> {
 		const mine = this.node.ledger.heads()[this.writer.pubHex];
 		const seq = mine ? mine.seq + 1 : 0;
@@ -57,23 +62,38 @@ export class Account {
 		return w;
 	}
 
-	/** A no-op write — just farm GAV by doing the PoST work. */
-	earn(): Promise<Write> {
+	/** A no-op write (does PoST work but carries no op). */
+	noop(): Promise<Write> {
 		return this.produce(null);
 	}
 
-	transfer(to: string, amount: bigint | number | string): Promise<Write> {
-		return this.produce({ kind: "transfer", to, amount: amountStr(amount) });
+	/** Deploy a coin; returns the token id (= the deploy-write's id). Supply is minted to you. */
+	async deployCoin(name: string, symbol: string, supply: bigint | number | string): Promise<string> {
+		return (await this.produce({ kind: "coin.deploy", name, symbol, supply: amountStr(supply) })).id;
 	}
 
-	/** List an item; returns the auction id (= the create-write's id). */
-	async createAuction(name: string, ask: bigint | number | string | null = null): Promise<string> {
-		return (await this.produce({ kind: "auction.create", name, ask: ask === null ? null : amountStr(ask) })).id;
+	transfer(token: string, to: string, amount: bigint | number | string): Promise<Write> {
+		return this.produce({ kind: "transfer", token, to, amount: amountStr(amount) });
 	}
 
-	/** Bid on an auction; returns the bid ref (= the bid-write's id) used to award it. */
-	async bid(auction: string, amount: bigint | number | string): Promise<string> {
-		return (await this.produce({ kind: "auction.bid", auction, amount: amountStr(amount) })).id;
+	/** List a unique item for sale; returns the auction id (= the create-write's id). */
+	createItemAuction(name: string, ask: Price | { token: string; amount: bigint | number | string } | null = null): Promise<string> {
+		return this.create({ kind: "item", name }, ask);
+	}
+
+	/** List a fungible amount of a coin for sale; returns the auction id. */
+	createCoinAuction(token: string, amount: bigint | number | string, ask: Price | { token: string; amount: bigint | number | string } | null = null): Promise<string> {
+		return this.create({ kind: "coin", token, amount: amountStr(amount) }, ask);
+	}
+
+	/** Low-level: list any `give`; returns the auction id. */
+	async create(give: Give, ask: Price | { token: string; amount: bigint | number | string } | null = null): Promise<string> {
+		return (await this.produce({ kind: "auction.create", give, ask: priceOf(ask) })).id;
+	}
+
+	/** Bid an amount of a coin; returns the bid ref (= the bid-write's id) used to award it. */
+	async bid(auction: string, token: string, amount: bigint | number | string): Promise<string> {
+		return (await this.produce({ kind: "auction.bid", auction, token, amount: amountStr(amount) })).id;
 	}
 
 	settle(auction: string, winnerRef: string): Promise<Write> {
@@ -94,8 +114,9 @@ export class Account {
 		return finalizedView(this.node.ledger.allWrites(), anchors, k);
 	}
 
-	balance(): bigint {
-		return this.view().balances.get(this.pubHex) ?? 0n;
+	/** This account's balance of `token`. */
+	balance(token: string): bigint {
+		return balanceOf(this.view(), token, this.pubHex);
 	}
 
 	auctions(): Auction[] {

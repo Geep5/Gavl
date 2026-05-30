@@ -13,7 +13,7 @@ import { Ledger } from "./ledger/ledger.ts";
 import { GavlNode } from "./sync/node.ts";
 import { SwarmTransport } from "./sync/swarm.ts";
 import { Account } from "./auction/account.ts";
-import { computeView, REWARD } from "./auction/state.ts";
+import { computeView, balanceOf } from "./auction/state.ts";
 import { defaultParams } from "./config.ts";
 
 const PARAMS = defaultParams(); // real chiavdf by default (GAVL_VDF=hash to opt out)
@@ -51,15 +51,20 @@ try {
 	await tb.join(NETWORK);
 	console.log("• nodes connected over the DHT\n");
 
-	const id = await seller.createAuction("Antique Star Map", null);
+	// Bidder deploys a coin to bid with (the protocol mints nothing on its own).
+	const coin = await bidder.deployCoin("Doubloon", "DBL", 1_000n);
+	console.log(`• bidder deploys coin DBL (${short(coin)}), supply 1000 → self`);
+	await waitFor(() => seller.view().coins.has(coin));
+
+	const id = await seller.createItemAuction("Antique Star Map", null);
 	console.log(`• seller lists "Antique Star Map"  (auction ${short(id)})`);
 	await waitFor(() => bidder.view().auctions.has(id));
 	console.log("• bidder discovered the listing via gossip");
 
-	// The bidder picks the open auction from its OWN synced view, then bids.
+	// The bidder picks the open auction from its OWN synced view, then bids 500 DBL.
 	const open = bidder.auctions().find((a) => a.status === "open")!;
-	const ref = await bidder.bid(open.id, 500n);
-	console.log("• bidder bids 500 GAV (escrowed)");
+	const ref = await bidder.bid(open.id, coin, 500n);
+	console.log("• bidder bids 500 DBL (escrowed)");
 	await waitFor(() => seller.view().auctions.get(id)!.bids.length === 1);
 
 	await seller.settle(id, ref);
@@ -69,9 +74,9 @@ try {
 	for (const [label, node] of [["A", nodeA], ["B", nodeB]] as const) {
 		const v = computeView(node.ledger.allWrites());
 		const a = v.auctions.get(id)!;
-		console.log(`node ${label}:  auction=${a.status}  item→${short(v.items.get(id)!.owner)}  ` + `seller=${v.balances.get(seller.pubHex)} GAV  bidder=${v.balances.get(bidder.pubHex)} GAV`);
+		console.log(`node ${label}:  auction=${a.status}  item→${short(v.items.get(id)!.owner)}  ` + `seller=${balanceOf(v, coin, seller.pubHex)} DBL  bidder=${balanceOf(v, coin, bidder.pubHex)} DBL`);
 	}
-	console.log(`\nBoth nodes agree. Total GAV = 3 × ${REWARD} reward, conserved. State roots match.`);
+	console.log(`\nBoth nodes agree. DBL supply (1000) conserved: seller 500 + bidder 500. State roots match.`);
 } finally {
 	await ta.destroy();
 	await tb.destroy();

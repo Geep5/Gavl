@@ -1,31 +1,47 @@
 /**
  * Auction-house operations — the payload an op-write carries.
  *
- * An op needs no signer field: the write that carries it is already Ed25519-
- * signed, so the op's actor IS `write.writer`. Amounts are decimal strings
- * (BigInt-parsed) to stay JSON/canonical-safe.
+ * The auction house is COIN-AGNOSTIC: no token id is privileged. A coin is
+ * deployed by anyone (`coin.deploy`), its id is the content-address of the
+ * deploy-write, and transfers, bids, asks, and listings all name the token
+ * explicitly. The protocol mints nothing on its own — the PoST cooldown's only
+ * job is rate-limiting; all value is user-deployed coins.
  *
- * The native token (GAV) is the unit of account. It is not minted by anyone —
- * every applied write earns its writer a farming reward (see state.ts), so GAV
- * issuance is proportional to space via the cooldown, Chia-style.
+ * An op needs no signer field: the write that carries it is already Ed25519-
+ * signed, so the op's actor IS `write.writer`. Amounts/supply are decimal
+ * strings (BigInt-parsed) to stay JSON/canonical-safe.
  */
 
+/** What an auction sells. A unique item (invented on create) or a fungible amount of a coin. */
+export type Give =
+	/** A unique, one-of-a-kind item. Its id becomes the auction id; escrowed to the seller. */
+	| { kind: "item"; name: string }
+	/** A fungible amount of a deployed coin, escrowed from the seller's balance. */
+	| { kind: "coin"; token: string; amount: string };
+
+/** A price tag: an amount of a specific coin. */
+export interface Price {
+	token: string;
+	amount: string;
+}
+
 export type Op =
-	/** Send GAV to another account. */
-	| { kind: "transfer"; to: string; amount: string }
-	/** List a unique item for sale. `ask` = fixed price, or null = open to bids. The
-	 *  auction's id is the create-write's id; that id also identifies the item. */
-	| { kind: "auction.create"; name: string; ask: string | null }
-	/** Bid GAV on an open auction. The bid is escrowed (locked) until resolved. */
-	| { kind: "auction.bid"; auction: string; amount: string }
+	/** Deploy a new coin. token id = this write's id; `supply` is minted to the deployer. */
+	| { kind: "coin.deploy"; name: string; symbol: string; supply: string }
+	/** Send an amount of a coin to another account. */
+	| { kind: "transfer"; token: string; to: string; amount: string }
+	/** List a `give` for sale. `ask` = advisory price (any coin), or null = open to bids. */
+	| { kind: "auction.create"; give: Give; ask: Price | null }
+	/** Bid an amount of a coin on an open auction. The bid is escrowed until resolved. */
+	| { kind: "auction.bid"; auction: string; token: string; amount: string }
 	/** Seller awards the auction to a bid, identified by that bid-write's id. */
 	| { kind: "auction.settle"; auction: string; winner: string }
-	/** Seller withdraws the auction; all bid escrows are refunded. */
+	/** Seller withdraws the auction; the give is released and all bids refunded. */
 	| { kind: "auction.cancel"; auction: string };
 
-const KINDS = new Set<string>(["transfer", "auction.create", "auction.bid", "auction.settle", "auction.cancel"]);
+const KINDS = new Set<string>(["coin.deploy", "transfer", "auction.create", "auction.bid", "auction.settle", "auction.cancel"]);
 
-/** True if a write payload is a recognized op (writes may also carry null = pure farming). */
+/** True if a write payload is a recognized op (writes may also carry null = no-op). */
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);
 }

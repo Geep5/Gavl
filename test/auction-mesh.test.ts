@@ -15,7 +15,7 @@ import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { MemoryNetwork } from "../src/sync/memory.ts";
 import { Account } from "../src/auction/account.ts";
-import { computeView, REWARD } from "../src/auction/state.ts";
+import { computeView, balanceOf } from "../src/auction/state.ts";
 import { PARAMS, K } from "./helpers.ts";
 
 test("seller on A and bidder on B run an auction to settlement", async () => {
@@ -31,14 +31,18 @@ test("seller on A and bidder on B run an auction to settlement", async () => {
 	net.link(nodeA, nodeB);
 	await net.idle();
 
+	// Bidder deploys a coin on B to bid with → propagates to A.
+	const coin = await bidder.deployCoin("Coin", "CN", 1_000n);
+	await net.idle();
+
 	// Seller lists on A → propagates to B.
-	const id = await seller.createAuction("Antique Map", null);
+	const id = await seller.createItemAuction("Antique Map", null);
 	await net.idle();
 	assert.ok(nodeB.ledger.allWrites().some((w) => w.id === id), "B received the listing");
 	assert.equal(bidder.view().auctions.get(id)!.status, "open", "bidder sees the open auction");
 
 	// Bidder bids on B → propagates to A.
-	const ref = await bidder.bid(id, 500n);
+	const ref = await bidder.bid(id, coin, 500n);
 	await net.idle();
 	assert.equal(seller.view().auctions.get(id)!.bids.length, 1, "seller received the bid");
 
@@ -54,7 +58,7 @@ test("seller on A and bidder on B run an auction to settlement", async () => {
 	for (const v of [va, vb]) {
 		assert.equal(v.auctions.get(id)!.status, "settled");
 		assert.equal(v.items.get(id)!.owner, bidder.pubHex, "winner owns the item on both nodes");
-		assert.equal(v.balances.get(seller.pubHex), REWARD * 2n + 500n);
-		assert.equal(v.balances.get(bidder.pubHex), REWARD - 500n);
+		assert.equal(balanceOf(v, coin, seller.pubHex), 500n, "seller paid 500 CN");
+		assert.equal(balanceOf(v, coin, bidder.pubHex), 500n, "bidder spent 500 of 1000 CN");
 	}
 });
