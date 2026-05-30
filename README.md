@@ -162,8 +162,32 @@ By default the daemon runs **real consensus**: it joins the live hyperswarm/hype
 (gossiping writes *and* anchors) and farms anchors over the heaviest tip with the real chiavdf
 cooldown. The UI's Consensus panel shows it advancing — anchor height, chain weight, finalized
 depth, peer count — and a settled auction gains a **✓ final** badge once an anchor certifies it.
-Env knobs: `GAVL_VDF=hash` (fast stand-in VDF), `GAVL_MESH=0` (local only), `GAVL_FARM=0`
-(don't produce anchors), `GAVL_NETWORK=<topic>` (the topic string *is* the network identity).
+Env knobs: `GAVL_VDF=hash` (fast stand-in VDF), `GAVL_SPACE=chiapos` (real disk-cost space
+proof instead of the stand-in), `GAVL_MESH=0` (local only), `GAVL_FARM=0` (don't produce
+anchors), `GAVL_RETARGET=0` (constant difficulty), `GAVL_TARGET_ITERS=<n>` (per-anchor VDF
+cost target), `GAVL_NETWORK=<topic>` (the topic string *is* the network identity).
+
+#### Hardening against the fast-VDF reorg
+
+The realistic attack on a heaviest-chain consensus is a *reorg*: out-produce a private fork and
+revert recent history. Three things blunt it, all on by default:
+
+- **Difficulty is the pace, not a timer.** A deterministic retarget schedule (`consensus/difficulty.ts`)
+  scales per-anchor difficulty toward a target VDF cost. Since weight = Σ difficulty and
+  required-iters ∝ difficulty, out-producing the chain means out-computing its *aggregate*
+  sequential work — there is no software pacing delay to simply delete. Producer and verifier
+  derive the same difficulty from the parent chain, so they never reject each other.
+- **Real Proof of Space (`GAVL_SPACE=chiapos`).** With chiapos, producing anchors costs real
+  disk per identity — restoring the Sybil resistance the stand-in plot lacks. The stand-in
+  remains the default for instant boot; the consensus mechanics are identical either way.
+- **Sticky finality.** Once a node has seen the tip reach finality depth over an anchor, that
+  anchor is *locked*: any fork that doesn't descend from it is rejected, even if heavier. A
+  fast attacker can still win the unfinalized tip, but **cannot revert a finalized settlement** —
+  the main damage a deep reorg would do.
+
+Still open (genuine remaining work): eclipse-resistant peer sampling (today "in sync?" trusts
+your current peers, so controlling all of a node's connections can still feed it a fabricated
+chain), and anchor-level equivocation slashing.
 
 The UI: deploy a coin, see per-coin balances, list a unique item or an amount of a coin
 (priced in any coin or open-to-bids), browse/filter listings, bid, and settle/cancel your own.
@@ -232,4 +256,5 @@ npm run demo:consensus  # two nodes farm + gossip anchors, finalize the same set
 - **Web UI** ✅ Svelte SPA + localhost daemon/API: deploy coins, multi-account wallet, create listings, bid, settle (`npm run daemon` + `npm run web:dev`)
 - **Consensus is live** ✅ anchors gossip over the mesh + a producer farms them (`demo:consensus`)
 - **Real proofs by default** ✅ chiavdf (proof of time) is the **default** cooldown via `defaultParams()` (async eval so gossip never blocks); chiapos (proof of space) secures anchors; both run live in `demo:consensus`
-- **P4 — hardening** eclipse-resistant peer sampling; log/anchor pruning + snapshots; incremental (non-replay) view computation
+- **Reorg hardening** ✅ difficulty-as-pace (deterministic retarget, weight ∝ VDF work); real chiapos space backend (`GAVL_SPACE=chiapos`); sticky finality (locked anchors can't be reverted by a heavier fork)
+- **P4 — remaining hardening** eclipse-resistant peer sampling; anchor-level equivocation slashing; log/anchor pruning + snapshots; incremental (non-replay) view computation

@@ -23,7 +23,16 @@ import { splitBalKey } from "./auction/state.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
-const daemon = new Daemon();
+// Space backend: real chiapos (real disk cost) when GAVL_SPACE=chiapos, else the stand-in.
+const SPACE = process.env.GAVL_SPACE === "chiapos" ? "chiapos" : "standin";
+// Difficulty schedule: ON by default so the VDF cost is the pace (anti fast-VDF reorg).
+// GAVL_RETARGET=0 disables it (constant difficulty). GAVL_TARGET_ITERS tunes the per-anchor cost.
+const RETARGET = process.env.GAVL_RETARGET !== "0";
+const TARGET_ITERS = BigInt(process.env.GAVL_TARGET_ITERS ?? "200000");
+const daemon = new Daemon({
+	space: SPACE,
+	schedule: RETARGET ? { base: 20n, targetIters: TARGET_ITERS, epoch: 4, window: 8, maxStep: 4n } : undefined,
+});
 
 // ── View → JSON (Maps + BigInts → plain, string amounts) ─────────
 
@@ -149,7 +158,8 @@ createServer((req, res) => {
 }).listen(PORT, "127.0.0.1", async () => {
 	console.log(`Gavl daemon API on http://127.0.0.1:${PORT}`);
 	console.log(`  active account: ${daemon.wallet.active().label} (${daemon.wallet.active().pubHex.slice(0, 16)}…)`);
-	console.log(`  consensus: network="${NETWORK}" mesh=${MESH} farming=${FARM} vdf=${daemon.consensus().vdf}`);
+	const cc = daemon.consensus();
+	console.log(`  consensus: network="${NETWORK}" mesh=${MESH} farming=${FARM} vdf=${cc.vdf} space=${cc.space} retarget=${RETARGET}`);
 	await daemon.startConsensus({ network: NETWORK, mesh: MESH, farm: FARM });
 	const c = daemon.consensus();
 	console.log(`  → mesh ${c.mesh ? "joined" : "off"}, ${c.peers} peer(s), farming ${c.farming ? "live" : "off"}`);

@@ -38,11 +38,16 @@ export interface ConsensusParams {
  * The Merkle stand-in already folds space into the quality (min over 2^k leaves),
  * so it passes 1. chiapos quality is a single full-range value, so it passes the
  * expected plot size — making iters ~inversely proportional to space either way.
+ *
+ * `difficulty` defaults to `p.difficulty` (the constant write-path difficulty),
+ * but the anchor layer passes a RETARGETED difficulty so the per-anchor VDF cost
+ * — and thus the cadence — tracks a target as network space/speed changes. The
+ * producer and verifier MUST pass the same value or they compute different iters.
  */
-export function requiredIters(qualityHex: string, p: ConsensusParams, spaceWeight: bigint = 1n): bigint {
+export function requiredIters(qualityHex: string, p: ConsensusParams, spaceWeight: bigint = 1n, difficulty: bigint = p.difficulty): bigint {
 	const q = BigInt("0x" + qualityHex); // 256-bit value
 	const denom = TWO_256 * (spaceWeight > 0n ? spaceWeight : 1n);
-	const iters = (p.difficulty * p.dcf * q) / denom;
+	const iters = (difficulty * p.dcf * q) / denom;
 	return iters < p.floorIters ? p.floorIters : iters;
 }
 

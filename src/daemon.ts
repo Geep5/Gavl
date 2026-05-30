@@ -27,12 +27,20 @@ import type { WalletAccount } from "./wallet.ts";
 import { defaultParams } from "./config.ts";
 import type { ChainParams } from "./chain/writer.ts";
 import { AnchorChain } from "./consensus/chain.ts";
+import type { RetargetSchedule } from "./consensus/difficulty.ts";
 import { Producer } from "./consensus/producer.ts";
 import { StandinSpaceProver, StandinSpaceVerifier } from "./consensus/space.ts";
+import type { SpaceVerifier, SpaceProver } from "./consensus/space.ts";
+import { ChiaSpaceProver, ChiaSpaceVerifier, ensurePlot } from "./pos/chia.ts";
 import { finalizedView } from "./consensus/order.ts";
 import { Plot } from "./pos/space.ts";
 import { SwarmTransport } from "./sync/swarm.ts";
 import { generateKeyPair } from "./det/ed25519.ts";
+import { toHex } from "./det/canonical.ts";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+export type SpaceMode = "standin" | "chiapos";
 
 export interface DaemonOptions {
 	walletDir?: string;
@@ -41,6 +49,12 @@ export interface DaemonOptions {
 	k?: number;
 	/** Anchor-depth at which state is considered final. */
 	finalityDepth?: number;
+	/** Anchor space backend: light stand-in (default) or real chiapos (real disk cost). */
+	space?: SpaceMode;
+	/** Difficulty schedule. Omit → constant; set → retargets so the VDF cost is the pace. */
+	schedule?: RetargetSchedule;
+	/** Plot directory for chiapos (default ~/.gavl/plots). */
+	plotDir?: string;
 }
 
 export interface ConsensusStatus {
@@ -61,6 +75,8 @@ export class Daemon {
 	readonly finalityDepth: number;
 	private readonly params: ChainParams;
 	private readonly k: number;
+	private readonly spaceMode: SpaceMode;
+	private readonly plotDir: string;
 	private readonly accounts = new Map<string, Account>();
 	private clock = 0;
 
@@ -73,8 +89,11 @@ export class Daemon {
 		this.params = opts.params ?? defaultParams();
 		this.k = opts.k ?? 11;
 		this.finalityDepth = opts.finalityDepth ?? 1;
-		const verifier = new StandinSpaceVerifier();
-		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, verifier));
+		this.spaceMode = opts.space ?? "standin";
+		this.plotDir = opts.plotDir ?? join(homedir(), ".gavl", "plots");
+		// Verifier must match the space backend producers use, or anchors are rejected.
+		const verifier: SpaceVerifier = this.spaceMode === "chiapos" ? new ChiaSpaceVerifier() : new StandinSpaceVerifier();
+		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, verifier, { schedule: opts.schedule, finalityDepth: this.finalityDepth }));
 		this.wallet = new Wallet(opts.walletDir);
 		this.wallet.ensureSeeded();
 		for (const wa of this.wallet.list()) this.bind(wa);
@@ -121,7 +140,7 @@ export class Daemon {
 		return {
 			enabled: !!this.node.anchors,
 			vdf: this.params.vdf.name,
-			space: "standin",
+			space: this.spaceMode,
 			mesh: !!this.transport,
 			network: this.network,
 			peers: this.node.peerCount,
@@ -149,10 +168,19 @@ export class Daemon {
 
 		if (opts.farm) {
 			const farmer = generateKeyPair();
-			const prover = new StandinSpaceProver(new Plot(farmer.publicKey, this.k));
+			let prover: SpaceProver;
+			if (this.spaceMode === "chiapos") {
+				// Real disk cost: plot the farmer's chiapos plot (slow the first time, then cached).
+				const pub = toHex(farmer.publicKey);
+				const plotPath = ensurePlot(pub, this.k, this.plotDir);
+				prover = new ChiaSpaceProver({ pubHex: pub, k: this.k, plotPath });
+			} else {
+				prover = new StandinSpaceProver(new Plot(farmer.publicKey, this.k));
+			}
 			this.producer = new Producer({ node: this.node, keypair: farmer, prover, params: this.params });
 			this.farming = true;
 			// Fire-and-forget farming loop; paced so the event loop (HTTP, gossip) stays responsive.
+			// With a difficulty schedule the VDF cost is the real pace; paceMs is just a yield.
 			void this.producer.run({ until: () => !this.farming, paceMs: 1500 });
 		}
 	}

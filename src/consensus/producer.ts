@@ -37,19 +37,30 @@ export class Producer {
 		this.params = opts.params;
 	}
 
-	/** Mine + submit one anchor over the current tip + heads. Null if no proof this round. */
+	/** Mine + submit one anchor over the current tip + heads. Null if no proof this round.
+	 *  Mines at the difficulty the chain expects for this tip (retargeted if a schedule
+	 *  is set) — so the per-anchor VDF cost IS the pace, not a software timer. */
 	async produceOne(): Promise<Anchor | null> {
+		const prev = this.node.anchorTip();
+		const difficulty = this.node.anchors?.difficultyFor(prev) ?? this.params.difficulty;
 		const anchor = await mineAnchor({
-			prev: this.node.anchorTip(),
+			prev,
 			producer: this.keypair,
 			prover: this.prover,
 			heads: this.node.ledger.heads(),
 			params: this.params,
+			difficulty,
 		});
 		if (anchor) await this.node.submitAnchor(anchor);
 		return anchor;
 	}
 
+	/**
+	 * Farm until `until()`. The cooldown (VDF) is the real pace; `paceMs` is only a
+	 * cooperative yield to keep tiny stand-in-VDF demos from spinning the CPU — it
+	 * is NOT a consensus rule and an attacker dropping it gains nothing once the
+	 * difficulty schedule sets a meaningful per-anchor VDF cost.
+	 */
 	async run(opts: { until: () => boolean; paceMs?: number }): Promise<void> {
 		this.active = true;
 		while (this.active && !opts.until()) {

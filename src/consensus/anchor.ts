@@ -82,9 +82,14 @@ function idOf(body: AnchorBody, time: TimeProof): string {
 	return sha256Hex(canonicalBytes({ body, time }));
 }
 
-/** Produce an anchor extending `prev`, certifying `heads`. Null if no proof this round. */
-export async function mineAnchor(opts: { prev: Anchor | null; producer: KeyPair; prover: SpaceProver; heads: Heads; params: ChainParams }): Promise<Anchor | null> {
+/** Produce an anchor extending `prev`, certifying `heads`. Null if no proof this round.
+ *  `difficulty` (the network's expected difficulty at this height) defaults to the
+ *  constant `params.difficulty`; the AnchorChain passes a retargeted value. The
+ *  committed difficulty, the cumulative weight, AND required-iters all use it, so
+ *  weight stays proportional to the VDF work actually served. */
+export async function mineAnchor(opts: { prev: Anchor | null; producer: KeyPair; prover: SpaceProver; heads: Heads; params: ChainParams; difficulty?: bigint }): Promise<Anchor | null> {
 	const { prev, producer, prover, heads, params } = opts;
+	const difficulty = opts.difficulty ?? params.difficulty;
 	const commitment = prover.commitment();
 	const sw = spaceWeightFor(commitment);
 
@@ -98,15 +103,15 @@ export async function mineAnchor(opts: { prev: Anchor | null; producer: KeyPair;
 	}
 	if (!mined) return null;
 
-	const need = requiredIters(mined.quality, params, sw);
+	const need = requiredIters(mined.quality, params, sw, difficulty);
 	const time = await params.vdf.eval(vdfChallenge(challenge, mined.quality), Number(need));
-	const weight = (prev ? BigInt(prev.weight) : 0n) + params.difficulty;
+	const weight = (prev ? BigInt(prev.weight) : 0n) + difficulty;
 	const body: AnchorBody = {
 		height: prev ? prev.height + 1 : 0,
 		prev: prev ? prev.id : null,
 		producer: toHex(producer.publicKey),
 		nonce,
-		difficulty: params.difficulty.toString(),
+		difficulty: difficulty.toString(),
 		heads,
 		stateRoot: rootOfHeads(heads),
 		weight: weight.toString(),
@@ -134,7 +139,9 @@ export async function verifyAnchor(anchor: Anchor, prev: Anchor | null, params: 
 	const v = await verifier.verify(anchor.space, anchor.producer, challenge, anchor.proof);
 	if (!v.ok || !v.quality) return { ok: false, reason: "bad space proof" };
 
-	const need = requiredIters(v.quality, params, spaceWeightFor(anchor.space));
+	// Use the EXPECTED difficulty (not the constant params.difficulty) so the
+	// cooldown check matches what an honest producer at this height would serve.
+	const need = requiredIters(v.quality, params, spaceWeightFor(anchor.space), expectedDifficulty);
 	if (BigInt(anchor.time.iters) < need) return { ok: false, reason: "insufficient cooldown" };
 	if (!params.vdf.verify(vdfChallenge(challenge, v.quality), anchor.time)) return { ok: false, reason: "bad time proof" };
 
