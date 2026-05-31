@@ -11,6 +11,7 @@ export const store = $state({
 	coins: [],
 	auctions: [],
 	balances: {}, // { pubkey: { token: amount } }
+	inventory: [], // active account's won secrets: { auctionId, name, plaintext, verified }
 	consensus: null, // { enabled, vdf, mesh, network, peers, farming, tip, finalizedHeight }
 });
 
@@ -22,6 +23,7 @@ export async function refresh() {
 		store.coins = s.coins;
 		store.auctions = s.auctions;
 		store.balances = s.balances;
+		store.inventory = s.inventory ?? [];
 		store.consensus = s.consensus ?? null;
 		store.error = null;
 	} catch (e) {

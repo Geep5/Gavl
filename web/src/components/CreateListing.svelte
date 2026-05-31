@@ -3,7 +3,7 @@
 	import { api } from "../lib/api.js";
 	import { parse as parseYaml } from "yaml";
 
-	let mode = $state("item"); // "item" | "coin"
+	let mode = $state("item"); // "item" | "coin" | "secret"
 	let busy = $state(false);
 
 	// item
@@ -11,6 +11,9 @@
 	// coin give
 	let giveToken = $state("");
 	let giveAmount = $state("");
+	// secret give
+	let secretName = $state("");
+	let secretBody = $state("");
 	// ask (optional, shared)
 	let askToken = $state("");
 	let askAmount = $state("");
@@ -54,8 +57,12 @@ terms: ships within 3 days of settlement`;
 		const body = details.trim() || undefined;
 		if (mode === "item") {
 			if (itemName.trim()) await act(() => api.createItemAuction(itemName.trim(), ask, body));
-		} else {
+		} else if (mode === "coin") {
 			if (giveToken && giveAmount) await act(() => api.createCoinAuction(giveToken, giveAmount, ask, body));
+		} else {
+			if (secretName.trim() && secretBody) await act(() => api.createSecretAuction(secretName.trim(), secretBody, ask, body));
+			secretName = "";
+			secretBody = "";
 		}
 		itemName = "";
 		giveAmount = "";
@@ -64,7 +71,7 @@ terms: ships within 3 days of settlement`;
 		busy = false;
 	}
 
-	const canList = $derived((mode === "item" ? !!itemName.trim() : !!giveToken && !!giveAmount) && !yamlError);
+	const canList = $derived((mode === "item" ? !!itemName.trim() : mode === "coin" ? !!giveToken && !!giveAmount : !!secretName.trim() && !!secretBody) && !yamlError);
 </script>
 
 <div class="panel">
@@ -73,12 +80,13 @@ terms: ships within 3 days of settlement`;
 	<div class="tabs">
 		<button class:active={mode === "item"} onclick={() => (mode = "item")}>Unique item</button>
 		<button class:active={mode === "coin"} onclick={() => (mode = "coin")}>Amount of a coin</button>
+		<button class:active={mode === "secret"} onclick={() => (mode = "secret")}>Sealed secret</button>
 	</div>
 
 	{#if mode === "item"}
 		<label>Item name <span class="muted">(headline)</span></label>
 		<input placeholder="Rare Sword" bind:value={itemName} />
-	{:else}
+	{:else if mode === "coin"}
 		<label>Coin to sell</label>
 		<select bind:value={giveToken}>
 			<option value="" disabled>— pick a coin you hold —</option>
@@ -88,6 +96,17 @@ terms: ships within 3 days of settlement`;
 		</select>
 		<label>Amount to sell</label>
 		<input placeholder="100" bind:value={giveAmount} inputmode="numeric" />
+	{:else}
+		<div class="warn">
+			⚠ <strong>Not a fair exchange.</strong> The secret is delivered to the winner encrypted and verified
+			against a commitment — but <strong>you keep a copy</strong>. Only sell secrets whose value survives you
+			still knowing them (messages, notes, codes, credentials). <strong>Never sell a private key that controls
+			funds</strong> — you could drain it after being paid.
+		</div>
+		<label>Secret title <span class="muted">(public headline)</span></label>
+		<input placeholder="Lost numbers" bind:value={secretName} />
+		<label>Secret contents <span class="muted">(stays local + encrypted; only the winner can open it)</span></label>
+		<textarea class="secret" rows="4" placeholder="the vault code is 4-8-15-16-23-42" bind:value={secretBody} spellcheck="false"></textarea>
 	{/if}
 
 	<label>Offer details <span class="muted">(optional — free-form YAML)</span></label>
@@ -113,6 +132,30 @@ terms: ships within 3 days of settlement`;
 </div>
 
 <style>
+	.warn {
+		background: #3a2a14;
+		border: 1px solid var(--accent-dim);
+		color: #f0d9a8;
+		padding: 0.55rem 0.7rem;
+		border-radius: 6px;
+		font-size: 0.76rem;
+		line-height: 1.5;
+		margin: 0.4rem 0 0.2rem;
+	}
+	.warn strong { color: var(--accent); }
+	textarea.secret {
+		width: 100%;
+		background: var(--panel-2);
+		border: 1px solid var(--border);
+		color: var(--text);
+		padding: 0.5rem 0.6rem;
+		border-radius: 6px;
+		font-family: ui-monospace, "SF Mono", Menlo, monospace;
+		font-size: 0.82rem;
+		line-height: 1.45;
+		resize: vertical;
+	}
+	textarea.secret:focus { outline: 1px solid var(--accent-dim); border-color: var(--accent-dim); }
 	textarea.yaml {
 		width: 100%;
 		background: var(--panel-2);

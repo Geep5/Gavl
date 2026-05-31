@@ -36,9 +36,15 @@
 	const myTokens = $derived(Object.keys(balances));
 	const isSeller = $derived(auction.seller === store.active);
 	const isOpen = $derived(auction.status === "open");
+	const isSecret = $derived(auction.give.kind === "secret");
+	const wonByMe = $derived(auction.status === "settled" && auction.winnerPubkey === store.active);
+	// the opened secret in my inventory, if I've already claimed it
+	const claimed = $derived(store.inventory.find((s) => s.auctionId === auction.id) ?? null);
 
 	function giveText(g) {
-		return g.kind === "item" ? g.name : `${g.amount} ${coinLabel(g.token)}`;
+		if (g.kind === "item") return g.name;
+		if (g.kind === "coin") return `${g.amount} ${coinLabel(g.token)}`;
+		return `🔒 ${g.name}`; // secret
 	}
 
 	async function placeBid() {
@@ -52,6 +58,9 @@
 	}
 	async function cancel() {
 		await act(() => api.cancel(auction.id));
+	}
+	async function claim() {
+		await act(() => api.claim(auction.id));
 	}
 </script>
 
@@ -88,6 +97,25 @@
 
 	{#if auction.winnerPubkey}
 		<div class="muted" style="font-size:0.82rem">won by {accountLabel(auction.winnerPubkey)}</div>
+	{/if}
+
+	{#if isSecret && isOpen}
+		<div class="muted" style="font-size:0.78rem">🔒 sealed secret — delivered encrypted to the winner. Seller keeps a copy (not fair exchange).</div>
+	{/if}
+
+	{#if isSecret && wonByMe}
+		{#if claimed}
+			<div class="secret-out">
+				<div class="spread">
+					<span class="muted" style="font-size:0.78rem">your secret {#if claimed.verified}<span class="pill open" title="matched the listed commitment">✓ verified</span>{:else}<span class="pill cancelled" title="did NOT match the commitment — possibly tampered">⚠ unverified</span>{/if}</span>
+				</div>
+				<pre class="raw">{claimed.plaintext}</pre>
+			</div>
+		{:else if auction.delivered}
+			<button onclick={claim}>🔓 Claim & reveal secret</button>
+		{:else}
+			<span class="muted" style="font-size:0.8rem">awaiting delivery from seller…</span>
+		{/if}
 	{/if}
 
 	{#if auction.details}
@@ -155,6 +183,10 @@
 		background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
 	}
 	.rawtoggle { font-size: 0.72rem; margin-top: 0.5rem; opacity: 0.7; }
+	.secret-out {
+		margin-top: 0.5rem; padding: 0.55rem 0.7rem;
+		background: var(--bg); border: 1px solid var(--green); border-radius: 6px;
+	}
 	dl.kv { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 0.15rem 0.7rem; }
 	dl.kv dt { color: var(--muted); font-size: 0.78rem; font-family: ui-monospace, monospace; }
 	dl.kv dd { margin: 0; font-size: 0.82rem; white-space: pre-wrap; word-break: break-word; }

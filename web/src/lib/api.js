@@ -19,7 +19,9 @@ export const api = {
 	transfer: (token, to, amount) => req("/transfer", "POST", { token, to, amount }),
 	createItemAuction: (name, ask, details) => req("/auctions", "POST", { give: { kind: "item", name }, ask, details }),
 	createCoinAuction: (token, amount, ask, details) => req("/auctions", "POST", { give: { kind: "coin", token, amount }, ask, details }),
+	createSecretAuction: (name, secret, ask, details) => req("/secrets", "POST", { name, secret, ask, details }),
 	bid: (id, token, amount) => req(`/auctions/${id}/bid`, "POST", { token, amount }),
 	settle: (id, winner) => req(`/auctions/${id}/settle`, "POST", { winner }),
 	cancel: (id) => req(`/auctions/${id}/cancel`, "POST", {}),
+	claim: (id) => req(`/auctions/${id}/claim`, "POST", {}),
 };
