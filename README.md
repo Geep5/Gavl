@@ -3,10 +3,12 @@
 A decentralized auction house on a **Proof-of-Space-Time cooldown ledger**, built on
 [Holepunch](https://github.com/holepunchto) (hypercore / hyperswarm / hyperdht).
 
-No servers, no global chain to replay from genesis. State lives in RAM and is verified
-against your current peers. Every write must pay a **cooldown** — a proof of space
-(committed plot) *and* a proof of time (VDF) — so an attacker can't spin up a swarm of
-cheap identities to flood or grind the network.
+No servers, no global chain to replay from genesis. State is computed in RAM and verified
+against your current peers — and persisted to a local append-only log so it survives a
+restart. Every write must pay a **cooldown** — a proof of space (committed plot) *and* a
+proof of time (VDF) — so an attacker can't spin up a swarm of cheap identities to flood or
+grind the network. Coins are user-deployed and the house is coin-agnostic; auctions sell
+unique items, fungible coin amounts, or **sealed secrets** delivered encrypted to the winner.
 
 ## Why Space *and* Time
 
@@ -59,12 +61,16 @@ src/sync/messages.ts   wire message shapes
 src/sync/memory.ts     in-memory transport (deterministic, offline tests)
 src/sync/swarm.ts      real Hyperswarm transport — the Holepunch mesh
 src/auction/ops.ts     op types: coin.deploy / transfer / auction.create|bid|settle|cancel
-src/auction/state.ts   pure view: writes → coins + (token,pubkey) balances + items + auctions
-src/auction/account.ts wallet + auctioneer: deploy coins, produce op-writes, query the view
+src/auction/state.ts   pure view: writes → coins + (token,pubkey) balances + items + auctions + secrets
+src/auction/account.ts wallet + auctioneer: deploy coins, list (item/coin/secret), bid, settle, claim
+src/secret/seal.ts     sealed-secret crypto: X25519 sealed boxes + commitment + at-rest vault key
+src/secret/vault.ts    per-account local secret store (selling secrets + inbox key + won inventory)
+src/store/store.ts     durable write store — one hypercore per writer, replays into the ledger on boot
+src/store/policy.ts    persist policy ("save only what I care about"): keep-all / mine / compose
 src/wallet.ts          multi-identity keystore (~/.gavl/wallet.json)
-src/daemon.ts          boots Ledger + node + one Account per identity (shared clock)
+src/daemon.ts          boots Ledger + node + store + one Account/vault per identity (shared clock)
 src/server.ts          localhost JSON API the web UI drives
-web/                   Vite + Svelte SPA (wallet, listings, deploy-coin, create-listing)
+web/                   Vite + Svelte SPA (connect stepper, wallet, listings, deploy-coin, create-listing)
 src/consensus/anchor.ts   PoST-proven anchor certifying a snapshot of writer-heads
 src/consensus/chain.ts    heaviest-weight fork choice + depth finality
 src/consensus/order.ts    anchor-bound canonical order → finalized (ts-attack-proof) view
@@ -76,7 +82,7 @@ src/pot/chia-vdf.ts       real Proof of Time — chiavdf Wesolowski VDF (the def
 src/chia/proc.ts          Python bridge to chiavdf + chiapos (sync + async variants)
 src/config.ts             composition root — defaultParams() resolves the real chiavdf
 scripts/chia_proofs.py    the Python helper wrapping chiavdf + chiapos
-test/                     P0 cooldown · P1 ledger/sync/mesh · P3 auction · P2 anchors/fork-choice · real chia
+test/                     cooldown · ledger/sync/mesh · auction · anchors/fork-choice/hardening · seal/secret-auction · store · real chia
 ```
 
 > Default `npm test` runs everything (incl. real chia + live mesh) when `.venv` is present;
@@ -143,8 +149,34 @@ only rate-limits writes.
   Invalid ops (overspend, self-bid, non-seller settle) are deterministically skipped, and no
   coin is created or destroyed outside its own `coin.deploy`.
 
+An auction's `give` can also be a free-form **YAML offer body** (`details`) — the protocol
+stores it as an opaque, content-addressed string and never parses it; the UI validates and
+renders it. And an `ask` can be left open for bids in any coin.
+
 Two views coexist: `computeView` is the optimistic tip (provisional `ts` order), and
 `finalizedView` is the safe state behind the consensus layer (below).
+
+### Sealed-secret auctions
+
+You can also auction a **sealed secret** — a message, note, code, or credential. The flow is
+confidential and tamper-evident, with **no trusted third party**:
+
+- **List.** The seller's plaintext is encrypted at rest in a local vault
+  ([src/secret/vault.ts](src/secret/vault.ts)); the listing publishes only a **commitment**
+  = `sha256(salt‖secret)`. The plaintext never touches the wire.
+- **Bid.** Each bid carries the bidder's **X25519 inbox** (a sealed-box public key).
+- **Settle.** The seller seals the secret to the winner's inbox (libsodium `crypto_box_seal`)
+  and the settle-write publishes that ciphertext — opaque to everyone but the winner.
+- **Claim.** The winner opens it and **verifies it against the listed commitment** (so the
+  seller can't swap secrets at settle), then it lands in their local inventory + UI.
+
+> **This is confidential, verifiable *delivery* — not fair exchange.** The seller inherently
+> keeps a copy of the secret, so this is right for things whose value survives that (messages,
+> notes, codes) and **unsafe for anything that controls funds** (a private key — the seller
+> could use their copy after being paid). The UI warns loudly; the protocol can make delivery
+> private and verifiable, but it cannot make the seller forget. We explored a Cashu-style
+> blind-signature mint (which *would* make a transferable secret safe via token-swap) and
+> rejected it: a mint is a trusted custodian, which defeats the point.
 
 ### Web UI + daemon
 
@@ -165,7 +197,8 @@ depth, peer count — and a settled auction gains a **✓ final** badge once an 
 Env knobs: `GAVL_VDF=hash` (fast stand-in VDF), `GAVL_SPACE=chiapos` (real disk-cost space
 proof instead of the stand-in), `GAVL_MESH=0` (local only), `GAVL_FARM=0` (don't produce
 anchors), `GAVL_RETARGET=0` (constant difficulty), `GAVL_TARGET_ITERS=<n>` (per-anchor VDF
-cost target), `GAVL_NETWORK=<topic>` (the topic string *is* the network identity).
+cost target), `GAVL_NETWORK=<topic>` (the topic string *is* the network identity),
+`GAVL_PERSIST=all|mine|off` (durable storage policy — see below).
 
 #### Hardening against the fast-VDF reorg
 
@@ -189,8 +222,12 @@ Still open (genuine remaining work): eclipse-resistant peer sampling (today "in 
 your current peers, so controlling all of a node's connections can still feed it a fabricated
 chain), and anchor-level equivocation slashing.
 
-The UI: deploy a coin, see per-coin balances, list a unique item or an amount of a coin
-(priced in any coin or open-to-bids), browse/filter listings, bid, and settle/cancel your own.
+The UI: a **connect stepper** below the header surfaces the decentralized backbone as it comes
+up (daemon → identity → peer mesh → PoST cooldown → anchor chain → finality), each step from
+real state. Below it: deploy a coin, see per-coin balances, list a unique item / coin amount /
+sealed secret (priced in any coin or open-to-bids, with an optional YAML offer body),
+browse/filter listings, bid, settle/cancel your own, and **claim** secrets you've won (a
+"Ready to claim" bar surfaces them regardless of the active filter).
 
 ### Durable, selective storage
 
@@ -249,14 +286,14 @@ node --test test/chiapos-anchor.test.ts   # plots a real k=18 plot once (cached)
 A plot is a real file under `~/.gavl/plots/` whose id is bound to the producer's key, so a
 producer can't present someone else's plot. Quality from chiapos's verifier feeds the same
 `requiredIters` coupling (normalized by expected plot size). The matching real VDF (chiavdf)
-slots into the existing `Vdf` interface the same way — that's the next step.
+is already the **default** cooldown (see "Real proofs" above), wired through the same interfaces.
 
 ## Run
 
 Needs Node ≥ 23.6 (native TypeScript — no build step). You're on Node 26.
 
 ```bash
-npm test            # full suite: PoST primitive + ledger + gossip + mesh + auction
+npm test            # full suite: cooldown + ledger + gossip + mesh + auction + secrets + storage + consensus
 npm run demo        # build + verify a PoST chain, showing space→cooldown
 npm run demo:auction  # run a live auction between two nodes over a real hyperdht mesh
 npm run demo:consensus  # two nodes farm + gossip anchors, finalize the same settled auction
@@ -272,4 +309,7 @@ npm run demo:consensus  # two nodes farm + gossip anchors, finalize the same set
 - **Consensus is live** ✅ anchors gossip over the mesh + a producer farms them (`demo:consensus`)
 - **Real proofs by default** ✅ chiavdf (proof of time) is the **default** cooldown via `defaultParams()` (async eval so gossip never blocks); chiapos (proof of space) secures anchors; both run live in `demo:consensus`
 - **Reorg hardening** ✅ difficulty-as-pace (deterministic retarget, weight ∝ VDF work); real chiapos space backend (`GAVL_SPACE=chiapos`); sticky finality (locked anchors can't be reverted by a heavier fork)
+- **Durable + selective storage** ✅ hypercore-backed write store, replayed into the ledger on boot (survives restart); per-write persist policy (`GAVL_PERSIST=all|mine|off`) — save only what you care about
+- **YAML offer bodies** ✅ optional free-form, opaque, content-addressed `details` on a listing; client-side validated + rendered
+- **Sealed-secret auctions** ✅ commit-on-list, sealed-box delivery to the winner's inbox, commitment-verified claim, local encrypted inventory + UI (confidential delivery, not fair exchange — surfaced loudly)
 - **P4 — remaining hardening** eclipse-resistant peer sampling; anchor-level equivocation slashing; log/anchor pruning + snapshots; incremental (non-replay) view computation
