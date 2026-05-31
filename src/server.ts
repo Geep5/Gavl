@@ -29,9 +29,15 @@ const SPACE = process.env.GAVL_SPACE === "chiapos" ? "chiapos" : "standin";
 // GAVL_RETARGET=0 disables it (constant difficulty). GAVL_TARGET_ITERS tunes the per-anchor cost.
 const RETARGET = process.env.GAVL_RETARGET !== "0";
 const TARGET_ITERS = BigInt(process.env.GAVL_TARGET_ITERS ?? "200000");
+
+// Durable storage: ON by default (GAVL_PERSIST=off → in-memory only, lost on restart).
+//   GAVL_PERSIST=all  (default) → archiver, keep every write
+//   GAVL_PERSIST=mine            → keep only writes touching my wallet keys + their coins/auctions
+const PERSIST = process.env.GAVL_PERSIST ?? "all";
 const daemon = new Daemon({
 	space: SPACE,
 	schedule: RETARGET ? { base: 20n, targetIters: TARGET_ITERS, epoch: 4, window: 8, maxStep: 4n } : undefined,
+	store: PERSIST === "off" ? undefined : { persist: PERSIST === "mine" ? "mine" : "all" },
 });
 
 // ── View → JSON (Maps + BigInts → plain, string amounts) ─────────
@@ -70,7 +76,7 @@ function serializeState() {
 	}
 
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));
-	return { accounts, active: daemon.wallet.active().pubHex, coins, auctions, balances, consensus: daemon.consensus() };
+	return { accounts, active: daemon.wallet.active().pubHex, coins, auctions, balances, consensus: daemon.consensus(), storage: daemon.storeStats() };
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -162,6 +168,16 @@ createServer((req, res) => {
 	console.log(`  active account: ${daemon.wallet.active().label} (${daemon.wallet.active().pubHex.slice(0, 16)}…)`);
 	const cc = daemon.consensus();
 	console.log(`  consensus: network="${NETWORK}" mesh=${MESH} farming=${FARM} vdf=${cc.vdf} space=${cc.space} retarget=${RETARGET}`);
+
+	// Durable storage: replay persisted writes into the ledger BEFORE going live.
+	const replayed = await daemon.init();
+	if (replayed) {
+		const st = daemon.storeStats();
+		console.log(`  storage: persist=${PERSIST}, replayed ${replayed.replayed} write(s) from disk — ${st?.policy ?? ""}`);
+	} else {
+		console.log(`  storage: in-memory only (GAVL_PERSIST=off) — writes are lost on restart`);
+	}
+
 	await daemon.startConsensus({ network: NETWORK, mesh: MESH, farm: FARM });
 	const c = daemon.consensus();
 	console.log(`  → mesh ${c.mesh ? "joined" : "off"}, ${c.peers} peer(s), farming ${c.farming ? "live" : "off"}`);

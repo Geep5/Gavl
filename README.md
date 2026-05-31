@@ -192,6 +192,21 @@ chain), and anchor-level equivocation slashing.
 The UI: deploy a coin, see per-coin balances, list a unique item or an amount of a coin
 (priced in any coin or open-to-bids), browse/filter listings, bid, and settle/cancel your own.
 
+### Durable, selective storage
+
+The ledger is held in RAM, but accepted writes are also persisted to a local
+**Holepunch `hypercore`** store (one append-only core per writer). On boot the daemon
+**replays the store into the ledger** before going live, so state survives a full restart —
+not just "as long as some peer stays up."
+
+Persistence is **selective** — you save only what you care about:
+
+- `GAVL_PERSIST=all` (default) — archiver, keep every write (full node). The network needs some of these.
+- `GAVL_PERSIST=mine` — keep only writes touching your wallet keys and their coins/auctions; everything else stays RAM-only and is dropped on restart, making your node a *partial node by choice*.
+- `GAVL_PERSIST=off` — in-memory only (writes lost on restart).
+
+> Pruning makes **your** node partial; the network only stays whole if some nodes archive.
+
 ### Consensus (P2)
 
 Per-writer chains already make conservation safe (every debit is in the debitor's own

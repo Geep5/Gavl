@@ -37,6 +37,9 @@ import { Plot } from "./pos/space.ts";
 import { SwarmTransport } from "./sync/swarm.ts";
 import { generateKeyPair } from "./det/ed25519.ts";
 import { toHex } from "./det/canonical.ts";
+import { WriteStore } from "./store/store.ts";
+import { KeepAllPolicy, MinePolicy } from "./store/policy.ts";
+import type { PersistPolicy } from "./store/policy.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -57,6 +60,14 @@ export interface DaemonOptions {
 	plotDir?: string;
 	/** Idle heartbeat: when caught up, mine one anchor every this many ms (default 120s). */
 	heartbeatMs?: number;
+	/** Durable storage. Omit → in-memory only (RAM, lost on restart). */
+	store?: {
+		dir?: string; // corestore dir (default ~/.gavl/store)
+		/** "all" → archiver (keep everything); "mine" → only my wallet keys + their coins/auctions. */
+		persist?: "all" | "mine";
+		/** Or supply a custom policy directly (overrides `persist`). */
+		policy?: PersistPolicy;
+	};
 }
 
 export interface ConsensusStatus {
@@ -87,6 +98,8 @@ export class Daemon {
 	private network: string | null = null;
 	private farming = false;
 	private readonly heartbeatMs: number;
+	private store?: WriteStore;
+	private readonly storeOpts?: DaemonOptions["store"];
 
 	constructor(opts: DaemonOptions = {}) {
 		this.params = opts.params ?? defaultParams();
@@ -95,12 +108,46 @@ export class Daemon {
 		this.heartbeatMs = opts.heartbeatMs ?? 120_000;
 		this.spaceMode = opts.space ?? "standin";
 		this.plotDir = opts.plotDir ?? join(homedir(), ".gavl", "plots");
+		this.storeOpts = opts.store;
 		// Verifier must match the space backend producers use, or anchors are rejected.
 		const verifier: SpaceVerifier = this.spaceMode === "chiapos" ? new ChiaSpaceVerifier() : new StandinSpaceVerifier();
 		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, verifier, { schedule: opts.schedule, finalityDepth: this.finalityDepth }));
 		this.wallet = new Wallet(opts.walletDir);
 		this.wallet.ensureSeeded();
 		for (const wa of this.wallet.list()) this.bind(wa);
+	}
+
+	/**
+	 * Open durable storage, replay persisted writes into the ledger (rebuilding
+	 * RAM state from disk), then hook persistence so every future accepted write
+	 * is offered to the store. Call once, before startConsensus. No-op if storage
+	 * is disabled (in-memory only). Replayed writes re-run apply() so the ledger,
+	 * anchors, and views are reconstructed exactly.
+	 */
+	async init(): Promise<{ replayed: number } | null> {
+		if (!this.storeOpts) return null;
+		const dir = this.storeOpts.dir ?? join(homedir(), ".gavl", "store");
+		// "mine" builds a MinePolicy from this node's wallet keys (now that the wallet is ready).
+		const policy: PersistPolicy = this.storeOpts.policy ?? (this.storeOpts.persist === "mine" ? new MinePolicy(this.wallet.list().map((a) => a.pubHex)) : new KeepAllPolicy());
+		this.store = new WriteStore({ dir, policy });
+		await this.store.ready();
+
+		// Replay persisted writes into the ledger BEFORE going live.
+		const { writes } = await this.store.replay((w) => {
+			this.node.ledger.apply(w);
+		});
+
+		// Persist every newly-applied write (write-through, policy-filtered).
+		const prev = this.node.onApplied;
+		this.node.onApplied = (applied) => {
+			prev?.(applied);
+			for (const w of applied) void this.store!.persist(w);
+		};
+		return { replayed: writes };
+	}
+
+	storeStats() {
+		return this.store?.stats() ?? null;
 	}
 
 	private now = (): number => ++this.clock;
@@ -199,5 +246,6 @@ export class Daemon {
 		this.farming = false;
 		this.producer?.stop();
 		if (this.transport) await this.transport.destroy().catch(() => {});
+		if (this.store) await this.store.close().catch(() => {});
 	}
 }
