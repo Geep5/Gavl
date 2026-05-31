@@ -16,6 +16,9 @@ import type { View, Auction } from "./state.ts";
 import type { Op, Give, Price } from "./ops.ts";
 import { finalizedView } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
+import type { SecretVault, WonSecret } from "../secret/vault.ts";
+import { commit, freshSalt, seal, openSealed, verifyCommitment } from "../secret/seal.ts";
+import { toHex, fromHex } from "../det/canonical.ts";
 
 function amountStr(a: bigint | number | string): string {
 	if (typeof a === "string") return a;
@@ -35,17 +38,21 @@ export interface AccountOptions {
 	/** Logical clock for op timestamps. Share one across accounts in a test for causal order. */
 	now: () => number;
 	keypair?: KeyPair;
+	/** Per-account secret vault, for selling/winning sealed secrets. Optional. */
+	vault?: SecretVault;
 }
 
 export class Account {
 	readonly node: GavlNode;
 	readonly writer: Writer;
+	readonly vault?: SecretVault;
 	private readonly now: () => number;
 
 	constructor(opts: AccountOptions) {
 		this.node = opts.node;
 		this.writer = new Writer({ k: opts.k, params: opts.params, keypair: opts.keypair });
 		this.now = opts.now;
+		this.vault = opts.vault;
 	}
 
 	get pubHex(): string {
@@ -93,13 +100,61 @@ export class Account {
 		return (await this.produce(op)).id;
 	}
 
-	/** Bid an amount of a coin; returns the bid ref (= the bid-write's id) used to award it. */
-	async bid(auction: string, token: string, amount: bigint | number | string): Promise<string> {
-		return (await this.produce({ kind: "auction.bid", auction, token, amount: amountStr(amount) })).id;
+	/** List a sealed secret for sale. The plaintext is vaulted locally; only the
+	 *  commitment is published. Returns the auction id. Requires a vault. */
+	async createSecretAuction(name: string, secret: string, ask: Price | { token: string; amount: bigint | number | string } | null = null, details?: string): Promise<string> {
+		if (!this.vault) throw new Error("account: no vault — cannot sell secrets");
+		const salt = freshSalt();
+		const secretBytes = new TextEncoder().encode(secret);
+		const commitment = commit(secretBytes, salt);
+		const id = await this.create({ kind: "secret", name, commitment }, ask, details);
+		// vault the plaintext keyed by auction id so settle can seal it later (survives restart)
+		this.vault.putSelling({ auctionId: id, name, salt: toHex(salt), commitment, plaintext: secret });
+		return id;
 	}
 
-	settle(auction: string, winnerRef: string): Promise<Write> {
+	/** Bid an amount of a coin; returns the bid ref. Auto-attaches this account's
+	 *  delivery inbox (from the vault) so it can win secret auctions. */
+	async bid(auction: string, token: string, amount: bigint | number | string): Promise<string> {
+		const op: Op = { kind: "auction.bid", auction, token, amount: amountStr(amount) };
+		if (this.vault) op.inbox = this.vault.inboxPub;
+		return (await this.produce(op)).id;
+	}
+
+	/** Settle to a winning bid. For a SECRET auction, seals the vaulted secret to the
+	 *  winner's inbox and publishes it in the settle write. Requires the vault for secrets. */
+	async settle(auction: string, winnerRef: string): Promise<Write> {
+		const a = this.view().auctions.get(auction);
+		if (a && a.give.kind === "secret") {
+			if (!this.vault) throw new Error("account: no vault — cannot settle a secret auction");
+			const selling = this.vault.getSelling(auction);
+			if (!selling) throw new Error(`account: no vaulted secret for auction ${auction}`);
+			const win = a.bids.find((b) => b.ref === winnerRef);
+			if (!win?.inbox) throw new Error("account: winning bid has no delivery inbox");
+			// seal (salt ‖ secret) to the winner so they can verify against the commitment
+			const payload = new Uint8Array([...fromHex(selling.salt), ...new TextEncoder().encode(selling.plaintext)]);
+			const delivery = seal(payload, fromHex(win.inbox));
+			return this.produce({ kind: "auction.settle", auction, winner: winnerRef, delivery });
+		}
 		return this.produce({ kind: "auction.settle", auction, winner: winnerRef });
+	}
+
+	/** Open a secret auction I won: decrypt the delivery, verify against the listed
+	 *  commitment, and store it in my inventory. Returns the opened secret or null. */
+	claimWon(auctionId: string): WonSecret | null {
+		if (!this.vault) return null;
+		const a = this.view().auctions.get(auctionId);
+		if (!a || a.give.kind !== "secret" || a.status !== "settled") return null;
+		if (a.winnerPubkey !== this.pubHex || !a.delivery) return null;
+
+		const opened = openSealed(a.delivery, this.vault.inboxKeyPair);
+		if (!opened) return null;
+		const salt = opened.slice(0, 16);
+		const secretBytes = opened.slice(16);
+		const verified = verifyCommitment(secretBytes, salt, a.give.commitment);
+		const won: WonSecret = { auctionId, name: a.give.name, plaintext: new TextDecoder().decode(secretBytes), verified };
+		this.vault.putWon(won);
+		return won;
 	}
 
 	cancel(auction: string): Promise<Write> {

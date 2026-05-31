@@ -54,16 +54,18 @@ function serializeState() {
 		deployer: c.deployer,
 	}));
 
+	const giveJson = (g) => (g.kind === "item" ? { kind: "item", itemId: g.itemId, name: g.name } : g.kind === "coin" ? { kind: "coin", token: g.token, amount: g.amount.toString() } : { kind: "secret", name: g.name, commitment: g.commitment });
 	const auctions = [...view.auctions.values()].map((a) => ({
 		id: a.id,
 		seller: a.seller,
-		give: a.give.kind === "item" ? { kind: "item", itemId: a.give.itemId, name: a.give.name } : { kind: "coin", token: a.give.token, amount: a.give.amount.toString() },
+		give: giveJson(a.give),
 		ask: a.ask ? { token: a.ask.token, amount: a.ask.amount.toString() } : null,
 		details: a.details ?? null,
 		status: a.status,
-		bids: a.bids.map((b) => ({ ref: b.ref, bidder: b.bidder, token: b.token, amount: b.amount.toString() })),
+		bids: a.bids.map((b) => ({ ref: b.ref, bidder: b.bidder, token: b.token, amount: b.amount.toString(), inbox: b.inbox ?? null })),
 		winner: a.winner ?? null,
 		winnerPubkey: a.winnerPubkey ?? null,
+		delivered: !!a.delivery, // secret auctions: has the sealed delivery been published?
 		// true once the anchor chain has certified this auction's settlement/outcome.
 		finalized: finalAuctions.get(a.id)?.status === a.status && a.status !== "open",
 	}));
@@ -76,7 +78,9 @@ function serializeState() {
 	}
 
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));
-	return { accounts, active: daemon.wallet.active().pubHex, coins, auctions, balances, consensus: daemon.consensus(), storage: daemon.storeStats() };
+	// active account's inventory of won secrets (decrypted locally, never on the wire)
+	const inventory = daemon.active().vault?.won() ?? [];
+	return { accounts, active: daemon.wallet.active().pubHex, coins, auctions, balances, inventory, consensus: daemon.consensus(), storage: daemon.storeStats() };
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -140,6 +144,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			// body.details = opaque offer body (free-form YAML), optional
 			const id = await daemon.active().create(body.give, body.ask ?? null, typeof body.details === "string" ? body.details : undefined);
 			return send(res, 200, { id });
+		}
+		if (path === "/api/secrets") {
+			// Sell a sealed secret: { name, secret, ask?, details? }. Plaintext is vaulted locally,
+			// only the commitment is published. NOT fair exchange — seller keeps a copy.
+			const id = await daemon.active().createSecretAuction(String(body.name), String(body.secret), body.ask ?? null, typeof body.details === "string" ? body.details : undefined);
+			return send(res, 200, { id });
+		}
+		const claimMatch = path.match(/^\/api\/auctions\/([0-9a-f]+)\/claim$/);
+		if (claimMatch) {
+			const won = daemon.active().claimWon(claimMatch[1]);
+			if (!won) return send(res, 400, { error: "nothing to claim (not winner, not settled, or already open)" });
+			return send(res, 200, { name: won.name, plaintext: won.plaintext, verified: won.verified });
 		}
 		const bidMatch = path.match(/^\/api\/auctions\/([0-9a-f]+)\/(bid|settle|cancel)$/);
 		if (bidMatch) {

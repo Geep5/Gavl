@@ -40,6 +40,7 @@ import { toHex } from "./det/canonical.ts";
 import { WriteStore } from "./store/store.ts";
 import { KeepAllPolicy, MinePolicy } from "./store/policy.ts";
 import type { PersistPolicy } from "./store/policy.ts";
+import { SecretVault } from "./secret/vault.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -153,7 +154,8 @@ export class Daemon {
 	private now = (): number => ++this.clock;
 
 	private bind(wa: WalletAccount): Account {
-		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: wa.keypair });
+		const vault = new SecretVault({ dir: join(homedir(), ".gavl", "secrets"), pubHex: wa.pubHex, seed: wa.keypair.privateKey });
+		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: wa.keypair, vault });
 		this.accounts.set(wa.pubHex, acct);
 		return acct;
 	}

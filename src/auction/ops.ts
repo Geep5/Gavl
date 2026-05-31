@@ -12,12 +12,17 @@
  * strings (BigInt-parsed) to stay JSON/canonical-safe.
  */
 
-/** What an auction sells. A unique item (invented on create) or a fungible amount of a coin. */
+/** What an auction sells. A unique item, a fungible coin amount, or a sealed secret. */
 export type Give =
 	/** A unique, one-of-a-kind item. Its id becomes the auction id; escrowed to the seller. */
 	| { kind: "item"; name: string }
 	/** A fungible amount of a deployed coin, escrowed from the seller's balance. */
-	| { kind: "coin"; token: string; amount: string };
+	| { kind: "coin"; token: string; amount: string }
+	/** A sealed secret (message/note/code/credential). The protocol holds ONLY the
+	 *  commitment = sha256(salt‖secret); the plaintext lives in the seller's local
+	 *  vault and is sealed to the winner at settle. NOT fair exchange — the seller
+	 *  keeps a copy, so this is unsafe for secrets that control funds. */
+	| { kind: "secret"; name: string; commitment: string };
 
 /** A price tag: an amount of a specific coin. */
 export interface Price {
@@ -35,10 +40,14 @@ export type Op =
 	 *  format the listing — description, condition, specs, terms. The protocol never parses
 	 *  it; it's stored verbatim and content-addressed like any other field. */
 	| { kind: "auction.create"; give: Give; ask: Price | null; details?: string }
-	/** Bid an amount of a coin on an open auction. The bid is escrowed until resolved. */
-	| { kind: "auction.bid"; auction: string; token: string; amount: string }
-	/** Seller awards the auction to a bid, identified by that bid-write's id. */
-	| { kind: "auction.settle"; auction: string; winner: string }
+	/** Bid an amount of a coin on an open auction. The bid is escrowed until resolved.
+	 *  `inbox` = the bidder's X25519 sealed-box public key (hex); required to win a
+	 *  secret auction, since delivery is sealed to it. Ignored for non-secret gives. */
+	| { kind: "auction.bid"; auction: string; token: string; amount: string; inbox?: string }
+	/** Seller awards the auction to a bid, identified by that bid-write's id.
+	 *  `delivery` = for a secret auction, the secret sealed to the winner's inbox (hex
+	 *  ciphertext). Opaque to the protocol; only the winner can open it. */
+	| { kind: "auction.settle"; auction: string; winner: string; delivery?: string }
 	/** Seller withdraws the auction; the give is released and all bids refunded. */
 	| { kind: "auction.cancel"; auction: string };
 
