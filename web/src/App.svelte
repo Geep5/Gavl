@@ -6,6 +6,7 @@
 	import CreateListing from "./components/CreateListing.svelte";
 	import ListingsView from "./components/ListingsView.svelte";
 	import ConsensusPanel from "./components/ConsensusPanel.svelte";
+	import ConnectProgress from "./components/ConnectProgress.svelte";
 
 	let timer;
 	onMount(() => {
@@ -22,6 +23,8 @@
 			<span class="tag" style="margin-left:auto">acting as <strong>{accountLabel(store.active)}</strong></span>
 		{/if}
 	</header>
+
+	<ConnectProgress />
 
 	{#if store.error}
 		<div class="err">{store.error}</div>
