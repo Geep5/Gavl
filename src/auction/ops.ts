@@ -30,8 +30,11 @@ export type Op =
 	| { kind: "coin.deploy"; name: string; symbol: string; supply: string }
 	/** Send an amount of a coin to another account. */
 	| { kind: "transfer"; token: string; to: string; amount: string }
-	/** List a `give` for sale. `ask` = advisory price (any coin), or null = open to bids. */
-	| { kind: "auction.create"; give: Give; ask: Price | null }
+	/** List a `give` for sale. `ask` = advisory price (any coin), or null = open to bids.
+	 *  `details` = an OPAQUE offer body (the UI uses free-form YAML) the seller writes to
+	 *  format the listing — description, condition, specs, terms. The protocol never parses
+	 *  it; it's stored verbatim and content-addressed like any other field. */
+	| { kind: "auction.create"; give: Give; ask: Price | null; details?: string }
 	/** Bid an amount of a coin on an open auction. The bid is escrowed until resolved. */
 	| { kind: "auction.bid"; auction: string; token: string; amount: string }
 	/** Seller awards the auction to a bid, identified by that bid-write's id. */

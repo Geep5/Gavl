@@ -77,18 +77,20 @@ export class Account {
 	}
 
 	/** List a unique item for sale; returns the auction id (= the create-write's id). */
-	createItemAuction(name: string, ask: Price | { token: string; amount: bigint | number | string } | null = null): Promise<string> {
-		return this.create({ kind: "item", name }, ask);
+	createItemAuction(name: string, ask: Price | { token: string; amount: bigint | number | string } | null = null, details?: string): Promise<string> {
+		return this.create({ kind: "item", name }, ask, details);
 	}
 
 	/** List a fungible amount of a coin for sale; returns the auction id. */
-	createCoinAuction(token: string, amount: bigint | number | string, ask: Price | { token: string; amount: bigint | number | string } | null = null): Promise<string> {
-		return this.create({ kind: "coin", token, amount: amountStr(amount) }, ask);
+	createCoinAuction(token: string, amount: bigint | number | string, ask: Price | { token: string; amount: bigint | number | string } | null = null, details?: string): Promise<string> {
+		return this.create({ kind: "coin", token, amount: amountStr(amount) }, ask, details);
 	}
 
-	/** Low-level: list any `give`; returns the auction id. */
-	async create(give: Give, ask: Price | { token: string; amount: bigint | number | string } | null = null): Promise<string> {
-		return (await this.produce({ kind: "auction.create", give, ask: priceOf(ask) })).id;
+	/** Low-level: list any `give` with an optional opaque offer body; returns the auction id. */
+	async create(give: Give, ask: Price | { token: string; amount: bigint | number | string } | null = null, details?: string): Promise<string> {
+		const op: Op = { kind: "auction.create", give, ask: priceOf(ask) };
+		if (details !== undefined && details !== "") op.details = details;
+		return (await this.produce(op)).id;
 	}
 
 	/** Bid an amount of a coin; returns the bid ref (= the bid-write's id) used to award it. */

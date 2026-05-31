@@ -53,6 +53,7 @@ function serializeState() {
 		seller: a.seller,
 		give: a.give.kind === "item" ? { kind: "item", itemId: a.give.itemId, name: a.give.name } : { kind: "coin", token: a.give.token, amount: a.give.amount.toString() },
 		ask: a.ask ? { token: a.ask.token, amount: a.ask.amount.toString() } : null,
+		details: a.details ?? null,
 		status: a.status,
 		bids: a.bids.map((b) => ({ ref: b.ref, bidder: b.bidder, token: b.token, amount: b.amount.toString() })),
 		winner: a.winner ?? null,
@@ -130,7 +131,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		}
 		if (path === "/api/auctions") {
 			// body.give = {kind:"item",name} | {kind:"coin",token,amount};  body.ask = {token,amount}|null
-			const id = await daemon.active().create(body.give, body.ask ?? null);
+			// body.details = opaque offer body (free-form YAML), optional
+			const id = await daemon.active().create(body.give, body.ask ?? null, typeof body.details === "string" ? body.details : undefined);
 			return send(res, 200, { id });
 		}
 		const bidMatch = path.match(/^\/api\/auctions\/([0-9a-f]+)\/(bid|settle|cancel)$/);

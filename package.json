@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "hyperdht": "^6.32.0",
-    "hyperswarm": "^4.17.0"
+    "hyperswarm": "^4.17.0",
+    "yaml": "^2.9.0"
   }
 }
