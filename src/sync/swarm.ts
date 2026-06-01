@@ -83,18 +83,46 @@ export interface SwarmOptions {
 export class SwarmTransport {
 	readonly swarm: InstanceType<typeof Hyperswarm>;
 	private readonly node: GavlNode;
+	/** node-key hex (hex of a connected peer's DHT/Noise public key) → connection count. */
+	private readonly peerKeys = new Map<string, number>();
+	private topicHex: string | null = null;
 
 	constructor(node: GavlNode, opts: SwarmOptions = {}) {
 		this.node = node;
 		this.swarm = new Hyperswarm({ bootstrap: opts.bootstrap, keyPair: opts.keyPair });
-		this.swarm.on("connection", (socket: Duplex) => {
+		this.swarm.on("connection", (socket: Duplex & { remotePublicKey?: Buffer }) => {
+			const key = socket.remotePublicKey ? socket.remotePublicKey.toString("hex") : null;
+			if (key) {
+				this.peerKeys.set(key, (this.peerKeys.get(key) ?? 0) + 1);
+				socket.once("close", () => {
+					const n = (this.peerKeys.get(key) ?? 1) - 1;
+					if (n <= 0) this.peerKeys.delete(key);
+					else this.peerKeys.set(key, n);
+				});
+			}
 			this.node.addPeer(new SwarmConnection(socket));
 		});
+	}
+
+	/** This node's stable DHT/Noise public key (hex) — its unique address on the wire. */
+	get nodeKeyHex(): string {
+		return this.swarm.keyPair.publicKey.toString("hex");
+	}
+
+	/** sha256(networkName) (hex) — the DHT topic every Gavl peer rendezvouses on. */
+	get topicHexValue(): string | null {
+		return this.topicHex;
+	}
+
+	/** Hex node-keys of currently-connected peers. */
+	connectedPeerKeys(): string[] {
+		return [...this.peerKeys.keys()];
 	}
 
 	/** Join a named network and wait until announced + connected to the swarm. */
 	async join(networkName: string): Promise<void> {
 		const topic = Buffer.from(sha256(networkName));
+		this.topicHex = topic.toString("hex");
 		const discovery = this.swarm.join(topic, { server: true, client: true });
 		await discovery.flushed();
 		await this.swarm.flush();

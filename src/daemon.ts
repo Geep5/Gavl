@@ -87,6 +87,12 @@ export interface ConsensusStatus {
 	secPerAnchor: number;
 	/** True if secPerAnchor is a live measurement; false if it's the target fallback (cold/idle). */
 	secPerAnchorMeasured: boolean;
+	/** This node's stable DHT/Noise public key (hex) — its unique address peers dial. Null if mesh off. */
+	nodeKey: string | null;
+	/** sha256(network) (hex) — the DHT topic every Gavl peer rendezvouses on. Null if mesh off. */
+	topic: string | null;
+	/** Hex node-keys of currently-connected peers. */
+	peerKeys: string[];
 }
 
 export class Daemon {
@@ -250,6 +256,9 @@ export class Daemon {
 			finalizedHeight: finalized ? finalized.height : null,
 			secPerAnchor: measured ?? this.targetSecPerAnchor,
 			secPerAnchorMeasured: measured != null,
+			nodeKey: this.transport ? this.transport.nodeKeyHex : null,
+			topic: this.transport ? this.transport.topicHexValue : null,
+			peerKeys: this.transport ? this.transport.connectedPeerKeys() : [],
 		};
 	}
 

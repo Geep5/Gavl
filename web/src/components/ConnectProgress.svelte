@@ -44,12 +44,40 @@
 	const fillPct = $derived(lastDone <= 0 ? 0 : (lastDone / (n - 1)) * 100);
 	const inset = $derived(50 / n); // % from each edge to the first/last dot center
 	const allDone = $derived(doneCount === n);
+
+	// The concrete identifiers a peer needs to find/dial this Gavl network — surfaced
+	// instead of vague labels, so the connection is verifiable, not just asserted.
+	let showIds = $state(false);
+	let copied = $state("");
+	const ids = $derived.by(() => {
+		const rows = [];
+		if (c?.network) rows.push({ k: "Network slug", v: c.network, hint: "Human-readable network name. Peers must use the same one to meet." });
+		if (c?.topic) rows.push({ k: "DHT topic", v: c.topic, hint: "sha256(network) — the universal rendezvous key all Gavl peers join on the hyperdht. THIS is the address of the network itself." });
+		if (c?.nodeKey) rows.push({ k: "This node", v: c.nodeKey, hint: "This node's DHT/Noise public key — its unique address other peers dial directly." });
+		for (const pk of c?.peerKeys ?? []) rows.push({ k: "Peer", v: pk, hint: "A currently-connected peer's node key." });
+		return rows;
+	});
+	function shortMid(s) {
+		return s.length > 20 ? s.slice(0, 10) + "…" + s.slice(-6) : s;
+	}
+	async function copy(v) {
+		try {
+			await navigator.clipboard.writeText(v);
+			copied = v;
+			setTimeout(() => (copied = copied === v ? "" : copied), 1200);
+		} catch {
+			/* clipboard blocked — ignore */
+		}
+	}
 </script>
 
 <div class="connect" class:complete={allDone}>
 	<div class="head">
 		<span class="title">Decentralized connection</span>
-		<span class="count" class:ok={allDone}>{doneCount}/{n} confirmed{allDone ? " · fully peer-to-peer" : ""}</span>
+		<span class="head-right">
+			<span class="count" class:ok={allDone}>{doneCount}/{n} confirmed{allDone ? " · fully peer-to-peer" : ""}</span>
+			{#if ids.length}<button class="idtoggle" onclick={() => (showIds = !showIds)}>{showIds ? "▾ identifiers" : "▸ identifiers"}</button>{/if}
+		</span>
 	</div>
 
 	<div class="steps" style="--inset:{inset}%">
@@ -66,6 +94,19 @@
 			</div>
 		{/each}
 	</div>
+
+	{#if showIds}
+		<div class="ids">
+			<div class="ids-note">The exact addresses peers use to find and dial this network — copy any to share.</div>
+			{#each ids as row}
+				<div class="idrow" title={row.hint}>
+					<span class="idk">{row.k}</span>
+					<code class="idv">{shortMid(row.v)}</code>
+					<button class="copy" class:ok={copied === row.v} onclick={() => copy(row.v)} title="Copy full value">{copied === row.v ? "✓" : "copy"}</button>
+				</div>
+			{/each}
+		</div>
+	{/if}
 </div>
 
 <style>
@@ -79,9 +120,21 @@
 	}
 	.connect.complete { border-color: var(--accent-dim); }
 	.head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.85rem; }
+	.head-right { display: flex; gap: 0.7rem; align-items: baseline; }
 	.title { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); }
 	.count { font-size: 0.78rem; color: var(--muted); font-variant-numeric: tabular-nums; }
 	.count.ok { color: var(--green); }
+	.idtoggle { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 0.74rem; padding: 0; margin: 0; }
+	.idtoggle:hover { text-decoration: underline; filter: none; }
+
+	.ids { margin-top: 0.95rem; padding-top: 0.8rem; border-top: 1px solid var(--border); }
+	.ids-note { font-size: 0.72rem; color: var(--muted); margin-bottom: 0.5rem; }
+	.idrow { display: flex; align-items: center; gap: 0.6rem; padding: 0.22rem 0; }
+	.idk { font-size: 0.72rem; color: var(--muted); width: 92px; flex: none; }
+	.idv { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.76rem; color: var(--text); background: var(--panel-2); padding: 0.12rem 0.45rem; border-radius: 5px; flex: 1; overflow: hidden; text-overflow: ellipsis; }
+	.copy { background: transparent; border: 1px solid var(--border); color: var(--muted); font-size: 0.68rem; padding: 0.12rem 0.5rem; border-radius: 5px; cursor: pointer; margin: 0; flex: none; }
+	.copy:hover { color: var(--text); filter: none; }
+	.copy.ok { color: var(--green); border-color: var(--green); }
 
 	.steps { position: relative; display: flex; }
 	.track {
