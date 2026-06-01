@@ -61,6 +61,12 @@ export const MAX_DETAILS_BYTES = 8192;
  * many anchors after the one that first certified it auto-cancels: the give is
  * released to the seller and all bids refunded. Deterministic — every node with
  * the same anchor chain computes the same expiry.
+ *
+ * This is a HARDCODED CONSENSUS CONSTANT, not configurable. Every node MUST agree
+ * on it, or they compute different expiries and diverge — so it is baked in, the
+ * same way the block reward or a coin's conservation rule is. There is no env
+ * knob and no per-listing override: a seller cannot opt out, extend, or shorten
+ * it. Changing it is a protocol change (a fork), identical for all nodes.
  */
 export const MAX_LISTING_ANCHORS = 14_400;
 

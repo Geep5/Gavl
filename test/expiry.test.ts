@@ -87,6 +87,36 @@ test("a bid placed after expiry is rejected (expiry runs before each op)", async
 	assert.equal(balanceOf(v, coin, bidder.pubHex), 1_000n, "late bidder keeps all coins");
 });
 
+test("enforcement: a seller's settle on an expired auction is a no-op for everyone", async () => {
+	// A seller tries to settle AFTER expiry. Because expireDue runs before applyOp,
+	// the auction is already "expired" when the settle folds → settle requires
+	// status==="open" → ignored. No node can honor it; expiry is a property of how
+	// state is computed, not a rule a node opts into.
+	const node = new GavlNode(new Ledger(PARAMS));
+	let t = 0;
+	const now = () => ++t;
+	const seller = new Account({ node, params: PARAMS, k: K, now });
+	const bidder = new Account({ node, params: PARAMS, k: K, now });
+	const coin = await bidder.deployCoin("Coin", "CN", 1_000n);
+	const id = await seller.createItemAuction("Too Late", null);
+	const ref = await bidder.bid(id, coin, 400n); // a valid in-time bid
+	const settleRef = await seller.settle(id, ref); // ...but the seller settles late
+
+	// create @10, bid @11, settle @ (10 + MAX + 1) — past the deadline.
+	const bornAt = new Map([
+		[id, 10],
+		[ref, 11],
+		[settleRef.id, 10 + MAX_LISTING_ANCHORS + 1],
+	]);
+	const v = computeView(node.ledger.allWrites(), { bornAt, nowHeight: 10 + MAX_LISTING_ANCHORS + 1 });
+	const a = v.auctions.get(id)!;
+	assert.equal(a.status, "expired", "auction expired, not settled");
+	assert.equal(a.winnerPubkey, undefined, "no winner — the late settle was ignored");
+	assert.equal(v.items.get(id)!.owner, seller.pubHex, "item returned to the seller, not handed to the bidder");
+	assert.equal(balanceOf(v, coin, bidder.pubHex), 1_000n, "bidder refunded in full (not charged for a lapsed win)");
+	assert.equal(balanceOf(v, coin, seller.pubHex), 0n, "seller did NOT collect payment on an expired listing");
+});
+
 test("end-to-end through finalizedView: a fresh listing is not expired", async () => {
 	const { node } = await setup();
 	const m = miner();
