@@ -184,7 +184,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
 // Consensus config. Mesh + farming are ON by default so the UI shows real
 // consensus; GAVL_MESH=0 / GAVL_FARM=0 disable them, GAVL_NETWORK sets the topic.
-const NETWORK = process.env.GAVL_NETWORK ?? "gavl-mainnet-v1";
+const NETWORK = process.env.GAVL_NETWORK ?? "gavl";
 const MESH = process.env.GAVL_MESH !== "0";
 const FARM = process.env.GAVL_FARM !== "0";
 

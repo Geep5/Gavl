@@ -49,10 +49,10 @@
 	// instead of vague labels, so the connection is verifiable, not just asserted.
 	let showIds = $state(false);
 	let copied = $state("");
+	// The DHT topic is THE network address — always shown, never hidden. Secondary
+	// identifiers (this node's key, connected peers) live in the disclosure below.
 	const ids = $derived.by(() => {
 		const rows = [];
-		if (c?.network) rows.push({ k: "Network slug", v: c.network, hint: "Human-readable network name. Peers must use the same one to meet." });
-		if (c?.topic) rows.push({ k: "DHT topic", v: c.topic, hint: "sha256(network) — the universal rendezvous key all Gavl peers join on the hyperdht. THIS is the address of the network itself." });
 		if (c?.nodeKey) rows.push({ k: "This node", v: c.nodeKey, hint: "This node's DHT/Noise public key — its unique address other peers dial directly." });
 		for (const pk of c?.peerKeys ?? []) rows.push({ k: "Peer", v: pk, hint: "A currently-connected peer's node key." });
 		return rows;
@@ -76,9 +76,20 @@
 		<span class="title">Decentralized connection</span>
 		<span class="head-right">
 			<span class="count" class:ok={allDone}>{doneCount}/{n} confirmed{allDone ? " · fully peer-to-peer" : ""}</span>
-			{#if ids.length}<button class="idtoggle" onclick={() => (showIds = !showIds)}>{showIds ? "▾ identifiers" : "▸ identifiers"}</button>{/if}
+			{#if ids.length}<button class="idtoggle" onclick={() => (showIds = !showIds)}>{showIds ? "▾ node & peers" : "▸ node & peers"}</button>{/if}
 		</span>
 	</div>
+
+	{#if c?.topic}
+		<div class="topic" title="sha256(network) — the universal rendezvous key every Gavl peer joins on the hyperdht. This IS the address of the network. Share it (or the slug) to point someone at this Gavl.">
+			<span class="topic-label">network</span>
+			<span class="topic-slug">{c.network}</span>
+			<code class="topic-hash">{c.topic}</code>
+			<button class="copy" class:ok={copied === c.topic} onclick={() => copy(c.topic)} title="Copy the full topic">{copied === c.topic ? "✓ copied" : "copy"}</button>
+		</div>
+	{:else if c?.network}
+		<div class="topic"><span class="topic-label">network</span><span class="topic-slug">{c.network}</span><span class="muted" style="font-size:0.72rem">· mesh off (no DHT topic)</span></div>
+	{/if}
 
 	<div class="steps" style="--inset:{inset}%">
 		<div class="track" style="left:{inset}%;right:{inset}%"></div>
@@ -97,7 +108,7 @@
 
 	{#if showIds}
 		<div class="ids">
-			<div class="ids-note">The exact addresses peers use to find and dial this network — copy any to share.</div>
+			<div class="ids-note">This node's key and any currently-connected peers — copy to share or verify.</div>
 			{#each ids as row}
 				<div class="idrow" title={row.hint}>
 					<span class="idk">{row.k}</span>
@@ -126,6 +137,18 @@
 	.count.ok { color: var(--green); }
 	.idtoggle { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 0.74rem; padding: 0; margin: 0; }
 	.idtoggle:hover { text-decoration: underline; filter: none; }
+
+	.topic {
+		display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap;
+		margin: 0 0 1rem; padding: 0.55rem 0.7rem;
+		background: var(--panel-2); border: 1px solid var(--accent-dim); border-radius: 8px;
+	}
+	.topic-label { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+	.topic-slug { font-weight: 700; color: var(--accent); font-size: 0.9rem; }
+	.topic-hash {
+		font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.78rem; color: var(--text);
+		flex: 1; min-width: 200px; overflow-wrap: anywhere; opacity: 0.92;
+	}
 
 	.ids { margin-top: 0.95rem; padding-top: 0.8rem; border-top: 1px solid var(--border); }
 	.ids-note { font-size: 0.72rem; color: var(--muted); margin-bottom: 0.5rem; }
