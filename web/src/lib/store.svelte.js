@@ -12,7 +12,7 @@ export const store = $state({
 	auctions: [],
 	balances: {}, // { pubkey: { token: amount } }
 	inventory: [], // active account's won secrets: { auctionId, name, plaintext, verified }
-	consensus: null, // { enabled, vdf, mesh, network, peers, farming, tip, finalizedHeight }
+	consensus: null, // { enabled, vdf, mesh, network, peers, farming, tip, finalizedHeight, secPerAnchor, secPerAnchorMeasured }
 });
 
 export async function refresh() {

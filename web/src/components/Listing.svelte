@@ -47,13 +47,16 @@
 		return `🔒 ${g.name}`; // secret
 	}
 
-	// Anchors → a human estimate. The clock is anchors, not seconds; at the ~1
-	// anchor/min target this maps to days/hours, but it's approximate by design.
-	function fmtAnchors(n) {
-		const mins = n; // ~1 anchor ≈ 1 min at target cadence
-		if (mins >= 1440) return `${(mins / 1440).toFixed(1)} days`;
-		if (mins >= 60) return `${Math.round(mins / 60)} h`;
-		return `${mins} anchors`;
+	// Anchors → a human time estimate, using the daemon's seconds-per-anchor
+	// (measured live cadence when available, else the target rate). The clock is
+	// anchors, not seconds, so this is always an estimate — the exact anchor count
+	// shown alongside is the authoritative, unfakeable number.
+	function fmtDuration(anchors) {
+		const sec = anchors * (store.consensus?.secPerAnchor ?? 60);
+		if (sec >= 86400) return `${(sec / 86400).toFixed(sec < 864000 ? 1 : 0)} days`;
+		if (sec >= 3600) return `${(sec / 3600).toFixed(1)} h`;
+		if (sec >= 60) return `${Math.round(sec / 60)} min`;
+		return `${Math.round(sec)}s`;
 	}
 
 	async function placeBid() {
@@ -106,7 +109,10 @@
 
 	{#if isOpen && auction.expiresIn != null}
 		<div class="expiry" class:soon={auction.expiresIn < 1440}>
-			⏳ expires in ~{fmtAnchors(auction.expiresIn)} <span class="muted">(anchor {auction.expiresAt})</span>
+			⏳ ~{fmtDuration(auction.expiresIn)} left
+			<span class="muted" title="The deadline is measured in anchors, not wall-clock time. This is a {store.consensus?.secPerAnchorMeasured ? 'live-rate' : 'target-rate'} estimate; the anchor count is exact.">
+				· {auction.expiresIn.toLocaleString()} anchors (expires at {auction.expiresAt.toLocaleString()}){store.consensus && !store.consensus.secPerAnchorMeasured ? " · est." : ""}
+			</span>
 		</div>
 	{/if}
 

@@ -61,6 +61,8 @@ export interface DaemonOptions {
 	plotDir?: string;
 	/** Idle heartbeat: when caught up, mine one anchor every this many ms (default 120s). */
 	heartbeatMs?: number;
+	/** Target seconds-per-anchor — the fallback time estimate when no live cadence is measured (default 60). */
+	targetSecPerAnchor?: number;
 	/** Durable storage. Omit → in-memory only (RAM, lost on restart). */
 	store?: {
 		dir?: string; // corestore dir (default ~/.gavl/store)
@@ -81,6 +83,10 @@ export interface ConsensusStatus {
 	farming: boolean;
 	tip: { height: number; weight: string; id: string } | null;
 	finalizedHeight: number | null;
+	/** Seconds per anchor used for time estimates — measured cadence if live, else the target rate. */
+	secPerAnchor: number;
+	/** True if secPerAnchor is a live measurement; false if it's the target fallback (cold/idle). */
+	secPerAnchorMeasured: boolean;
 }
 
 export class Daemon {
@@ -99,14 +105,19 @@ export class Daemon {
 	private network: string | null = null;
 	private farming = false;
 	private readonly heartbeatMs: number;
+	private readonly targetSecPerAnchor: number;
 	private store?: WriteStore;
 	private readonly storeOpts?: DaemonOptions["store"];
+	/** Wall-clock arrival times (ms) of recent tip heights — for a measured anchor cadence.
+	 *  Display-only (never touches the deterministic fold), so Date.now() is fine here. */
+	private readonly anchorTimes: { height: number; at: number }[] = [];
 
 	constructor(opts: DaemonOptions = {}) {
 		this.params = opts.params ?? defaultParams();
 		this.k = opts.k ?? 11;
 		this.finalityDepth = opts.finalityDepth ?? 1;
 		this.heartbeatMs = opts.heartbeatMs ?? 120_000;
+		this.targetSecPerAnchor = opts.targetSecPerAnchor ?? 60;
 		this.spaceMode = opts.space ?? "standin";
 		this.plotDir = opts.plotDir ?? join(homedir(), ".gavl", "plots");
 		this.storeOpts = opts.store;
@@ -116,6 +127,37 @@ export class Daemon {
 		this.wallet = new Wallet(opts.walletDir);
 		this.wallet.ensureSeeded();
 		for (const wa of this.wallet.list()) this.bind(wa);
+
+		// Record when each new tip height is observed → a rolling measured cadence.
+		this.node.onTip = (tip) => {
+			const last = this.anchorTimes[this.anchorTimes.length - 1];
+			if (!last || tip.height > last.height) {
+				this.anchorTimes.push({ height: tip.height, at: Date.now() });
+				if (this.anchorTimes.length > 32) this.anchorTimes.shift(); // keep a small window
+			}
+		};
+	}
+
+	/**
+	 * Observed seconds-per-anchor over the recent window, or null if we lack data
+	 * (cold start) or the network looks idle. "Idle" = the gap since the last
+	 * anchor already exceeds the measured average by a wide margin, meaning anchors
+	 * have effectively stopped (quiescent heartbeat); the caller falls back to the
+	 * difficulty-target rate so the estimate never claims "2 hours" on a network
+	 * that won't produce those anchors for days.
+	 */
+	measuredSecPerAnchor(): number | null {
+		const w = this.anchorTimes;
+		if (w.length < 3) return null; // not enough samples yet
+		const first = w[0];
+		const last = w[w.length - 1];
+		const spanSec = (last.at - first.at) / 1000;
+		const heights = last.height - first.height;
+		if (heights <= 0 || spanSec <= 0) return null;
+		const avg = spanSec / heights;
+		const sinceLast = (Date.now() - last.at) / 1000;
+		if (sinceLast > avg * 4 && sinceLast > 30) return null; // looks idle → let caller use target rate
+		return avg;
 	}
 
 	/**
@@ -195,6 +237,7 @@ export class Daemon {
 	consensus(): ConsensusStatus {
 		const tip = this.node.anchorTip();
 		const finalized = this.node.anchors?.finalized(this.finalityDepth) ?? null;
+		const measured = this.measuredSecPerAnchor();
 		return {
 			enabled: !!this.node.anchors,
 			vdf: this.params.vdf.name,
@@ -205,6 +248,8 @@ export class Daemon {
 			farming: this.farming,
 			tip: tip ? { height: tip.height, weight: tip.weight, id: tip.id } : null,
 			finalizedHeight: finalized ? finalized.height : null,
+			secPerAnchor: measured ?? this.targetSecPerAnchor,
+			secPerAnchorMeasured: measured != null,
 		};
 	}
 
