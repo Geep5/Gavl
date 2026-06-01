@@ -70,5 +70,9 @@ export function finalizedView(writes: Write[], anchors: AnchorChain, k: number):
 		if (a.writer !== b.writer) return a.writer < b.writer ? -1 : 1;
 		return a.seq - b.seq;
 	};
-	return computeView(included, { order });
+	// `epoch` (writeId → certifying anchor height) is the listing clock origin, and the
+	// finalized anchor's height is "now" — together they drive deterministic anchor-clock
+	// expiry (MAX_LISTING_ANCHORS). `bornAt` is keyed by every write; computeView only reads
+	// the entries for auction.create writes.
+	return computeView(included, { order, bornAt: epoch, nowHeight: finalAnchor.height });
 }

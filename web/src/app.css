@@ -86,6 +86,7 @@ button:hover:not(:disabled) { filter: brightness(1.08); }
 .pill.open { color: var(--green); border-color: var(--green); }
 .pill.settled { color: var(--accent); border-color: var(--accent-dim); }
 .pill.cancelled { color: var(--muted); }
+.pill.expired { color: var(--red); border-color: var(--red); }
 .err { background: #3a1d20; border: 1px solid var(--red); color: #f3c0c4; padding: 0.5rem 0.8rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.85rem; }
 
 .listing { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 0.8rem 1rem; margin-bottom: 0.8rem; }

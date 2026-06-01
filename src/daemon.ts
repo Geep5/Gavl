@@ -187,6 +187,11 @@ export class Daemon {
 		return finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth);
 	}
 
+	/** Current "now" on the anchor clock — the finalized anchor's height, or null pre-consensus. */
+	finalizedHeight(): number | null {
+		return this.node.anchors?.finalized(this.finalityDepth)?.height ?? null;
+	}
+
 	consensus(): ConsensusStatus {
 		const tip = this.node.anchorTip();
 		const finalized = this.node.anchors?.finalized(this.finalityDepth) ?? null;

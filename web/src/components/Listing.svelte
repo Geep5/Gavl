@@ -47,6 +47,15 @@
 		return `🔒 ${g.name}`; // secret
 	}
 
+	// Anchors → a human estimate. The clock is anchors, not seconds; at the ~1
+	// anchor/min target this maps to days/hours, but it's approximate by design.
+	function fmtAnchors(n) {
+		const mins = n; // ~1 anchor ≈ 1 min at target cadence
+		if (mins >= 1440) return `${(mins / 1440).toFixed(1)} days`;
+		if (mins >= 60) return `${Math.round(mins / 60)} h`;
+		return `${mins} anchors`;
+	}
+
 	async function placeBid() {
 		if (!bidToken || !bidAmount) return;
 		await act(() => api.bid(auction.id, bidToken, bidAmount));
@@ -94,6 +103,12 @@
 		{#if auction.ask}· ask {auction.ask.amount} {coinLabel(auction.ask.token)}{:else}· open to bids{/if}
 		· {auction.bids.length} bid{auction.bids.length === 1 ? "" : "s"}
 	</div>
+
+	{#if isOpen && auction.expiresIn != null}
+		<div class="expiry" class:soon={auction.expiresIn < 1440}>
+			⏳ expires in ~{fmtAnchors(auction.expiresIn)} <span class="muted">(anchor {auction.expiresAt})</span>
+		</div>
+	{/if}
 
 	{#if auction.winnerPubkey}
 		<div class="muted" style="font-size:0.82rem">won by {accountLabel(auction.winnerPubkey)}</div>
@@ -183,6 +198,8 @@
 		background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
 	}
 	.rawtoggle { font-size: 0.72rem; margin-top: 0.5rem; opacity: 0.7; }
+	.expiry { font-size: 0.78rem; color: var(--muted); margin-top: 0.25rem; }
+	.expiry.soon { color: var(--accent); }
 	.secret-out {
 		margin-top: 0.5rem; padding: 0.55rem 0.7rem;
 		background: var(--bg); border: 1px solid var(--green); border-radius: 6px;

@@ -54,21 +54,32 @@ function serializeState() {
 		deployer: c.deployer,
 	}));
 
+	const nowHeight = daemon.finalizedHeight(); // current anchor-clock "now" (or null pre-consensus)
 	const giveJson = (g) => (g.kind === "item" ? { kind: "item", itemId: g.itemId, name: g.name } : g.kind === "coin" ? { kind: "coin", token: g.token, amount: g.amount.toString() } : { kind: "secret", name: g.name, commitment: g.commitment });
-	const auctions = [...view.auctions.values()].map((a) => ({
-		id: a.id,
-		seller: a.seller,
-		give: giveJson(a.give),
-		ask: a.ask ? { token: a.ask.token, amount: a.ask.amount.toString() } : null,
-		details: a.details ?? null,
-		status: a.status,
-		bids: a.bids.map((b) => ({ ref: b.ref, bidder: b.bidder, token: b.token, amount: b.amount.toString(), inbox: b.inbox ?? null })),
-		winner: a.winner ?? null,
-		winnerPubkey: a.winnerPubkey ?? null,
-		delivered: !!a.delivery, // secret auctions: has the sealed delivery been published?
-		// true once the anchor chain has certified this auction's settlement/outcome.
-		finalized: finalAuctions.get(a.id)?.status === a.status && a.status !== "open",
-	}));
+	const auctions = [...view.auctions.values()].map((a) => {
+		const fa = finalAuctions.get(a.id); // finalized counterpart (carries bornAt/expiresAt + expiry status)
+		// Expiry lives in the finalized view (the only place with an anchor clock). Surface it
+		// even while the optimistic status still says "open".
+		const expiresAt = fa?.expiresAt ?? null;
+		const expired = fa?.status === "expired";
+		const remaining = expiresAt != null && nowHeight != null ? Math.max(0, expiresAt - nowHeight) : null;
+		return {
+			id: a.id,
+			seller: a.seller,
+			give: giveJson(a.give),
+			ask: a.ask ? { token: a.ask.token, amount: a.ask.amount.toString() } : null,
+			details: a.details ?? null,
+			status: expired ? "expired" : a.status, // reflect anchor-clock expiry in the headline status
+			bids: a.bids.map((b) => ({ ref: b.ref, bidder: b.bidder, token: b.token, amount: b.amount.toString(), inbox: b.inbox ?? null })),
+			winner: a.winner ?? null,
+			winnerPubkey: a.winnerPubkey ?? null,
+			delivered: !!a.delivery, // secret auctions: has the sealed delivery been published?
+			// true once the anchor chain has certified this auction's settlement/outcome.
+			finalized: fa?.status === a.status && a.status !== "open",
+			expiresAt, // anchor height at which it auto-cancels (null until certified)
+			expiresIn: remaining, // anchors remaining (null pre-consensus)
+		};
+	});
 
 	// balances: { pubkey: { token: amount } }
 	const balances: Record<string, Record<string, string>> = {};
