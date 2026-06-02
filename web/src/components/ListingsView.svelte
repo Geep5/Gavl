@@ -45,7 +45,7 @@
 	{/if}
 
 	{#if shown.length === 0 && toClaim.length === 0}
-		<p class="muted">No listings{filter === "open" ? " open right now" : ""}. Create one on the left.</p>
+		<p class="muted">No listings{filter === "open" ? " open right now" : ""}. Create one from the <strong>Sell</strong> tab.</p>
 	{:else if shown.length > 0}
 		<div style="margin-top:0.8rem">
 			{#each shown as a (a.id)}
