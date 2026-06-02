@@ -3,9 +3,31 @@
 	// REAL daemon/consensus state — nothing here is theater. It stays visible as a
 	// live readout of the backbone: each confirmed step keeps its check, so the
 	// user can always see the app is genuinely running peer-to-peer.
-	import { store } from "../lib/store.svelte.js";
+	import { store, act } from "../lib/store.svelte.js";
+	import { api } from "../lib/api.js";
 
 	const c = $derived(store.consensus);
+
+	// Channel switching: a channel is a name → its own DHT topic, mesh, and economy.
+	// Your wallet/identity is shared; coins/auctions are per-channel.
+	let editingChannel = $state(false);
+	let channelInput = $state("");
+	let switching = $state(false);
+	function openChannelEdit() {
+		channelInput = c?.network ?? "";
+		editingChannel = true;
+	}
+	async function joinChannel() {
+		const name = channelInput.trim();
+		if (!name || name === c?.network) {
+			editingChannel = false;
+			return;
+		}
+		switching = true;
+		await act(() => api.switchChannel(name));
+		switching = false;
+		editingChannel = false;
+	}
 
 	// status: "done" | "active" | "pending"
 	const steps = $derived.by(() => {
@@ -80,15 +102,38 @@
 		</span>
 	</div>
 
-	{#if c?.topic}
+	{#if editingChannel}
+		<div class="topic chanedit">
+			<span class="topic-label">join channel</span>
+			<input
+				class="chaninput"
+				placeholder="gavl-global-v1"
+				bind:value={channelInput}
+				disabled={switching}
+				onkeydown={(e) => {
+					if (e.key === "Enter") joinChannel();
+					if (e.key === "Escape") (editingChannel = false);
+				}}
+				autofocus
+			/>
+			<button class="join" onclick={joinChannel} disabled={switching || !channelInput.trim()}>{switching ? "joining…" : "Join"}</button>
+			<button class="chanx" onclick={() => (editingChannel = false)} disabled={switching} title="Cancel">✕</button>
+		</div>
+		<div class="chanhint">A channel is its own economy — separate coins, listings, and peers. Your identity (keys) is shared. The name is its address: sha256(name) is the DHT topic peers meet on.</div>
+	{:else if c?.topic}
 		<div class="topic" title="sha256(network) — the universal rendezvous key every Gavl peer joins on the hyperdht. This IS the address of the network. Share it (or the slug) to point someone at this Gavl.">
-			<span class="topic-label">network</span>
+			<span class="topic-label">channel</span>
 			<span class="topic-slug">{c.network}</span>
 			<code class="topic-hash">{c.topic}</code>
 			<button class="copy" class:ok={copied === c.topic} onclick={() => copy(c.topic)} title="Copy the full topic">{copied === c.topic ? "✓ copied" : "copy"}</button>
+			<button class="switch" onclick={openChannelEdit} title="Join a different channel">switch ⇄</button>
 		</div>
 	{:else if c?.network}
-		<div class="topic"><span class="topic-label">network</span><span class="topic-slug">{c.network}</span><span class="muted" style="font-size:0.72rem">· mesh off (no DHT topic)</span></div>
+		<div class="topic">
+			<span class="topic-label">channel</span><span class="topic-slug">{c.network}</span>
+			<span class="muted" style="font-size:0.72rem">· mesh off</span>
+			<button class="switch" onclick={openChannelEdit} title="Join a different channel">switch ⇄</button>
+		</div>
 	{/if}
 
 	<div class="steps" style="--inset:{inset}%">
@@ -158,6 +203,20 @@
 	.copy { background: transparent; border: 1px solid var(--border); color: var(--muted); font-size: 0.68rem; padding: 0.12rem 0.5rem; border-radius: 5px; cursor: pointer; margin: 0; flex: none; }
 	.copy:hover { color: var(--text); filter: none; }
 	.copy.ok { color: var(--green); border-color: var(--green); }
+
+	.switch { background: transparent; border: 1px solid var(--accent-dim); color: var(--accent); font-size: 0.68rem; padding: 0.12rem 0.5rem; border-radius: 5px; cursor: pointer; margin: 0; flex: none; }
+	.switch:hover { filter: brightness(1.15); }
+	.topic.chanedit { border-style: dashed; }
+	.chaninput {
+		flex: 1; min-width: 180px; margin: 0;
+		background: var(--bg); border: 1px solid var(--accent-dim); color: var(--text);
+		font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.82rem;
+		padding: 0.3rem 0.5rem; border-radius: 5px;
+	}
+	.join { background: var(--accent); color: #1a1303; border: none; font-size: 0.72rem; font-weight: 600; padding: 0.3rem 0.7rem; border-radius: 5px; cursor: pointer; margin: 0; flex: none; }
+	.join:disabled { opacity: 0.5; cursor: not-allowed; }
+	.chanx { background: transparent; border: 1px solid var(--border); color: var(--muted); font-size: 0.72rem; padding: 0.3rem 0.5rem; border-radius: 5px; cursor: pointer; margin: 0; flex: none; }
+	.chanhint { font-size: 0.7rem; color: var(--muted); margin: -0.5rem 0 1rem; line-height: 1.4; }
 
 	.steps { position: relative; display: flex; }
 	.track {

@@ -41,7 +41,15 @@ const HEARTBEAT_MS = Number(process.env.GAVL_HEARTBEAT_MS ?? "60000");
 //   GAVL_PERSIST=all  (default) → archiver, keep every write
 //   GAVL_PERSIST=mine            → keep only writes touching my wallet keys + their coins/auctions
 const PERSIST = process.env.GAVL_PERSIST ?? "all";
+
+// Channel/network: the name IS the address (its DHT topic is sha256 of it). GAVL_NETWORK
+// sets the initial channel; the UI can switch at runtime. MESH/FARM gate consensus.
+const NETWORK = process.env.GAVL_NETWORK ?? "gavl";
+const MESH = process.env.GAVL_MESH !== "0";
+const FARM = process.env.GAVL_FARM !== "0";
+
 const daemon = new Daemon({
+	network: NETWORK,
 	space: SPACE,
 	schedule: RETARGET ? { base: 20n, targetIters: TARGET_ITERS, epoch: 4, window: 8, maxStep: 4n } : undefined,
 	heartbeatMs: HEARTBEAT_MS,
@@ -190,6 +198,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			const id = await daemon.active().createSecretAuction(String(body.name), String(body.secret), body.ask ?? null, typeof body.details === "string" ? body.details : undefined);
 			return send(res, 200, { id });
 		}
+		if (path === "/api/channel") {
+			// Join a different channel by name. Each channel is its own economy (own anchor
+			// chain + listings); your wallet/identity is shared. Returns once the switch lands.
+			const name = String(body.name ?? "").trim();
+			if (!name) return send(res, 400, { error: "channel name required" });
+			await daemon.switchChannel(name);
+			return send(res, 200, { channel: daemon.currentChannel() });
+		}
 		const claimMatch = path.match(/^\/api\/auctions\/([0-9a-f]+)\/claim$/);
 		if (claimMatch) {
 			const won = daemon.active().claimWon(claimMatch[1]);
@@ -212,12 +228,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
 	send(res, 404, { error: "not found" });
 }
-
-// Consensus config. Mesh + farming are ON by default so the UI shows real
-// consensus; GAVL_MESH=0 / GAVL_FARM=0 disable them, GAVL_NETWORK sets the topic.
-const NETWORK = process.env.GAVL_NETWORK ?? "gavl";
-const MESH = process.env.GAVL_MESH !== "0";
-const FARM = process.env.GAVL_FARM !== "0";
 
 createServer((req, res) => {
 	handle(req, res).catch((e) => send(res, 400, { error: String(e?.message ?? e) }));

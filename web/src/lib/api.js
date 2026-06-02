@@ -24,4 +24,5 @@ export const api = {
 	settle: (id, winner) => req(`/auctions/${id}/settle`, "POST", { winner }),
 	cancel: (id) => req(`/auctions/${id}/cancel`, "POST", {}),
 	claim: (id) => req(`/auctions/${id}/claim`, "POST", {}),
+	switchChannel: (name) => req("/channel", "POST", { name }),
 };

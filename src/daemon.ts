@@ -55,6 +55,8 @@ export interface DaemonOptions {
 	finalityDepth?: number;
 	/** Anchor space backend: light stand-in (default) or real chiapos (real disk cost). */
 	space?: SpaceMode;
+	/** Initial channel/network name (the DHT topic is sha256 of it). Default "gavl". */
+	network?: string;
 	/** Difficulty schedule. Omit → constant; set → retargets so the VDF cost is the pace. */
 	schedule?: RetargetSchedule;
 	/** Plot directory for chiapos (default ~/.gavl/plots). */
@@ -108,12 +110,18 @@ export class Daemon {
 
 	private transport?: SwarmTransport;
 	private producer?: Producer;
-	private network: string | null = null;
+	private network: string;
 	private farming = false;
 	private readonly heartbeatMs: number;
 	private readonly targetSecPerAnchor: number;
 	private store?: WriteStore;
 	private readonly storeOpts?: DaemonOptions["store"];
+	/** Kept so a channel switch can rebuild ledger/anchors/store identically. */
+	private readonly verifier: SpaceVerifier;
+	private readonly schedule?: RetargetSchedule;
+	/** Whether the last startConsensus joined the mesh / farmed — replayed on switch. */
+	private meshOn = false;
+	private farmOn = false;
 	/** Wall-clock arrival times (ms) of recent tip heights — for a measured anchor cadence.
 	 *  Display-only (never touches the deterministic fold), so Date.now() is fine here. */
 	private readonly anchorTimes: { height: number; at: number }[] = [];
@@ -127,14 +135,20 @@ export class Daemon {
 		this.spaceMode = opts.space ?? "standin";
 		this.plotDir = opts.plotDir ?? join(homedir(), ".gavl", "plots");
 		this.storeOpts = opts.store;
+		this.schedule = opts.schedule;
+		this.network = opts.network ?? "gavl";
 		// Verifier must match the space backend producers use, or anchors are rejected.
-		const verifier: SpaceVerifier = this.spaceMode === "chiapos" ? new ChiaSpaceVerifier() : new StandinSpaceVerifier();
-		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, verifier, { schedule: opts.schedule, finalityDepth: this.finalityDepth }));
+		this.verifier = this.spaceMode === "chiapos" ? new ChiaSpaceVerifier() : new StandinSpaceVerifier();
+		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, this.verifier, { schedule: opts.schedule, finalityDepth: this.finalityDepth }));
 		this.wallet = new Wallet(opts.walletDir);
 		this.wallet.ensureSeeded();
 		for (const wa of this.wallet.list()) this.bind(wa);
+		this.wireTipCadence();
+	}
 
-		// Record when each new tip height is observed → a rolling measured cadence.
+	/** Record when each new tip height is observed → a rolling measured cadence.
+	 *  Re-wired onto the fresh node after a channel switch. */
+	private wireTipCadence(): void {
 		this.node.onTip = (tip) => {
 			const last = this.anchorTimes[this.anchorTimes.length - 1];
 			if (!last || tip.height > last.height) {
@@ -175,7 +189,11 @@ export class Daemon {
 	 */
 	async init(): Promise<{ replayed: number } | null> {
 		if (!this.storeOpts) return null;
-		const dir = this.storeOpts.dir ?? join(homedir(), ".gavl", "store");
+		// Per-channel store dir: each channel is its own economy (its own anchor chain +
+		// listings), so its persisted writes live under channels/<slug>/. The wallet
+		// (your identity/keys) is shared across all channels, one level up.
+		const base = this.storeOpts.dir ?? join(homedir(), ".gavl", "store");
+		const dir = join(base, "channels", channelSlug(this.network ?? "gavl"));
 		// "mine" builds a MinePolicy from this node's wallet keys (now that the wallet is ready).
 		const policy: PersistPolicy = this.storeOpts.policy ?? (this.storeOpts.persist === "mine" ? new MinePolicy(this.wallet.list().map((a) => a.pubHex)) : new KeepAllPolicy());
 		this.store = new WriteStore({ dir, policy });
@@ -263,14 +281,18 @@ export class Daemon {
 	}
 
 	/** Join the live mesh and (optionally) start farming anchors. Resilient to a missing network. */
-	async startConsensus(opts: { network: string; mesh: boolean; farm: boolean }): Promise<void> {
-		this.network = opts.network;
+	async startConsensus(opts: { network?: string; mesh: boolean; farm: boolean }): Promise<void> {
+		if (opts.network) this.network = opts.network;
+		this.meshOn = opts.mesh;
+		this.farmOn = opts.farm;
 
 		if (opts.mesh) {
 			try {
 				this.transport = new SwarmTransport(this.node, {});
 				// Don't let a slow/absent DHT block boot — join in the background with a soft cap.
-				const joined = this.transport.join(opts.network);
+				// Use the resolved channel (this.network), not opts.network — on a channel
+				// switch opts.network is omitted and the name lives in this.network.
+				const joined = this.transport.join(this.network);
 				await Promise.race([joined, new Promise((r) => setTimeout(r, 8000))]);
 			} catch (e) {
 				console.warn(`[daemon] mesh join failed (continuing local): ${(e as Error).message}`);
@@ -303,10 +325,55 @@ export class Daemon {
 		}
 	}
 
+	/** The channel/network this node is currently on. */
+	currentChannel(): string {
+		return this.network;
+	}
+
+	/**
+	 * Leave the current channel and join `name`. A channel is a name-based network:
+	 * its own DHT topic (sha256(name)), its own mesh, anchor chain, and economy. We
+	 * tear down consensus + the current ledger/store, build a FRESH ledger + anchor
+	 * chain for the new channel, rebind accounts (your keys/identity are shared
+	 * across channels), replay the new channel's persisted writes, and re-join. No-op
+	 * if already on `name`.
+	 */
+	async switchChannel(name: string): Promise<void> {
+		const next = name.trim();
+		if (!next || next === this.network) return;
+
+		// 1. Tear down the current channel's consensus + storage.
+		this.farming = false;
+		this.producer?.stop();
+		this.producer = undefined;
+		if (this.transport) await this.transport.destroy().catch(() => {});
+		this.transport = undefined;
+		if (this.store) await this.store.close().catch(() => {});
+		this.store = undefined;
+		this.anchorTimes.length = 0; // reset cadence samples for the new chain
+
+		// 2. Fresh ledger + anchor chain — a clean economy for the new channel.
+		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, this.verifier, { schedule: this.schedule, finalityDepth: this.finalityDepth }));
+		this.wireTipCadence();
+		this.accounts.clear();
+		for (const wa of this.wallet.list()) this.bind(wa); // same identities, new node
+
+		// 3. Switch to the new channel and bring it up (init store → replay → join + farm).
+		this.network = next;
+		await this.init();
+		await this.startConsensus({ mesh: this.meshOn, farm: this.farmOn });
+	}
+
 	async stop(): Promise<void> {
 		this.farming = false;
 		this.producer?.stop();
 		if (this.transport) await this.transport.destroy().catch(() => {});
 		if (this.store) await this.store.close().catch(() => {});
 	}
+}
+
+/** Filesystem-safe slug for a channel name (its store lives under channels/<slug>/). */
+function channelSlug(name: string): string {
+	const safe = name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 64);
+	return safe || "default";
 }
