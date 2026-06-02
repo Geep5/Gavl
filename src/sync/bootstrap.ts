@@ -1,19 +1,21 @@
 /**
- * Bootstrap nodes — the DHT "DNS"/entry layer.
+ * Bootstrap nodes — the DHT "DNS"/entry layer, fully editable.
  *
  * A fresh node knows nobody. To ENTER the hyperdht it first contacts a few
- * well-known bootstrap servers (Holepunch's defaults: node1/2/3.hyperdht.org);
- * from there discovery is fully peer-to-peer. Bootstrap nodes are thus the
- * closest thing to "root DNS servers" — the one centralized-ish dependency in
- * an otherwise serverless stack, and exactly what to make customizable for a
- * truly sovereign network (run your own entry points, or join a private DHT).
+ * well-known bootstrap servers; from there discovery is fully peer-to-peer.
+ * Bootstrap nodes are thus the closest thing to "root DNS servers" — the one
+ * centralized-ish dependency in an otherwise serverless stack.
  *
- * Custom nodes are ADDED to the defaults (not replacing them): more entry
- * points, more resilient, and you can't accidentally isolate yourself by
- * setting a wrong/dead list. Persisted to ~/.gavl/bootstrap.json; GAVL_BOOTSTRAP
- * (comma-separated host:port) seeds it at launch.
+ * IMPORTANT: hyperdht's `bootstrap` option REPLACES its built-in defaults, it
+ * does not merge (`const bootstrap = opts.bootstrap || BOOTSTRAP_NODES`). So to
+ * make the defaults themselves editable we manage the FULL effective list here:
+ * seed it with Holepunch's real defaults (visible + removable), and always pass
+ * the complete list to hyperdht — what you see is exactly what's used. A reset()
+ * restores the defaults so you can't permanently lock yourself out.
  *
- * Format on the wire to hyperdht: { host, port }. We store "host:port" strings.
+ * Persisted to ~/.gavl/bootstrap.json; GAVL_BOOTSTRAP (comma-separated host:port)
+ * overrides the seed at launch. Format on the wire: { host, port }; stored as
+ * "host:port" strings (host may carry hyperdht's `id@` prefix).
  */
 
 import { homedir } from "node:os";
@@ -24,6 +26,10 @@ export interface BootstrapNode {
 	host: string;
 	port: number;
 }
+
+/** Holepunch's built-in default bootstrap nodes (hyperdht BOOTSTRAP_NODES). These
+ *  are what hyperdht uses when given none — surfaced here so they're editable. */
+export const DEFAULT_BOOTSTRAP: readonly string[] = ["88.99.3.86@node1.hyperdht.org:49737", "142.93.90.113@node2.hyperdht.org:49737", "138.68.147.8@node3.hyperdht.org:49737"];
 
 /** Parse a "host:port" string into a node, or null if malformed. host may contain
  *  an `id@` prefix (hyperdht's addressed form), which we keep verbatim. */
@@ -53,23 +59,37 @@ export class BootstrapList {
 				const arr = JSON.parse(readFileSync(this.path, "utf8"));
 				if (Array.isArray(arr)) this.nodes = arr.map(parseNode).filter((n): n is BootstrapNode => !!n);
 			} catch {
-				/* corrupt → start empty */
+				/* corrupt → fall through to seed */
 			}
 		}
-		// GAVL_BOOTSTRAP seeds/extends the list at launch (comma-separated host:port).
-		if (envValue) for (const part of envValue.split(",")) this.addParsed(part);
+		// GAVL_BOOTSTRAP overrides the seed at launch (comma-separated host:port).
+		if (envValue) {
+			this.nodes = [];
+			for (const part of envValue.split(",")) this.addParsed(part);
+		}
+		// First run (or empty file, no env): seed with the real Holepunch defaults so
+		// they're visible + editable. The list is ALWAYS the full effective set.
+		if (this.nodes.length === 0) {
+			for (const d of DEFAULT_BOOTSTRAP) this.addParsed(d);
+			this.save();
+		}
 	}
 
-	/** Custom bootstrap nodes (added alongside Holepunch's defaults). */
+	/** The full effective bootstrap list (defaults + any custom, all editable). */
 	list(): BootstrapNode[] {
 		return [...this.nodes];
 	}
 
-	/** The value to pass hyperdht: custom nodes, or undefined to use defaults only.
-	 *  (hyperdht merges these with its built-in defaults; an empty list → undefined
-	 *  so we don't override anything.) */
+	/** The value to pass hyperdht — the complete list (it REPLACES, so we send all).
+	 *  Undefined only if the user emptied it entirely (then hyperdht uses its own). */
 	forSwarm(): BootstrapNode[] | undefined {
 		return this.nodes.length ? this.list() : undefined;
+	}
+
+	/** True if this exact node is one of Holepunch's built-in defaults. */
+	isDefault(s: string): boolean {
+		const n = parseNode(s);
+		return !!n && DEFAULT_BOOTSTRAP.some((d) => fmt(parseNode(d)!) === fmt(n));
 	}
 
 	private addParsed(s: string): boolean {
@@ -96,6 +116,13 @@ export class BootstrapList {
 		if (this.nodes.length === before) return false;
 		this.save();
 		return true;
+	}
+
+	/** Restore the built-in defaults (so you can't permanently lock yourself out). Persists. */
+	reset(): void {
+		this.nodes = [];
+		for (const d of DEFAULT_BOOTSTRAP) this.addParsed(d);
+		this.save();
 	}
 
 	asStrings(): string[] {

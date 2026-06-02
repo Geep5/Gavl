@@ -247,6 +247,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			await daemon.removeBootstrap(String(body.node ?? ""));
 			return send(res, 200, { bootstrap: daemon.bootstrapNodes() });
 		}
+		if (path === "/api/bootstrap/reset") {
+			await daemon.resetBootstrap(); // restore Holepunch's built-in defaults
+			return send(res, 200, { bootstrap: daemon.bootstrapNodes() });
+		}
 		const claimMatch = path.match(/^\/api\/auctions\/([0-9a-f]+)\/claim$/);
 		if (claimMatch) {
 			const won = daemon.active().claimWon(claimMatch[1]);

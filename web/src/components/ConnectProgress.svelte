@@ -95,6 +95,9 @@
 	async function removeBoot(node) {
 		await act(() => api.removeBootstrap(node));
 	}
+	async function resetBoot() {
+		await act(() => api.resetBootstrap());
+	}
 
 	// status: "done" | "active" | "pending"
 	const steps = $derived.by(() => {
@@ -283,16 +286,16 @@
 			<!-- BOOTSTRAP (DHT entry / "DNS" layer) -->
 			<div class="sect">
 				<div class="sect-head"><span class="sect-title">DHT entry</span><span class="sect-sub">the “DNS” layer — how you reach the network</span></div>
-				<div class="empty" style="margin-bottom:0.3rem">Defaults: Holepunch's public bootstrap (node1–3.hyperdht.org). Custom nodes below are added alongside them — run your own entry points or join a private DHT.</div>
-				{#each bootstrapNodes as node}
-					<div class="idrow" title="A custom DHT bootstrap node, added to the defaults.">
-						<span class="idk">bootstrap</span>
-						<code class="idv">{node}</code>
-						<button class="copy" onclick={() => removeBoot(node)} title="Remove">remove</button>
+				<div class="empty" style="margin-bottom:0.3rem">The bootstrap nodes you contact to enter the DHT. Holepunch's public defaults are listed and fully editable — remove them, add your own, or run a private DHT. This exact list is what's used (it replaces hyperdht's built-ins).</div>
+				{#each bootstrapNodes as b}
+					<div class="idrow" title={b.default ? "A Holepunch built-in default bootstrap node — editable." : "A custom DHT bootstrap node."}>
+						<span class="idk">{b.default ? "default" : "custom"}</span>
+						<code class="idv">{b.node}</code>
+						<button class="copy" onclick={() => removeBoot(b.node)} title="Remove">remove</button>
 					</div>
 				{/each}
 				{#if bootstrapNodes.length === 0}
-					<div class="empty">No custom nodes — running on the public defaults.</div>
+					<div class="empty">⚠ No bootstrap nodes — you'll only reach peers you dial directly. Reset to restore the defaults.</div>
 				{/if}
 				<div class="ctl">
 					{#if addingBoot}
@@ -300,7 +303,8 @@
 						<button class="join" onclick={addBoot} disabled={busyBoot || !bootInput.trim()}>Add</button>
 						<button class="chanx" onclick={() => (addingBoot = false)}>✕</button>
 					{:else}
-						<button class="mini" onclick={() => (addingBoot = true)} title="Add a custom DHT bootstrap node">+ add bootstrap</button>
+						<button class="mini" onclick={() => (addingBoot = true)} title="Add a DHT bootstrap node">+ add bootstrap</button>
+						<button class="mini" onclick={resetBoot} title="Restore Holepunch's built-in default bootstrap nodes">↺ reset to defaults</button>
 					{/if}
 				</div>
 			</div>

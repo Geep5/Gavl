@@ -101,8 +101,8 @@ export interface ConsensusStatus {
 	peerKeys: string[];
 	/** Hex node-keys pinned for re-dial on every boot (eclipse resistance). */
 	pinnedPeers: string[];
-	/** Custom DHT bootstrap nodes ("host:port"), added alongside Holepunch defaults. */
-	bootstrap: string[];
+	/** The full effective DHT bootstrap list ("host:port"), each flagged if it's a built-in default. */
+	bootstrap: { node: string; default: boolean }[];
 }
 
 export class Daemon {
@@ -289,7 +289,7 @@ export class Daemon {
 			topic: this.transport ? this.transport.topicHexValue : null,
 			peerKeys: this.transport ? this.transport.connectedPeerKeys() : [],
 			pinnedPeers: this.knownPeers.list(),
-			bootstrap: this.bootstrap.asStrings(),
+			bootstrap: this.bootstrap.asStrings().map((node) => ({ node, default: this.bootstrap.isDefault(node) })),
 		};
 	}
 
@@ -406,9 +406,15 @@ export class Daemon {
 		await this.restartTransport();
 	}
 
-	/** Remove a custom bootstrap node and reconnect. */
+	/** Remove a bootstrap node and reconnect. */
 	async removeBootstrap(hostPort: string): Promise<void> {
 		if (!this.bootstrap.remove(hostPort)) return;
+		await this.restartTransport();
+	}
+
+	/** Restore the built-in default bootstrap nodes and reconnect. */
+	async resetBootstrap(): Promise<void> {
+		this.bootstrap.reset();
 		await this.restartTransport();
 	}
 
