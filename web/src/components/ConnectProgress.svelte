@@ -163,40 +163,6 @@
 		</span>
 	</div>
 
-	{#if editingChannel}
-		<div class="topic chanedit">
-			<span class="topic-label">join channel</span>
-			<input
-				class="chaninput"
-				placeholder="gavl-global-v1"
-				bind:value={channelInput}
-				disabled={switching}
-				onkeydown={(e) => {
-					if (e.key === "Enter") joinChannel();
-					if (e.key === "Escape") (editingChannel = false);
-				}}
-				autofocus
-			/>
-			<button class="join" onclick={joinChannel} disabled={switching || !channelInput.trim()}>{switching ? "joining…" : "Join"}</button>
-			<button class="chanx" onclick={() => (editingChannel = false)} disabled={switching} title="Cancel">✕</button>
-		</div>
-		<div class="chanhint">A channel is its own economy — separate coins, listings, and peers. Your identity (keys) is shared. The name is its address: sha256(name) is the DHT topic peers meet on.</div>
-	{:else if c?.topic}
-		<div class="topic" title="sha256(network) — the universal rendezvous key every Gavl peer joins on the hyperdht. This IS the address of the network. Share it (or the slug) to point someone at this Gavl.">
-			<span class="topic-label">channel</span>
-			<span class="topic-slug">{c.network}</span>
-			<code class="topic-hash">{c.topic}</code>
-			<button class="copy" class:ok={copied === c.topic} onclick={() => copy(c.topic)} title="Copy the full topic">{copied === c.topic ? "✓ copied" : "copy"}</button>
-			<button class="switch" onclick={openChannelEdit} title="Join a different channel">switch ⇄</button>
-		</div>
-	{:else if c?.network}
-		<div class="topic">
-			<span class="topic-label">channel</span><span class="topic-slug">{c.network}</span>
-			<span class="muted" style="font-size:0.72rem">· mesh off</span>
-			<button class="switch" onclick={openChannelEdit} title="Join a different channel">switch ⇄</button>
-		</div>
-	{/if}
-
 	<div class="steps" style="--inset:{inset}%">
 		<div class="track" style="left:{inset}%;right:{inset}%"></div>
 		<div class="track fill" style="left:{inset}%;width:calc({fillPct}% * (1 - 2*{inset}/100))"></div>
@@ -215,6 +181,43 @@
 	{#if showIds}
 		<div class="dash">
 			<div class="dash-note">Your decentralized connection — all of it viewable and swappable. Gavl's values are the defaults, not the only option.</div>
+
+			<!-- NETWORK / CHANNEL -->
+			<div class="sect">
+				<div class="sect-head"><span class="sect-title">Channel</span><span class="sect-sub">the network you're on — its own economy</span></div>
+				{#if editingChannel}
+					<div class="ctl">
+						<input
+							class="kinput"
+							placeholder="gavl-global-v1"
+							bind:value={channelInput}
+							disabled={switching}
+							onkeydown={(e) => {
+								if (e.key === "Enter") joinChannel();
+								if (e.key === "Escape") editingChannel = false;
+							}}
+						/>
+						<button class="join" onclick={joinChannel} disabled={switching || !channelInput.trim()}>{switching ? "joining…" : "Join"}</button>
+						<button class="chanx" onclick={() => (editingChannel = false)} disabled={switching}>✕</button>
+					</div>
+					<div class="empty">A channel is its own economy — separate coins, listings, peers. Your identity (keys) is shared. The name is its address: sha256(name) is the DHT topic peers meet on.</div>
+				{:else}
+					<div class="idrow" title="The channel name — its address is sha256(name).">
+						<span class="idk">name</span>
+						<code class="idv slug">{c?.network ?? "—"}</code>
+						<button class="mini" onclick={openChannelEdit} title="Join a different channel">switch ⇄</button>
+					</div>
+					{#if c?.topic}
+						<div class="idrow" title="sha256(network) — the universal rendezvous key every Gavl peer joins on the hyperdht. This IS the address of the network.">
+							<span class="idk">address</span>
+							<code class="idv">{shortMid(c.topic)}</code>
+							<button class="copy" class:ok={copied === c.topic} onclick={() => copy(c.topic)} title="Copy the full topic">{copied === c.topic ? "✓" : "copy"}</button>
+						</div>
+					{:else}
+						<div class="empty">mesh off — no DHT topic</div>
+					{/if}
+				{/if}
+			</div>
 
 			<!-- IDENTITY -->
 			<div class="sect">
@@ -323,18 +326,6 @@
 	.idtoggle { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 0.74rem; padding: 0; margin: 0; }
 	.idtoggle:hover { text-decoration: underline; filter: none; }
 
-	.topic {
-		display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap;
-		margin: 0 0 1rem; padding: 0.55rem 0.7rem;
-		background: var(--panel-2); border: 1px solid var(--accent-dim); border-radius: 8px;
-	}
-	.topic-label { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-	.topic-slug { font-weight: 700; color: var(--accent); font-size: 0.9rem; }
-	.topic-hash {
-		font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.78rem; color: var(--text);
-		flex: 1; min-width: 200px; overflow-wrap: anywhere; opacity: 0.92;
-	}
-
 	.dash { margin-top: 0.95rem; padding-top: 0.8rem; border-top: 1px solid var(--border); }
 	.dash-note { font-size: 0.72rem; color: var(--muted); margin-bottom: 0.8rem; line-height: 1.4; }
 	.sect { margin-bottom: 0.9rem; }
@@ -355,23 +346,14 @@
 	.idrow.offline { opacity: 0.6; }
 	.idk { font-size: 0.72rem; color: var(--muted); width: 92px; flex: none; }
 	.idv { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.76rem; color: var(--text); background: var(--panel-2); padding: 0.12rem 0.45rem; border-radius: 5px; flex: 1; overflow: hidden; text-overflow: ellipsis; }
+	.idv.slug { color: var(--accent); font-weight: 700; }
 	.copy { background: transparent; border: 1px solid var(--border); color: var(--muted); font-size: 0.68rem; padding: 0.12rem 0.5rem; border-radius: 5px; cursor: pointer; margin: 0; flex: none; }
 	.copy:hover { color: var(--text); filter: none; }
 	.copy.ok { color: var(--green); border-color: var(--green); }
 
-	.switch { background: transparent; border: 1px solid var(--accent-dim); color: var(--accent); font-size: 0.68rem; padding: 0.12rem 0.5rem; border-radius: 5px; cursor: pointer; margin: 0; flex: none; }
-	.switch:hover { filter: brightness(1.15); }
-	.topic.chanedit { border-style: dashed; }
-	.chaninput {
-		flex: 1; min-width: 180px; margin: 0;
-		background: var(--bg); border: 1px solid var(--accent-dim); color: var(--text);
-		font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.82rem;
-		padding: 0.3rem 0.5rem; border-radius: 5px;
-	}
 	.join { background: var(--accent); color: #1a1303; border: none; font-size: 0.72rem; font-weight: 600; padding: 0.3rem 0.7rem; border-radius: 5px; cursor: pointer; margin: 0; flex: none; }
 	.join:disabled { opacity: 0.5; cursor: not-allowed; }
 	.chanx { background: transparent; border: 1px solid var(--border); color: var(--muted); font-size: 0.72rem; padding: 0.3rem 0.5rem; border-radius: 5px; cursor: pointer; margin: 0; flex: none; }
-	.chanhint { font-size: 0.7rem; color: var(--muted); margin: -0.5rem 0 1rem; line-height: 1.4; }
 
 	.steps { position: relative; display: flex; }
 	.track {
