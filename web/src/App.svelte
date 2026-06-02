@@ -7,6 +7,7 @@
 	import ListingsView from "./components/ListingsView.svelte";
 	import ConsensusPanel from "./components/ConsensusPanel.svelte";
 	import ConnectProgress from "./components/ConnectProgress.svelte";
+	import ChannelBar from "./components/ChannelBar.svelte";
 
 	let timer;
 	onMount(() => {
@@ -44,6 +45,7 @@
 	{:else}
 		<main class="content">
 			{#if tab === "market"}
+				<ChannelBar />
 				<ListingsView />
 			{:else if tab === "sell"}
 				<CreateCoin />
