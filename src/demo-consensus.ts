@@ -64,12 +64,16 @@ try {
 	await tb.join(NETWORK);
 	console.log("• two nodes connected over the DHT\n");
 
-	const id = await seller.createAuction("Meteorite Shard", null);
+	// Bidder deploys a coin to bid with (the protocol mints nothing on its own).
+	const coin = await bidder.deployCoin("Meteorite Dust", "MTD", 1_000n);
+	await waitFor(() => seller.view().coins.has(coin));
+
+	const id = await seller.createItemAuction("Meteorite Shard", null);
 	await waitFor(() => bidder.view().auctions.has(id));
-	const ref = await bidder.bid(id, 500n);
+	const ref = await bidder.bid(id, coin, 500n);
 	await waitFor(() => seller.view().auctions.get(id)!.bids.length === 1);
 	await seller.settle(id, ref);
-	console.log(`• auction ${short(id)}: listed → bid 500 → settled (writes gossiped)\n`);
+	console.log(`• auction ${short(id)}: listed → bid 500 MTD → settled (writes gossiped)\n`);
 
 	console.log(`• node A farms anchors (real ${PARAMS.vdf.name} cooldown); node B follows via gossip…`);
 	const farming = prodA.run({ until: () => stop, paceMs: 120 });
