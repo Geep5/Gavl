@@ -19,7 +19,7 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Daemon } from "./daemon.ts";
-import { splitBalKey } from "./auction/state.ts";
+import { splitBalKey, balanceOf } from "./auction/state.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
@@ -29,6 +29,13 @@ const SPACE = process.env.GAVL_SPACE === "chiapos" ? "chiapos" : "standin";
 // GAVL_RETARGET=0 disables it (constant difficulty). GAVL_TARGET_ITERS tunes the per-anchor cost.
 const RETARGET = process.env.GAVL_RETARGET !== "0";
 const TARGET_ITERS = BigInt(process.env.GAVL_TARGET_ITERS ?? "200000");
+// Idle heartbeat: when caught up, a lone node mints one anchor every this many ms.
+// This sets the anchor cadence when there's no competing work, so it MUST match the
+// time-estimate target (targetSecPerAnchor = 60s) — otherwise listing lifetimes,
+// which are measured in anchors (MAX_LISTING_ANCHORS = 14_400 ≈ 10 days @ 60s),
+// read at the wrong wall-clock. Upstream defaulted this to 120s, which made the
+// 10-day cap display as ~20 days. Default it to 60s to match.
+const HEARTBEAT_MS = Number(process.env.GAVL_HEARTBEAT_MS ?? "60000");
 
 // Durable storage: ON by default (GAVL_PERSIST=off → in-memory only, lost on restart).
 //   GAVL_PERSIST=all  (default) → archiver, keep every write
@@ -37,8 +44,29 @@ const PERSIST = process.env.GAVL_PERSIST ?? "all";
 const daemon = new Daemon({
 	space: SPACE,
 	schedule: RETARGET ? { base: 20n, targetIters: TARGET_ITERS, epoch: 4, window: 8, maxStep: 4n } : undefined,
+	heartbeatMs: HEARTBEAT_MS,
 	store: PERSIST === "off" ? undefined : { persist: PERSIST === "mine" ? "mine" : "all" },
 });
+
+/**
+ * Pre-flight a bid against the current view and throw a clear error if it would
+ * be silently dropped by the conservation rules (auction/state.ts). Without this
+ * the API accepts the write, pays the PoST cooldown, gossips it, and the bid
+ * just never appears — the user sees "0 bids" with no explanation.
+ */
+function validateBid(auctionId: string, token: string, amountStr: string): void {
+	const view = daemon.view();
+	const me = daemon.active().pubHex;
+	const a = view.auctions.get(auctionId);
+	if (!a) throw new Error("no such auction");
+	if (a.status !== "open") throw new Error(`auction is ${a.status}, not open`);
+	if (me === a.seller) throw new Error("you cannot bid on your own auction");
+	if (!/^[0-9]+$/.test(amountStr) || BigInt(amountStr) <= 0n) throw new Error("bid amount must be a positive integer");
+	const amount = BigInt(amountStr);
+	const sym = view.coins.get(token)?.symbol ?? token.slice(0, 8) + "…";
+	const held = balanceOf(view, token, me);
+	if (held < amount) throw new Error(`insufficient balance: you hold ${held} ${sym}, but the bid needs ${amount}`);
+}
 
 // ── View → JSON (Maps + BigInts → plain, string amounts) ─────────
 
@@ -172,7 +200,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		if (bidMatch) {
 			const [, id, action] = bidMatch;
 			const acct = daemon.active();
-			if (action === "bid") await acct.bid(id, String(body.token), String(body.amount));
+			if (action === "bid") {
+				validateBid(id, String(body.token), String(body.amount));
+				await acct.bid(id, String(body.token), String(body.amount));
+			}
 			else if (action === "settle") await acct.settle(id, String(body.winner));
 			else await acct.cancel(id);
 			return send(res, 200, { ok: true });
