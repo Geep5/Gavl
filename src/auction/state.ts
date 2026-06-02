@@ -21,7 +21,7 @@
  */
 
 import type { Write } from "../chain/writer.ts";
-import type { Op, Give, Price } from "./ops.ts";
+import type { Op, Price } from "./ops.ts";
 import { isOp } from "./ops.ts";
 
 /** A deployed coin's metadata. */
@@ -43,11 +43,14 @@ export interface Bid {
 	inbox?: string;
 }
 
-/** A resolved view of what an auction sells. */
-export type GiveView =
-	| { kind: "item"; itemId: string; name: string }
-	| { kind: "coin"; token: string; amount: bigint }
-	| { kind: "secret"; name: string; commitment: string };
+/** A resolved view of what a listing contains. Always a named item (by id); optionally
+ *  a bundled escrowed coin amount and/or a sealed secret. */
+export interface Contents {
+	itemId: string;
+	name: string;
+	coin?: { token: string; amount: bigint };
+	secret?: { commitment: string };
+}
 
 /** Max bytes of the opaque offer body. Over-cap creates are skipped (deterministic). */
 export const MAX_DETAILS_BYTES = 8192;
@@ -73,7 +76,7 @@ export const MAX_LISTING_ANCHORS = 14_400;
 export interface Auction {
 	id: string;
 	seller: string;
-	give: GiveView;
+	contents: Contents;
 	/** Advisory ask price (any coin), or null for open-to-bids. */
 	ask: { token: string; amount: bigint } | null;
 	/** Opaque seller-authored offer body (free-form YAML in the UI), or undefined. */
@@ -193,7 +196,7 @@ function expireDue(view: View, opts: ViewOptions): void {
 	for (const a of view.auctions.values()) {
 		if (a.status !== "open" || a.expiresAt === undefined) continue;
 		if (opts.nowHeight >= a.expiresAt) {
-			releaseGive(view, a.give, a.seller); // give back to seller
+			releaseContents(view, a.contents, a.seller); // item + bundled coins back to seller
 			for (const b of a.bids) add(view.balances, b.token, b.bidder, b.amount); // refund all bids
 			a.status = "expired";
 		}
@@ -221,6 +224,7 @@ function applyOp(view: View, w: Write, op: Op): void {
 		}
 		case "auction.create": {
 			if (view.auctions.has(w.id)) return; // id is content-addressed; collisions impossible
+			if (typeof op.name !== "string" || op.name.length === 0) return; // every listing has a name
 			const ask = parsePrice(op.ask);
 			if (ask === undefined) return; // malformed ask
 			let details: string | undefined;
@@ -229,9 +233,10 @@ function applyOp(view: View, w: Write, op: Op): void {
 				if (Buffer.byteLength(op.details, "utf8") > MAX_DETAILS_BYTES) return; // over cap → skip (deterministic)
 				details = op.details;
 			}
-			const give = escrowGive(view, w, op.give);
-			if (!give) return; // give could not be escrowed (insufficient balance / malformed)
-			view.auctions.set(w.id, { id: w.id, seller: w.writer, give, ask, details, status: "open", bids: [] });
+			const contents = escrowContents(view, w, op);
+			if (!contents) return; // a bundled coin/secret was malformed or unaffordable → skip whole listing
+			view.items.set(w.id, { name: op.name, owner: w.writer }); // the listing is itself a unique item, escrowed to the seller
+			view.auctions.set(w.id, { id: w.id, seller: w.writer, contents, ask, details, status: "open", bids: [] });
 			return;
 		}
 		case "auction.bid": {
@@ -252,14 +257,14 @@ function applyOp(view: View, w: Write, op: Op): void {
 			if (w.writer !== a.seller) return; // only the seller settles
 			const win = a.bids.find((b) => b.ref === op.winner);
 			if (!win) return; // must name an actual bid
-			// A secret auction can only settle to a bid that supplied a delivery inbox,
-			// and the settle must carry the sealed delivery — else the winner gets nothing.
-			if (a.give.kind === "secret") {
+			// A listing bundling a secret can only settle to a bid that supplied a delivery
+			// inbox, and the settle must carry the sealed delivery — else the secret part fails.
+			if (a.contents.secret) {
 				if (!win.inbox || typeof op.delivery !== "string") return;
 				a.delivery = op.delivery; // opaque ciphertext, sealed to win.inbox
 			}
 			add(view.balances, win.token, a.seller, win.amount); // payment → seller
-			releaseGive(view, a.give, win.bidder); // the give → winner (no-op for secret; delivery is the give)
+			releaseContents(view, a.contents, win.bidder); // item + bundled coins → winner
 			for (const b of a.bids) if (b.ref !== win.ref) add(view.balances, b.token, b.bidder, b.amount); // refund losers
 			a.status = "settled";
 			a.winner = win.ref;
@@ -270,7 +275,7 @@ function applyOp(view: View, w: Write, op: Op): void {
 			const a = view.auctions.get(op.auction);
 			if (!a || a.status !== "open") return;
 			if (w.writer !== a.seller) return;
-			releaseGive(view, a.give, a.seller); // return the give to the seller
+			releaseContents(view, a.contents, a.seller); // return item + bundled coins to the seller
 			for (const b of a.bids) add(view.balances, b.token, b.bidder, b.amount); // refund all
 			a.status = "cancelled";
 			return;
@@ -278,36 +283,37 @@ function applyOp(view: View, w: Write, op: Op): void {
 	}
 }
 
-/** Escrow what an auction gives, debiting the seller. Returns the resolved give, or null if invalid. */
-function escrowGive(view: View, w: Write, give: Give): GiveView | null {
-	if (give?.kind === "item") {
-		if (typeof give.name !== "string") return null;
-		view.items.set(w.id, { name: give.name, owner: w.writer }); // a fresh unique item, escrowed to the seller
-		return { kind: "item", itemId: w.id, name: give.name };
+/**
+ * Validate + escrow a listing's optional bundled coin/secret, debiting the seller.
+ * The named item itself is escrowed by the create case (view.items). Returns the
+ * resolved Contents, or null if any bundled part is malformed/unaffordable — in
+ * which case the whole listing is skipped (atomic: no partial escrow).
+ */
+function escrowContents(view: View, w: Write, op: { name: string; coin?: { token: string; amount: string }; secret?: { commitment: string } }): Contents | null {
+	const contents: Contents = { itemId: w.id, name: op.name };
+
+	if (op.coin !== undefined) {
+		const amt = parseAmount(op.coin.amount);
+		if (amt === null || typeof op.coin.token !== "string") return null;
+		if (bal(view.balances, op.coin.token, w.writer) < amt) return null; // can't escrow coins you don't hold
+		add(view.balances, op.coin.token, w.writer, -amt); // lock the amount out of the seller's balance
+		contents.coin = { token: op.coin.token, amount: amt };
 	}
-	if (give?.kind === "coin") {
-		const amt = parseAmount(give.amount);
-		if (amt === null || typeof give.token !== "string") return null;
-		if (bal(view.balances, give.token, w.writer) < amt) return null; // can't escrow coins you don't hold
-		add(view.balances, give.token, w.writer, -amt); // lock the amount out of the seller's balance
-		return { kind: "coin", token: give.token, amount: amt };
-	}
-	if (give?.kind === "secret") {
+
+	if (op.secret !== undefined) {
 		// Nothing balance-wise to escrow — the seller commits to a secret by its hash.
 		// 64 hex chars = sha256; reject anything else so the commitment is well-formed.
-		if (typeof give.name !== "string" || typeof give.commitment !== "string" || !/^[0-9a-f]{64}$/.test(give.commitment)) return null;
-		return { kind: "secret", name: give.name, commitment: give.commitment };
+		if (typeof op.secret.commitment !== "string" || !/^[0-9a-f]{64}$/.test(op.secret.commitment)) return null;
+		contents.secret = { commitment: op.secret.commitment };
 	}
-	return null;
+
+	return contents;
 }
 
-/** Release an escrowed give to `recipient` (winner on settle, seller on cancel). */
-function releaseGive(view: View, give: GiveView, recipient: string): void {
-	if (give.kind === "item") {
-		const item = view.items.get(give.itemId);
-		if (item) item.owner = recipient;
-	} else if (give.kind === "coin") {
-		add(view.balances, give.token, recipient, give.amount);
-	}
-	// secret: the "release" IS the sealed delivery recorded on the auction; nothing to move here.
+/** Release a listing's item + bundled coins to `recipient` (winner on settle, seller on cancel).
+ *  The secret (if any) is delivered via the sealed `delivery` recorded on the auction, not here. */
+function releaseContents(view: View, contents: Contents, recipient: string): void {
+	const item = view.items.get(contents.itemId);
+	if (item) item.owner = recipient;
+	if (contents.coin) add(view.balances, contents.coin.token, recipient, contents.coin.amount);
 }

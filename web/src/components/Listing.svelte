@@ -36,16 +36,13 @@
 	const myTokens = $derived(Object.keys(balances));
 	const isSeller = $derived(auction.seller === store.active);
 	const isOpen = $derived(auction.status === "open");
-	const isSecret = $derived(auction.give.kind === "secret");
+	const isSecret = $derived(!!auction.contents.secret);
 	const wonByMe = $derived(auction.status === "settled" && auction.winnerPubkey === store.active);
 	// the opened secret in my inventory, if I've already claimed it
 	const claimed = $derived(store.inventory.find((s) => s.auctionId === auction.id) ?? null);
 
-	function giveText(g) {
-		if (g.kind === "item") return g.name;
-		if (g.kind === "coin") return `${g.amount} ${coinLabel(g.token)}`;
-		return `🔒 ${g.name}`; // secret
-	}
+	// What this listing contains: the name, plus chips for a bundled coin / secret.
+	const c = $derived(auction.contents);
 
 	// Anchors → a human time estimate, using the daemon's seconds-per-anchor
 	// (measured live cadence when available, else the target rate). The clock is
@@ -95,7 +92,11 @@
 
 <div class="listing">
 	<div class="spread">
-		<span class="give">{giveText(auction.give)}</span>
+		<span class="give">
+			{c.name}
+			{#if c.coin}<span class="chip coin" title="this listing bundles coins, delivered to the winner">+{c.coin.amount} {coinLabel(c.coin.token)}</span>{/if}
+			{#if c.secret}<span class="chip secret" title="this listing bundles a sealed secret">🔒 secret</span>{/if}
+		</span>
 		<span class="row" style="gap:0.35rem">
 			{#if auction.finalized}<span class="pill settled" title="certified by the anchor chain">✓ final</span>{/if}
 			<span class="pill {auction.status}">{auction.status}</span>
@@ -194,6 +195,12 @@
 </div>
 
 <style>
+	.chip {
+		display: inline-block; margin-left: 0.4rem; padding: 0.05rem 0.45rem; border-radius: 999px;
+		font-size: 0.68rem; font-weight: 600; vertical-align: middle;
+	}
+	.chip.coin { color: var(--green); border: 1px solid var(--green); }
+	.chip.secret { color: var(--accent); border: 1px solid var(--accent-dim); }
 	.link {
 		background: none; border: none; color: var(--accent); cursor: pointer;
 		font-size: 0.78rem; padding: 0; margin-top: 0.45rem;

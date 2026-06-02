@@ -3,18 +3,18 @@
 	import { api } from "../lib/api.js";
 	import { parse as parseYaml } from "yaml";
 
-	let mode = $state("item"); // "item" | "coin" | "secret"
 	let busy = $state(false);
 
-	// item
-	let itemName = $state("");
-	// coin give
-	let giveToken = $state("");
-	let giveAmount = $state("");
-	// secret give
-	let secretName = $state("");
+	// every listing has a name
+	let name = $state("");
+	// optional bundled coin
+	let includeCoin = $state(false);
+	let coinToken = $state("");
+	let coinAmount = $state("");
+	// optional bundled secret
+	let includeSecret = $state(false);
 	let secretBody = $state("");
-	// ask (optional, shared)
+	// ask (optional)
 	let askToken = $state("");
 	let askAmount = $state("");
 	// offer body (free-form YAML)
@@ -25,16 +25,11 @@
   northern smithies. Light, fast, deadly.
 condition: excellent
 category: weapons
-attributes:
-  reach: long
-  weight: 1.2kg
-  era: 14th century
 terms: ships within 3 days of settlement`;
 
 	const balances = $derived(activeBalances());
 	const myTokens = $derived(Object.keys(balances));
 
-	// Validate the YAML as the seller types — block submit on a parse error.
 	const yamlError = $derived.by(() => {
 		if (!details.trim()) return null;
 		try {
@@ -45,72 +40,66 @@ terms: ships within 3 days of settlement`;
 		}
 	});
 
-	function buildAsk() {
-		if (!askToken || !askAmount) return null;
-		return { token: askToken, amount: askAmount };
-	}
-
 	async function list() {
-		if (yamlError) return;
+		if (yamlError || !canList) return;
 		busy = true;
-		const ask = buildAsk();
-		const body = details.trim() || undefined;
-		if (mode === "item") {
-			if (itemName.trim()) await act(() => api.createItemAuction(itemName.trim(), ask, body));
-		} else if (mode === "coin") {
-			if (giveToken && giveAmount) await act(() => api.createCoinAuction(giveToken, giveAmount, ask, body));
-		} else {
-			if (secretName.trim() && secretBody) await act(() => api.createSecretAuction(secretName.trim(), secretBody, ask, body));
-			secretName = "";
-			secretBody = "";
-		}
-		itemName = "";
-		giveAmount = "";
+		const payload = {
+			name: name.trim(),
+			coin: includeCoin && coinToken && coinAmount ? { token: coinToken, amount: coinAmount } : undefined,
+			secret: includeSecret && secretBody ? secretBody : undefined,
+			ask: askToken && askAmount ? { token: askToken, amount: askAmount } : null,
+			details: details.trim() || undefined,
+		};
+		await act(() => api.createListing(payload));
+		name = "";
+		coinAmount = "";
+		secretBody = "";
 		askAmount = "";
 		details = "";
+		includeCoin = false;
+		includeSecret = false;
 		busy = false;
 	}
 
-	const canList = $derived((mode === "item" ? !!itemName.trim() : mode === "coin" ? !!giveToken && !!giveAmount : !!secretName.trim() && !!secretBody) && !yamlError);
+	// valid if it has a name, any included bundle is filled in, and the YAML parses
+	const canList = $derived(!!name.trim() && (!includeCoin || (!!coinToken && !!coinAmount)) && (!includeSecret || !!secretBody) && !yamlError);
 </script>
 
 <div class="panel">
 	<h2>Create a listing</h2>
 
-	<div class="tabs">
-		<button class:active={mode === "item"} onclick={() => (mode = "item")}>Unique item</button>
-		<button class:active={mode === "coin"} onclick={() => (mode = "coin")}>Amount of a coin</button>
-		<button class:active={mode === "secret"} onclick={() => (mode = "secret")}>Sealed secret</button>
-	</div>
+	<label>Name <span class="muted">(every listing is a named, ownable item)</span></label>
+	<input placeholder="Rare Sword" bind:value={name} />
 
-	{#if mode === "item"}
-		<label>Item name <span class="muted">(headline)</span></label>
-		<input placeholder="Rare Sword" bind:value={itemName} />
-	{:else if mode === "coin"}
-		<label>Coin to sell</label>
-		<select bind:value={giveToken}>
-			<option value="" disabled>— pick a coin you hold —</option>
-			{#each myTokens as t}
-				<option value={t}>{coinLabel(t)} ({balances[t]})</option>
-			{/each}
-		</select>
-		<label>Amount to sell</label>
-		<input placeholder="100" bind:value={giveAmount} inputmode="numeric" />
-	{:else}
-		<div class="warn">
-			⚠ <strong>Not a fair exchange.</strong> The secret is delivered to the winner encrypted and verified
-			against a commitment — but <strong>you keep a copy</strong>. Only sell secrets whose value survives you
-			still knowing them (messages, notes, codes, credentials). <strong>Never sell a private key that controls
-			funds</strong> — you could drain it after being paid.
+	<!-- optional: bundle a coin amount -->
+	<label class="check"><input type="checkbox" bind:checked={includeCoin} /> include an amount of a coin</label>
+	{#if includeCoin}
+		<div class="bundle">
+			<select bind:value={coinToken}>
+				<option value="" disabled>— pick a coin you hold —</option>
+				{#each myTokens as t}
+					<option value={t}>{coinLabel(t)} ({balances[t]})</option>
+				{/each}
+			</select>
+			<input placeholder="amount to bundle" bind:value={coinAmount} inputmode="numeric" />
 		</div>
-		<label>Secret title <span class="muted">(public headline)</span></label>
-		<input placeholder="Lost numbers" bind:value={secretName} />
-		<label>Secret contents <span class="muted">(stays local + encrypted; only the winner can open it)</span></label>
-		<textarea class="secret" rows="4" placeholder="the vault code is 4-8-15-16-23-42" bind:value={secretBody} spellcheck="false"></textarea>
+	{/if}
+
+	<!-- optional: bundle a sealed secret -->
+	<label class="check"><input type="checkbox" bind:checked={includeSecret} /> include a sealed secret</label>
+	{#if includeSecret}
+		<div class="bundle">
+			<div class="warn">
+				⚠ <strong>Not a fair exchange.</strong> The secret is delivered to the winner encrypted and verified
+				against a commitment — but <strong>you keep a copy</strong>. Safe for messages, notes, codes. <strong>Never
+				include a private key that controls funds.</strong>
+			</div>
+			<textarea class="secret" rows="3" placeholder="the vault code is 4-8-15-16-23-42" bind:value={secretBody} spellcheck="false"></textarea>
+		</div>
 	{/if}
 
 	<label>Offer details <span class="muted">(optional — free-form YAML)</span></label>
-	<textarea class="yaml" class:bad={!!yamlError} rows="8" placeholder={PLACEHOLDER} bind:value={details} spellcheck="false"></textarea>
+	<textarea class="yaml" class:bad={!!yamlError} rows="6" placeholder={PLACEHOLDER} bind:value={details} spellcheck="false"></textarea>
 	{#if yamlError}
 		<div class="yaml-err">⚠ {yamlError}</div>
 	{:else if details.trim()}
@@ -132,45 +121,22 @@ terms: ships within 3 days of settlement`;
 </div>
 
 <style>
+	label.check { display: flex; align-items: center; gap: 0.4rem; cursor: pointer; margin-top: 0.7rem; color: var(--text); }
+	label.check input { width: auto; }
+	.bundle { margin: 0.4rem 0 0.2rem; padding-left: 0.6rem; border-left: 2px solid var(--border); }
+	.bundle select, .bundle input { margin-bottom: 0.4rem; }
 	.warn {
-		background: #3a2a14;
-		border: 1px solid var(--accent-dim);
-		color: #f0d9a8;
-		padding: 0.55rem 0.7rem;
-		border-radius: 6px;
-		font-size: 0.76rem;
-		line-height: 1.5;
-		margin: 0.4rem 0 0.2rem;
+		background: #3a2a14; border: 1px solid var(--accent-dim); color: #f0d9a8;
+		padding: 0.5rem 0.65rem; border-radius: 6px; font-size: 0.74rem; line-height: 1.5; margin-bottom: 0.4rem;
 	}
 	.warn strong { color: var(--accent); }
-	textarea.secret {
-		width: 100%;
-		background: var(--panel-2);
-		border: 1px solid var(--border);
-		color: var(--text);
-		padding: 0.5rem 0.6rem;
-		border-radius: 6px;
-		font-family: ui-monospace, "SF Mono", Menlo, monospace;
-		font-size: 0.82rem;
-		line-height: 1.45;
-		resize: vertical;
+	textarea.secret, textarea.yaml {
+		width: 100%; background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+		padding: 0.5rem 0.6rem; border-radius: 6px;
+		font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.82rem; line-height: 1.45; resize: vertical;
 	}
-	textarea.secret:focus { outline: 1px solid var(--accent-dim); border-color: var(--accent-dim); }
-	textarea.yaml {
-		width: 100%;
-		background: var(--panel-2);
-		border: 1px solid var(--border);
-		color: var(--text);
-		padding: 0.5rem 0.6rem;
-		border-radius: 6px;
-		font-family: ui-monospace, "SF Mono", Menlo, monospace;
-		font-size: 0.82rem;
-		line-height: 1.45;
-		resize: vertical;
-		tab-size: 2;
-	}
-	textarea.yaml:focus { outline: 1px solid var(--accent-dim); border-color: var(--accent-dim); }
 	textarea.yaml.bad { border-color: var(--red); }
+	textarea.secret:focus, textarea.yaml:focus { outline: 1px solid var(--accent-dim); border-color: var(--accent-dim); }
 	.yaml-err { color: var(--red); font-size: 0.76rem; margin-top: 0.25rem; }
 	.yaml-ok { color: var(--green); font-size: 0.76rem; margin-top: 0.25rem; }
 </style>

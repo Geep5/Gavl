@@ -77,8 +77,8 @@ export class MinePolicy implements PersistPolicy {
 			case "transfer":
 				return me.has(op.to) || ctx.keptCoins.has(op.token);
 			case "auction.create":
-				// keep if it sells/asks a coin I track (I authored is already handled above)
-				return (op.give.kind === "coin" && ctx.keptCoins.has(op.give.token)) || (op.ask != null && ctx.keptCoins.has(op.ask.token));
+				// keep if it bundles/asks a coin I track (I authored is already handled above)
+				return (!!op.coin && ctx.keptCoins.has(op.coin.token)) || (op.ask != null && ctx.keptCoins.has(op.ask.token));
 			case "auction.bid":
 				return ctx.keptAuctions.has(op.auction) || ctx.keptCoins.has(op.token);
 			case "auction.settle":

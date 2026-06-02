@@ -91,7 +91,12 @@ function serializeState() {
 	}));
 
 	const nowHeight = daemon.finalizedHeight(); // current anchor-clock "now" (or null pre-consensus)
-	const giveJson = (g) => (g.kind === "item" ? { kind: "item", itemId: g.itemId, name: g.name } : g.kind === "coin" ? { kind: "coin", token: g.token, amount: g.amount.toString() } : { kind: "secret", name: g.name, commitment: g.commitment });
+	const contentsJson = (c) => ({
+		itemId: c.itemId,
+		name: c.name,
+		coin: c.coin ? { token: c.coin.token, amount: c.coin.amount.toString() } : null,
+		secret: c.secret ? { commitment: c.secret.commitment } : null,
+	});
 	const auctions = [...view.auctions.values()].map((a) => {
 		const fa = finalAuctions.get(a.id); // finalized counterpart (carries bornAt/expiresAt + expiry status)
 		// Expiry lives in the finalized view (the only place with an anchor clock). Surface it
@@ -102,7 +107,8 @@ function serializeState() {
 		return {
 			id: a.id,
 			seller: a.seller,
-			give: giveJson(a.give),
+			name: a.contents.name,
+			contents: contentsJson(a.contents),
 			ask: a.ask ? { token: a.ask.token, amount: a.ask.amount.toString() } : null,
 			details: a.details ?? null,
 			status: expired ? "expired" : a.status, // reflect anchor-clock expiry in the headline status
@@ -187,15 +193,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			return send(res, 200, { ok: true });
 		}
 		if (path === "/api/auctions") {
-			// body.give = {kind:"item",name} | {kind:"coin",token,amount};  body.ask = {token,amount}|null
-			// body.details = opaque offer body (free-form YAML), optional
-			const id = await daemon.active().create(body.give, body.ask ?? null, typeof body.details === "string" ? body.details : undefined);
-			return send(res, 200, { id });
-		}
-		if (path === "/api/secrets") {
-			// Sell a sealed secret: { name, secret, ask?, details? }. Plaintext is vaulted locally,
-			// only the commitment is published. NOT fair exchange — seller keeps a copy.
-			const id = await daemon.active().createSecretAuction(String(body.name), String(body.secret), body.ask ?? null, typeof body.details === "string" ? body.details : undefined);
+			// One unified listing: { name, coin?:{token,amount}, secret?, ask?:{token,amount}, details? }.
+			// name is required; coin escrows an amount; secret is vaulted locally (only its
+			// commitment is published — NOT fair exchange, the seller keeps a copy).
+			const id = await daemon.active().createListing({
+				name: String(body.name ?? ""),
+				coin: body.coin && body.coin.token ? { token: String(body.coin.token), amount: String(body.coin.amount) } : undefined,
+				secret: typeof body.secret === "string" && body.secret !== "" ? body.secret : undefined,
+				ask: body.ask ?? null,
+				details: typeof body.details === "string" ? body.details : undefined,
+			});
 			return send(res, 200, { id });
 		}
 		if (path === "/api/channel") {

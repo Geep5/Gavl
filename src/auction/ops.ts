@@ -12,17 +12,19 @@
  * strings (BigInt-parsed) to stay JSON/canonical-safe.
  */
 
-/** What an auction sells. A unique item, a fungible coin amount, or a sealed secret. */
-export type Give =
-	/** A unique, one-of-a-kind item. Its id becomes the auction id; escrowed to the seller. */
-	| { kind: "item"; name: string }
-	/** A fungible amount of a deployed coin, escrowed from the seller's balance. */
-	| { kind: "coin"; token: string; amount: string }
-	/** A sealed secret (message/note/code/credential). The protocol holds ONLY the
-	 *  commitment = sha256(salt‖secret); the plaintext lives in the seller's local
-	 *  vault and is sealed to the winner at settle. NOT fair exchange — the seller
-	 *  keeps a copy, so this is unsafe for secrets that control funds. */
-	| { kind: "secret"; name: string; commitment: string };
+/** A fungible amount of a deployed coin, escrowed into a listing from the seller's balance. */
+export interface CoinBundle {
+	token: string;
+	amount: string;
+}
+
+/** A sealed secret bundled into a listing. The protocol holds ONLY the commitment
+ *  = sha256(salt‖secret); the plaintext lives in the seller's local vault and is
+ *  sealed to the winner at settle. NOT fair exchange — the seller keeps a copy, so
+ *  this is unsafe for secrets that control funds. */
+export interface SecretBundle {
+	commitment: string;
+}
 
 /** A price tag: an amount of a specific coin. */
 export interface Price {
@@ -35,11 +37,15 @@ export type Op =
 	| { kind: "coin.deploy"; name: string; symbol: string; supply: string }
 	/** Send an amount of a coin to another account. */
 	| { kind: "transfer"; token: string; to: string; amount: string }
-	/** List a `give` for sale. `ask` = advisory price (any coin), or null = open to bids.
+	/** List something for sale. Every listing has a `name` and is itself a unique, ownable
+	 *  item (identified by the create-write's id). It MAY also bundle an escrowed `coin`
+	 *  amount and/or a sealed `secret`. The winner receives the item, the bundled coins,
+	 *  and the sealed secret (if any), all at settle.
+	 *  `ask` = advisory price (any coin), or null = open to bids.
 	 *  `details` = an OPAQUE offer body (the UI uses free-form YAML) the seller writes to
 	 *  format the listing — description, condition, specs, terms. The protocol never parses
 	 *  it; it's stored verbatim and content-addressed like any other field. */
-	| { kind: "auction.create"; give: Give; ask: Price | null; details?: string }
+	| { kind: "auction.create"; name: string; coin?: CoinBundle; secret?: SecretBundle; ask: Price | null; details?: string }
 	/** Bid an amount of a coin on an open auction. The bid is escrowed until resolved.
 	 *  `inbox` = the bidder's X25519 sealed-box public key (hex); required to win a
 	 *  secret auction, since delivery is sealed to it. Ignored for non-secret gives. */

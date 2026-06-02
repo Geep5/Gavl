@@ -8,7 +8,7 @@
 	// get pinned at the top regardless of the active filter (the claim button finds
 	// me without switching to "All").
 	const toClaim = $derived(
-		store.auctions.filter((a) => a.give.kind === "secret" && a.status === "settled" && a.winnerPubkey === store.active && a.delivered && !store.inventory.some((s) => s.auctionId === a.id)),
+		store.auctions.filter((a) => a.contents.secret && a.status === "settled" && a.winnerPubkey === store.active && a.delivered && !store.inventory.some((s) => s.auctionId === a.id)),
 	);
 	const pinnedIds = $derived(new Set(toClaim.map((a) => a.id)));
 

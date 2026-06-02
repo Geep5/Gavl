@@ -47,8 +47,8 @@ test("winner receives and verifies the secret; non-winners and protocol cannot r
 
 		// The listing publishes only a commitment — never the plaintext.
 		const listed = seller.view().auctions.get(id);
-		assert.equal(listed.give.kind, "secret");
-		assert.ok(/^[0-9a-f]{64}$/.test(listed.give.commitment), "commitment is a sha256 hex");
+		assert.ok(listed.contents.secret, "listing bundles a secret");
+		assert.ok(/^[0-9a-f]{64}$/.test(listed.contents.secret.commitment), "commitment is a sha256 hex");
 		assert.equal(JSON.stringify(listed).includes(SECRET), false, "plaintext is NOT in the published state");
 
 		// Bids carry each bidder's delivery inbox automatically.

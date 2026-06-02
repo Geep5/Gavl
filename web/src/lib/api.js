@@ -17,9 +17,8 @@ export const api = {
 	setActive: (pubHex) => req("/accounts/active", "POST", { pubHex }),
 	deployCoin: (name, symbol, supply) => req("/coins", "POST", { name, symbol, supply }),
 	transfer: (token, to, amount) => req("/transfer", "POST", { token, to, amount }),
-	createItemAuction: (name, ask, details) => req("/auctions", "POST", { give: { kind: "item", name }, ask, details }),
-	createCoinAuction: (token, amount, ask, details) => req("/auctions", "POST", { give: { kind: "coin", token, amount }, ask, details }),
-	createSecretAuction: (name, secret, ask, details) => req("/secrets", "POST", { name, secret, ask, details }),
+	// One unified listing: { name, coin?:{token,amount}, secret?, ask?:{token,amount}, details? }
+	createListing: (payload) => req("/auctions", "POST", payload),
 	bid: (id, token, amount) => req(`/auctions/${id}/bid`, "POST", { token, amount }),
 	settle: (id, winner) => req(`/auctions/${id}/settle`, "POST", { winner }),
 	cancel: (id) => req(`/auctions/${id}/cancel`, "POST", {}),
