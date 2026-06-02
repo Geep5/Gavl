@@ -35,6 +35,7 @@ import { ChiaSpaceProver, ChiaSpaceVerifier, ensurePlot } from "./pos/chia.ts";
 import { finalizedView } from "./consensus/order.ts";
 import { Plot } from "./pos/space.ts";
 import { SwarmTransport } from "./sync/swarm.ts";
+import { KnownPeers } from "./sync/known-peers.ts";
 import { generateKeyPair } from "./det/ed25519.ts";
 import { toHex } from "./det/canonical.ts";
 import { WriteStore } from "./store/store.ts";
@@ -95,11 +96,14 @@ export interface ConsensusStatus {
 	topic: string | null;
 	/** Hex node-keys of currently-connected peers. */
 	peerKeys: string[];
+	/** Hex node-keys pinned for re-dial on every boot (eclipse resistance). */
+	pinnedPeers: string[];
 }
 
 export class Daemon {
 	readonly node: GavlNode;
 	readonly wallet: Wallet;
+	readonly knownPeers = new KnownPeers();
 	readonly finalityDepth: number;
 	private readonly params: ChainParams;
 	private readonly k: number;
@@ -277,6 +281,7 @@ export class Daemon {
 			nodeKey: this.transport ? this.transport.nodeKeyHex : null,
 			topic: this.transport ? this.transport.topicHexValue : null,
 			peerKeys: this.transport ? this.transport.connectedPeerKeys() : [],
+			pinnedPeers: this.knownPeers.list(),
 		};
 	}
 
@@ -294,6 +299,14 @@ export class Daemon {
 				// switch opts.network is omitted and the name lives in this.network.
 				const joined = this.transport.join(this.network);
 				await Promise.race([joined, new Promise((r) => setTimeout(r, 8000))]);
+				// Re-dial pinned peers directly (independent of DHT discovery) — eclipse resistance.
+				for (const key of this.knownPeers.list()) {
+					try {
+						this.transport.dialPeer(key);
+					} catch {
+						/* skip a malformed pin */
+					}
+				}
 			} catch (e) {
 				console.warn(`[daemon] mesh join failed (continuing local): ${(e as Error).message}`);
 				this.transport = undefined;
@@ -328,6 +341,45 @@ export class Daemon {
 	/** The channel/network this node is currently on. */
 	currentChannel(): string {
 		return this.network;
+	}
+
+	// ── identity control ─────────────────────────────────────────────
+
+	/** Reroll: create a fresh identity and make it active. Returns its pubkey. */
+	rerollIdentity(label?: string): string {
+		const acct = this.wallet.create(label || `identity ${this.wallet.list().length + 1}`);
+		this.bind(acct);
+		return acct.pubHex;
+	}
+
+	/** Import an identity from a 32-byte seed (hex), make it active. Returns its pubkey. */
+	importIdentity(seedHex: string, label?: string): string {
+		const acct = this.wallet.importSeed(seedHex, label);
+		this.bind(acct);
+		return acct.pubHex;
+	}
+
+	/** Export the active identity's seed (private key, hex). Handle with care. */
+	exportActiveSeed(): string {
+		return this.wallet.exportSeed(this.wallet.active().pubHex);
+	}
+
+	// ── peer control ─────────────────────────────────────────────────
+
+	/** Dial a peer by node-key now; if `pin`, also persist it for re-dial on every boot. */
+	dialPeer(nodeKeyHex: string, pin = true): void {
+		if (pin) this.knownPeers.add(nodeKeyHex);
+		this.transport?.dialPeer(nodeKeyHex); // no-op if mesh is off; the pin still applies next boot
+	}
+
+	/** Unpin a known peer (stops re-dialing it on boot; doesn't drop a live connection). */
+	unpinPeer(nodeKeyHex: string): boolean {
+		return this.knownPeers.remove(nodeKeyHex);
+	}
+
+	/** Pinned peer node-keys (re-dialed every boot). */
+	pinnedPeers(): string[] {
+		return this.knownPeers.list();
 	}
 
 	/**

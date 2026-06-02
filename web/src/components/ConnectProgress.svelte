@@ -29,6 +29,55 @@
 		editingChannel = false;
 	}
 
+	// ── identity controls ──
+	let importingId = $state(false);
+	let seedInput = $state("");
+	let revealedSeed = $state("");
+	let busyId = $state(false);
+	async function reroll() {
+		if (!confirm("Reroll creates a NEW identity with a new address and empty balances, and makes it active. Your current identity stays in the wallet. Continue?")) return;
+		busyId = true;
+		await act(() => api.rerollIdentity());
+		busyId = false;
+	}
+	async function importId() {
+		const seed = seedInput.trim();
+		if (!seed) return;
+		busyId = true;
+		await act(() => api.importIdentity(seed));
+		seedInput = "";
+		importingId = false;
+		busyId = false;
+	}
+	async function revealSeed() {
+		if (revealedSeed) {
+			revealedSeed = "";
+			return;
+		}
+		if (!confirm("Reveal the PRIVATE KEY (seed) of your active identity? Anyone who sees it controls this identity and its coins. Don't share it or screen-share it.")) return;
+		const r = await api.exportSeed();
+		revealedSeed = r.seed;
+	}
+
+	// ── peer controls ──
+	let dialingPeer = $state(false);
+	let peerInput = $state("");
+	let busyPeer = $state(false);
+	async function dialPeer() {
+		const key = peerInput.trim();
+		if (!key) return;
+		busyPeer = true;
+		await act(() => api.dialPeer(key, true));
+		peerInput = "";
+		dialingPeer = false;
+		busyPeer = false;
+	}
+	async function unpin(key) {
+		await act(() => api.unpinPeer(key));
+	}
+	const connectedPeers = $derived(c?.peerKeys ?? []);
+	const pinnedPeers = $derived(c?.pinnedPeers ?? []);
+
 	// status: "done" | "active" | "pending"
 	const steps = $derived.by(() => {
 		const daemonUp = !store.loading && !store.error;
@@ -71,14 +120,8 @@
 	// instead of vague labels, so the connection is verifiable, not just asserted.
 	let showIds = $state(false);
 	let copied = $state("");
-	// The DHT topic is THE network address — always shown, never hidden. Secondary
-	// identifiers (this node's key, connected peers) live in the disclosure below.
-	const ids = $derived.by(() => {
-		const rows = [];
-		if (c?.nodeKey) rows.push({ k: "This node", v: c.nodeKey, hint: "This node's DHT/Noise public key — its unique address other peers dial directly." });
-		for (const pk of c?.peerKeys ?? []) rows.push({ k: "Peer", v: pk, hint: "A currently-connected peer's node key." });
-		return rows;
-	});
+	// The DHT topic is THE network address — always shown in the banner. This node's
+	// key, peers, and identity controls live in the "connectivity" dashboard below.
 	function shortMid(s) {
 		return s.length > 20 ? s.slice(0, 10) + "…" + s.slice(-6) : s;
 	}
@@ -98,7 +141,7 @@
 		<span class="title">Decentralized connection</span>
 		<span class="head-right">
 			<span class="count" class:ok={allDone}>{doneCount}/{n} confirmed{allDone ? " · fully peer-to-peer" : ""}</span>
-			{#if ids.length}<button class="idtoggle" onclick={() => (showIds = !showIds)}>{showIds ? "▾ node & peers" : "▸ node & peers"}</button>{/if}
+			<button class="idtoggle" onclick={() => (showIds = !showIds)}>{showIds ? "▾ connectivity" : "▸ connectivity"}</button>
 		</span>
 	</div>
 
@@ -152,15 +195,69 @@
 	</div>
 
 	{#if showIds}
-		<div class="ids">
-			<div class="ids-note">This node's key and any currently-connected peers — copy to share or verify.</div>
-			{#each ids as row}
-				<div class="idrow" title={row.hint}>
-					<span class="idk">{row.k}</span>
-					<code class="idv">{shortMid(row.v)}</code>
-					<button class="copy" class:ok={copied === row.v} onclick={() => copy(row.v)} title="Copy full value">{copied === row.v ? "✓" : "copy"}</button>
+		<div class="dash">
+			<div class="dash-note">Your decentralized connection — all of it viewable and swappable. Gavl's values are the defaults, not the only option.</div>
+
+			<!-- IDENTITY -->
+			<div class="sect">
+				<div class="sect-head"><span class="sect-title">Identity</span><span class="sect-sub">who you sign as</span></div>
+				{#if c?.nodeKey}
+					<div class="idrow" title="This node's DHT/Noise public key — its unique address other peers dial directly.">
+						<span class="idk">node key</span>
+						<code class="idv">{shortMid(c.nodeKey)}</code>
+						<button class="copy" class:ok={copied === c.nodeKey} onclick={() => copy(c.nodeKey)}>{copied === c.nodeKey ? "✓" : "copy"}</button>
+					</div>
+				{/if}
+				<div class="ctl">
+					<button class="mini" onclick={reroll} disabled={busyId} title="Generate a fresh identity">⟳ reroll</button>
+					<button class="mini" onclick={() => (importingId = !importingId)} title="Restore an identity from its seed">⇩ import</button>
+					<button class="mini danger" onclick={revealSeed} title="Reveal this identity's private key">{revealedSeed ? "hide key" : "🔑 reveal key"}</button>
 				</div>
-			{/each}
+				{#if importingId}
+					<div class="ctl">
+						<input class="kinput" placeholder="64-hex seed to import" bind:value={seedInput} disabled={busyId} />
+						<button class="join" onclick={importId} disabled={busyId || !seedInput.trim()}>Import</button>
+					</div>
+				{/if}
+				{#if revealedSeed}
+					<div class="seedbox">
+						<div class="warn-mini">⚠ private key — anyone with this controls your identity & coins. Never share or screen-share.</div>
+						<code class="seedval">{revealedSeed}</code>
+						<button class="copy" class:ok={copied === revealedSeed} onclick={() => copy(revealedSeed)}>{copied === revealedSeed ? "✓" : "copy"}</button>
+					</div>
+				{/if}
+			</div>
+
+			<!-- PEERS -->
+			<div class="sect">
+				<div class="sect-head"><span class="sect-title">Peers</span><span class="sect-sub">{connectedPeers.length} connected · {pinnedPeers.length} pinned</span></div>
+				{#each connectedPeers as pk}
+					<div class="idrow" title="A currently-connected peer's node key.">
+						<span class="idk">{pinnedPeers.includes(pk) ? "📌 peer" : "peer"}</span>
+						<code class="idv">{shortMid(pk)}</code>
+						<button class="copy" class:ok={copied === pk} onclick={() => copy(pk)}>{copied === pk ? "✓" : "copy"}</button>
+					</div>
+				{/each}
+				{#each pinnedPeers.filter((p) => !connectedPeers.includes(p)) as pk}
+					<div class="idrow offline" title="Pinned but not currently connected — re-dialed each boot.">
+						<span class="idk">📌 offline</span>
+						<code class="idv">{shortMid(pk)}</code>
+						<button class="copy" onclick={() => unpin(pk)} title="Unpin">unpin</button>
+					</div>
+				{/each}
+				{#if connectedPeers.length === 0 && pinnedPeers.length === 0}
+					<div class="empty">No peers yet — discovered automatically on the channel topic, or dial one directly below.</div>
+				{/if}
+				<div class="ctl">
+					{#if dialingPeer}
+						<input class="kinput" placeholder="64-hex peer node key" bind:value={peerInput} disabled={busyPeer} />
+						<button class="join" onclick={dialPeer} disabled={busyPeer || !peerInput.trim()}>Dial + pin</button>
+						<button class="chanx" onclick={() => (dialingPeer = false)}>✕</button>
+					{:else}
+						<button class="mini" onclick={() => (dialingPeer = true)} title="Connect directly to a known peer (eclipse-resistant bootstrap)">+ dial a peer</button>
+					{/if}
+				</div>
+			</div>
 		</div>
 	{/if}
 </div>
@@ -195,9 +292,24 @@
 		flex: 1; min-width: 200px; overflow-wrap: anywhere; opacity: 0.92;
 	}
 
-	.ids { margin-top: 0.95rem; padding-top: 0.8rem; border-top: 1px solid var(--border); }
-	.ids-note { font-size: 0.72rem; color: var(--muted); margin-bottom: 0.5rem; }
+	.dash { margin-top: 0.95rem; padding-top: 0.8rem; border-top: 1px solid var(--border); }
+	.dash-note { font-size: 0.72rem; color: var(--muted); margin-bottom: 0.8rem; line-height: 1.4; }
+	.sect { margin-bottom: 0.9rem; }
+	.sect-head { display: flex; align-items: baseline; gap: 0.5rem; margin-bottom: 0.4rem; }
+	.sect-title { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--accent); font-weight: 700; }
+	.sect-sub { font-size: 0.68rem; color: var(--muted); }
+	.ctl { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; margin-top: 0.45rem; }
+	.mini { background: transparent; border: 1px solid var(--border); color: var(--text); font-size: 0.7rem; padding: 0.18rem 0.55rem; border-radius: 5px; cursor: pointer; margin: 0; }
+	.mini:hover { filter: none; border-color: var(--accent-dim); }
+	.mini.danger { color: var(--red); border-color: var(--red); }
+	.mini:disabled { opacity: 0.5; cursor: not-allowed; }
+	.kinput { flex: 1; min-width: 160px; margin: 0; background: var(--bg); border: 1px solid var(--accent-dim); color: var(--text); font-family: ui-monospace, monospace; font-size: 0.78rem; padding: 0.28rem 0.5rem; border-radius: 5px; }
+	.seedbox { margin-top: 0.5rem; padding: 0.5rem 0.6rem; background: #3a1d20; border: 1px solid var(--red); border-radius: 6px; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+	.warn-mini { font-size: 0.7rem; color: #f3c0c4; flex-basis: 100%; line-height: 1.4; }
+	.seedval { font-family: ui-monospace, monospace; font-size: 0.74rem; color: #f3c0c4; flex: 1; overflow-wrap: anywhere; }
+	.empty { font-size: 0.72rem; color: var(--muted); padding: 0.2rem 0; }
 	.idrow { display: flex; align-items: center; gap: 0.6rem; padding: 0.22rem 0; }
+	.idrow.offline { opacity: 0.6; }
 	.idk { font-size: 0.72rem; color: var(--muted); width: 92px; flex: none; }
 	.idv { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.76rem; color: var(--text); background: var(--panel-2); padding: 0.12rem 0.45rem; border-radius: 5px; flex: 1; overflow: hidden; text-overflow: ellipsis; }
 	.copy { background: transparent; border: 1px solid var(--border); color: var(--muted); font-size: 0.68rem; padding: 0.12rem 0.5rem; border-radius: 5px; cursor: pointer; margin: 0; flex: none; }

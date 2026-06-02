@@ -25,4 +25,9 @@ export const api = {
 	cancel: (id) => req(`/auctions/${id}/cancel`, "POST", {}),
 	claim: (id) => req(`/auctions/${id}/claim`, "POST", {}),
 	switchChannel: (name) => req("/channel", "POST", { name }),
+	rerollIdentity: (label) => req("/identity/reroll", "POST", { label }),
+	importIdentity: (seed, label) => req("/identity/import", "POST", { seed, label }),
+	exportSeed: () => req("/identity/export", "POST", {}),
+	dialPeer: (key, pin = true) => req("/peers/dial", "POST", { key, pin }),
+	unpinPeer: (key) => req("/peers/unpin", "POST", { key }),
 };

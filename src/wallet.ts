@@ -77,6 +77,36 @@ export class Wallet {
 		return acct;
 	}
 
+	/**
+	 * Import an identity from a 32-byte Ed25519 seed (hex). If it's already in the
+	 * wallet, just re-activates it. Makes it active and persists. The seed IS the
+	 * private key — whoever holds it controls this identity.
+	 */
+	importSeed(seedHex: string, label?: string): WalletAccount {
+		const clean = seedHex.trim().toLowerCase();
+		if (!/^[0-9a-f]{64}$/.test(clean)) throw new Error("seed must be 64 hex chars (a 32-byte Ed25519 seed)");
+		const keypair = keyPairFromSeed(fromHex(clean));
+		const pubHex = toHex(keypair.publicKey);
+		const existing = this.accounts.find((a) => a.pubHex === pubHex);
+		if (existing) {
+			this.activePub = pubHex;
+			this.save();
+			return existing;
+		}
+		const acct: WalletAccount = { label: label?.trim() || `imported ${this.accounts.length + 1}`, pubHex, keypair };
+		this.accounts.push(acct);
+		this.activePub = pubHex;
+		this.save();
+		return acct;
+	}
+
+	/** The 32-byte seed (hex) of an identity — its private key. Handle with care. */
+	exportSeed(pubHex: string): string {
+		const a = this.accounts.find((x) => x.pubHex === pubHex);
+		if (!a) throw new Error(`wallet: no account ${pubHex}`);
+		return toHex(a.keypair.privateKey);
+	}
+
 	/** Ensure at least one account exists (used on first boot). */
 	ensureSeeded(label = "default"): WalletAccount {
 		if (this.accounts.length === 0) return this.create(label);

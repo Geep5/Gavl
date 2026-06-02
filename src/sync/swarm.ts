@@ -128,6 +128,18 @@ export class SwarmTransport {
 		await this.swarm.flush();
 	}
 
+	/**
+	 * Directly dial a specific peer by its node-key (hex), bypassing DHT topic
+	 * discovery. This is how you bootstrap to a KNOWN peer (a friend's node, a
+	 * pinned bootstrap) — and pinning a few such peers is the standard defense
+	 * against eclipse attacks, since they're re-dialed independently of the DHT.
+	 */
+	dialPeer(nodeKeyHex: string): void {
+		const clean = nodeKeyHex.trim().toLowerCase();
+		if (!/^[0-9a-f]{64}$/.test(clean)) throw new Error("peer key must be 64 hex chars (a 32-byte node key)");
+		this.swarm.joinPeer(Buffer.from(clean, "hex"));
+	}
+
 	async destroy(): Promise<void> {
 		await this.swarm.destroy();
 	}
