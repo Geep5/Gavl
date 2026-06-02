@@ -50,6 +50,7 @@ const FARM = process.env.GAVL_FARM !== "0";
 
 const daemon = new Daemon({
 	network: NETWORK,
+	bootstrapEnv: process.env.GAVL_BOOTSTRAP, // comma-separated host:port custom DHT entry nodes
 	space: SPACE,
 	schedule: RETARGET ? { base: 20n, targetIters: TARGET_ITERS, epoch: 4, window: 8, maxStep: 4n } : undefined,
 	heartbeatMs: HEARTBEAT_MS,
@@ -235,6 +236,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		if (path === "/api/peers/unpin") {
 			daemon.unpinPeer(String(body.key ?? ""));
 			return send(res, 200, { pinned: daemon.pinnedPeers() });
+		}
+		// ── bootstrap control (DHT entry / "DNS" layer) ──
+		if (path === "/api/bootstrap/add") {
+			// "host:port" — added alongside Holepunch defaults, then reconnect through it.
+			await daemon.addBootstrap(String(body.node ?? ""));
+			return send(res, 200, { bootstrap: daemon.bootstrapNodes() });
+		}
+		if (path === "/api/bootstrap/remove") {
+			await daemon.removeBootstrap(String(body.node ?? ""));
+			return send(res, 200, { bootstrap: daemon.bootstrapNodes() });
 		}
 		const claimMatch = path.match(/^\/api\/auctions\/([0-9a-f]+)\/claim$/);
 		if (claimMatch) {

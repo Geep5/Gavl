@@ -36,6 +36,7 @@ import { finalizedView } from "./consensus/order.ts";
 import { Plot } from "./pos/space.ts";
 import { SwarmTransport } from "./sync/swarm.ts";
 import { KnownPeers } from "./sync/known-peers.ts";
+import { BootstrapList } from "./sync/bootstrap.ts";
 import { generateKeyPair } from "./det/ed25519.ts";
 import { toHex } from "./det/canonical.ts";
 import { WriteStore } from "./store/store.ts";
@@ -58,6 +59,8 @@ export interface DaemonOptions {
 	space?: SpaceMode;
 	/** Initial channel/network name (the DHT topic is sha256 of it). Default "gavl". */
 	network?: string;
+	/** GAVL_BOOTSTRAP value (comma-separated host:port) — custom DHT entry nodes, added to defaults. */
+	bootstrapEnv?: string;
 	/** Difficulty schedule. Omit → constant; set → retargets so the VDF cost is the pace. */
 	schedule?: RetargetSchedule;
 	/** Plot directory for chiapos (default ~/.gavl/plots). */
@@ -98,12 +101,15 @@ export interface ConsensusStatus {
 	peerKeys: string[];
 	/** Hex node-keys pinned for re-dial on every boot (eclipse resistance). */
 	pinnedPeers: string[];
+	/** Custom DHT bootstrap nodes ("host:port"), added alongside Holepunch defaults. */
+	bootstrap: string[];
 }
 
 export class Daemon {
 	readonly node: GavlNode;
 	readonly wallet: Wallet;
 	readonly knownPeers = new KnownPeers();
+	readonly bootstrap: BootstrapList;
 	readonly finalityDepth: number;
 	private readonly params: ChainParams;
 	private readonly k: number;
@@ -141,6 +147,7 @@ export class Daemon {
 		this.storeOpts = opts.store;
 		this.schedule = opts.schedule;
 		this.network = opts.network ?? "gavl";
+		this.bootstrap = new BootstrapList(undefined, opts.bootstrapEnv);
 		// Verifier must match the space backend producers use, or anchors are rejected.
 		this.verifier = this.spaceMode === "chiapos" ? new ChiaSpaceVerifier() : new StandinSpaceVerifier();
 		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, this.verifier, { schedule: opts.schedule, finalityDepth: this.finalityDepth }));
@@ -282,7 +289,31 @@ export class Daemon {
 			topic: this.transport ? this.transport.topicHexValue : null,
 			peerKeys: this.transport ? this.transport.connectedPeerKeys() : [],
 			pinnedPeers: this.knownPeers.list(),
+			bootstrap: this.bootstrap.asStrings(),
 		};
+	}
+
+	/** Build the swarm transport, join the current channel's topic, re-dial pinned peers.
+	 *  Resilient to a slow/absent DHT (soft 8s cap) — falls back to local if it fails. */
+	private async joinMesh(): Promise<void> {
+		try {
+			// Custom bootstrap nodes (the DHT entry/"DNS" layer) are added alongside
+			// Holepunch's defaults; undefined → defaults only.
+			this.transport = new SwarmTransport(this.node, { bootstrap: this.bootstrap.forSwarm() });
+			const joined = this.transport.join(this.network); // resolved channel, not a param
+			await Promise.race([joined, new Promise((r) => setTimeout(r, 8000))]);
+			// Re-dial pinned peers directly (independent of DHT discovery) — eclipse resistance.
+			for (const key of this.knownPeers.list()) {
+				try {
+					this.transport.dialPeer(key);
+				} catch {
+					/* skip a malformed pin */
+				}
+			}
+		} catch (e) {
+			console.warn(`[daemon] mesh join failed (continuing local): ${(e as Error).message}`);
+			this.transport = undefined;
+		}
 	}
 
 	/** Join the live mesh and (optionally) start farming anchors. Resilient to a missing network. */
@@ -291,27 +322,7 @@ export class Daemon {
 		this.meshOn = opts.mesh;
 		this.farmOn = opts.farm;
 
-		if (opts.mesh) {
-			try {
-				this.transport = new SwarmTransport(this.node, {});
-				// Don't let a slow/absent DHT block boot — join in the background with a soft cap.
-				// Use the resolved channel (this.network), not opts.network — on a channel
-				// switch opts.network is omitted and the name lives in this.network.
-				const joined = this.transport.join(this.network);
-				await Promise.race([joined, new Promise((r) => setTimeout(r, 8000))]);
-				// Re-dial pinned peers directly (independent of DHT discovery) — eclipse resistance.
-				for (const key of this.knownPeers.list()) {
-					try {
-						this.transport.dialPeer(key);
-					} catch {
-						/* skip a malformed pin */
-					}
-				}
-			} catch (e) {
-				console.warn(`[daemon] mesh join failed (continuing local): ${(e as Error).message}`);
-				this.transport = undefined;
-			}
-		}
+		if (opts.mesh) await this.joinMesh();
 
 		if (opts.farm) {
 			const farmer = generateKeyPair();
@@ -380,6 +391,34 @@ export class Daemon {
 	/** Pinned peer node-keys (re-dialed every boot). */
 	pinnedPeers(): string[] {
 		return this.knownPeers.list();
+	}
+
+	// ── bootstrap control (the DHT "DNS"/entry layer) ────────────────
+
+	/** Custom bootstrap nodes as "host:port" strings (added alongside Holepunch defaults). */
+	bootstrapNodes(): string[] {
+		return this.bootstrap.asStrings();
+	}
+
+	/** Add a custom bootstrap node ("host:port") and reconnect to the DHT through it. */
+	async addBootstrap(hostPort: string): Promise<void> {
+		if (!this.bootstrap.add(hostPort)) return; // malformed or duplicate
+		await this.restartTransport();
+	}
+
+	/** Remove a custom bootstrap node and reconnect. */
+	async removeBootstrap(hostPort: string): Promise<void> {
+		if (!this.bootstrap.remove(hostPort)) return;
+		await this.restartTransport();
+	}
+
+	/** Tear down + rebuild the swarm transport (e.g. after a bootstrap change), same channel.
+	 *  Farming is untouched — it runs off the shared node, not the transport. */
+	private async restartTransport(): Promise<void> {
+		if (!this.meshOn) return; // mesh off → nothing live to restart; the new list applies next start
+		if (this.transport) await this.transport.destroy().catch(() => {});
+		this.transport = undefined;
+		await this.joinMesh();
 	}
 
 	/**

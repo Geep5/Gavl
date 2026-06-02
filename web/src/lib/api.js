@@ -29,4 +29,6 @@ export const api = {
 	exportSeed: () => req("/identity/export", "POST", {}),
 	dialPeer: (key, pin = true) => req("/peers/dial", "POST", { key, pin }),
 	unpinPeer: (key) => req("/peers/unpin", "POST", { key }),
+	addBootstrap: (node) => req("/bootstrap/add", "POST", { node }),
+	removeBootstrap: (node) => req("/bootstrap/remove", "POST", { node }),
 };

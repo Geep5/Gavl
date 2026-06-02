@@ -78,6 +78,24 @@
 	const connectedPeers = $derived(c?.peerKeys ?? []);
 	const pinnedPeers = $derived(c?.pinnedPeers ?? []);
 
+	// ── bootstrap (DHT entry / "DNS" layer) ──
+	let addingBoot = $state(false);
+	let bootInput = $state("");
+	let busyBoot = $state(false);
+	const bootstrapNodes = $derived(c?.bootstrap ?? []);
+	async function addBoot() {
+		const node = bootInput.trim();
+		if (!node) return;
+		busyBoot = true;
+		await act(() => api.addBootstrap(node));
+		bootInput = "";
+		addingBoot = false;
+		busyBoot = false;
+	}
+	async function removeBoot(node) {
+		await act(() => api.removeBootstrap(node));
+	}
+
 	// status: "done" | "active" | "pending"
 	const steps = $derived.by(() => {
 		const daemonUp = !store.loading && !store.error;
@@ -255,6 +273,31 @@
 						<button class="chanx" onclick={() => (dialingPeer = false)}>✕</button>
 					{:else}
 						<button class="mini" onclick={() => (dialingPeer = true)} title="Connect directly to a known peer (eclipse-resistant bootstrap)">+ dial a peer</button>
+					{/if}
+				</div>
+			</div>
+
+			<!-- BOOTSTRAP (DHT entry / "DNS" layer) -->
+			<div class="sect">
+				<div class="sect-head"><span class="sect-title">DHT entry</span><span class="sect-sub">the “DNS” layer — how you reach the network</span></div>
+				<div class="empty" style="margin-bottom:0.3rem">Defaults: Holepunch's public bootstrap (node1–3.hyperdht.org). Custom nodes below are added alongside them — run your own entry points or join a private DHT.</div>
+				{#each bootstrapNodes as node}
+					<div class="idrow" title="A custom DHT bootstrap node, added to the defaults.">
+						<span class="idk">bootstrap</span>
+						<code class="idv">{node}</code>
+						<button class="copy" onclick={() => removeBoot(node)} title="Remove">remove</button>
+					</div>
+				{/each}
+				{#if bootstrapNodes.length === 0}
+					<div class="empty">No custom nodes — running on the public defaults.</div>
+				{/if}
+				<div class="ctl">
+					{#if addingBoot}
+						<input class="kinput" placeholder="host:port  (e.g. 1.2.3.4:49737)" bind:value={bootInput} disabled={busyBoot} onkeydown={(e) => e.key === "Enter" && addBoot()} />
+						<button class="join" onclick={addBoot} disabled={busyBoot || !bootInput.trim()}>Add</button>
+						<button class="chanx" onclick={() => (addingBoot = false)}>✕</button>
+					{:else}
+						<button class="mini" onclick={() => (addingBoot = true)} title="Add a custom DHT bootstrap node">+ add bootstrap</button>
 					{/if}
 				</div>
 			</div>
