@@ -34,7 +34,7 @@ export class WriteStore {
 	private readonly store: InstanceType<typeof Corestore>;
 	private readonly policy: PersistPolicy;
 	private readonly cores = new Map<string, any>(); // writer hex → hypercore
-	private readonly ctx: PolicyContext = { op: null, keptAuctions: new Set(), keptCoins: new Set() };
+	private readonly ctx: PolicyContext = { op: null, keptPositions: new Set() };
 	private kept = 0;
 	private seen = 0;
 

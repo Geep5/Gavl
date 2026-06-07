@@ -19,9 +19,9 @@
 
 import { Ledger } from "./ledger/ledger.ts";
 import { GavlNode } from "./sync/node.ts";
-import { Account } from "./auction/account.ts";
-import { computeView } from "./auction/state.ts";
-import type { View } from "./auction/state.ts";
+import { Account } from "./market/account.ts";
+import { computeView, finalizedView } from "./market/btc.ts";
+import type { View } from "./market/btc.ts";
 import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
 import { defaultParams } from "./config.ts";
@@ -32,7 +32,6 @@ import { Producer } from "./consensus/producer.ts";
 import { StandinSpaceProver, StandinSpaceVerifier } from "./consensus/space.ts";
 import type { SpaceVerifier, SpaceProver } from "./consensus/space.ts";
 import { ChiaSpaceProver, ChiaSpaceVerifier, ensurePlot } from "./pos/chia.ts";
-import { finalizedView } from "./consensus/order.ts";
 import { Plot } from "./pos/space.ts";
 import { SwarmTransport } from "./sync/swarm.ts";
 import { KnownPeers } from "./sync/known-peers.ts";
@@ -42,7 +41,6 @@ import { toHex } from "./det/canonical.ts";
 import { WriteStore } from "./store/store.ts";
 import { KeepAllPolicy, MinePolicy } from "./store/policy.ts";
 import type { PersistPolicy } from "./store/policy.ts";
-import { SecretVault } from "./secret/vault.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -231,8 +229,7 @@ export class Daemon {
 	private now = (): number => ++this.clock;
 
 	private bind(wa: WalletAccount): Account {
-		const vault = new SecretVault({ dir: join(homedir(), ".gavl", "secrets"), pubHex: wa.pubHex, seed: wa.keypair.privateKey });
-		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: wa.keypair, vault });
+		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: wa.keypair });
 		this.accounts.set(wa.pubHex, acct);
 		return acct;
 	}

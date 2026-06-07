@@ -18,8 +18,6 @@
 import type { Write } from "../chain/writer.ts";
 import type { Anchor } from "./anchor.ts";
 import { AnchorChain } from "./chain.ts";
-import { computeView } from "../auction/state.ts";
-import type { View } from "../auction/state.ts";
 
 /** writeId → height of the first anchor (in `chain`, genesis→tip) that certified it. */
 function epochOf(chain: Anchor[], writes: Write[]): Map<string, number> {
@@ -46,13 +44,22 @@ function epochOf(chain: Anchor[], writes: Write[]): Map<string, number> {
 }
 
 /**
- * Finalized state: the canonical view as of the anchor `k` deep from the tip.
- * Only writes that anchor certifies are included, ordered by (epoch, writer, seq)
- * — entirely independent of `ts`.
+ * The finalized ordering — PURE CONSENSUS, application-agnostic. Returns the
+ * writes the anchor `k` deep certifies, the PoST-bound fold order, the per-write
+ * certifying-epoch map (`bornAt`), and "now" on the anchor clock. The application
+ * layer composes these with its own state-fold (e.g. computeView), so consensus
+ * never imports app state. Null `nowHeight` ⇒ no finalized anchor yet.
  */
-export function finalizedView(writes: Write[], anchors: AnchorChain, k: number): View {
+export interface FinalOrdering {
+	included: Write[];
+	order: (a: Write, b: Write) => number;
+	bornAt: Map<string, number>;
+	nowHeight: number | null;
+}
+
+export function finalizedOrdering(writes: Write[], anchors: AnchorChain, k: number): FinalOrdering {
 	const finalAnchor = anchors.finalized(k);
-	if (!finalAnchor) return computeView([]);
+	if (!finalAnchor) return { included: [], order: () => 0, bornAt: new Map(), nowHeight: null };
 
 	const chain = anchors.chainTo(finalAnchor); // genesis → finalized, in height order
 	const heads = finalAnchor.heads;
@@ -70,9 +77,5 @@ export function finalizedView(writes: Write[], anchors: AnchorChain, k: number):
 		if (a.writer !== b.writer) return a.writer < b.writer ? -1 : 1;
 		return a.seq - b.seq;
 	};
-	// `epoch` (writeId → certifying anchor height) is the listing clock origin, and the
-	// finalized anchor's height is "now" — together they drive deterministic anchor-clock
-	// expiry (MAX_LISTING_ANCHORS). `bornAt` is keyed by every write; computeView only reads
-	// the entries for auction.create writes.
-	return computeView(included, { order, bornAt: epoch, nowHeight: finalAnchor.height });
+	return { included, order, bornAt: epoch, nowHeight: finalAnchor.height };
 }

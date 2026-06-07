@@ -1,45 +1,31 @@
 /**
  * Persist policy — "save only what I care about."
  *
- * A node holds the full write set in RAM for the session (so it can validate and
- * gossip), but only DURABLY persists writes its policy keeps. Anything the policy
- * drops still flows through RAM/gossip live; it just isn't written to disk, so it
- * is gone on restart. This is what makes a Gavl node a light/partial node BY
- * CHOICE: as the AH grows huge, you keep only the coins, auctions, and
- * counterparties you actually care about.
+ * A node holds the full write set in RAM for the session (to validate + gossip),
+ * but only DURABLY persists writes its policy keeps. Dropped writes still flow
+ * through RAM/gossip live; they're just not written to disk, so they're gone on
+ * restart — making a node a light/partial node BY CHOICE. The network only stays
+ * whole if some nodes archive (keep everything).
  *
- * A policy is a pure predicate over (write, decoded op). It must be monotonic in
- * the obvious sense — if you keep an auction.create you should keep its bids and
- * settle — but the engine helps with that by tracking "kept auction ids" so a
- * policy can reference them without bookkeeping.
- *
- * NOTE: pruning makes YOUR node partial. The network only stays whole if some
- * nodes keep everything (archivers). Selective saving is a per-user convenience,
- * not a replacement for at-least-one full copy.
+ * v1 op set: credit.farm / credit.transfer / oracle.post / position.* /
+ * pool.deposit.
  */
 
 import type { Write } from "../chain/writer.ts";
-import type { Op } from "../auction/ops.ts";
-import { isOp } from "../auction/ops.ts";
+import type { Op } from "../market/ops.ts";
+import { isOp } from "../market/ops.ts";
 
-/** Context a policy can consult: the decoded op (if any) and what's been kept so far. */
 export interface PolicyContext {
 	op: Op | null;
-	/** Auction ids this policy has already chosen to keep (for keeping their bids/settles). */
-	keptAuctions: Set<string>;
-	/** Coin (token) ids this policy has already chosen to keep. */
-	keptCoins: Set<string>;
+	/** Position ids this policy has chosen to keep (to keep their close/liquidate). */
+	keptPositions: Set<string>;
 }
 
 export interface PersistPolicy {
 	readonly name: string;
-	/** True → durably persist this write. Pure given (write, ctx). */
 	keep(write: Write, ctx: PolicyContext): boolean;
-	/** Human description for the UI / status. */
 	describe(): string;
 }
-
-// ── built-in policies ────────────────────────────────────────────
 
 /** Archiver: keep everything. The network needs some of these. */
 export class KeepAllPolicy implements PersistPolicy {
@@ -53,9 +39,8 @@ export class KeepAllPolicy implements PersistPolicy {
 }
 
 /**
- * Mine: keep only what touches a set of pubkeys I care about (mine by default) —
- * their coins, their auctions, bids by/for them, transfers in/out. Everything
- * else is RAM-only and drops on restart.
+ * Mine: keep what touches my keys — my farms/transfers/positions, plus the oracle
+ * posts (everyone needs the price). Everything else is RAM-only.
  */
 export class MinePolicy implements PersistPolicy {
 	readonly name = "mine";
@@ -66,31 +51,24 @@ export class MinePolicy implements PersistPolicy {
 	}
 
 	keep(write: Write, ctx: PolicyContext): boolean {
-		const me = this.keys;
-		if (me.has(write.writer)) return true; // anything I authored
-
+		if (this.keys.has(write.writer)) return true; // anything I authored
 		const op = ctx.op;
 		if (!op) return false;
 		switch (op.kind) {
-			case "coin.deploy":
-				return false; // someone else's coin — kept only if I interact (handled by the cases below)
-			case "transfer":
-				return me.has(op.to) || ctx.keptCoins.has(op.token);
-			case "auction.create":
-				// keep if it bundles/asks a coin I track (I authored is already handled above)
-				return (!!op.coin && ctx.keptCoins.has(op.coin.token)) || (op.ask != null && ctx.keptCoins.has(op.ask.token));
-			case "auction.bid":
-				return ctx.keptAuctions.has(op.auction) || ctx.keptCoins.has(op.token);
-			case "auction.settle":
-			case "auction.cancel":
-				return ctx.keptAuctions.has(op.auction);
+			case "oracle.post":
+				return true; // the price is shared infrastructure — always keep
+			case "credit.transfer":
+				return this.keys.has(op.to);
+			case "position.close":
+			case "position.liquidate":
+				return ctx.keptPositions.has(op.position);
 			default:
 				return false;
 		}
 	}
 
 	describe(): string {
-		return `Mine — persist writes touching ${this.keys.size} key(s) and their coins/auctions.`;
+		return `Mine — persist writes touching ${this.keys.size} key(s), plus oracle posts.`;
 	}
 }
 
@@ -109,15 +87,13 @@ export class AnyPolicy implements PersistPolicy {
 	}
 }
 
-/** Build the kept-id context incrementally as writes are decided. */
 export function decode(write: Write): Op | null {
 	const op = write.payload as Op | null;
 	return isOp(op) ? op : null;
 }
 
-/** After deciding to KEEP a write, record any ids it establishes so later writes can reference them. */
+/** After deciding to KEEP a write, record ids it establishes for later references. */
 export function recordKept(write: Write, op: Op | null, ctx: PolicyContext): void {
 	if (!op) return;
-	if (op.kind === "coin.deploy") ctx.keptCoins.add(write.id);
-	if (op.kind === "auction.create") ctx.keptAuctions.add(write.id);
+	if (op.kind === "position.open") ctx.keptPositions.add(write.id);
 }

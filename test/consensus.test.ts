@@ -14,13 +14,12 @@ import assert from "node:assert/strict";
 import { generateKeyPair } from "../src/det/ed25519.ts";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
-import { Account } from "../src/auction/account.ts";
-import { computeView, balanceOf } from "../src/auction/state.ts";
+import { Account } from "../src/market/account.ts";
+import { computeView, creditOf, finalizedView } from "../src/market/btc.ts";
 import { mineAnchor, verifyAnchor } from "../src/consensus/anchor.ts";
 import type { Anchor } from "../src/consensus/anchor.ts";
 import { AnchorChain } from "../src/consensus/chain.ts";
 import { retarget } from "../src/consensus/difficulty.ts";
-import { finalizedView } from "../src/consensus/order.ts";
 import { PARAMS, K, STANDIN_VERIFIER, standinProver } from "./helpers.ts";
 
 function miner() {
@@ -117,17 +116,18 @@ test("finalized order is anchor-bound, neutralizing the ts-ordering attack", asy
 	const B = new Account({ node, params: PARAMS, k: K, now });
 	const C = new Account({ node, params: PARAMS, k: K, now });
 
-	// A deploys a coin and funds B with a LATE ts; B then forwards more than it
-	// could hold without A's funding, with an EARLY ts.
+	// A farms credit and funds B with a LATE ts; B then forwards more than it
+	// could hold without A's funding, with an EARLY ts. (A farms 2× = 2000 credit.)
 	ts = 50;
-	const coin = await A.deployCoin("Gold", "GLD", 10_000n);
+	await A.farm();
+	await A.farm();
 	ts = 100;
-	await A.transfer(coin, B.pubHex, 1_500n);
+	await A.transfer(B.pubHex, 1_500n);
 	const m = miner();
 	const g = (await mineAnchor({ prev: null, producer: m.keypair, prover: m.prover, heads: node.ledger.heads(), params: PARAMS }))!;
 
 	ts = 1;
-	await B.transfer(coin, C.pubHex, 1_400n); // only affordable once A's 1500 has landed
+	await B.transfer(C.pubHex, 1_400n); // only affordable once A's 1500 has landed
 	const a1 = (await mineAnchor({ prev: g, producer: m.keypair, prover: m.prover, heads: node.ledger.heads(), params: PARAMS }))!;
 
 	const c = chain();
@@ -138,8 +138,8 @@ test("finalized order is anchor-bound, neutralizing the ts-ordering attack", asy
 	const provisional = computeView(writes);
 	const finalized = finalizedView(writes, c, 0);
 
-	assert.equal(balanceOf(provisional, coin, C.pubHex), 0n, "ts attack: spend folds before funding → fails");
-	assert.equal(balanceOf(finalized, coin, C.pubHex), 1_400n, "anchor order respects funding causality regardless of ts");
+	assert.equal(creditOf(provisional, C.pubHex), 0n, "ts attack: spend folds before funding → fails");
+	assert.equal(creditOf(finalized, C.pubHex), 1_400n, "anchor order respects funding causality regardless of ts");
 });
 
 test("difficulty retargets toward a target iters-per-anchor", async () => {
@@ -165,12 +165,9 @@ test("a fresh node trusts the heaviest chain as a checkpoint and ignores a light
 	const node = new GavlNode(new Ledger(PARAMS));
 	let ts = 0;
 	const now = () => ++ts;
-	const seller = new Account({ node, params: PARAMS, k: K, now });
-	const bidder = new Account({ node, params: PARAMS, k: K, now });
-	const coin = await bidder.deployCoin("Coin", "CN", 1_000n);
-	const id = await seller.createItemAuction("Relic", null);
-	const ref = await bidder.bid(id, coin, 500n);
-	await seller.settle(id, ref);
+	const alice = new Account({ node, params: PARAMS, k: K, now });
+	await alice.farm();
+	await alice.farm(); // 2000 credit earned
 
 	const m = miner();
 	const heavy: Anchor[] = [];
@@ -189,8 +186,7 @@ test("a fresh node trusts the heaviest chain as a checkpoint and ignores a light
 		return h !== undefined && w.seq <= h.seq;
 	});
 	const view = finalizedView(writesUpToCheckpoint, fresh, 0);
-	assert.equal(view.auctions.get(id)!.status, "settled");
-	assert.equal(view.items.get(id)!.owner, bidder.pubHex, "checkpoint reconstructs the settled outcome");
+	assert.equal(creditOf(view, alice.pubHex), 2000n, "checkpoint reconstructs the farmed credit balance");
 
 	const m2 = miner();
 	const evil = (await mineAnchor({ prev: null, producer: m2.keypair, prover: m2.prover, heads: {}, params: PARAMS }))!;

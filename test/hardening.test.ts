@@ -22,7 +22,7 @@ import { nextDifficulty } from "../src/consensus/difficulty.ts";
 import type { RetargetSchedule } from "../src/consensus/difficulty.ts";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
-import { Account } from "../src/auction/account.ts";
+import { Account } from "../src/market/account.ts";
 import { PARAMS, K, standinProver, STANDIN_VERIFIER } from "./helpers.ts";
 
 function miner() {
@@ -178,7 +178,7 @@ test("adaptive producer idles when caught up, bursts after an action", async () 
 	// Phase 2: an action lands a write → producer must burst to finalize it.
 	let t = 0;
 	const actor = new Account({ node, params: PARAMS, k: K, now: () => ++t });
-	await actor.deployCoin("Gold", "GLD", 1000n); // new write → ledger heads advance
+	await actor.farm(); // new write → ledger heads advance
 	assert.equal(node.anchors.headsCovered(node.ledger.heads(), 1), false, "fresh write is not yet finalized");
 	// Wait until the burst buries it (or time out).
 	for (let i = 0; i < 100 && !node.anchors.headsCovered(node.ledger.heads(), 1); i++) {

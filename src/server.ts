@@ -19,10 +19,10 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Daemon } from "./daemon.ts";
-import { splitBalKey, balanceOf } from "./auction/state.ts";
-import { markPrice } from "./perp/market.ts";
+import { mark, creditOf, BTC_ORACLE, MAX_LEVERAGE, skewBps, fundingRateBps } from "./market/btc.ts";
 import { backingBps, totalOwed } from "./perp/pool.ts";
-import { skewBps, fundingRateBps, DEFAULT_FUNDING } from "./perp/funding.ts";
+import { unrealizedPnl } from "./perp/engine.ts";
+import { DEFAULT_FUNDING } from "./perp/funding.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
@@ -60,115 +60,52 @@ const daemon = new Daemon({
 	store: PERSIST === "off" ? undefined : { persist: PERSIST === "mine" ? "mine" : "all" },
 });
 
-/**
- * Pre-flight a bid against the current view and throw a clear error if it would
- * be silently dropped by the conservation rules (auction/state.ts). Without this
- * the API accepts the write, pays the PoST cooldown, gossips it, and the bid
- * just never appears — the user sees "0 bids" with no explanation.
- */
-function validateBid(auctionId: string, token: string, amountStr: string): void {
-	const view = daemon.view();
-	const me = daemon.active().pubHex;
-	const a = view.auctions.get(auctionId);
-	if (!a) throw new Error("no such auction");
-	if (a.status !== "open") throw new Error(`auction is ${a.status}, not open`);
-	if (me === a.seller) throw new Error("you cannot bid on your own auction");
-	if (!/^[0-9]+$/.test(amountStr) || BigInt(amountStr) <= 0n) throw new Error("bid amount must be a positive integer");
-	const amount = BigInt(amountStr);
-	const sym = view.coins.get(token)?.symbol ?? token.slice(0, 8) + "…";
-	const held = balanceOf(view, token, me);
-	if (held < amount) throw new Error(`insufficient balance: you hold ${held} ${sym}, but the bid needs ${amount}`);
-}
-
 // ── View → JSON (Maps + BigInts → plain, string amounts) ─────────
 
 function serializeState() {
 	const view = daemon.view(); // optimistic tip — reflects actions immediately
-	const finalAuctions = daemon.finalView().auctions; // which auctions are consensus-final
+	const me = daemon.wallet.active().pubHex;
+	const m = mark(view); // the BTC oracle price (null until first post)
 
-	const coins = [...view.coins.values()].map((c) => ({
-		id: c.id,
-		name: c.name,
-		symbol: c.symbol,
-		supply: c.supply.toString(),
-		deployer: c.deployer,
-	}));
+	// credit balances: { pubkey: amount }
+	const credit: Record<string, string> = {};
+	for (const [pubkey, amt] of view.credit) credit[pubkey] = amt.toString();
 
-	const nowHeight = daemon.finalizedHeight(); // current anchor-clock "now" (or null pre-consensus)
-	const contentsJson = (c) => ({
-		itemId: c.itemId,
-		name: c.name,
-		coin: c.coin ? { token: c.coin.token, amount: c.coin.amount.toString() } : null,
-		secret: c.secret ? { commitment: c.secret.commitment } : null,
-	});
-	const auctions = [...view.auctions.values()].map((a) => {
-		const fa = finalAuctions.get(a.id); // finalized counterpart (carries bornAt/expiresAt + expiry status)
-		// Expiry lives in the finalized view (the only place with an anchor clock). Surface it
-		// even while the optimistic status still says "open".
-		const expiresAt = fa?.expiresAt ?? null;
-		const expired = fa?.status === "expired";
-		const remaining = expiresAt != null && nowHeight != null ? Math.max(0, expiresAt - nowHeight) : null;
-		return {
-			id: a.id,
-			seller: a.seller,
-			name: a.contents.name,
-			contents: contentsJson(a.contents),
-			ask: a.ask ? { token: a.ask.token, amount: a.ask.amount.toString() } : null,
-			details: a.details ?? null,
-			status: expired ? "expired" : a.status, // reflect anchor-clock expiry in the headline status
-			bids: a.bids.map((b) => ({ ref: b.ref, bidder: b.bidder, token: b.token, amount: b.amount.toString(), inbox: b.inbox ?? null })),
-			winner: a.winner ?? null,
-			winnerPubkey: a.winnerPubkey ?? null,
-			delivered: !!a.delivery, // secret auctions: has the sealed delivery been published?
-			// true once the anchor chain has certified this auction's settlement/outcome.
-			finalized: fa?.status === a.status && a.status !== "open",
-			expiresAt, // anchor height at which it auto-cancels (null until certified)
-			expiresIn: remaining, // anchors remaining (null pre-consensus)
-		};
-	});
+	// my open positions (bull/bear), with live PnL at the current mark
+	const myPositions = [...view.positions.values()]
+		.filter((p) => p.owner === me)
+		.map((p) => ({
+			id: p.id,
+			instrument: p.instrument,
+			side: p.side,
+			size: p.size.toString(),
+			entry: p.entry.toString(),
+			margin: p.margin.toString(),
+			pnl: m != null ? unrealizedPnl(p, m).toString() : null,
+		}));
 
-	// balances: { pubkey: { token: amount } }
-	const balances: Record<string, Record<string, string>> = {};
-	for (const [key, amt] of view.balances) {
-		const [token, pubkey] = splitBalKey(key);
-		(balances[pubkey] ??= {})[token] = amt.toString();
-	}
+	// the single shared pool: backing ratio (insolvency visible) + live funding
+	const skew = m != null ? skewBps(view.positions.values(), m) : 0n;
+	const rate = fundingRateBps(skew, DEFAULT_FUNDING);
+	const market = {
+		oracle: view.oracle.id,
+		price: m != null ? m.toString() : null,
+		oracleSeq: view.oracle.seq,
+		maxLeverage: Number(MAX_LEVERAGE),
+		poolAssets: view.pool.assets.toString(),
+		owed: totalOwed(view.pool).toString(),
+		backingBps: Number(backingBps(view.pool)), // 10000 = 100% backed; < 10000 = insolvent
+		openPositions: view.positions.size,
+		skewBps: Number(skew), // +10000 all bull, −10000 all bear
+		fundingRateBps: Number(rate), // >0 bulls pay, <0 bears pay
+		fundingPays: rate > 0n ? "bulls" : rate < 0n ? "bears" : "none",
+		fundingEpochAnchors: DEFAULT_FUNDING.epochAnchors,
+		myCredit: creditOf(view, me).toString(),
+		myPositions,
+	};
 
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));
-	// active account's inventory of won secrets (decrypted locally, never on the wire)
-	const inventory = daemon.active().vault?.won() ?? [];
-
-	// perp markets — with the SURFACED backing ratio (insolvency is visible, not hidden)
-	const me = daemon.wallet.active().pubHex;
-	const perps = [...view.perps.values()].map((m) => {
-		const mark = nowHeight != null ? markPrice(m, nowHeight) : null;
-		const myPositions = [...m.positions.values()]
-			.filter((p) => p.owner === me)
-			.map((p) => ({ id: p.id, side: p.side, size: p.size.toString(), entry: p.entry.toString(), margin: p.margin.toString() }));
-		const sym = view.coins.get(m.collateral)?.symbol ?? m.collateral.slice(0, 8);
-		// Live funding: skew (signed OI imbalance) → clamped rate. Needs a mark to value notional.
-		const skew = mark != null ? skewBps(m.positions.values(), mark) : 0n;
-		const rate = fundingRateBps(skew, DEFAULT_FUNDING);
-		return {
-			id: m.id,
-			name: m.name,
-			collateral: m.collateral,
-			collateralSymbol: sym,
-			mark: mark != null ? mark.toString() : null,
-			poolAssets: m.pool.assets.toString(),
-			owed: totalOwed(m.pool).toString(),
-			backingBps: Number(backingBps(m.pool)), // 10000 = 100% backed; < 10000 = insolvent
-			openPositions: m.positions.size,
-			// live funding readout: skewBps + which side pays + rate per epoch
-			skewBps: Number(skew), // +10000 all long, −10000 all short, 0 balanced
-			fundingRateBps: Number(rate), // signed; >0 longs pay, <0 shorts pay
-			fundingPays: rate > 0n ? "longs" : rate < 0n ? "shorts" : "none",
-			fundingEpochAnchors: DEFAULT_FUNDING.epochAnchors,
-			myPositions,
-		};
-	});
-
-	return { accounts, active: me, coins, auctions, balances, inventory, perps, consensus: daemon.consensus(), storage: daemon.storeStats() };
+	return { accounts, active: me, credit, market, consensus: daemon.consensus(), storage: daemon.storeStats() };
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -219,47 +156,37 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			daemon.wallet.setActive(String(body.pubHex));
 			return send(res, 200, { active: body.pubHex });
 		}
-		if (path === "/api/coins") {
-			const id = await daemon.active().deployCoin(String(body.name), String(body.symbol), String(body.supply));
-			return send(res, 200, { id });
+		// ── v1: BTC bull/bear ──
+		if (path === "/api/farm") {
+			// Mint native credit by doing the PoST work (v1's "money"; real BTC in Phase 4).
+			await daemon.active().farm();
+			return send(res, 200, { ok: true });
 		}
 		if (path === "/api/transfer") {
-			await daemon.active().transfer(String(body.token), String(body.to), String(body.amount));
+			await daemon.active().transfer(String(body.to), String(body.amount));
 			return send(res, 200, { ok: true });
 		}
-		// ── perpetuals ──
-		if (path === "/api/perps") {
-			const id = await daemon.active().deployPerp(String(body.name), String(body.collateral));
+		if (path === "/api/oracle/post") {
+			// Publish a signed BTC price. Only valid if the active account IS the oracle key.
+			await daemon.active().postPrice(String(body.oracle ?? BTC_ORACLE), String(body.price), Number(body.seq));
+			return send(res, 200, { ok: true });
+		}
+		if (path === "/api/position/open") {
+			// instrument: "BTC-BULL" | "BTC-BEAR"; margin in credit; leverage ≤ MAX_LEVERAGE.
+			const id = await daemon.active().open(body.instrument === "BTC-BEAR" ? "BTC-BEAR" : "BTC-BULL", String(body.margin), String(body.leverage ?? "1"));
 			return send(res, 200, { id });
 		}
-		if (path === "/api/perps/order") {
-			const id = await daemon.active().perpOrder(String(body.market), body.side === "sell" ? "sell" : "buy", String(body.price), String(body.size), String(body.leverage ?? "1"));
-			return send(res, 200, { id });
-		}
-		if (path === "/api/perps/close") {
-			await daemon.active().perpClose(String(body.market), String(body.position));
+		if (path === "/api/position/close") {
+			await daemon.active().close(String(body.position));
 			return send(res, 200, { ok: true });
 		}
-		if (path === "/api/perps/liquidate") {
-			await daemon.active().perpLiquidate(String(body.market), String(body.position));
+		if (path === "/api/position/liquidate") {
+			await daemon.active().liquidate(String(body.position));
 			return send(res, 200, { ok: true });
 		}
-		if (path === "/api/perps/deposit") {
-			await daemon.active().perpDeposit(String(body.market), String(body.amount));
+		if (path === "/api/pool/deposit") {
+			await daemon.active().poolDeposit(String(body.amount));
 			return send(res, 200, { ok: true });
-		}
-		if (path === "/api/auctions") {
-			// One unified listing: { name, coin?:{token,amount}, secret?, ask?:{token,amount}, details? }.
-			// name is required; coin escrows an amount; secret is vaulted locally (only its
-			// commitment is published — NOT fair exchange, the seller keeps a copy).
-			const id = await daemon.active().createListing({
-				name: String(body.name ?? ""),
-				coin: body.coin && body.coin.token ? { token: String(body.coin.token), amount: String(body.coin.amount) } : undefined,
-				secret: typeof body.secret === "string" && body.secret !== "" ? body.secret : undefined,
-				ask: body.ask ?? null,
-				details: typeof body.details === "string" ? body.details : undefined,
-			});
-			return send(res, 200, { id });
 		}
 		if (path === "/api/channel") {
 			// Join a different channel by name. Each channel is its own economy (own anchor

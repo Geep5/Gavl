@@ -16,8 +16,8 @@ import { AnchorChain } from "../src/consensus/chain.ts";
 import { mineAnchor } from "../src/consensus/anchor.ts";
 import type { Anchor } from "../src/consensus/anchor.ts";
 import { Producer } from "../src/consensus/producer.ts";
-import { Account } from "../src/auction/account.ts";
-import { finalizedView } from "../src/consensus/order.ts";
+import { Account } from "../src/market/account.ts";
+import { finalizedView, creditOf } from "../src/market/btc.ts";
 import { PARAMS, K, STANDIN_VERIFIER, standinProver } from "./helpers.ts";
 
 function miner() {
@@ -76,16 +76,11 @@ test("a settled auction finalizes from gossiped anchors on the other node", asyn
 
 	let ts = 0;
 	const now = () => ++ts;
-	const seller = new Account({ node: A, params: PARAMS, k: K, now });
-	const bidder = new Account({ node: B, params: PARAMS, k: K, now });
+	const alice = new Account({ node: A, params: PARAMS, k: K, now });
 
-	const coin = await bidder.deployCoin("Coin", "CN", 1_000n);
-	await net.idle();
-	const id = await seller.createItemAuction("Codex", null);
-	await net.idle();
-	const ref = await bidder.bid(id, coin, 500n);
-	await net.idle();
-	await seller.settle(id, ref);
+	// alice farms credit on node A; it gossips to B.
+	await alice.farm();
+	await alice.farm();
 	await net.idle();
 
 	const pa = new Producer({ node: A, ...miner(), params: PARAMS });
@@ -96,6 +91,5 @@ test("a settled auction finalizes from gossiped anchors on the other node", asyn
 
 	assert.equal(B.anchorTip()!.id, A.anchorTip()!.id, "anchor tips converged over gossip");
 	const vb = finalizedView(B.ledger.allWrites(), B.anchors!, 1);
-	assert.equal(vb.auctions.get(id)!.status, "settled");
-	assert.equal(vb.items.get(id)!.owner, bidder.pubHex);
+	assert.equal(creditOf(vb, alice.pubHex), 2000n, "B finalized alice's farmed credit via gossip");
 });

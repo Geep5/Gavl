@@ -20,7 +20,8 @@
  * Pure (BigInt), deterministic, no deps, not yet consensus-wired.
  */
 
-import type { Side } from "./book.ts";
+/** Position side: "buy" = long/bull, "sell" = short/bear. */
+export type Side = "buy" | "sell";
 
 export interface Position {
 	id: string; // the opening fill / order id
