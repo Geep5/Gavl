@@ -120,3 +120,14 @@ test("CONSERVATION: a wiped long never costs the engine more than its margin", (
 	assert.ok(S.returned <= longP.margin + shortP.margin, "short's payout is bounded by the locked pool");
 	assert.equal(L.returned + S.returned, longP.margin + shortP.margin, "pool fully conserved");
 });
+
+test("bounded leverage: in-bounds margin scales, out-of-bounds is rejected", async () => {
+	const { leverageOk, MAX_LEVERAGE, marginRequired } = await import("../src/perp/engine.ts");
+	assert.equal(leverageOk(1n), true);
+	assert.equal(leverageOk(MAX_LEVERAGE), true, "max leverage is allowed");
+	assert.equal(leverageOk(MAX_LEVERAGE + 1n), false, "above max rejected");
+	assert.equal(leverageOk(0n), false, "zero rejected");
+	// margin = notional / leverage: 10×100 = 1000 notional
+	assert.equal(marginRequired(10n, 100n, 1n), 1000n, "1× = fully collateralized");
+	assert.equal(marginRequired(10n, 100n, 5n), 200n, "5× = a fifth of notional");
+});

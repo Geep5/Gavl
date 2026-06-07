@@ -51,12 +51,28 @@ export function equity(p: Position, mark: bigint): bigint {
 }
 
 /**
- * Margin required to open `size` at `price` with `leverage` (v0: leverage 1n).
- * Fully-collateralized: notional / leverage.
+ * Maximum leverage (consensus constant). BOUNDED because Gavl's clock is slow:
+ * liquidation finalizes anchors deep (minutes), so a position must keep enough
+ * collateral buffer to survive the worst plausible price move within that window.
+ * Safe leverage ≈ 1 / (worst move over the settlement lag) → low single digits on
+ * a cooldown ledger, NOT 20×. Bounding it is what keeps the insolvency-possible
+ * pool from going insolvent on EVERY volatile candle rather than only rarely.
+ */
+export const MAX_LEVERAGE = 5n;
+
+/** True if `leverage` is a valid, in-bounds leverage. */
+export function leverageOk(leverage: bigint): boolean {
+	return leverage >= 1n && leverage <= MAX_LEVERAGE;
+}
+
+/**
+ * Margin required to open `size` at `price` with `leverage`.
+ * Fully-collateralized when leverage = 1; notional / leverage otherwise.
+ * Caller must validate `leverageOk` first (this clamps defensively).
  */
 export function marginRequired(size: bigint, price: bigint, leverage: bigint = 1n): bigint {
-	if (leverage < 1n) throw new Error("perp: leverage must be >= 1");
-	return (size * price) / leverage;
+	const L = leverage < 1n ? 1n : leverage > MAX_LEVERAGE ? MAX_LEVERAGE : leverage;
+	return (size * price) / L;
 }
 
 /**
