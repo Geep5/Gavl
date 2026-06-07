@@ -87,8 +87,27 @@ function serializeState() {
 	// the single shared pool: backing ratio (insolvency visible) + live funding
 	const skew = m != null ? skewBps(view.positions.values(), m) : 0n;
 	const rate = fundingRateBps(skew, DEFAULT_FUNDING);
+
+	// The oracle(s) this market depends on — the price-authority, hence the v1 trust
+	// point, surfaced explicitly. A LIST (future-proof for the multi-oracle design),
+	// though v1 ships exactly one: the BTC price oracle both instruments mark against.
+	const oracles = [
+		{
+			id: view.oracle.id, // the signing key IS the authority
+			label: "BTC / USD price",
+			feeds: ["BTC-BULL", "BTC-BEAR"], // which instruments it prices
+			price: m != null ? m.toString() : null,
+			seq: view.oracle.seq, // monotonic; update count = seq+1
+			updates: view.oracle.seq + 1,
+			live: m != null,
+			mine: view.oracle.id === me, // is THIS node the publisher?
+			webhook: null, // v1 publishes via signed writes, not a fetch endpoint
+		},
+	];
+
 	const market = {
 		oracle: view.oracle.id,
+		oracles,
 		price: m != null ? m.toString() : null,
 		oracleSeq: view.oracle.seq,
 		maxLeverage: Number(MAX_LEVERAGE),

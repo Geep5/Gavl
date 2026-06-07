@@ -3,11 +3,21 @@
 	// Oracle-priced (mark = the BTC oracle), pool-as-counterparty, insolvency-
 	// possible (watch the backing bar), bounded leverage, funding as the solvency
 	// defense.
-	import { store, act, myCredit } from "../lib/store.svelte.js";
+	import { store, act, myCredit, short } from "../lib/store.svelte.js";
 	import { api } from "../lib/api.js";
 
 	const m = $derived(store.market);
 	const priceNum = $derived(m?.price != null ? Number(m.price) : null);
+	const oracles = $derived(m?.oracles ?? []);
+
+	let copied = $state(null);
+	async function copyKey(id) {
+		try {
+			await navigator.clipboard.writeText(id);
+			copied = id;
+			setTimeout(() => (copied = null), 1200);
+		} catch {}
+	}
 
 	// open form
 	let side = $state("BTC-BULL"); // BTC-BULL | BTC-BEAR
@@ -57,7 +67,7 @@
 		<div class="ticker">BTC <span class="muted">/ credit</span></div>
 		{#if priceNum != null}
 			<div class="price">{priceNum.toLocaleString()}</div>
-			<div class="muted small">oracle mark · seq {m.oracleSeq}</div>
+			<div class="muted small">via {oracles[0]?.label ?? "oracle"} · {oracles[0] ? short(oracles[0].id) : "—"} · {m.oracleSeq + 1} updates</div>
 		{:else}
 			<div class="price muted">— no price —</div>
 			<div class="muted small">waiting for the oracle to post…</div>
@@ -70,6 +80,35 @@
 		<button class="ghost full" onclick={farm} disabled={busy}>{busy ? "…" : "＋ Farm credit"}</button>
 		<div class="muted tiny">native credit is earned by doing the proof-of-space-time work (v1 collateral)</div>
 	</div>
+</div>
+
+<!-- the oracle(s) pricing this market — the v1 trust point, made visible -->
+<div class="panel oracles">
+	<h3>Price oracle{oracles.length === 1 ? "" : "s"} <span class="muted small">· who sets the price you trade against</span></h3>
+	{#each oracles as o}
+		<div class="orow">
+			<span class="odot" class:live={o.live}></span>
+			<div class="oinfo">
+				<div class="oline">
+					<strong>{o.label}</strong>
+					{#if o.mine}<span class="tag">this node</span>{/if}
+					<span class="muted tiny">prices {o.feeds.join(" · ")}</span>
+				</div>
+				<button class="okey mono" title="click to copy the oracle's public key" onclick={() => copyKey(o.id)}>
+					{copied === o.id ? "copied ✓" : short(o.id)}
+				</button>
+			</div>
+			<div class="ostat">
+				<div class="oprice">{o.price != null ? Number(o.price).toLocaleString() : "—"}</div>
+				<div class="muted tiny">{o.live ? `${o.updates} updates` : "no price yet"}</div>
+			</div>
+		</div>
+	{/each}
+	<p class="muted tiny disclaimer">
+		The price comes from this signing key — whoever holds it sets the mark the whole market settles against. It's
+		signed on-chain (every node verifies the signature), but it is <strong>the v1 trust assumption</strong>: a single
+		signer. Future versions allow multiple oracles with a median, and let instruments choose which they trust.
+	</p>
 </div>
 
 <!-- open a position -->
@@ -188,4 +227,17 @@
 	.depline { display: flex; gap: 0.4rem; }
 	.depline input { flex: 1; }
 	.disclaimer { margin: 0.7rem 0 0; line-height: 1.4; }
+
+	/* oracle panel */
+	.orow { display: flex; align-items: center; gap: 0.7rem; padding: 0.5rem 0; border-top: 1px solid var(--border); }
+	.orow:first-of-type { border-top: none; }
+	.odot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+	.odot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
+	.oinfo { flex: 1; min-width: 0; }
+	.oline { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+	.tag { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.05rem 0.3rem; border: 1px solid var(--accent); color: var(--accent); border-radius: 3px; }
+	.okey { background: transparent; border: 1px solid var(--border); color: var(--muted); font-size: 0.72rem; padding: 0.1rem 0.4rem; border-radius: 4px; margin: 0.2rem 0 0; cursor: pointer; }
+	.okey:hover { color: var(--text); border-color: var(--accent); }
+	.ostat { text-align: right; }
+	.oprice { font-weight: 700; font-variant-numeric: tabular-nums; }
 </style>
