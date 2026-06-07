@@ -103,6 +103,19 @@
 				<div class="muted tiny">{o.live ? `${o.updates} updates` : "no price yet"}</div>
 			</div>
 		</div>
+		{#if o.source}
+			<div class="osource">
+				<div class="srow"><span class="slabel">endpoint</span> <a class="mono sval" href={o.source.endpoint} target="_blank" rel="noopener">{o.source.endpoint}</a></div>
+				<div class="srow"><span class="slabel">key</span> <code class="sval">{o.source.key}</code></div>
+				{#if o.source.error}
+					<div class="srow err-row"><span class="slabel">error</span> <span class="sval">{o.source.error}</span></div>
+				{:else}
+					<div class="srow"><span class="slabel">value</span> <span class="sval"><code>{o.source.raw}</code> → <strong>{Number(o.source.value).toLocaleString()}</strong> <span class="muted tiny">({(o.source.ageMs / 1000).toFixed(0)}s ago)</span></span></div>
+				{/if}
+			</div>
+		{:else}
+			<div class="osource muted tiny">Source not disclosed — published by a remote oracle node (only the signed price is on-chain).</div>
+		{/if}
 	{/each}
 	<p class="muted tiny disclaimer">
 		The price comes from this signing key — whoever holds it sets the mark the whole market settles against. It's
@@ -240,4 +253,12 @@
 	.okey:hover { color: var(--text); border-color: var(--accent); }
 	.ostat { text-align: right; }
 	.oprice { font-weight: 700; font-variant-numeric: tabular-nums; }
+	.osource { margin: 0.1rem 0 0.3rem 1.4rem; padding: 0.4rem 0.6rem; background: var(--panel-2); border-radius: 6px; font-size: 0.74rem; }
+	.srow { display: flex; gap: 0.5rem; padding: 0.1rem 0; }
+	.slabel { color: var(--muted); flex: 0 0 64px; text-transform: uppercase; font-size: 0.62rem; letter-spacing: 0.04em; padding-top: 0.1rem; }
+	.sval { word-break: break-all; }
+	a.sval { color: var(--accent); text-decoration: none; }
+	a.sval:hover { text-decoration: underline; }
+	.osource code { background: var(--panel); padding: 0.05rem 0.3rem; border-radius: 3px; }
+	.err-row .sval { color: var(--red); }
 </style>

@@ -23,6 +23,7 @@ import { mark, creditOf, BTC_ORACLE, MAX_LEVERAGE, skewBps, fundingRateBps } fro
 import { backingBps, totalOwed } from "./perp/pool.ts";
 import { unrealizedPnl } from "./perp/engine.ts";
 import { DEFAULT_FUNDING } from "./perp/funding.ts";
+import { DEFAULT_SOURCE } from "./market/pricefeed.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
@@ -91,6 +92,9 @@ function serializeState() {
 	// The oracle(s) this market depends on — the price-authority, hence the v1 trust
 	// point, surfaced explicitly. A LIST (future-proof for the multi-oracle design),
 	// though v1 ships exactly one: the BTC price oracle both instruments mark against.
+	// the publisher's actual data source (endpoint/key/raw value) — only this node
+	// knows it, since only the publisher fetches; null on non-publishing nodes.
+	const src = daemon.oracleSource();
 	const oracles = [
 		{
 			id: view.oracle.id, // the signing key IS the authority
@@ -101,7 +105,11 @@ function serializeState() {
 			updates: view.oracle.seq + 1,
 			live: m != null,
 			mine: view.oracle.id === me, // is THIS node the publisher?
-			webhook: null, // v1 publishes via signed writes, not a fetch endpoint
+			// the real number's provenance (publisher-local): where it's fetched, the
+			// JSON key-path, the raw value pulled, and the parsed price.
+			source: src
+				? { endpoint: src.endpoint, key: src.key, raw: src.raw, value: src.value != null ? src.value.toString() : null, error: src.error ?? null, ageMs: Date.now() - src.at }
+				: null,
 		},
 	];
 
@@ -293,10 +301,12 @@ createServer((req, res) => {
 	}
 
 	// Oracle publisher: only the node holding the oracle seed should run it
-	// (GAVL_ORACLE_PUBLISH=1). v1 price source is a fixed dev price (GAVL_BTC_PRICE,
-	// default 50000) — a real feed swaps in here later. Everyone else just folds
-	// the signed posts.
-	const publishOracle = process.env.GAVL_ORACLE_PUBLISH === "1" ? { seedHex: process.env.GAVL_ORACLE_SEED, price: () => BigInt(process.env.GAVL_BTC_PRICE ?? "50000"), everyMs: Number(process.env.GAVL_ORACLE_MS ?? "5000") } : undefined;
+	// (GAVL_ORACLE_PUBLISH=1). Price source:
+	//   GAVL_BTC_PRICE       → a fixed dev price (overrides the feed), else
+	//   GAVL_ORACLE_URL+_KEY → fetch a real price (defaults to Coinbase BTC-USD spot).
+	// Everyone else just folds the signed posts.
+	const source = process.env.GAVL_BTC_PRICE ? { fixed: BigInt(process.env.GAVL_BTC_PRICE) } : { url: process.env.GAVL_ORACLE_URL ?? DEFAULT_SOURCE.url, key: process.env.GAVL_ORACLE_KEY ?? DEFAULT_SOURCE.key };
+	const publishOracle = process.env.GAVL_ORACLE_PUBLISH === "1" ? { seedHex: process.env.GAVL_ORACLE_SEED, source, everyMs: Number(process.env.GAVL_ORACLE_MS ?? "5000") } : undefined;
 	await daemon.startConsensus({ network: NETWORK, mesh: MESH, farm: FARM, publishOracle });
 	const c = daemon.consensus();
 	console.log(`  → mesh ${c.mesh ? "joined" : "off"}, ${c.peers} peer(s), farming ${c.farming ? "live" : "off"}`);
