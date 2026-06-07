@@ -56,7 +56,8 @@ export class MinePolicy implements PersistPolicy {
 		if (!op) return false;
 		switch (op.kind) {
 			case "oracle.post":
-				return true; // the price is shared infrastructure — always keep
+			case "oracle.meta":
+				return true; // the price + disclosed methodology are shared infra — always keep
 			case "credit.transfer":
 				return this.keys.has(op.to);
 			case "position.close":

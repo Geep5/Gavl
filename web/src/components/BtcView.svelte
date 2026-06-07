@@ -105,15 +105,21 @@
 		</div>
 		{#if o.source}
 			<div class="osource">
-				<div class="smethod">{o.source.method} → <strong>{Number(o.source.value).toLocaleString()}</strong> <span class="muted tiny">posted · {(o.source.ageMs / 1000).toFixed(0)}s ago</span></div>
+				<div class="smethod">
+					{o.source.method}
+					{#if o.source.onChain}<span class="chain-tag" title="the oracle signed these sources onto the Gavl chain — every client sees them">⛓ on-chain</span>{:else}<span class="muted tiny">(local — not yet disclosed on-chain)</span>{/if}
+					{#if o.source.ageMs != null}<span class="muted tiny">· live {(o.source.ageMs / 1000).toFixed(0)}s ago</span>{/if}
+				</div>
 				{#each o.source.feeds as f}
 					<div class="feed">
 						<a class="fhost mono" href={f.endpoint} target="_blank" rel="noopener" title={f.endpoint}>{(f.endpoint || "").split("/")[2] || "?"}</a>
 						<code class="fkey">{f.key}</code>
 						{#if f.error}
 							<span class="fval err">⚠ {f.error}</span>
-						{:else}
+						{:else if f.value != null}
 							<span class="fval"><code>{f.raw}</code> → {Number(f.value).toLocaleString()}</span>
+						{:else}
+							<span class="fval muted tiny">disclosed source · fetch to verify</span>
 						{/if}
 					</div>
 				{/each}
@@ -274,6 +280,7 @@
 	.oprice { font-weight: 700; font-variant-numeric: tabular-nums; }
 	.osource { margin: 0.1rem 0 0.3rem 1.4rem; padding: 0.5rem 0.6rem; background: var(--panel-2); border-radius: 6px; font-size: 0.74rem; }
 	.smethod { margin-bottom: 0.35rem; }
+	.chain-tag { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.04em; padding: 0.05rem 0.35rem; border: 1px solid var(--green); color: var(--green); border-radius: 3px; }
 	.feed { display: flex; align-items: baseline; gap: 0.6rem; padding: 0.12rem 0; flex-wrap: wrap; }
 	.fhost { color: var(--accent); text-decoration: none; flex: 0 0 auto; min-width: 130px; }
 	.fhost:hover { text-decoration: underline; }

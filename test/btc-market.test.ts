@@ -55,6 +55,27 @@ test("oracle key sets the mark; a stranger's post is ignored; seq is monotonic",
 	assert.equal(mark(view(node)), 60000n, "higher seq updates the mark");
 });
 
+test("oracle.meta: the oracle discloses its sources on-chain; a stranger can't", async () => {
+	const { node, mk, oracle } = setup();
+	const stranger = mk();
+	const sources = [
+		{ endpoint: "https://api.coinbase.com/v2/prices/BTC-USD/spot", key: "data.amount" },
+		{ endpoint: "https://api.kraken.com/0/public/Ticker?pair=XBTUSD", key: "result.XXBTZUSD.c.0" },
+	];
+	// a stranger's disclosure is ignored
+	await stranger.postMeta(BTC_ORACLE, sources);
+	assert.equal(view(node).oracle.sources.length, 0, "only the oracle key may disclose");
+	// the real oracle's disclosure folds into state (visible to every client)
+	await oracle.postMeta(BTC_ORACLE, sources);
+	const disclosed = view(node).oracle.sources;
+	assert.equal(disclosed.length, 2);
+	assert.equal(disclosed[0].endpoint, sources[0].endpoint);
+	assert.equal(disclosed[0].key, "data.amount");
+	// latest-wins: a new disclosure replaces it
+	await oracle.postMeta(BTC_ORACLE, [sources[0]]);
+	assert.equal(view(node).oracle.sources.length, 1, "latest disclosure wins");
+});
+
 test("open a BULL position at the oracle mark; margin leaves balance → pool", async () => {
 	const { node, mk, oracle } = setup();
 	const trader = mk();

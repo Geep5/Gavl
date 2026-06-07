@@ -49,6 +49,9 @@ export interface OracleState {
 	id: string;
 	price: bigint | null; // latest finalized price, or null until first post
 	seq: number; // monotonic; rejects stale/replayed posts
+	/** The oracle's on-chain-disclosed methodology: the sources it derives the price
+	 *  from. Visible to EVERY client (folded into state), not just the publisher. */
+	sources: { endpoint: string; key: string }[];
 }
 
 export interface View {
@@ -101,7 +104,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	const cmp = opts.order ?? cmpWrite;
 	const view: View = {
 		credit: new Map(),
-		oracle: { id: BTC_ORACLE, price: null, seq: -1 },
+		oracle: { id: BTC_ORACLE, price: null, seq: -1, sources: [] },
 		pool: emptyPool(),
 		positions: new Map(),
 		lastFundingHeight: -1,
@@ -158,6 +161,13 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
 			if (price === null) return;
 			view.oracle.price = price;
 			view.oracle.seq = op.seq;
+			return;
+		}
+		case "oracle.meta": {
+			// The oracle discloses its sources on-chain (latest-wins). Only the oracle key.
+			if (op.oracle !== view.oracle.id || w.writer !== view.oracle.id) return;
+			if (!Array.isArray(op.sources)) return;
+			view.oracle.sources = op.sources.filter((s) => s && typeof s.endpoint === "string" && typeof s.key === "string").map((s) => ({ endpoint: s.endpoint, key: s.key }));
 			return;
 		}
 		case "position.open": {

@@ -92,9 +92,32 @@ function serializeState() {
 	// The oracle(s) this market depends on — the price-authority, hence the v1 trust
 	// point, surfaced explicitly. A LIST (future-proof for the multi-oracle design),
 	// though v1 ships exactly one: the BTC price oracle both instruments mark against.
-	// the publisher's actual data source (endpoint/key/raw value) — only this node
-	// knows it, since only the publisher fetches; null on non-publishing nodes.
-	const src = daemon.oracleSource();
+	// Provenance shown to clients. The METHODOLOGY (endpoints + keys) is disclosed
+	// ON-CHAIN by the oracle (view.oracle.sources) so EVERY client sees it. The live
+	// RAW values are publisher-local (only the node that fetches has them) and merged
+	// in by endpoint when present.
+	const disclosed = view.oracle.sources; // [{endpoint, key}] folded from oracle.meta — all clients
+	const live = daemon.oracleSource(); // publisher-only live readings (raw values)
+	let source: unknown = null;
+	if (disclosed.length > 0) {
+		source = {
+			onChain: true,
+			method: `average of ${disclosed.length} source${disclosed.length === 1 ? "" : "s"}`,
+			ageMs: live ? Date.now() - live.at : null,
+			feeds: disclosed.map((d) => {
+				const r = live?.readings.find((x) => x.endpoint === d.endpoint);
+				return { endpoint: d.endpoint, key: d.key, raw: r?.raw ?? null, value: r?.value != null ? r.value.toString() : null, error: r?.error ?? null };
+			}),
+		};
+	} else if (live) {
+		// publisher running but hasn't disclosed on-chain yet (e.g. fixed dev price)
+		source = {
+			onChain: false,
+			method: live.method,
+			ageMs: Date.now() - live.at,
+			feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })),
+		};
+	}
 	const oracles = [
 		{
 			id: view.oracle.id, // the signing key IS the authority
@@ -105,17 +128,7 @@ function serializeState() {
 			updates: view.oracle.seq + 1,
 			live: m != null,
 			mine: view.oracle.id === me, // is THIS node the publisher?
-			// the real number's provenance (publisher-local): the average method, every
-			// feed's endpoint/key/raw/value, and how fresh. null on non-publisher nodes.
-			source: src
-				? {
-						method: src.method, // e.g. "average of 3/3 sources"
-						value: src.value != null ? src.value.toString() : null, // the averaged price posted
-						used: src.used,
-						ageMs: Date.now() - src.at,
-						feeds: src.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })),
-					}
-				: null,
+			source, // { onChain, method, ageMs, feeds:[{endpoint,key,raw,value,error}] } | null
 		},
 	];
 

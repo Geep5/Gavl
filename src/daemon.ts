@@ -368,11 +368,25 @@ export class Daemon {
 		const kp = oracleKeyPair(opts.seedHex);
 		const oraclePub = toHex(kp.publicKey);
 		const oracle = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: kp });
+		// The methodology disclosed on-chain so EVERY client sees the sources (not just
+		// this node). Only feeds with a real endpoint are disclosed (a fixed dev price
+		// has none). Re-posted periodically so late-joining nodes pick it up.
+		const disclose = opts.sources.filter((s) => s.url).map((s) => ({ endpoint: s.url!, key: s.key ?? "" }));
 		this.publishing = true;
 		const loop = async () => {
 			// seq continues from whatever the chain already has (survives restarts).
 			let seq = (this.view().oracle.seq ?? -1) + 1;
+			let tick = 0;
 			while (this.publishing) {
+				// disclose methodology on-chain at start + every ~30 ticks (cheap, idempotent).
+				if (disclose.length > 0 && tick % 30 === 0) {
+					try {
+						await oracle.postMeta(oraclePub, disclose);
+					} catch {
+						/* retry next cycle */
+					}
+				}
+				tick++;
 				const agg = await readPriceAggregate(opts.sources); // fetch all, average the responders
 				this.lastOracleSource = { ...agg, at: Date.now() }; // display-only metadata
 				if (agg.value != null) {

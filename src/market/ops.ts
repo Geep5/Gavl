@@ -23,6 +23,10 @@ export type Op =
 	/** A signed BTC price reading from the oracle. Authority = the oracle's key
 	 *  (checked in state); the webhook URL is only where it's published. Monotonic seq. */
 	| { kind: "oracle.post"; oracle: string; price: string; seq: number }
+	/** The oracle DISCLOSES its methodology on-chain — the sources (endpoint + JSON
+	 *  key-path) it derives the price from — so EVERY client sees what they trust,
+	 *  not just the publishing node. Signed by the oracle key; latest-wins. */
+	| { kind: "oracle.meta"; oracle: string; sources: { endpoint: string; key: string }[] }
 	/** Open a bull or bear position: escrow `margin` credit at the current oracle mark. */
 	| { kind: "position.open"; instrument: Instrument; margin: string; leverage: string }
 	/** Close your position at the current mark; pay margin+PnL back pay-when-able. */
@@ -32,7 +36,7 @@ export type Op =
 	/** Add native credit to the shared pool backing (drains the unpaid queue). */
 	| { kind: "pool.deposit"; amount: string };
 
-const KINDS = new Set<string>(["credit.farm", "credit.transfer", "oracle.post", "position.open", "position.close", "position.liquidate", "pool.deposit"]);
+const KINDS = new Set<string>(["credit.farm", "credit.transfer", "oracle.post", "oracle.meta", "position.open", "position.close", "position.liquidate", "pool.deposit"]);
 
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);

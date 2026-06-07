@@ -71,6 +71,11 @@ export class Account {
 		return this.produce({ kind: "oracle.post", oracle, price: amountStr(price), seq });
 	}
 
+	/** Disclose the oracle's source methodology on-chain (only valid as the oracle key). */
+	postMeta(oracle: string, sources: { endpoint: string; key: string }[]): Promise<Write> {
+		return this.produce({ kind: "oracle.meta", oracle, sources });
+	}
+
 	/** Open a bull/bear position with `margin` credit at `leverage` (≤5×). Returns position id. */
 	async open(instrument: Instrument, margin: bigint | number | string, leverage: bigint | number | string = 1): Promise<string> {
 		return (await this.produce({ kind: "position.open", instrument, margin: amountStr(margin), leverage: amountStr(leverage) })).id;
