@@ -20,6 +20,8 @@ import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Daemon } from "./daemon.ts";
 import { splitBalKey, balanceOf } from "./auction/state.ts";
+import { markPrice } from "./perp/market.ts";
+import { backingBps, totalOwed } from "./perp/pool.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
@@ -134,7 +136,30 @@ function serializeState() {
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));
 	// active account's inventory of won secrets (decrypted locally, never on the wire)
 	const inventory = daemon.active().vault?.won() ?? [];
-	return { accounts, active: daemon.wallet.active().pubHex, coins, auctions, balances, inventory, consensus: daemon.consensus(), storage: daemon.storeStats() };
+
+	// perp markets — with the SURFACED backing ratio (insolvency is visible, not hidden)
+	const me = daemon.wallet.active().pubHex;
+	const perps = [...view.perps.values()].map((m) => {
+		const mark = nowHeight != null ? markPrice(m, nowHeight) : null;
+		const myPositions = [...m.positions.values()]
+			.filter((p) => p.owner === me)
+			.map((p) => ({ id: p.id, side: p.side, size: p.size.toString(), entry: p.entry.toString(), margin: p.margin.toString() }));
+		const sym = view.coins.get(m.collateral)?.symbol ?? m.collateral.slice(0, 8);
+		return {
+			id: m.id,
+			name: m.name,
+			collateral: m.collateral,
+			collateralSymbol: sym,
+			mark: mark != null ? mark.toString() : null,
+			poolAssets: m.pool.assets.toString(),
+			owed: totalOwed(m.pool).toString(),
+			backingBps: Number(backingBps(m.pool)), // 10000 = 100% backed; < 10000 = insolvent
+			openPositions: m.positions.size,
+			myPositions,
+		};
+	});
+
+	return { accounts, active: me, coins, auctions, balances, inventory, perps, consensus: daemon.consensus(), storage: daemon.storeStats() };
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -191,6 +216,27 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		}
 		if (path === "/api/transfer") {
 			await daemon.active().transfer(String(body.token), String(body.to), String(body.amount));
+			return send(res, 200, { ok: true });
+		}
+		// ── perpetuals ──
+		if (path === "/api/perps") {
+			const id = await daemon.active().deployPerp(String(body.name), String(body.collateral));
+			return send(res, 200, { id });
+		}
+		if (path === "/api/perps/order") {
+			const id = await daemon.active().perpOrder(String(body.market), body.side === "sell" ? "sell" : "buy", String(body.price), String(body.size), String(body.leverage ?? "1"));
+			return send(res, 200, { id });
+		}
+		if (path === "/api/perps/close") {
+			await daemon.active().perpClose(String(body.market), String(body.position));
+			return send(res, 200, { ok: true });
+		}
+		if (path === "/api/perps/liquidate") {
+			await daemon.active().perpLiquidate(String(body.market), String(body.position));
+			return send(res, 200, { ok: true });
+		}
+		if (path === "/api/perps/deposit") {
+			await daemon.active().perpDeposit(String(body.market), String(body.amount));
 			return send(res, 200, { ok: true });
 		}
 		if (path === "/api/auctions") {

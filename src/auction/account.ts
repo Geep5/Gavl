@@ -182,6 +182,30 @@ export class Account {
 		return this.produce({ kind: "auction.cancel", auction });
 	}
 
+	// ── perpetuals ──
+
+	/** Deploy a perp market denominated in `collateral` (a coin id). Returns market id. */
+	async deployPerp(name: string, collateral: string): Promise<string> {
+		return (await this.produce({ kind: "perp.deploy", name, collateral })).id;
+	}
+
+	/** Open/extend a position. side "buy"=long, "sell"=short. Returns the order-write id. */
+	async perpOrder(market: string, side: "buy" | "sell", price: bigint | number | string, size: bigint | number | string, leverage: bigint | number | string = 1): Promise<string> {
+		return (await this.produce({ kind: "perp.order", market, side, price: amountStr(price), size: amountStr(size), leverage: amountStr(leverage) })).id;
+	}
+
+	perpClose(market: string, position: string): Promise<Write> {
+		return this.produce({ kind: "perp.close", market, position });
+	}
+
+	perpLiquidate(market: string, position: string): Promise<Write> {
+		return this.produce({ kind: "perp.liquidate", market, position });
+	}
+
+	perpDeposit(market: string, amount: bigint | number | string): Promise<Write> {
+		return this.produce({ kind: "perp.deposit", market, amount: amountStr(amount) });
+	}
+
 	/** Optimistic state from everything this node has synced (provisional ts order). */
 	view(): View {
 		return computeView(this.node.ledger.allWrites());

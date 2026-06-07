@@ -55,9 +55,25 @@ export type Op =
 	 *  ciphertext). Opaque to the protocol; only the winner can open it. */
 	| { kind: "auction.settle"; auction: string; winner: string; delivery?: string }
 	/** Seller withdraws the auction; the give is released and all bids refunded. */
-	| { kind: "auction.cancel"; auction: string };
+	| { kind: "auction.cancel"; auction: string }
+	// ── perpetuals (pool-as-counterparty, oracle-free, insolvency-possible) ──
+	/** Deploy a perp market denominated in an existing coin. market id = this write's id.
+	 *  The market owns a shared pool (the counterparty) + an order book; mark price is the
+	 *  pool's own epoch-TWAP. No oracle. */
+	| { kind: "perp.deploy"; name: string; collateral: string }
+	/** Open/extend a leveraged position against the market pool. Escrows margin =
+	 *  size·price/leverage of the collateral coin from your balance into the pool, then
+	 *  matches/rests on the book at `price`. side: "buy"=long, "sell"=short. */
+	| { kind: "perp.order"; market: string; side: "buy" | "sell"; price: string; size: string; leverage: string }
+	/** Close your position in `market` at the current mark (epoch-TWAP). Pays margin+PnL
+	 *  from the pool back to your coin balance PAY-WHEN-ABLE (queues if the pool is short). */
+	| { kind: "perp.close"; market: string; position: string }
+	/** Liquidate an underwater position (anyone may; earns a fee). Closes it at mark. */
+	| { kind: "perp.liquidate"; market: string; position: string }
+	/** Deposit collateral into a market's pool (adds backing / drains the unpaid queue). */
+	| { kind: "perp.deposit"; market: string; amount: string };
 
-const KINDS = new Set<string>(["coin.deploy", "transfer", "auction.create", "auction.bid", "auction.settle", "auction.cancel"]);
+const KINDS = new Set<string>(["coin.deploy", "transfer", "auction.create", "auction.bid", "auction.settle", "auction.cancel", "perp.deploy", "perp.order", "perp.close", "perp.liquidate", "perp.deposit"]);
 
 /** True if a write payload is a recognized op (writes may also carry null = no-op). */
 export function isOp(v: unknown): v is Op {

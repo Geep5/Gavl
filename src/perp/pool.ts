@@ -72,18 +72,23 @@ export function backingBps(pool: Pool): bigint {
 
 // ── money in ─────────────────────────────────────────────────────
 
+/** Called when a queued claim is paid down, so the caller can credit the owner's
+ *  real balance (the pool only tracks its own assets; the coins live elsewhere). */
+export type OnPay = (owner: string, amount: bigint) => void;
+
 /** Deposit collateral into the pool (margin on open, LP top-up, or new money).
- *  Immediately tries to drain the queue with the fresh funds. */
-export function deposit(pool: Pool, amount: bigint): void {
+ *  Immediately tries to drain the queue with the fresh funds; `onPay` (if given)
+ *  is invoked for each queued claim payment so winners actually receive coins. */
+export function deposit(pool: Pool, amount: bigint, onPay?: OnPay): void {
 	if (amount <= 0n) return;
 	pool.assets += amount;
 	pool.totalIn += amount;
-	drainQueue(pool);
+	drainQueue(pool, onPay);
 }
 
 /** Lock a position's margin into the pool on open. */
-export function lockMargin(pool: Pool, margin: bigint): void {
-	deposit(pool, margin);
+export function lockMargin(pool: Pool, margin: bigint, onPay?: OnPay): void {
+	deposit(pool, margin, onPay);
 	pool.lockedMargin += margin;
 }
 
@@ -108,14 +113,16 @@ export function payOrQueue(pool: Pool, owner: string, amount: bigint): bigint {
 	return payNow;
 }
 
-/** Pay down the FIFO queue with whatever assets are available. Called on every inflow. */
-function drainQueue(pool: Pool): void {
+/** Pay down the FIFO queue with whatever assets are available. Called on every inflow.
+ *  `onPay` (if given) is invoked per claim payment so the caller credits the owner. */
+function drainQueue(pool: Pool, onPay?: OnPay): void {
 	while (pool.queue.length > 0 && pool.assets > 0n) {
 		const head = pool.queue[0];
 		const pay = pool.assets >= head.amount ? head.amount : pool.assets;
 		head.amount -= pay;
 		pool.assets -= pay;
 		pool.totalOut += pay;
+		if (onPay && pay > 0n) onPay(head.owner, pay);
 		if (head.amount === 0n) pool.queue.shift();
 		else break; // pool drained, head partially paid
 	}

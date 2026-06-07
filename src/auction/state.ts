@@ -23,6 +23,8 @@
 import type { Write } from "../chain/writer.ts";
 import type { Op, Price } from "./ops.ts";
 import { isOp } from "./ops.ts";
+import { newMarket, applyOrder, applyClose, applyDeposit } from "../perp/market.ts";
+import type { PerpMarket, Balances as PerpBalances } from "../perp/market.ts";
 
 /** A deployed coin's metadata. */
 export interface Coin {
@@ -102,6 +104,8 @@ export interface View {
 	/** itemId (= auctionId for item auctions) → current owner. */
 	items: Map<string, { name: string; owner: string }>;
 	auctions: Map<string, Auction>;
+	/** Deployed perp markets by id (pool-as-counterparty, oracle-free). */
+	perps: Map<string, PerpMarket>;
 }
 
 // ── balance helpers (keyed by token + pubkey) ────────────────────
@@ -165,7 +169,7 @@ export interface ViewOptions {
 
 export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	const cmp = opts.order ?? cmpWrite;
-	const view: View = { coins: new Map(), balances: new Map(), items: new Map(), auctions: new Map() };
+	const view: View = { coins: new Map(), balances: new Map(), items: new Map(), auctions: new Map(), perps: new Map() };
 	const ordered = [...writes].sort(cmp);
 	for (const w of ordered) {
 		const op = w.payload as Op | null;
@@ -174,7 +178,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 			// a bid on an expired listing is correctly rejected. Uses the anchor clock,
 			// never Date.now() — keeping the fold deterministic across nodes.
 			expireDue(view, opts);
-			applyOp(view, w, op);
+			applyOp(view, w, op, opts.nowHeight ?? 0);
 			// Stamp the clock origin the first time we see a create (finalized view only).
 			if (op.kind === "auction.create" && opts.bornAt?.has(w.id)) {
 				const a = view.auctions.get(w.id);
@@ -203,7 +207,7 @@ function expireDue(view: View, opts: ViewOptions): void {
 	}
 }
 
-function applyOp(view: View, w: Write, op: Op): void {
+function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
 	switch (op.kind) {
 		case "coin.deploy": {
 			if (view.coins.has(w.id)) return; // id is content-addressed; collisions impossible
@@ -280,7 +284,46 @@ function applyOp(view: View, w: Write, op: Op): void {
 			a.status = "cancelled";
 			return;
 		}
+		// ── perpetuals — dispatch to the isolated, conservation-tested market module ──
+		case "perp.deploy": {
+			if (view.perps.has(w.id)) return; // id is content-addressed
+			if (typeof op.name !== "string" || !view.coins.has(op.collateral)) return; // must denominate in a real coin
+			view.perps.set(w.id, newMarket(w.id, op.name, op.collateral));
+			return;
+		}
+		case "perp.order": {
+			const m = view.perps.get(op.market);
+			if (!m) return;
+			applyOrder(m, perpBalances(view), { writer: w.writer, writeId: w.id, side: op.side, price: op.price, size: op.size, leverage: op.leverage, nowHeight });
+			return;
+		}
+		case "perp.close": {
+			const m = view.perps.get(op.market);
+			if (!m) return;
+			applyClose(m, perpBalances(view), { writer: w.writer, position: op.position, nowHeight });
+			return;
+		}
+		case "perp.liquidate": {
+			const m = view.perps.get(op.market);
+			if (!m) return;
+			applyClose(m, perpBalances(view), { writer: w.writer, position: op.position, nowHeight, liquidator: w.writer });
+			return;
+		}
+		case "perp.deposit": {
+			const m = view.perps.get(op.market);
+			if (!m) return;
+			applyDeposit(m, perpBalances(view), { writer: w.writer, amount: op.amount });
+			return;
+		}
 	}
+}
+
+/** Adapter exposing the View's balance map to the perp market module. */
+function perpBalances(view: View): PerpBalances {
+	return {
+		get: (token, pubkey) => bal(view.balances, token, pubkey),
+		add: (token, pubkey, v) => add(view.balances, token, pubkey, v),
+	};
 }
 
 /**
