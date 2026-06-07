@@ -32,4 +32,10 @@ export const api = {
 	addBootstrap: (node) => req("/bootstrap/add", "POST", { node }),
 	removeBootstrap: (node) => req("/bootstrap/remove", "POST", { node }),
 	resetBootstrap: () => req("/bootstrap/reset", "POST", {}),
+	// perpetuals
+	deployPerp: (name, collateral) => req("/perps", "POST", { name, collateral }),
+	perpOrder: (market, side, price, size, leverage) => req("/perps/order", "POST", { market, side, price, size, leverage }),
+	perpClose: (market, position) => req("/perps/close", "POST", { market, position }),
+	perpLiquidate: (market, position) => req("/perps/liquidate", "POST", { market, position }),
+	perpDeposit: (market, amount) => req("/perps/deposit", "POST", { market, amount }),
 };

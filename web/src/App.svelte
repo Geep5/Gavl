@@ -5,6 +5,7 @@
 	import CreateCoin from "./components/CreateCoin.svelte";
 	import CreateListing from "./components/CreateListing.svelte";
 	import ListingsView from "./components/ListingsView.svelte";
+	import PerpsView from "./components/PerpsView.svelte";
 	import ConsensusPanel from "./components/ConsensusPanel.svelte";
 	import ConnectProgress from "./components/ConnectProgress.svelte";
 	import ChannelSwitcher from "./components/ChannelSwitcher.svelte";
@@ -23,6 +24,7 @@
 
 	const NAV = [
 		{ id: "market", label: "market", icon: "⚖", hint: "Browse & bid on listings" },
+		{ id: "perps", label: "perps", icon: "≈", hint: "Perpetual markets — leverage, funding, backing" },
 		{ id: "sell", label: "sell", icon: "＋", hint: "Deploy a coin · create a listing" },
 		{ id: "wallet", label: "wallet", icon: "◈", hint: "Accounts, balances, transfers" },
 		{ id: "network", label: "network", icon: "⇄", hint: "Connectivity & consensus" },
@@ -82,6 +84,8 @@
 			<div class="scroll">
 				{#if view === "market"}
 					<ListingsView />
+				{:else if view === "perps"}
+					<PerpsView />
 				{:else if view === "sell"}
 					<CreateCoin />
 					<CreateListing />
