@@ -8,11 +8,8 @@ export const store = $state({
 	error: null,
 	accounts: [],
 	active: null,
-	coins: [],
-	auctions: [],
-	balances: {}, // { pubkey: { token: amount } }
-	inventory: [], // active account's won secrets: { auctionId, name, plaintext, verified }
-	perps: [], // perp markets: { id, name, mark, backingBps, skewBps, fundingRateBps, myPositions, ... }
+	credit: {}, // { pubkey: amount } native-credit balances
+	market: null, // the single BTC market: { price, backingBps, skewBps, fundingRateBps, fundingPays, maxLeverage, poolAssets, owed, myCredit, myPositions, ... }
 	consensus: null, // { enabled, vdf, mesh, network, peers, farming, tip, finalizedHeight, secPerAnchor, secPerAnchorMeasured }
 });
 
@@ -21,11 +18,8 @@ export async function refresh() {
 		const s = await api.state();
 		store.accounts = s.accounts;
 		store.active = s.active;
-		store.coins = s.coins;
-		store.auctions = s.auctions;
-		store.balances = s.balances;
-		store.inventory = s.inventory ?? [];
-		store.perps = s.perps ?? [];
+		store.credit = s.credit ?? {};
+		store.market = s.market ?? null;
 		store.consensus = s.consensus ?? null;
 		store.error = null;
 	} catch (e) {
@@ -53,15 +47,9 @@ export function startPolling(ms = 2000) {
 
 // ── lookups ──────────────────────────────────────────────────────
 
-export function coinById(id) {
-	return store.coins.find((c) => c.id === id);
-}
-export function coinLabel(id) {
-	const c = coinById(id);
-	return c ? c.symbol : short(id);
-}
-export function activeBalances() {
-	return store.balances[store.active] ?? {};
+/** Active account's native-credit balance (string). */
+export function myCredit() {
+	return store.market?.myCredit ?? store.credit[store.active] ?? "0";
 }
 export function accountLabel(pubHex) {
 	const a = store.accounts.find((x) => x.pubHex === pubHex);

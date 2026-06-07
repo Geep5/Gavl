@@ -15,14 +15,13 @@ export const api = {
 	state: () => req("/state"),
 	createAccount: (label) => req("/accounts", "POST", { label }),
 	setActive: (pubHex) => req("/accounts/active", "POST", { pubHex }),
-	deployCoin: (name, symbol, supply) => req("/coins", "POST", { name, symbol, supply }),
-	transfer: (token, to, amount) => req("/transfer", "POST", { token, to, amount }),
-	// One unified listing: { name, coin?:{token,amount}, secret?, ask?:{token,amount}, details? }
-	createListing: (payload) => req("/auctions", "POST", payload),
-	bid: (id, token, amount) => req(`/auctions/${id}/bid`, "POST", { token, amount }),
-	settle: (id, winner) => req(`/auctions/${id}/settle`, "POST", { winner }),
-	cancel: (id) => req(`/auctions/${id}/cancel`, "POST", {}),
-	claim: (id) => req(`/auctions/${id}/claim`, "POST", {}),
+	// v1: BTC bull/bear
+	farm: () => req("/farm", "POST", {}),
+	transfer: (to, amount) => req("/transfer", "POST", { to, amount }),
+	open: (instrument, margin, leverage) => req("/position/open", "POST", { instrument, margin, leverage }),
+	closePosition: (position) => req("/position/close", "POST", { position }),
+	liquidate: (position) => req("/position/liquidate", "POST", { position }),
+	poolDeposit: (amount) => req("/pool/deposit", "POST", { amount }),
 	switchChannel: (name) => req("/channel", "POST", { name }),
 	rerollIdentity: (label) => req("/identity/reroll", "POST", { label }),
 	importIdentity: (seed, label) => req("/identity/import", "POST", { seed, label }),
@@ -32,10 +31,4 @@ export const api = {
 	addBootstrap: (node) => req("/bootstrap/add", "POST", { node }),
 	removeBootstrap: (node) => req("/bootstrap/remove", "POST", { node }),
 	resetBootstrap: () => req("/bootstrap/reset", "POST", {}),
-	// perpetuals
-	deployPerp: (name, collateral) => req("/perps", "POST", { name, collateral }),
-	perpOrder: (market, side, price, size, leverage) => req("/perps/order", "POST", { market, side, price, size, leverage }),
-	perpClose: (market, position) => req("/perps/close", "POST", { market, position }),
-	perpLiquidate: (market, position) => req("/perps/liquidate", "POST", { market, position }),
-	perpDeposit: (market, amount) => req("/perps/deposit", "POST", { market, amount }),
 };

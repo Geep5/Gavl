@@ -1,11 +1,7 @@
 <script>
 	import { onMount, onDestroy } from "svelte";
 	import { store, startPolling, accountLabel, short } from "./lib/store.svelte.js";
-	import WalletPanel from "./components/WalletPanel.svelte";
-	import CreateCoin from "./components/CreateCoin.svelte";
-	import CreateListing from "./components/CreateListing.svelte";
-	import ListingsView from "./components/ListingsView.svelte";
-	import PerpsView from "./components/PerpsView.svelte";
+	import BtcView from "./components/BtcView.svelte";
 	import ConsensusPanel from "./components/ConsensusPanel.svelte";
 	import ConnectProgress from "./components/ConnectProgress.svelte";
 	import ChannelSwitcher from "./components/ChannelSwitcher.svelte";
@@ -17,16 +13,11 @@
 	});
 	onDestroy(() => clearInterval(timer));
 
-	let view = $state("market"); // market | sell | wallet | network
+	let view = $state("trade"); // trade | network
 	let mobileNav = $state(false); // left pane drawer on narrow screens
 
-	const claimable = $derived(store.auctions.filter((a) => a.contents?.secret && a.status === "settled" && a.winnerPubkey === store.active && a.delivered && !store.inventory.some((s) => s.auctionId === a.id)).length);
-
 	const NAV = [
-		{ id: "market", label: "market", icon: "⚖", hint: "Browse & bid on listings" },
-		{ id: "perps", label: "perps", icon: "≈", hint: "Perpetual markets — leverage, funding, backing" },
-		{ id: "sell", label: "sell", icon: "＋", hint: "Deploy a coin · create a listing" },
-		{ id: "wallet", label: "wallet", icon: "◈", hint: "Accounts, balances, transfers" },
+		{ id: "trade", label: "trade", icon: "₿", hint: "Go bullish or bearish on Bitcoin" },
 		{ id: "network", label: "network", icon: "⇄", hint: "Connectivity & consensus" },
 	];
 	const channel = $derived(store.consensus?.network ?? "—");
@@ -53,7 +44,6 @@
 					<button class="navitem" class:active={view === n.id} onclick={() => go(n.id)} title={n.hint}>
 						<span class="navicon">{n.icon}</span>
 						<span class="navtext"># {n.label}</span>
-						{#if n.id === "market" && claimable > 0}<span class="badge">{claimable}</span>{/if}
 					</button>
 				{/each}
 			</nav>
@@ -82,15 +72,8 @@
 			{#if store.error}<div class="err">{store.error}</div>{/if}
 
 			<div class="scroll">
-				{#if view === "market"}
-					<ListingsView />
-				{:else if view === "perps"}
-					<PerpsView />
-				{:else if view === "sell"}
-					<CreateCoin />
-					<CreateListing />
-				{:else if view === "wallet"}
-					<WalletPanel />
+				{#if view === "trade"}
+					<BtcView />
 				{:else if view === "network"}
 					<ConnectProgress />
 					<ConsensusPanel />

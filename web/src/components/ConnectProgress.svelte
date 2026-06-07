@@ -9,7 +9,7 @@
 	const c = $derived(store.consensus);
 
 	// Channel switching: a channel is a name → its own DHT topic, mesh, and economy.
-	// Your wallet/identity is shared; coins/auctions are per-channel.
+	// Your wallet/identity is shared; the market (price + pool) is per-channel.
 	let editingChannel = $state(false);
 	let channelInput = $state("");
 	let switching = $state(false);
@@ -203,7 +203,7 @@
 						<button class="join" onclick={joinChannel} disabled={switching || !channelInput.trim()}>{switching ? "joining…" : "Join"}</button>
 						<button class="chanx" onclick={() => (editingChannel = false)} disabled={switching}>✕</button>
 					</div>
-					<div class="empty">A channel is its own economy — separate coins, listings, peers. Your identity (keys) is shared. The name is its address: sha256(name) is the DHT topic peers meet on.</div>
+					<div class="empty">A channel is its own market — separate price, pool, peers. Your identity (keys) is shared. The name is its address: sha256(name) is the DHT topic peers meet on.</div>
 				{:else}
 					<div class="idrow" title="The channel name — its address is sha256(name).">
 						<span class="idk">name</span>
