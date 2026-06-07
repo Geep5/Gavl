@@ -23,7 +23,7 @@ import { mark, creditOf, BTC_ORACLE, MAX_LEVERAGE, skewBps, fundingRateBps } fro
 import { backingBps, totalOwed } from "./perp/pool.ts";
 import { unrealizedPnl } from "./perp/engine.ts";
 import { DEFAULT_FUNDING } from "./perp/funding.ts";
-import { DEFAULT_SOURCE } from "./market/pricefeed.ts";
+import { DEFAULT_SOURCES } from "./market/pricefeed.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
@@ -105,10 +105,16 @@ function serializeState() {
 			updates: view.oracle.seq + 1,
 			live: m != null,
 			mine: view.oracle.id === me, // is THIS node the publisher?
-			// the real number's provenance (publisher-local): where it's fetched, the
-			// JSON key-path, the raw value pulled, and the parsed price.
+			// the real number's provenance (publisher-local): the average method, every
+			// feed's endpoint/key/raw/value, and how fresh. null on non-publisher nodes.
 			source: src
-				? { endpoint: src.endpoint, key: src.key, raw: src.raw, value: src.value != null ? src.value.toString() : null, error: src.error ?? null, ageMs: Date.now() - src.at }
+				? {
+						method: src.method, // e.g. "average of 3/3 sources"
+						value: src.value != null ? src.value.toString() : null, // the averaged price posted
+						used: src.used,
+						ageMs: Date.now() - src.at,
+						feeds: src.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })),
+					}
 				: null,
 		},
 	];
@@ -302,11 +308,16 @@ createServer((req, res) => {
 
 	// Oracle publisher: only the node holding the oracle seed should run it
 	// (GAVL_ORACLE_PUBLISH=1). Price source:
-	//   GAVL_BTC_PRICE       → a fixed dev price (overrides the feed), else
-	//   GAVL_ORACLE_URL+_KEY → fetch a real price (defaults to Coinbase BTC-USD spot).
+	//   GAVL_BTC_PRICE       → a fixed dev price (overrides the feeds), else
+	//   GAVL_ORACLE_URL+_KEY → a single custom feed, else
+	//   default              → AVERAGE of 3 BTC feeds (Coinbase, Kraken, Bitstamp).
 	// Everyone else just folds the signed posts.
-	const source = process.env.GAVL_BTC_PRICE ? { fixed: BigInt(process.env.GAVL_BTC_PRICE) } : { url: process.env.GAVL_ORACLE_URL ?? DEFAULT_SOURCE.url, key: process.env.GAVL_ORACLE_KEY ?? DEFAULT_SOURCE.key };
-	const publishOracle = process.env.GAVL_ORACLE_PUBLISH === "1" ? { seedHex: process.env.GAVL_ORACLE_SEED, source, everyMs: Number(process.env.GAVL_ORACLE_MS ?? "5000") } : undefined;
+	const sources = process.env.GAVL_BTC_PRICE
+		? [{ fixed: BigInt(process.env.GAVL_BTC_PRICE) }]
+		: process.env.GAVL_ORACLE_URL
+			? [{ url: process.env.GAVL_ORACLE_URL, key: process.env.GAVL_ORACLE_KEY }]
+			: DEFAULT_SOURCES;
+	const publishOracle = process.env.GAVL_ORACLE_PUBLISH === "1" ? { seedHex: process.env.GAVL_ORACLE_SEED, sources, everyMs: Number(process.env.GAVL_ORACLE_MS ?? "5000") } : undefined;
 	await daemon.startConsensus({ network: NETWORK, mesh: MESH, farm: FARM, publishOracle });
 	const c = daemon.consensus();
 	console.log(`  → mesh ${c.mesh ? "joined" : "off"}, ${c.peers} peer(s), farming ${c.farming ? "live" : "off"}`);

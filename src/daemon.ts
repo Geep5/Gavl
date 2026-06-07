@@ -23,8 +23,8 @@ import { Account } from "./market/account.ts";
 import { computeView, finalizedView } from "./market/btc.ts";
 import type { View } from "./market/btc.ts";
 import { oracleKeyPair } from "./market/oracle.ts";
-import { readPrice } from "./market/pricefeed.ts";
-import type { PriceSource, PriceReading } from "./market/pricefeed.ts";
+import { readPriceAggregate } from "./market/pricefeed.ts";
+import type { PriceSource, AggregateReading } from "./market/pricefeed.ts";
 import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
 import { defaultParams } from "./config.ts";
@@ -134,7 +134,7 @@ export class Daemon {
 	private meshOn = false;
 	private farmOn = false;
 	private publishing = false;
-	private lastOracleSource: (PriceReading & { at: number }) | null = null;
+	private lastOracleSource: (AggregateReading & { at: number }) | null = null;
 	/** Wall-clock arrival times (ms) of recent tip heights — for a measured anchor cadence.
 	 *  Display-only (never touches the deterministic fold), so Date.now() is fine here. */
 	private readonly anchorTimes: { height: number; at: number }[] = [];
@@ -323,7 +323,7 @@ export class Daemon {
 	}
 
 	/** Join the live mesh and (optionally) start farming anchors. Resilient to a missing network. */
-	async startConsensus(opts: { network?: string; mesh: boolean; farm: boolean; publishOracle?: { seedHex?: string; source: PriceSource; everyMs: number } }): Promise<void> {
+	async startConsensus(opts: { network?: string; mesh: boolean; farm: boolean; publishOracle?: { seedHex?: string; sources: PriceSource[]; everyMs: number } }): Promise<void> {
 		if (opts.network) this.network = opts.network;
 		this.meshOn = opts.mesh;
 		this.farmOn = opts.farm;
@@ -364,7 +364,7 @@ export class Daemon {
 	 * Only the node holding the oracle seed runs this; everyone else folds the signed
 	 * posts. Each fetch is recorded (endpoint, key, raw, value) for transparency.
 	 */
-	private startOraclePublisher(opts: { seedHex?: string; source: PriceSource; everyMs: number }): void {
+	private startOraclePublisher(opts: { seedHex?: string; sources: PriceSource[]; everyMs: number }): void {
 		const kp = oracleKeyPair(opts.seedHex);
 		const oraclePub = toHex(kp.publicKey);
 		const oracle = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: kp });
@@ -373,11 +373,11 @@ export class Daemon {
 			// seq continues from whatever the chain already has (survives restarts).
 			let seq = (this.view().oracle.seq ?? -1) + 1;
 			while (this.publishing) {
-				const reading = await readPrice(opts.source);
-				this.lastOracleSource = { ...reading, at: Date.now() }; // display-only metadata
-				if (reading.value != null) {
+				const agg = await readPriceAggregate(opts.sources); // fetch all, average the responders
+				this.lastOracleSource = { ...agg, at: Date.now() }; // display-only metadata
+				if (agg.value != null) {
 					try {
-						await oracle.postPrice(oraclePub, reading.value, seq);
+						await oracle.postPrice(oraclePub, agg.value, seq);
 						seq++;
 					} catch {
 						/* a post failed (e.g. mid-restart) — retry next tick */
@@ -387,13 +387,12 @@ export class Daemon {
 			}
 		};
 		void loop();
-		const where = opts.source.url ?? "fixed price";
-		console.log(`  oracle: publishing BTC price as ${oraclePub.slice(0, 16)}… from ${where} every ${opts.everyMs}ms`);
+		console.log(`  oracle: publishing BTC price as ${oraclePub.slice(0, 16)}… (avg of ${opts.sources.length} source(s)) every ${opts.everyMs}ms`);
 	}
 
-	/** The publisher's latest price-source reading (endpoint/key/raw/value), or null
-	 *  if this node isn't publishing. Local display metadata, never on-chain. */
-	oracleSource(): (PriceReading & { at: number }) | null {
+	/** The publisher's latest aggregate reading (per-source endpoint/key/raw/value +
+	 *  the average), or null if this node isn't publishing. Local metadata, never on-chain. */
+	oracleSource(): (AggregateReading & { at: number }) | null {
 		return this.lastOracleSource;
 	}
 

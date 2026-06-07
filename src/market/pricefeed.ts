@@ -31,6 +31,35 @@ export interface PriceReading {
 /** Sensible default: Coinbase BTC-USD spot, no API key required. */
 export const DEFAULT_SOURCE: PriceSource = { url: "https://api.coinbase.com/v2/prices/BTC-USD/spot", key: "data.amount" };
 
+/** Three independent BTC-USD feeds (no API keys). The publisher averages the ones
+ *  that respond, so one source being down/wrong/manipulated can't set the price. */
+export const DEFAULT_SOURCES: PriceSource[] = [
+	{ url: "https://api.coinbase.com/v2/prices/BTC-USD/spot", key: "data.amount" },
+	{ url: "https://api.kraken.com/0/public/Ticker?pair=XBTUSD", key: "result.XXBTZUSD.c.0" },
+	{ url: "https://www.bitstamp.net/api/v2/ticker/btcusd/", key: "last" },
+];
+
+export interface AggregateReading {
+	value: bigint | null; // average of the sources that responded (floored), or null if none did
+	method: string; // human description, e.g. "average of 3/3 sources"
+	used: number; // how many sources contributed
+	readings: PriceReading[]; // per-source detail (value/raw/endpoint/key/error)
+}
+
+/**
+ * Fetch every source concurrently and AVERAGE the ones that returned a number.
+ * A failed/missing source is simply excluded — the price still posts as long as
+ * at least one responds. Returns the average plus each source's reading, so the
+ * full provenance (every endpoint, key, raw value) stays visible.
+ */
+export async function readPriceAggregate(sources: PriceSource[]): Promise<AggregateReading> {
+	const readings = await Promise.all(sources.map((s) => readPrice(s)));
+	const ok = readings.filter((r) => r.value != null);
+	if (ok.length === 0) return { value: null, method: `average of 0/${sources.length} sources`, used: 0, readings };
+	const sum = ok.reduce((a, r) => a + r.value!, 0n);
+	return { value: sum / BigInt(ok.length), method: `average of ${ok.length}/${sources.length} sources`, used: ok.length, readings };
+}
+
 /** Read a dot-path (e.g. "data.amount") out of a parsed JSON object. */
 function getPath(obj: unknown, path: string): unknown {
 	return path.split(".").reduce<unknown>((o, k) => (o != null && typeof o === "object" ? (o as Record<string, unknown>)[k] : undefined), obj);
