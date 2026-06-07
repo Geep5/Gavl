@@ -129,12 +129,12 @@
 		{/if}
 	{/each}
 	<div class="trust">
-		<div class="trust-title">What's decentralized here — and the one thing that isn't</div>
+		<div class="trust-title">What's trustless, what's transparent, and the one thing you trust</div>
 		<div class="trow ok"><span class="tmark">✓</span><span><strong>Consensus</strong> — every node independently validates, orders, and stores the ledger. No single node is trusted, and the price isn't fetched per-node: it's one signed value all nodes fold identically.</span></div>
-		<div class="trow ok"><span class="tmark">✓</span><span><strong>Signature</strong> — every node checks the price was signed by the oracle key, so it can't be forged or altered in transit.</span></div>
-		<div class="trow ok"><span class="tmark">✓</span><span><strong>Data</strong> — averaged over 3 independent exchanges, so one wrong or offline feed can't skew it (and you can audit each above).</span></div>
-		<div class="trow warn"><span class="tmark">⚠</span><span><strong>Price authority — the one trusted part.</strong> Verifying the signature proves <em>who</em> posted the price, not that it's <em>true</em>. Nothing on-chain knows the real BTC price, so the key-holder is trusted not to lie. A bad signer's (correctly-signed) lie would be accepted by every node.</span></div>
-		<div class="trow next"><span class="tmark">→</span><span>Removed in a later version by multiple <em>independent</em> signers each posting a price, with the chain taking the <strong>median</strong> — then no single key can move the mark.</span></div>
+		<div class="trow ok"><span class="tmark">✓</span><span><strong>Signature</strong> — every node checks the price was signed by the oracle, so it can't be forged or altered in transit.</span></div>
+		<div class="trow ok"><span class="tmark">✓</span><span><strong>Disclosed sources</strong> — the oracle publishes <em>on-chain</em> the exact public endpoints it averages (shown above), so every client sees what it's trusting — and anyone can fetch those same feeds to confirm the posted price matches.</span></div>
+		<div class="trow warn"><span class="tmark">⚠</span><span><strong>The price itself — what you trust.</strong> Nothing on-chain <em>knows</em> the real BTC price; it's reported by the oracle. So you trust the oracle to report honestly — but because its sources are public and disclosed, a wrong price is openly <em>detectable</em>, not hidden. The honest limit: disclosure gives detection and accountability, not prevention — a compromised oracle could still post a bad price that settles before anyone reacts.</span></div>
+		<div class="trow next"><span class="tmark">→</span><span>This is a deliberate choice: <em>one</em> transparent, auditable oracle. To remove even that trust, a later version can run multiple <em>independent</em> oracles and take an on-chain <strong>median</strong>, so no single one can move the mark.</span></div>
 	</div>
 </div>
 
