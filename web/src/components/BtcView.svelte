@@ -171,11 +171,21 @@
 		<h3>Your positions</h3>
 		{#each m.myPositions as p}
 			<div class="pos">
-				<span class="pside {p.side}">{p.instrument === "BTC-BULL" ? "BULL" : "BEAR"}</span>
-				<span class="mono">{(Number(p.size) / 1_000_000).toPrecision(3)} BTC @ {fmt(p.entry)}</span>
-				<span class="muted">margin {fmt(p.margin)}</span>
-				<span class="pnl" class:up={Number(p.pnl) > 0} class:down={Number(p.pnl) < 0}>{Number(p.pnl) > 0 ? "+" : ""}{fmt(p.pnl)}</span>
-				<button class="mini" onclick={() => close(p.id)}>close</button>
+				<div class="prow">
+					<span class="pside {p.side}">{p.instrument === "BTC-BULL" ? "BULL" : "BEAR"}</span>
+					<span class="mono">{(Number(p.size) / 1_000_000).toPrecision(3)} BTC @ {fmt(p.entry)}</span>
+					<span class="muted">margin {fmt(p.margin)}</span>
+					<span class="pnl" class:up={Number(p.pnl) > 0} class:down={Number(p.pnl) < 0}>{Number(p.pnl) > 0 ? "+" : ""}{fmt(p.pnl)}</span>
+					<button class="mini" onclick={() => close(p.id)}>close</button>
+				</div>
+				<div class="liq">
+					{#if p.liq == null}
+						<span class="liq-safe">✓ no liquidation — you only lose value as price moves against you</span>
+					{:else}
+						<span class="liq-warn">✕ liquidates if BTC {p.side === "buy" ? "falls to" : "rises to"} <strong>{fmt(p.liq)}</strong></span>
+						{#if priceNum}<span class="liq-dist">· {(Math.abs(priceNum - Number(p.liq)) / priceNum * 100).toFixed(1)}% away</span>{/if}
+					{/if}
+				</div>
 			</div>
 		{/each}
 	</div>
@@ -230,8 +240,14 @@
 	button.primary.bull { background: var(--green); }
 	button.primary.bear { background: var(--red); color: #fff; }
 
-	.pos { display: flex; align-items: center; gap: 0.6rem; font-size: 0.85rem; padding: 0.4rem 0; border-top: 1px solid var(--border); }
+	.pos { padding: 0.5rem 0; border-top: 1px solid var(--border); }
 	.pos:first-of-type { border-top: none; }
+	.prow { display: flex; align-items: center; gap: 0.6rem; font-size: 0.85rem; }
+	.liq { font-size: 0.74rem; margin-top: 0.25rem; padding-left: 0.1rem; }
+	.liq-warn { color: var(--red); }
+	.liq-warn strong { color: var(--red); font-variant-numeric: tabular-nums; }
+	.liq-safe { color: var(--green); }
+	.liq-dist { color: var(--muted); }
 	.pside { font-weight: 700; font-size: 0.68rem; padding: 0.1rem 0.4rem; border-radius: 4px; }
 	.pside.buy { color: var(--green); border: 1px solid var(--green); }
 	.pside.sell { color: var(--red); border: 1px solid var(--red); }

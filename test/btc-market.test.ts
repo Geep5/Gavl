@@ -142,6 +142,25 @@ test("BULL profits when BTC rises: close returns margin + PnL, conserved", async
 	assert.equal(totalCredit(), before, "credit conserved across the profitable close");
 });
 
+test("liquidation price matches the actual liquidation rule", async () => {
+	const { liquidationPrice, liquidatable, SIZE_SCALE } = await import("../src/perp/engine.ts");
+	// 2× long: margin 1000, entry 50000 → notional 2000 → size 0.04 BTC
+	const longP = { id: "L", owner: "x", side: "buy", size: (2000n * SIZE_SCALE) / 50000n, entry: 50000n, margin: 1000n };
+	const Llong = liquidationPrice(longP);
+	assert.ok(Llong && Llong > 26_000n && Llong < 26_400n, `2× long liq ≈ 26.3k (got ${Llong})`);
+	assert.equal(liquidatable(longP, Llong - 1000n), true, "below the liq price → liquidatable");
+	assert.equal(liquidatable(longP, Llong + 1000n), false, "above the liq price → safe");
+
+	// 2× short: liquidates ABOVE entry (~71.4k)
+	const shortP = { id: "S", owner: "y", side: "sell", size: (2000n * SIZE_SCALE) / 50000n, entry: 50000n, margin: 1000n };
+	const Lshort = liquidationPrice(shortP);
+	assert.ok(Lshort && Lshort > 71_000n && Lshort < 71_600n, `2× short liq ≈ 71.4k (got ${Lshort})`);
+
+	// 1× long: fully collateralized → no liquidation
+	const oneX = { id: "O", owner: "z", side: "buy", size: (1000n * SIZE_SCALE) / 50000n, entry: 50000n, margin: 1000n };
+	assert.equal(liquidationPrice(oneX), null, "1× long has no liquidation price");
+});
+
 test("conservation: credit is only created by farm, never by the pool", async () => {
 	const { node, mk } = setup();
 	const a = mk();

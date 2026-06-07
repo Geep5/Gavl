@@ -98,6 +98,31 @@ export function liquidatable(p: Position, mark: bigint, bps: bigint = 500n): boo
 	return equity(p, mark) <= maintenanceMargin(p, mark, bps);
 }
 
+/**
+ * The mark price at which this position gets liquidated — the price you "can't be
+ * more wrong than." Solves equity(L) == maintenance(L) for L, using the SAME
+ * constants as `liquidatable`, so the displayed number always matches reality.
+ *
+ *   long:  L = (margin·SCALE − entry·size)·10000 / (size·(bps − 10000))   (below entry)
+ *   short: L = (margin·SCALE + entry·size)·10000 / (size·(bps + 10000))   (above entry)
+ *
+ * Returns null when there's effectively no liquidation (a 1× long: equity tracks
+ * notional and always clears maintenance until price ~0).
+ */
+export function liquidationPrice(p: Position, bps: bigint = 500n): bigint | null {
+	if (p.size <= 0n) return null;
+	const TEN_K = 10_000n;
+	if (p.side === "buy") {
+		const num = (p.margin * SIZE_SCALE - p.entry * p.size) * TEN_K;
+		const denom = p.size * (bps - TEN_K); // negative (bps < 10000)
+		const L = num / denom;
+		return L > 0n ? L : null; // ≤0 → fully collateralized, no real liquidation
+	}
+	const num = (p.margin * SIZE_SCALE + p.entry * p.size) * TEN_K;
+	const denom = p.size * (bps + TEN_K);
+	return num / denom;
+}
+
 // ── epoch-TWAP mark price ────────────────────────────────────────
 
 /** A trade observation folded into the TWAP (price at an anchor height). */

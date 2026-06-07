@@ -21,7 +21,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { Daemon } from "./daemon.ts";
 import { mark, creditOf, BTC_ORACLE, MAX_LEVERAGE, skewBps, fundingRateBps } from "./market/btc.ts";
 import { backingBps, totalOwed } from "./perp/pool.ts";
-import { unrealizedPnl } from "./perp/engine.ts";
+import { unrealizedPnl, liquidationPrice } from "./perp/engine.ts";
 import { DEFAULT_FUNDING } from "./perp/funding.ts";
 import { DEFAULT_SOURCES } from "./market/pricefeed.ts";
 
@@ -75,15 +75,19 @@ function serializeState() {
 	// my open positions (bull/bear), with live PnL at the current mark
 	const myPositions = [...view.positions.values()]
 		.filter((p) => p.owner === me)
-		.map((p) => ({
-			id: p.id,
-			instrument: p.instrument,
-			side: p.side,
-			size: p.size.toString(),
-			entry: p.entry.toString(),
-			margin: p.margin.toString(),
-			pnl: m != null ? unrealizedPnl(p, m).toString() : null,
-		}));
+		.map((p) => {
+			const liq = liquidationPrice(p); // price at which you're force-closed, or null (1× = none)
+			return {
+				id: p.id,
+				instrument: p.instrument,
+				side: p.side,
+				size: p.size.toString(),
+				entry: p.entry.toString(),
+				margin: p.margin.toString(),
+				pnl: m != null ? unrealizedPnl(p, m).toString() : null,
+				liq: liq != null ? liq.toString() : null, // null → no liquidation (fully collateralized)
+			};
+		});
 
 	// the single shared pool: backing ratio (insolvency visible) + live funding
 	const skew = m != null ? skewBps(view.positions.values(), m) : 0n;
