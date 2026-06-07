@@ -122,11 +122,14 @@
 			<div class="osource muted tiny">Source not disclosed — published by a remote oracle node (only the signed price is on-chain).</div>
 		{/if}
 	{/each}
-	<p class="muted tiny disclaimer">
-		The price comes from this signing key — whoever holds it sets the mark the whole market settles against. It's
-		signed on-chain (every node verifies the signature), but it is <strong>the v1 trust assumption</strong>: a single
-		signer. Future versions allow multiple oracles with a median, and let instruments choose which they trust.
-	</p>
+	<div class="trust">
+		<div class="trust-title">What's decentralized here — and the one thing that isn't</div>
+		<div class="trow ok"><span class="tmark">✓</span><span><strong>Consensus</strong> — every node independently validates, orders, and stores the ledger. No single node is trusted, and the price isn't fetched per-node: it's one signed value all nodes fold identically.</span></div>
+		<div class="trow ok"><span class="tmark">✓</span><span><strong>Signature</strong> — every node checks the price was signed by the oracle key, so it can't be forged or altered in transit.</span></div>
+		<div class="trow ok"><span class="tmark">✓</span><span><strong>Data</strong> — averaged over 3 independent exchanges, so one wrong or offline feed can't skew it (and you can audit each above).</span></div>
+		<div class="trow warn"><span class="tmark">⚠</span><span><strong>Price authority — the one trusted part.</strong> Verifying the signature proves <em>who</em> posted the price, not that it's <em>true</em>. Nothing on-chain knows the real BTC price, so the key-holder is trusted not to lie. A bad signer's (correctly-signed) lie would be accepted by every node.</span></div>
+		<div class="trow next"><span class="tmark">→</span><span>Removed in a later version by multiple <em>independent</em> signers each posting a price, with the chain taking the <strong>median</strong> — then no single key can move the mark.</span></div>
+	</div>
 </div>
 
 <!-- open a position -->
@@ -245,6 +248,17 @@
 	.depline { display: flex; gap: 0.4rem; }
 	.depline input { flex: 1; }
 	.disclaimer { margin: 0.7rem 0 0; line-height: 1.4; }
+
+	/* trust-model breakdown */
+	.trust { margin-top: 0.8rem; padding: 0.7rem 0.8rem; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; }
+	.trust-title { font-size: 0.78rem; font-weight: 700; margin-bottom: 0.5rem; }
+	.trow { display: flex; gap: 0.5rem; font-size: 0.74rem; line-height: 1.45; padding: 0.18rem 0; color: var(--muted); }
+	.trow strong { color: var(--text); }
+	.tmark { flex: 0 0 1rem; text-align: center; font-weight: 700; }
+	.trow.ok .tmark { color: var(--green); }
+	.trow.warn .tmark { color: var(--accent); }
+	.trow.warn { color: var(--text); }
+	.trow.next .tmark { color: var(--muted); }
 
 	/* oracle panel */
 	.orow { display: flex; align-items: center; gap: 0.7rem; padding: 0.5rem 0; border-top: 1px solid var(--border); }
