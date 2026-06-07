@@ -22,6 +22,7 @@ import { Daemon } from "./daemon.ts";
 import { splitBalKey, balanceOf } from "./auction/state.ts";
 import { markPrice } from "./perp/market.ts";
 import { backingBps, totalOwed } from "./perp/pool.ts";
+import { skewBps, fundingRateBps, DEFAULT_FUNDING } from "./perp/funding.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
@@ -145,6 +146,9 @@ function serializeState() {
 			.filter((p) => p.owner === me)
 			.map((p) => ({ id: p.id, side: p.side, size: p.size.toString(), entry: p.entry.toString(), margin: p.margin.toString() }));
 		const sym = view.coins.get(m.collateral)?.symbol ?? m.collateral.slice(0, 8);
+		// Live funding: skew (signed OI imbalance) → clamped rate. Needs a mark to value notional.
+		const skew = mark != null ? skewBps(m.positions.values(), mark) : 0n;
+		const rate = fundingRateBps(skew, DEFAULT_FUNDING);
 		return {
 			id: m.id,
 			name: m.name,
@@ -155,6 +159,11 @@ function serializeState() {
 			owed: totalOwed(m.pool).toString(),
 			backingBps: Number(backingBps(m.pool)), // 10000 = 100% backed; < 10000 = insolvent
 			openPositions: m.positions.size,
+			// live funding readout: skewBps + which side pays + rate per epoch
+			skewBps: Number(skew), // +10000 all long, −10000 all short, 0 balanced
+			fundingRateBps: Number(rate), // signed; >0 longs pay, <0 shorts pay
+			fundingPays: rate > 0n ? "longs" : rate < 0n ? "shorts" : "none",
+			fundingEpochAnchors: DEFAULT_FUNDING.epochAnchors,
 			myPositions,
 		};
 	});
