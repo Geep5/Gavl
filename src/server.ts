@@ -273,7 +273,12 @@ createServer((req, res) => {
 		console.log(`  storage: in-memory only (GAVL_PERSIST=off) — writes are lost on restart`);
 	}
 
-	await daemon.startConsensus({ network: NETWORK, mesh: MESH, farm: FARM });
+	// Oracle publisher: only the node holding the oracle seed should run it
+	// (GAVL_ORACLE_PUBLISH=1). v1 price source is a fixed dev price (GAVL_BTC_PRICE,
+	// default 50000) — a real feed swaps in here later. Everyone else just folds
+	// the signed posts.
+	const publishOracle = process.env.GAVL_ORACLE_PUBLISH === "1" ? { seedHex: process.env.GAVL_ORACLE_SEED, price: () => BigInt(process.env.GAVL_BTC_PRICE ?? "50000"), everyMs: Number(process.env.GAVL_ORACLE_MS ?? "5000") } : undefined;
+	await daemon.startConsensus({ network: NETWORK, mesh: MESH, farm: FARM, publishOracle });
 	const c = daemon.consensus();
 	console.log(`  → mesh ${c.mesh ? "joined" : "off"}, ${c.peers} peer(s), farming ${c.farming ? "live" : "off"}`);
 });

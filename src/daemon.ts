@@ -22,6 +22,7 @@ import { GavlNode } from "./sync/node.ts";
 import { Account } from "./market/account.ts";
 import { computeView, finalizedView } from "./market/btc.ts";
 import type { View } from "./market/btc.ts";
+import { oracleKeyPair } from "./market/oracle.ts";
 import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
 import { defaultParams } from "./config.ts";
@@ -130,6 +131,7 @@ export class Daemon {
 	/** Whether the last startConsensus joined the mesh / farmed — replayed on switch. */
 	private meshOn = false;
 	private farmOn = false;
+	private publishing = false;
 	/** Wall-clock arrival times (ms) of recent tip heights — for a measured anchor cadence.
 	 *  Display-only (never touches the deterministic fold), so Date.now() is fine here. */
 	private readonly anchorTimes: { height: number; at: number }[] = [];
@@ -208,9 +210,13 @@ export class Daemon {
 		this.store = new WriteStore({ dir, policy });
 		await this.store.ready();
 
-		// Replay persisted writes into the ledger BEFORE going live.
+		// Replay persisted writes into the ledger BEFORE going live. Seed the logical
+		// clock past the highest replayed ts so new writes are GLOBALLY monotonic —
+		// otherwise a restart resets ts to 0, colliding with persisted writes and
+		// scrambling the optimistic (ts-ordered) fold.
 		const { writes } = await this.store.replay((w) => {
 			this.node.ledger.apply(w);
+			if (w.ts > this.clock) this.clock = w.ts;
 		});
 
 		// Persist every newly-applied write (write-through, policy-filtered).
@@ -314,12 +320,14 @@ export class Daemon {
 	}
 
 	/** Join the live mesh and (optionally) start farming anchors. Resilient to a missing network. */
-	async startConsensus(opts: { network?: string; mesh: boolean; farm: boolean }): Promise<void> {
+	async startConsensus(opts: { network?: string; mesh: boolean; farm: boolean; publishOracle?: { seedHex?: string; price: () => bigint; everyMs: number } }): Promise<void> {
 		if (opts.network) this.network = opts.network;
 		this.meshOn = opts.mesh;
 		this.farmOn = opts.farm;
 
 		if (opts.mesh) await this.joinMesh();
+
+		if (opts.publishOracle) this.startOraclePublisher(opts.publishOracle);
 
 		if (opts.farm) {
 			const farmer = generateKeyPair();
@@ -344,6 +352,34 @@ export class Daemon {
 				heartbeatMs: this.heartbeatMs,
 			});
 		}
+	}
+
+	/**
+	 * Run the BTC oracle publisher: an Account holding the oracle key that signs +
+	 * submits an `oracle.post` every `everyMs` with a monotonic seq. Only the node
+	 * holding the oracle seed should run this; everyone else just folds the signed
+	 * posts. The price source is injected (dev fixed price now, real feed later).
+	 */
+	private startOraclePublisher(opts: { seedHex?: string; price: () => bigint; everyMs: number }): void {
+		const kp = oracleKeyPair(opts.seedHex);
+		const oraclePub = toHex(kp.publicKey);
+		const oracle = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: kp });
+		this.publishing = true;
+		const loop = async () => {
+			// seq continues from whatever the chain already has (survives restarts).
+			let seq = (this.view().oracle.seq ?? -1) + 1;
+			while (this.publishing) {
+				try {
+					await oracle.postPrice(oraclePub, opts.price(), seq);
+					seq++;
+				} catch {
+					/* a post failed (e.g. mid-restart) — retry next tick */
+				}
+				await new Promise((r) => setTimeout(r, opts.everyMs));
+			}
+		};
+		void loop();
+		console.log(`  oracle: publishing BTC price as ${oraclePub.slice(0, 16)}… every ${opts.everyMs}ms`);
 	}
 
 	/** The channel/network this node is currently on. */

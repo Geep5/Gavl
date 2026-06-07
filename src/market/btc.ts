@@ -23,18 +23,20 @@ import type { Op, Instrument } from "./ops.ts";
 import { isOp } from "./ops.ts";
 import { emptyPool, lockMargin, deposit as poolDeposit, closeAgainstPool } from "../perp/pool.ts";
 import type { Pool } from "../perp/pool.ts";
-import { marginRequired, liquidatable, unrealizedPnl } from "../perp/engine.ts";
+import { liquidatable, unrealizedPnl, SIZE_SCALE } from "../perp/engine.ts";
 import type { Position } from "../perp/engine.ts";
 import { skewBps, fundingRateBps, fundingPayment, DEFAULT_FUNDING } from "../perp/funding.ts";
 import { finalizedOrdering } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
+import { oraclePubHex } from "./oracle.ts";
 
 // ── consensus constants (every node must agree) ──────────────────
 
 /** The single hardcoded BTC price oracle for v1 (its Ed25519 pubkey hex).
- *  Placeholder zero key until the real publisher key is set; generic so more
- *  oracles/instruments can be registered later. */
-export const BTC_ORACLE = "00".repeat(32);
+ *  Derived from a fixed seed (see oracle.ts) so the constant is a REAL key the
+ *  publisher can sign with; generic so more oracles/instruments register later.
+ *  Override the seed (and thus this) via GAVL_ORACLE_SEED for a real deployment. */
+export const BTC_ORACLE = oraclePubHex(process.env.GAVL_ORACLE_SEED);
 
 /** Native credit minted per `credit.farm` write (policy-fixed, not caller-chosen). */
 export const FARM_REWARD = 1000n;
@@ -167,8 +169,9 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
 			const leverage = parseAmount(op.leverage);
 			if (margin === null || leverage === null) return;
 			if (!leverageOk(leverage)) return;
-			// size = notional / mark; notional = margin × leverage
-			const size = (margin * leverage) / m;
+			// size = notional × SIZE_SCALE / mark (fixed-point, so fractional units are
+			// possible even when price ≫ margin); notional = margin × leverage.
+			const size = (margin * leverage * SIZE_SCALE) / m;
 			if (size <= 0n) return;
 			if (bal(view.credit, w.writer) < margin) return;
 			add(view.credit, w.writer, -margin); // escrow credit → pool

@@ -38,12 +38,22 @@ function dir(side: Side): bigint {
 }
 
 /**
- * Unrealized PnL at `mark`: (mark − entry) × size × dir.
+ * SIZE_SCALE — fixed-point scale for `size`, so positions can be FRACTIONAL units
+ * of the underlying. Without it, integer size truncates to 0 whenever the price
+ * exceeds the margin (e.g. margin 1000 at BTC 50000 → size 0). With it, size is
+ * carried in micro-units: `size = notional × SIZE_SCALE / price`, and value
+ * (PnL/notional/maintenance) divides back down by SIZE_SCALE. 1e6 = micro-unit
+ * granularity; consensus constant (every node must agree).
+ */
+export const SIZE_SCALE = 1_000_000n;
+
+/**
+ * Unrealized PnL at `mark`: (mark − entry) × size × dir / SIZE_SCALE.
  * Long profits when mark > entry; short profits when mark < entry. Exactly
  * equal-and-opposite for the two sides of the same fill → zero-sum.
  */
 export function unrealizedPnl(p: Position, mark: bigint): bigint {
-	return (mark - p.entry) * p.size * dir(p.side);
+	return ((mark - p.entry) * p.size * dir(p.side)) / SIZE_SCALE;
 }
 
 /** Equity backing a position = margin + unrealized PnL. Liquidatable when ≤ maintenance. */
@@ -81,7 +91,7 @@ export function marginRequired(size: bigint, price: bigint, leverage: bigint = 1
  * at the mark. Expressed as basis points (e.g. 500 = 5%).
  */
 export function maintenanceMargin(p: Position, mark: bigint, bps: bigint = 500n): bigint {
-	return (p.size * mark * bps) / 10_000n;
+	return (p.size * mark * bps) / (10_000n * SIZE_SCALE);
 }
 
 export function liquidatable(p: Position, mark: bigint, bps: bigint = 500n): boolean {

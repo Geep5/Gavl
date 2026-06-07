@@ -14,6 +14,7 @@
  */
 
 import type { Position } from "./engine.ts";
+import { SIZE_SCALE } from "./engine.ts";
 
 /** Funding parameters (consensus constants — every node must agree). */
 export interface FundingParams {
@@ -25,9 +26,10 @@ export interface FundingParams {
 
 export const DEFAULT_FUNDING: FundingParams = { maxRateBps: 50n, epochAnchors: 60 };
 
-/** Notional value of a position at `mark` = size × mark. */
+/** Notional value of a position at `mark` = size × mark / SIZE_SCALE (size is
+ *  fixed-point; see engine.SIZE_SCALE). In real collateral units. */
 export function notional(p: Position, mark: bigint): bigint {
-	return p.size * mark;
+	return (p.size * mark) / SIZE_SCALE;
 }
 
 /**
