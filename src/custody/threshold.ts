@@ -87,6 +87,44 @@ export function quorumOf(key: FundKey, n: number = key.min): Record<string, Shar
 	return out;
 }
 
-/** Production keygen (no trusted dealer). Wired next — FROST.DKG runs a multi-round
- *  protocol so no party ever sees the whole key. Exposed so the bridge can adopt it. */
-export const DKG = FROST.DKG;
+/**
+ * Production keygen — DISTRIBUTED key generation, NO trusted dealer.
+ *
+ * Runs FROST's 3-round DKG (RFC 9591 §C): each participant samples its own secret
+ * polynomial; the group key is the sum of everyone's constant terms and each final
+ * share is the sum of everyone's evaluations — so the private key is NEVER formed
+ * anywhere, not even at setup. This closes the trusted-dealer gap: with `generateFundKey`
+ * one party transiently saw the key; here no one ever does.
+ *
+ * The three rounds map onto the network like this (orchestrated in-process here for
+ * the local/test path; in production each runs on a different node and only the
+ * round-1 PUBLIC packages + point-to-point round-2 shares cross the wire — never a
+ * whole key, never a reconstructed secret):
+ *   round1 — sample polynomial, broadcast commitment + proof-of-knowledge
+ *   round2 — compute the secret share to send to each other participant
+ *   round3 — combine others' commitments + the shares sent to you → your final share
+ *
+ * The taproot ciphersuite auto-applies the BIP-341 empty-merkle-root tweak in
+ * round3, so the resulting group key is directly a valid Taproot output key.
+ * Returns a FundKey — a drop-in for thresholdSign / the bitcoin.ts address+spend.
+ */
+export function generateFundKeyDKG(min: number, max: number): FundKey {
+	const ids = Array.from({ length: max }, (_, i) => FROST.Identifier.fromNumber(i + 1));
+	// round 1 — each participant's polynomial + public commitment
+	const r1 = ids.map((id) => FROST.DKG.round1(id, { min, max }));
+	const pubId = r1.map((p) => p.public.identifier);
+	const othersOf = (k: number) => r1.filter((_, j) => j !== k).map((q) => q.public);
+	// round 2 — each participant's secret shares destined for every other participant
+	const r2 = r1.map((p, k) => FROST.DKG.round2(p.secret, othersOf(k)));
+	// round 3 — each combines others' round-1 publics + the round-2 shares sent to it
+	const r3 = r1.map((p, k) => {
+		const received = ids.map((_, j) => j).filter((j) => j !== k).map((j) => r2[j][pubId[k]]);
+		return FROST.DKG.round3(p.secret, othersOf(k), received);
+	});
+	const pub = r3[0].public as PublicPackage;
+	const shares: Record<string, Share> = {};
+	r3.forEach((res, k) => {
+		shares[pubId[k]] = res.secret as Share;
+	});
+	return { groupPubKey: pub.commitments[0], pub, shares, min, max };
+}
