@@ -1,14 +1,26 @@
 # Gavl
 
-A decentralized auction house on a **Proof-of-Space-Time cooldown ledger**, built on
-[Holepunch](https://github.com/holepunchto) (hypercore / hyperswarm / hyperdht).
+A decentralized **Bitcoin bull/bear perpetual exchange** on a **Proof-of-Space-Time
+cooldown ledger**, built on [Holepunch](https://github.com/holepunchto) (hypercore /
+hyperswarm / hyperdht).
 
-No servers, no global chain to replay from genesis. State is computed in RAM and verified
-against your current peers — and persisted to a local append-only log so it survives a
-restart. Every write must pay a **cooldown** — a proof of space (committed plot) *and* a
-proof of time (VDF) — so an attacker can't spin up a swarm of cheap identities to flood or
-grind the network. Coins are user-deployed and the house is coin-agnostic; auctions sell
-unique items, fungible coin amounts, or **sealed secrets** delivered encrypted to the winner.
+Put collateral in, go **bullish** or **bearish** on Bitcoin with bounded leverage, take
+it out worth more or less depending on how BTC moved. That's the whole product. There are
+no servers and no global chain to replay from genesis — state is computed in RAM, verified
+against your current peers, and persisted to a local append-only log. Every write pays a
+**cooldown** (a proof of space *and* a proof of time), so an attacker can't spin up cheap
+identities to flood or grind the network.
+
+The price comes from a **signed, on-chain oracle** (no internal order book). Collateral is
+**gBTC** — a 1:1 claim on real Bitcoin held in a **threshold-custody fund** that only a
+quorum can spend (no single party ever holds the key).
+
+> **Status:** the native exchange (consensus + perp + oracle) is complete and runs live.
+> The real-BTC bridge runs end-to-end on **testnet**. Mainnet is gated on an audit and
+> four named items — see [Trust model & status](#trust-model--status). Don't put real
+> mainnet BTC in it yet.
+
+---
 
 ## Why Space *and* Time
 
@@ -27,289 +39,187 @@ peers" cheap and "RAM chain / no genesis replay" possible.
 
 ### The Chia-style coupling
 
-Space and time aren't two separate gates — they're bound, the way Chia binds them:
-
-- **Quality → cooldown.** A proof of space has a *quality*; that quality sets the
-  required VDF iterations. More space ⇒ rarer (better) proofs ⇒ fewer iterations ⇒
-  shorter cooldown. Space buys throughput, proportionally. (`src/chain/iters.ts`)
-- **Infusion.** The VDF runs over a challenge that folds in the proof of space, so a
-  time proof is bound to one specific space proof — you can't reuse a VDF.
+- **Quality → cooldown.** A proof of space has a *quality*; that quality sets the required
+  VDF iterations. More space ⇒ rarer (better) proofs ⇒ fewer iterations ⇒ shorter
+  cooldown. (`src/chain/iters.ts`)
+- **Infusion.** The VDF runs over a challenge that folds in the proof of space, so a time
+  proof is bound to one specific space proof — you can't reuse a VDF.
 - **Trunk vs foliage.** The challenge is derived only from chain position
   (`writer, seq, prev, stateRoot`), never the payload, so you can't grind a cheaper
-  cooldown by varying what you write. `prev` chains to the previous write's VDF output,
-  so future challenges stay unpredictable until the sequential work reveals them.
-- **Weight.** Each write carries difficulty; a chain accrues cumulative weight — the
-  input to heaviest-chain fork choice (cross-writer selection lands in P2).
+  cooldown by varying what you write. `prev` chains to the previous write's VDF output, so
+  future challenges stay unpredictable until the sequential work reveals them.
 
-Double-spending means emitting two writes at the same sequence number — forking your own
-chain. That's self-evident equivocation: a portable fraud proof the live set slashes on.
-No global total order required.
+Real proofs are the default: **chiavdf** (proof of time, async eval so gossip never blocks)
+and **chiapos** (proof of space, securing anchors). Set `GAVL_VDF=hash` for a fast stand-in
+in tests.
 
-## Layout — P0 (cooldown) + P1 (mesh + sync)
+---
+
+## The product — BTC bull/bear
+
+1. **Deposit** real (testnet) BTC to the fund's Taproot address → mint **gBTC** 1:1.
+2. **Take a position** — Bullish (long) or Bearish (short) on Bitcoin, bounded leverage
+   (≤ 5×), collateralized in gBTC.
+3. **Withdraw** — burn gBTC → a quorum threshold-signs and broadcasts a real Bitcoin
+   transaction sending BTC back to you.
+
+### The perpetual engine (`src/perp`, `src/market/btc.ts`)
+
+Oracle-priced and **pool-as-counterparty** — there is no order book. You trade against a
+shared pool; the mark is the signed oracle price.
+
+- **Mark = the oracle**, not an internal book. (`src/market/btc.ts`)
+- **Pool-as-counterparty.** Open/close against a shared gBTC pool; no matching needed.
+- **Insolvency-possible, but honest.** A win is paid from the pool (funded by losers + LPs).
+  If the crowd is collectively right and the pool can't cover a win, the unpaid remainder
+  is **queued pay-when-able** — the pool never goes negative, no gBTC is ever minted, and
+  the shortfall is visible (a backing ratio + a per-account "owed" amount), never hidden.
+  (`src/perp/pool.ts`)
+- **Funding as solvency defense.** No spot to peg to, so funding's job is to price the
+  pool's directional risk: the crowded side pays the other, scaled by open-interest skew —
+  pushing the book back toward balance. (`src/perp/funding.ts`)
+- **Bounded leverage + liquidation.** Leverage is capped because the clock is slow
+  (liquidation finalizes minutes deep). A position's liquidation price is shown up front;
+  a fully-collateralized 1× long has none (loss is capped at margin). (`src/perp/engine.ts`)
+- **Conservation, proven.** Collateral is never created or destroyed; PnL is zero-sum
+  between the sides. Tested as a hard invariant.
+
+### The oracle (`src/market/oracle.ts`, `src/market/pricefeed.ts`)
+
+The price is the one *trusted* part — and it's made transparent:
+
+- Prices enter as **signed `oracle.post` writes folded by every node** (monotonic seq),
+  not per-node web fetches (which would diverge).
+- The publisher averages **three independent feeds** (Coinbase, Kraken, Bitstamp), so one
+  bad/offline source can't set the mark.
+- The oracle **discloses its methodology on-chain** (`oracle.meta`) — every client sees the
+  exact endpoints + keys it derives the price from, and can audit the posted price against
+  them.
+- **The honest caveat:** verifying the signature proves *who* posted, not that the price is
+  *true*. v1 is a single signer (the one trusted party). Multiple independent signers with
+  an on-chain median is the trust-removing upgrade.
+
+---
+
+## The real-BTC bridge (`src/custody`)
+
+gBTC is a 1:1 claim on Bitcoin in a fund **no single party can spend** — secured by FROST
+threshold Schnorr (Taproot-compatible), proven against Bitcoin's own BIP340 verifier.
+
+- **Threshold signing** (`threshold.ts`) — a quorum (min-of-max) produces one valid
+  signature for the fund's single key, without anyone reconstructing it.
+- **DKG** (`threshold.ts`) — distributed key generation: the key is born as shares; no one
+  ever sees it whole, even at setup.
+- **Taproot binding** (`bitcoin.ts`) — the fund key → a real `bc1p…` / `tb1p…` address; a
+  quorum's withdrawal signature is BIP340-valid (verified against the BIP341 test vector).
+- **Withdrawal txs** (`btctx.ts`) — build the real BIP-341 sighash from the fund's UTXOs,
+  threshold-sign, broadcast (via `@scure/btc-signer`).
+- **Bridge ledger** (`bridge.ts`) — deposit → mint gBTC; burn → pending withdrawal →
+  settle once the payout confirms. Invariant: `reserves == gBTC outstanding + pending`.
+- **Deposit watcher** (`watcher.ts`, `esplora.ts`) — verifies a real on-chain deposit (via
+  Esplora, reorg-safe) before minting; the reverse path broadcasts withdrawals.
+- **Proof of reserves** — the daemon polls the fund's real on-chain balance and reconciles
+  it against the ledger's reserves, flagging any shortfall (the solvency check a custodial
+  bridge must run).
+
+The Phase-0 spikes — Shamir secret sharing, proactive resharing under churn, and
+VDF-seeded stake-weighted committee sampling (`custody/{shamir,reshare,sampling}.ts`) — are
+the foundation for rotating the committee that holds the shares.
+
+---
+
+## Consensus (`src/consensus`)
+
+- **Anchor chain** — PoST-proven head certificates. Heaviest-cumulative-weight fork choice
+  + depth finality (a locked anchor can't be reverted by a heavier fork).
+- **Anchor-epoch canonical order** — cross-epoch order is bound to PoST weight, not
+  timestamps, neutralizing the `ts`-reorder attack while respecting funding causality.
+- **Difficulty as pace** — deterministic retarget so the VDF cost is the cadence; weight ∝
+  VDF work.
+- **App/consensus split** — `consensus/order.ts` is application-agnostic (it yields the
+  PoST-bound ordering); the market fold composes it. Consensus never imports app state.
+
+State sync is epidemic: nodes compare a `stateRoot`, diff-pull what's missing, and join a
+hyperdht topic whose name *is* the network identity.
+
+---
+
+## Layout
 
 ```
-src/det/canonical.ts   deterministic canonical bytes + sha256
-src/det/ed25519.ts     raw-key Ed25519 (ported from glon)
-src/pot/vdf.ts         Proof of Time — VDF interface
-src/pot/hash-vdf.ts    reference VDF: sequential SHA-256 chain  (P0 stand-in)
-src/pos/space.ts       Proof of Space — committed Merkle plot + verifier
-src/chain/iters.ts     Chia-style consensus math: quality→required-iters, infusion, weight
-src/chain/writer.ts    the per-writer PoST chain + equivocation detection
-src/ledger/ledger.ts   multi-writer RAM ledger: chains, heads, stateRoot, out-of-order buffer
-src/sync/node.ts       gossip protocol: writes (hello/want/writes/announce) + anchors (tip/want/chain)
-src/sync/messages.ts   wire message shapes
-src/sync/memory.ts     in-memory transport (deterministic, offline tests)
-src/sync/swarm.ts      real Hyperswarm transport — the Holepunch mesh
-src/auction/ops.ts     op types: coin.deploy / transfer / auction.create|bid|settle|cancel
-src/auction/state.ts   pure view: writes → coins + (token,pubkey) balances + items + auctions + secrets
-src/auction/account.ts wallet + auctioneer: deploy coins, list (item/coin/secret), bid, settle, claim
-src/secret/seal.ts     sealed-secret crypto: X25519 sealed boxes + commitment + at-rest vault key
-src/secret/vault.ts    per-account local secret store (selling secrets + inbox key + won inventory)
-src/store/store.ts     durable write store — one hypercore per writer, replays into the ledger on boot
-src/store/policy.ts    persist policy ("save only what I care about"): keep-all / mine / compose
-src/wallet.ts          multi-identity keystore (~/.gavl/wallet.json)
-src/daemon.ts          boots Ledger + node + store + one Account/vault per identity (shared clock)
-src/server.ts          localhost JSON API the web UI drives
-web/                   Vite + Svelte SPA (connect stepper, wallet, listings, deploy-coin, create-listing)
-src/consensus/anchor.ts   PoST-proven anchor certifying a snapshot of writer-heads
-src/consensus/chain.ts    heaviest-weight fork choice + depth finality
-src/consensus/order.ts    anchor-bound canonical order → finalized (ts-attack-proof) view
-src/consensus/difficulty.ts  retarget difficulty toward a target iters-per-anchor
-src/consensus/producer.ts the farming loop: mine an anchor over the heaviest tip, gossip it
-src/consensus/space.ts    pluggable anchor space backend: SpaceProver/Verifier + stand-in engine
-src/pos/chia.ts           real chiapos Proof-of-Space backend for anchors
-src/pot/chia-vdf.ts       real Proof of Time — chiavdf Wesolowski VDF (the default Vdf)
-src/chia/proc.ts          Python bridge to chiavdf + chiapos (sync + async variants)
-src/config.ts             composition root — defaultParams() resolves the real chiavdf
-scripts/chia_proofs.py    the Python helper wrapping chiavdf + chiapos
-test/                     cooldown · ledger/sync/mesh · auction · anchors/fork-choice/hardening · seal/secret-auction · store · real chia
+src/
+  chain/         per-writer PoST write + quality→iters coupling
+  pot/  pos/     proof of time (chiavdf) · proof of space (chiapos) + stand-ins
+  ledger/        multi-writer RAM ledger + stateRoot
+  consensus/     anchor chain, fork choice, finality, difficulty, canonical order
+  sync/          hyperswarm/hyperdht mesh, gossip, peer/bootstrap management
+  store/         durable hypercore write store + selective persist policy
+  market/        the product: btc fold (gBTC + perp + oracle), ops, account, oracle, pricefeed
+  perp/          perp math: engine (PnL/liq), pool (pay-when-able), funding
+  custody/       real-BTC bridge: threshold (FROST) · DKG · Taproot · tx · ledger · watcher · esplora
+  daemon.ts      boots ledger + node + store + consensus + oracle publisher + bridge
+  server.ts      localhost JSON API for the web UI
+web/             Svelte SPA — the BTC bull/bear trading UI
 ```
 
-> Default `npm test` runs everything (incl. real chia + live mesh) when `.venv` is present;
-> the chia tests skip cleanly otherwise. `npm run test:fast` skips chia + mesh for quick iteration.
-
-### Real proofs — chiavdf / chiapos (the default)
-
-A running Gavl node uses the **real Chia primitives** by default — `defaultParams()` in
-[src/config.ts](src/config.ts) resolves to **chiavdf**, so the cooldown is genuine wall-clock
-time. The lightweight stand-ins remain available for fast, zero-dependency tests and dev.
-
-- **`ChiaVdf`** ([src/pot/chia-vdf.ts](src/pot/chia-vdf.ts)) implements `Vdf` using **chiavdf**'s
-  Wesolowski VDF over a 1024-bit class group — real non-parallelizable sequential time, cheap
-  to verify. `eval` is **async** (it runs in a subprocess) so a node keeps gossiping while the
-  VDF computes — a node doing network I/O must never block its event loop on a multi-second
-  primitive. `verify` stays synchronous (Wesolowski verification is ≈O(1)), keeping the hot
-  gossip-receive path fast.
-- **`ChiaSpaceProver`/`ChiaSpaceVerifier`** ([src/pos/chia.ts](src/pos/chia.ts)) wrap **chiapos**
-  at the anchor layer (the pluggable `SpaceProver`/`SpaceVerifier` from
-  [src/consensus/space.ts](src/consensus/space.ts)). A plot is *probabilistic* — a challenge
-  yields a proof only sometimes (Chia's farming lottery) — which is exactly the anchor/"block"
-  lottery. The plot id is bound to the producer's key, so no one can present another's plot.
-
-Both shell out to a small Python helper ([scripts/chia_proofs.py](scripts/chia_proofs.py)) —
-async (`execFile`) for the VDF eval path, sync (`spawnSync`) elsewhere. Set up the venv once:
-
-```bash
-python3.12 -m venv .venv
-.venv/bin/pip install chiavdf chiapos
-```
-
-Defaulting to `chia` **fails loudly** if the bridge is missing — Gavl never silently downgrades
-the cooldown to the insecure stand-in. Use `GAVL_VDF=hash` to opt into the stand-in explicitly
-(that's what `npm run test:fast` and the core suite use). `test/chia.test.ts` proves a real-VDF
-PoST write verifies through the pipeline and a real chiapos anchor mines + verifies.
-
-### How sync works (P1)
-
-State is every known writer's chain, held in RAM — no genesis replay, because each write
-is self-verifying. The `stateRoot` is a cheap commitment over writer *heads*. Two peers are
-"in sync" exactly when their roots match. On connect they exchange `hello` (root + heads),
-each pulls what it lacks (`want` → `writes`), and new writes spread by `announce`. The same
-protocol runs over an in-memory link (tests) or real Hyperswarm sockets; peers find each
-other on `sha256(networkName)` — the topic string *is* the network identity.
-
-### The auction house (P3) — coin-agnostic
-
-The app rides on top as op payloads: `coin.deploy`, `transfer`, `auction.create / bid /
-settle / cancel`. The view is a pure replay of all writes → coins + balances + items +
-auctions. **No token is privileged** — the protocol mints nothing on its own; the cooldown
-only rate-limits writes.
-
-- **Coins are user-deployed.** Anyone runs `coin.deploy {name, symbol, supply}`; the coin's
-  id is the deploy-write's content-address, and the full supply is minted to the deployer.
-  Balances are keyed by `(token, pubkey)` and no code path special-cases any id.
-- **List an item *or* an amount of a coin.** An auction's `give` is either a fresh unique
-  item or a fungible `{token, amount}`. The `ask` (optional) and every `bid` name their coin
-  explicitly, so you can list in one coin and be paid in another.
-- **Authorization is free.** Each op is signed by its write, so the op's actor *is*
-  `write.writer`; only the seller can settle or cancel their own auction.
-- **Escrow + per-token conservation.** Creating a coin-auction escrows the give out of the
-  seller's balance; a bid locks the bidder's coins. Settle pays the seller in the winning
-  bid's coin, hands the give to the winner, and refunds losers; cancel returns everything.
-  Invalid ops (overspend, self-bid, non-seller settle) are deterministically skipped, and no
-  coin is created or destroyed outside its own `coin.deploy`.
-
-An auction's `give` can also be a free-form **YAML offer body** (`details`) — the protocol
-stores it as an opaque, content-addressed string and never parses it; the UI validates and
-renders it. And an `ask` can be left open for bids in any coin.
-
-Two views coexist: `computeView` is the optimistic tip (provisional `ts` order), and
-`finalizedView` is the safe state behind the consensus layer (below).
-
-### Sealed-secret auctions
-
-You can also auction a **sealed secret** — a message, note, code, or credential. The flow is
-confidential and tamper-evident, with **no trusted third party**:
-
-- **List.** The seller's plaintext is encrypted at rest in a local vault
-  ([src/secret/vault.ts](src/secret/vault.ts)); the listing publishes only a **commitment**
-  = `sha256(salt‖secret)`. The plaintext never touches the wire.
-- **Bid.** Each bid carries the bidder's **X25519 inbox** (a sealed-box public key).
-- **Settle.** The seller seals the secret to the winner's inbox (libsodium `crypto_box_seal`)
-  and the settle-write publishes that ciphertext — opaque to everyone but the winner.
-- **Claim.** The winner opens it and **verifies it against the listed commitment** (so the
-  seller can't swap secrets at settle), then it lands in their local inventory + UI.
-
-> **This is confidential, verifiable *delivery* — not fair exchange.** The seller inherently
-> keeps a copy of the secret, so this is right for things whose value survives that (messages,
-> notes, codes) and **unsafe for anything that controls funds** (a private key — the seller
-> could use their copy after being paid). The UI warns loudly; the protocol can make delivery
-> private and verifiable, but it cannot make the seller forget. We explored a Cashu-style
-> blind-signature mint (which *would* make a transferable secret safe via token-swap) and
-> rejected it: a mint is a trusted custodian, which defeats the point.
-
-### Web UI + daemon
-
-A Svelte SPA (`web/`) drives a localhost daemon (`src/daemon.ts` + `src/server.ts`) that
-holds the wallet and produces writes — the VDF cooldown must run server-side, so the browser
-is a thin control panel over a JSON API. The daemon holds multiple identities with an in-UI
-switcher (so you can list as one account and bid as another locally). Run it:
-
-```bash
-npm run daemon     # JSON API on :6440, real chiavdf + live mesh + anchor farming
-npm run web:dev    # Vite SPA on :5180, proxying /api → the daemon
-```
-
-By default the daemon runs **real consensus**: it joins the live hyperswarm/hyperdht mesh
-(gossiping writes *and* anchors) and farms anchors over the heaviest tip with the real chiavdf
-cooldown. The UI's Consensus panel shows it advancing — anchor height, chain weight, finalized
-depth, peer count — and a settled auction gains a **✓ final** badge once an anchor certifies it.
-Env knobs: `GAVL_VDF=hash` (fast stand-in VDF), `GAVL_SPACE=chiapos` (real disk-cost space
-proof instead of the stand-in), `GAVL_MESH=0` (local only), `GAVL_FARM=0` (don't produce
-anchors), `GAVL_RETARGET=0` (constant difficulty), `GAVL_TARGET_ITERS=<n>` (per-anchor VDF
-cost target), `GAVL_NETWORK=<topic>` (the topic string *is* the network identity),
-`GAVL_PERSIST=all|mine|off` (durable storage policy — see below).
-
-#### Hardening against the fast-VDF reorg
-
-The realistic attack on a heaviest-chain consensus is a *reorg*: out-produce a private fork and
-revert recent history. Three things blunt it, all on by default:
-
-- **Difficulty is the pace, not a timer.** A deterministic retarget schedule (`consensus/difficulty.ts`)
-  scales per-anchor difficulty toward a target VDF cost. Since weight = Σ difficulty and
-  required-iters ∝ difficulty, out-producing the chain means out-computing its *aggregate*
-  sequential work — there is no software pacing delay to simply delete. Producer and verifier
-  derive the same difficulty from the parent chain, so they never reject each other.
-- **Real Proof of Space (`GAVL_SPACE=chiapos`).** With chiapos, producing anchors costs real
-  disk per identity — restoring the Sybil resistance the stand-in plot lacks. The stand-in
-  remains the default for instant boot; the consensus mechanics are identical either way.
-- **Sticky finality.** Once a node has seen the tip reach finality depth over an anchor, that
-  anchor is *locked*: any fork that doesn't descend from it is rejected, even if heavier. A
-  fast attacker can still win the unfinalized tip, but **cannot revert a finalized settlement** —
-  the main damage a deep reorg would do.
-
-Still open (genuine remaining work): eclipse-resistant peer sampling (today "in sync?" trusts
-your current peers, so controlling all of a node's connections can still feed it a fabricated
-chain), and anchor-level equivocation slashing.
-
-The UI: a **connect stepper** below the header surfaces the decentralized backbone as it comes
-up (daemon → identity → peer mesh → PoST cooldown → anchor chain → finality), each step from
-real state. Below it: deploy a coin, see per-coin balances, list a unique item / coin amount /
-sealed secret (priced in any coin or open-to-bids, with an optional YAML offer body),
-browse/filter listings, bid, settle/cancel your own, and **claim** secrets you've won (a
-"Ready to claim" bar surfaces them regardless of the active filter).
-
-### Durable, selective storage
-
-The ledger is held in RAM, but accepted writes are also persisted to a local
-**Holepunch `hypercore`** store (one append-only core per writer). On boot the daemon
-**replays the store into the ledger** before going live, so state survives a full restart —
-not just "as long as some peer stays up."
-
-Persistence is **selective** — you save only what you care about:
-
-- `GAVL_PERSIST=all` (default) — archiver, keep every write (full node). The network needs some of these.
-- `GAVL_PERSIST=mine` — keep only writes touching your wallet keys and their coins/auctions; everything else stays RAM-only and is dropped on restart, making your node a *partial node by choice*.
-- `GAVL_PERSIST=off` — in-memory only (writes lost on restart).
-
-> Pruning makes **your** node partial; the network only stays whole if some nodes archive.
-
-### Consensus (P2)
-
-Per-writer chains already make conservation safe (every debit is in the debitor's own
-seq-ordered chain; double-spending needs equivocation, which is a fork proof). What they
-don't give is canonical cross-account order, finality, or Sybil-bound agreement. An
-**anchor chain** provides them, Chia-style:
-
-- **Anchors.** An anchor is a PoST-proven certificate (same space+time machinery as a write)
-  of a snapshot of writer-heads. Its challenge chains from the previous anchor's VDF output,
-  so the sequence is unpredictable and ungrindable.
-- **Fork choice.** Follow the **heaviest cumulative weight** chain. Out-running it needs
-  majority space. A heavier fork reorgs; an anchor `k` deep is final (reorging it costs `k`
-  anchors of PoST).
-- **Canonical order.** Writes fold in **anchor-epoch** order — the height of the first anchor
-  that certified them — so cross-account funding order is bound to PoST weight, not `ts`. The
-  `ts` field can no longer be used to grief settlement across an anchor boundary. (Intra-epoch,
-  order falls back to the honest declared `ts`, like transaction order within a block.)
-- **Difficulty retarget.** Scale difficulty toward a target iters-per-anchor, holding the
-  anchor interval steady as total network space changes.
-- **Checkpoints.** A finalized anchor commits heads + stateRoot + cumulative weight, so a
-  fresh node trusts the heaviest chain's finalized tip and fetches only the writes up to it —
-  no genesis replay. A lighter (eclipse) fork is rejected by weight.
-
-Anchors gossip over the same mesh as writes (`anchor-tip / anchor-want / anchor-chain`), and a
-`Producer` farms them over the heaviest tip — so consensus runs end-to-end across nodes. See
-`npm run demo:consensus`: two nodes farm and gossip anchors over a real hyperdht mesh and
-finalize the same settled auction.
-
-#### Real Proof-of-Space (chiapos)
-
-The anchor space backend is pluggable (`src/consensus/space.ts`). The default stand-in is a
-light Merkle plot (fast, deterministic — used by all the consensus tests). For genuine
-disk-bound space, `src/pos/chia.ts` drives real **chiapos** through a Python helper. Setup:
-
-```bash
-python3.12 -m venv .venv && .venv/bin/pip install chiavdf chiapos
-node --test test/chiapos-anchor.test.ts   # plots a real k=18 plot once (cached), mines a real anchor
-```
-
-A plot is a real file under `~/.gavl/plots/` whose id is bound to the producer's key, so a
-producer can't present someone else's plot. Quality from chiapos's verifier feeds the same
-`requiredIters` coupling (normalized by expected plot size). The matching real VDF (chiavdf)
-is already the **default** cooldown (see "Real proofs" above), wired through the same interfaces.
+---
 
 ## Run
 
-Needs Node ≥ 23.6 (native TypeScript — no build step). You're on Node 26.
+Needs Node ≥ 23.6 (native TypeScript — no build step).
 
 ```bash
-npm test            # full suite: cooldown + ledger + gossip + mesh + auction + secrets + storage + consensus
-npm run demo        # build + verify a PoST chain, showing space→cooldown
-npm run demo:auction  # run a live auction between two nodes over a real hyperdht mesh
-npm run demo:consensus  # two nodes farm + gossip anchors, finalize the same settled auction
+npm test                 # full suite (90 tests): consensus, perp, oracle, custody, bridge, watcher
+npm run demo             # PoST cooldown chain — watch space→cooldown
+npm run demo:consensus   # two nodes farm + gossip anchors, finalize the same state over a real mesh
+
+# the live app:
+GAVL_ORACLE_PUBLISH=1 npm run daemon   # daemon: consensus + farming + 3-feed oracle publisher + bridge
+npm run web:dev                        # web UI → http://localhost:5180
 ```
+
+Useful env: `GAVL_VDF=hash` (fast stand-in VDF) · `GAVL_BTC_NET=testnet|signet|mainnet` ·
+`GAVL_ORACLE_PUBLISH=1` (this node holds the oracle key) · `GAVL_PERSIST=all|mine|off` ·
+`GAVL_MESH=0` (local only) · `GAVL_NETWORK=<channel>`.
+
+**Testnet round-trip:** open the UI → send testnet BTC to the fund address shown in the
+Custody panel → paste the txid to claim → mint gBTC → trade → withdraw → process payouts
+(broadcasts a real testnet BTC tx).
+
+---
+
+## Trust model & status
+
+What's **trustless**: consensus, ordering, storage (no node is trusted); the perp math
+(conservation proven); the threshold signing (no one holds the fund key).
+
+What's **trusted** (and surfaced honestly in the UI):
+
+- **The oracle price** — a single signer in v1 (mitigable with a multi-signer median).
+- **The bridge, on testnet** — currently **single-operator**: the daemon holds all the
+  fund's key shares (deterministic dev seed) and is the deposit attestor. Real BTC custody
+  is never zero-trust; this pushes trust as thin as it goes, but it isn't there yet.
+
+**Before any mainnet satoshi, four gates must close:**
+
+1. **Independent audit.**
+2. **Real distributed DKG** across independent nodes (not in-process).
+3. **Bonding + slashing** so the honest-majority assumption is economically enforced.
+4. **Non-public keys** — the oracle / attestor / fund keys currently derive from public dev
+   seeds (fine for testnet, instant theft on mainnet).
 
 ## Roadmap
 
-- **P0 — cooldown primitive** ✅ per-writer PoST chain, Chia-style quality→cooldown coupling, infusion, trunk/foliage split, weight, self-verifying writes, fork proofs
-- **P1 — RAM state + gossip** ✅ multi-writer RAM ledger; `stateRoot` compare + diff pull ("are we in sync?"); epidemic announce; real hyperswarm/hyperdht mesh (topic = network identity)
-- **P2 — consensus** ✅ anchor chain (PoST-proven head certificates); heaviest-weight fork choice + depth finality; anchor-epoch canonical order (neutralizes the `ts` attack); difficulty retargeting; weight-trusted checkpoints for cold-start bootstrap
-- **P3 — the auction house** ✅ coin-agnostic: user-deployed coins (`coin.deploy`), `transfer`, and `auction.create/bid/settle/cancel` selling items *or* coin amounts, priced in any coin; escrow + per-token conservation + seller-authority; runs live across the mesh
-- **Web UI** ✅ Svelte SPA + localhost daemon/API: deploy coins, multi-account wallet, create listings, bid, settle (`npm run daemon` + `npm run web:dev`)
-- **Consensus is live** ✅ anchors gossip over the mesh + a producer farms them (`demo:consensus`)
-- **Real proofs by default** ✅ chiavdf (proof of time) is the **default** cooldown via `defaultParams()` (async eval so gossip never blocks); chiapos (proof of space) secures anchors; both run live in `demo:consensus`
-- **Reorg hardening** ✅ difficulty-as-pace (deterministic retarget, weight ∝ VDF work); real chiapos space backend (`GAVL_SPACE=chiapos`); sticky finality (locked anchors can't be reverted by a heavier fork)
-- **Durable + selective storage** ✅ hypercore-backed write store, replayed into the ledger on boot (survives restart); per-write persist policy (`GAVL_PERSIST=all|mine|off`) — save only what you care about
-- **YAML offer bodies** ✅ optional free-form, opaque, content-addressed `details` on a listing; client-side validated + rendered
-- **Sealed-secret auctions** ✅ commit-on-list, sealed-box delivery to the winner's inbox, commitment-verified claim, local encrypted inventory + UI (confidential delivery, not fair exchange — surfaced loudly)
-- **P4 — remaining hardening** eclipse-resistant peer sampling; anchor-level equivocation slashing; log/anchor pruning + snapshots; incremental (non-replay) view computation
+- **Consensus** ✅ PoST cooldown · RAM ledger + gossip · anchor chain, finality, canonical
+  order, difficulty retarget, sticky finality · durable selective storage · live over a
+  real hyperdht mesh
+- **Native BTC bull/bear exchange** ✅ oracle-priced pool perp · bounded leverage ·
+  funding-as-solvency-defense · pay-when-able insolvency (visible) · liquidation · gBTC
+  collateral · Svelte trading UI
+- **Oracle** ✅ signed on-chain · 3-feed average · on-chain methodology disclosure · live
+  feeds. **Next:** multiple independent signers + median.
+- **Real-BTC bridge (testnet)** ✅ FROST threshold signing · DKG · Taproot address +
+  BIP340-valid spends · withdrawal tx build/sign/broadcast · deposit watcher · bridge
+  ledger · proof of reserves
+- **Mainnet** ⛔ gated on the four items above (audit, distributed DKG, bonding/slashing,
+  non-public keys)

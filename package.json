@@ -3,13 +3,12 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Gavl — a decentralized auction house on a Proof-of-Space-Time cooldown ledger (Holepunch).",
+  "description": "Gavl — a decentralized Bitcoin bull/bear perpetual exchange on a Proof-of-Space-Time cooldown ledger (Holepunch).",
   "scripts": {
     "test": "node --test test/*.test.ts",
-    "test:fast": "node --test test/auction.test.ts test/auction-mesh.test.ts test/consensus.test.ts test/consensus-gossip.test.ts test/ledger.test.ts test/post-cooldown.test.ts test/sync.test.ts",
+    "test:fast": "node --test test/btc-market.test.ts test/consensus.test.ts test/consensus-gossip.test.ts test/ledger.test.ts test/post-cooldown.test.ts test/sync.test.ts test/custody-threshold.test.ts test/custody-bridge.test.ts",
     "test:chia": "node --test test/chia.test.ts",
     "demo": "node src/index.ts",
-    "demo:auction": "node src/demo-auction.ts",
     "demo:consensus": "node src/demo-consensus.ts",
     "daemon": "node src/server.ts",
     "web:dev": "cd web && vite",
@@ -32,8 +31,6 @@
     "corestore": "^7.10.0",
     "hypercore": "^11.33.1",
     "hyperdht": "^6.32.0",
-    "hyperswarm": "^4.17.0",
-    "sodium-native": "^5.1.0",
-    "yaml": "^2.9.0"
+    "hyperswarm": "^4.17.0"
   }
 }
