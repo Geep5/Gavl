@@ -23,6 +23,12 @@ import { Account } from "./market/account.ts";
 import { computeView, finalizedView } from "./market/btc.ts";
 import type { View } from "./market/btc.ts";
 import { oracleKeyPair, bridgeKeyPair } from "./market/oracle.ts";
+import { fundKeyFromSeed } from "./custody/threshold.ts";
+import type { FundKey } from "./custody/threshold.ts";
+import { fundAddress as deriveFundAddress } from "./custody/bitcoin.ts";
+import { buildWithdrawalTx, signWithdrawalTx } from "./custody/btctx.ts";
+import { Esplora } from "./custody/esplora.ts";
+import { checkDeposit, utxosToInputs, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
 import { readPriceAggregate } from "./market/pricefeed.ts";
 import type { PriceSource, AggregateReading } from "./market/pricefeed.ts";
 import { Wallet } from "./wallet.ts";
@@ -413,13 +419,81 @@ export class Daemon {
 	/**
 	 * DEV: mint test gBTC to `depositor` by attesting a synthetic deposit with the
 	 * bridge attestor key (which this dev node holds). This stands in for real
-	 * BTC-deposit detection (Phase 4 #1) — the gBTC is backed by a CLAIMED reserve,
-	 * not a real on-chain BTC tx. Clearly a testnet faucet until the watcher lands.
+	 * BTC-deposit detection — the gBTC is backed by a CLAIMED reserve, not a real
+	 * on-chain BTC tx. Clearly a testnet faucet; prefer claimDeposit for real coins.
 	 */
 	private bridgeAcct?: Account;
-	async attestTestDeposit(depositor: string, amount: bigint | number | string): Promise<void> {
+	private attestor(): Account {
 		if (!this.bridgeAcct) this.bridgeAcct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: bridgeKeyPair(process.env.GAVL_BRIDGE_SEED) });
-		await this.bridgeAcct.attestDeposit(`test-${depositor.slice(0, 8)}-${this.now()}:0`, depositor, amount);
+		return this.bridgeAcct;
+	}
+	async attestTestDeposit(depositor: string, amount: bigint | number | string): Promise<void> {
+		await this.attestor().attestDeposit(`test-${depositor.slice(0, 8)}-${this.now()}:0`, depositor, amount);
+	}
+
+	// ── real-BTC bridge (testnet) ────────────────────────────────────
+
+	/** The threshold-custody fund key. TESTNET single-operator (this node holds all
+	 *  shares, deterministic from GAVL_FUND_SEED). Production = distributed DKG. */
+	private fundKeyCache?: FundKey;
+	private fundKey(): FundKey {
+		if (!this.fundKeyCache) this.fundKeyCache = fundKeyFromSeed(2, 3, process.env.GAVL_FUND_SEED ?? "gavl-testnet-fund-v1");
+		return this.fundKeyCache;
+	}
+	private esploraCache?: Esplora;
+	private esplora(): Esplora {
+		const net = process.env.GAVL_BTC_NET === "signet" ? "signet" : process.env.GAVL_BTC_NET === "mainnet" ? "mainnet" : "testnet";
+		if (!this.esploraCache || this.esploraCache.net !== net) this.esploraCache = new Esplora({ net });
+		return this.esploraCache;
+	}
+	/** Which Bitcoin network the bridge is on (testnet by default). */
+	btcNetwork(): "mainnet" | "testnet" | "signet" {
+		return this.esplora().net;
+	}
+	/** The fund's Bitcoin deposit address — send real (testnet) BTC here. */
+	fundAddress(): string {
+		return deriveFundAddress(this.fundKey(), this.btcNetwork());
+	}
+
+	/**
+	 * Verify a real BTC deposit `txid` paid the fund (via Esplora), and attest each
+	 * fund output → mints gBTC 1:1 to `depositor`. Idempotent by txid:vout. Returns
+	 * the total credited (0 if not found / not confirmed deep enough).
+	 */
+	async claimDeposit(txid: string, depositor: string): Promise<bigint> {
+		const deps = await checkDeposit(this.esplora(), this.fundAddress(), txid, MIN_CONFIRMATIONS);
+		let total = 0n;
+		for (const d of deps) {
+			await this.attestor().attestDeposit(`${d.txid}:${d.vout}`, depositor, d.amount);
+			total += d.amount;
+		}
+		return total;
+	}
+
+	/**
+	 * Settle all pending withdrawals: fetch the fund's UTXOs, build ONE payout tx to
+	 * the pending recipients (+ change back to the fund, − fee), threshold-sign it,
+	 * broadcast via Esplora, then mark each withdrawal settled. Returns the broadcast
+	 * txid, or null if there's nothing pending / insufficient confirmed UTXOs.
+	 */
+	async processWithdrawals(feeSats = 1_000n): Promise<string | null> {
+		const pending = this.view().bridge.pending;
+		if (pending.length === 0) return null;
+		const esplora = this.esplora();
+		const tip = await esplora.tipHeight();
+		const inputs = utxosToInputs(await esplora.utxos(this.fundAddress()), MIN_CONFIRMATIONS, tip);
+		const inSum = inputs.reduce((a, u) => a + u.amount, 0n);
+		const payouts = pending.map((w) => ({ address: w.btcAddress, amount: w.amount }));
+		const outSum = payouts.reduce((a, p) => a + p.amount, 0n);
+		if (inputs.length === 0 || inSum < outSum + feeSats) return null; // not enough confirmed BTC yet
+		const change = inSum - outSum - feeSats;
+		if (change > 0n) payouts.push({ address: this.fundAddress(), amount: change });
+		const unsigned = buildWithdrawalTx(this.fundKey(), { inputs, outputs: payouts, network: this.btcNetwork() });
+		const quorum = Object.fromEntries(Object.entries(this.fundKey().shares).slice(0, this.fundKey().min));
+		const { hex } = signWithdrawalTx(unsigned, this.fundKey(), quorum);
+		const txid = await esplora.broadcast(hex);
+		for (const w of pending) await this.attestor().settleWithdrawal(w.id);
+		return txid;
 	}
 
 	/** The channel/network this node is currently on. */

@@ -3,7 +3,7 @@
 	// real BTC in the threshold-custody fund. Oracle-priced (mark = the BTC oracle),
 	// pool-as-counterparty, insolvency-possible (watch the backing bar), bounded
 	// leverage, funding as the solvency defense.
-	import { store, act, myGbtc, short } from "../lib/store.svelte.js";
+	import { store, act, refresh, myGbtc, short } from "../lib/store.svelte.js";
 	import { api } from "../lib/api.js";
 
 	const m = $derived(store.market);
@@ -43,6 +43,23 @@
 		if (!wAmt || !wAddr) return;
 		await act(() => api.withdraw(wAmt, wAddr));
 		wAmt = "";
+	}
+	let claimTxid = $state("");
+	let claimMsg = $state("");
+	async function claim() {
+		if (!claimTxid.trim()) return;
+		claimMsg = "verifying on-chain…";
+		try {
+			const r = await api.claimDeposit(claimTxid.trim());
+			claimMsg = Number(r.credited) > 0 ? `credited ${Number(r.credited).toLocaleString()} gBTC` : "no confirmed fund output in that tx yet";
+			if (Number(r.credited) > 0) claimTxid = "";
+		} catch (e) {
+			claimMsg = String(e.message ?? e);
+		}
+		await refresh();
+	}
+	async function processPayouts() {
+		await act(() => api.processWithdrawals());
 	}
 	async function close(pid) {
 		await act(() => api.closePosition(pid));
@@ -95,19 +112,29 @@
 <!-- the custody fund: gBTC backed 1:1 by BTC reserves -->
 {#if m}
 	<div class="panel fund">
-		<h3>Custody fund <span class="muted small">· gBTC is a 1:1 claim on BTC held by a threshold quorum</span></h3>
-		<div class="fundrow">
-			<span class="muted">reserves (BTC in fund)</span><strong>{fmt(m.reserves)}</strong>
+		<h3>Custody fund <span class="muted small">· gBTC is a 1:1 claim on real Bitcoin held by a threshold quorum</span></h3>
+		<div class="fundrow"><span class="muted">reserves (BTC in fund)</span><strong>{fmt(m.reserves)}</strong></div>
+		<div class="fundrow"><span class="muted">gBTC outstanding</span><span>{fmt(m.gbtcOutstanding)}{Number(m.pending) > 0 ? ` · ${fmt(m.pending)} pending payout` : ""}</span></div>
+
+		<!-- DEPOSIT: send real (testnet) BTC to the fund address, then claim by txid -->
+		<div class="net-tag">{m.btcNetwork} · send BTC here to deposit</div>
+		<div class="addr mono" title="the fund's Bitcoin address">{m.fundAddress}</div>
+		<div class="depline">
+			<input placeholder="deposit txid (after you send BTC)" bind:value={claimTxid} />
+			<button class="ghost" onclick={claim} disabled={!claimTxid.trim()}>Claim</button>
 		</div>
-		<div class="fundrow">
-			<span class="muted">gBTC outstanding</span><span>{fmt(m.gbtcOutstanding)}{Number(m.pending) > 0 ? ` · ${fmt(m.pending)} pending payout` : ""}</span>
-		</div>
-		<div class="muted tiny" style="margin-top:0.3rem">Every gBTC is backed by a satoshi in the fund — withdraw burns gBTC and a quorum signs the BTC payout (no one holds the key).</div>
+		{#if claimMsg}<div class="muted tiny">{claimMsg}</div>{/if}
+
+		<!-- WITHDRAW: burn gBTC → pending → a quorum signs + broadcasts the BTC payout -->
 		<div class="depline" style="margin-top:0.5rem">
 			<input placeholder="gBTC to withdraw" bind:value={wAmt} inputmode="numeric" />
-			<input placeholder="your BTC address (bc1…)" bind:value={wAddr} />
+			<input placeholder="your BTC address (tb1…)" bind:value={wAddr} />
 			<button class="ghost" onclick={withdraw} disabled={!wAmt || !wAddr}>Withdraw</button>
 		</div>
+		{#if m.pendingCount > 0}
+			<button class="ghost full" style="margin-top:0.4rem" onclick={processPayouts}>Process {m.pendingCount} pending payout{m.pendingCount === 1 ? "" : "s"} → broadcast BTC tx</button>
+		{/if}
+		<div class="muted tiny" style="margin-top:0.4rem">Every gBTC is backed by a satoshi in the fund. Withdraw burns gBTC; a quorum threshold-signs the Bitcoin payout (no one holds the key). <strong>Testnet</strong> — not real coins.</div>
 	</div>
 {/if}
 
@@ -253,6 +280,8 @@
 	.credit { font-size: 1.8rem; font-weight: 700; font-variant-numeric: tabular-nums; margin: 0.1rem 0 0.5rem; }
 	.fundrow { display: flex; justify-content: space-between; font-size: 0.82rem; padding: 0.15rem 0; }
 	.fundrow strong { font-variant-numeric: tabular-nums; }
+	.net-tag { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent); margin: 0.6rem 0 0.2rem; }
+	.addr { font-size: 0.72rem; word-break: break-all; background: var(--panel-2); padding: 0.4rem 0.5rem; border-radius: 6px; border: 1px solid var(--border); margin-bottom: 0.4rem; }
 	.small { font-size: 0.8rem; }
 	.tiny { font-size: 0.7rem; }
 

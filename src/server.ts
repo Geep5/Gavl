@@ -156,6 +156,10 @@ function serializeState() {
 		reserves: view.bridge.reserves.toString(), // BTC sats in the fund
 		gbtcOutstanding: (totalGbtc(view.bridge) + view.pool.assets).toString(),
 		pending: pendingTotal(view.bridge).toString(), // burned, awaiting BTC payout
+		pendingCount: view.bridge.pending.length,
+		// the real Bitcoin custody fund: send (testnet) BTC here to deposit
+		fundAddress: daemon.fundAddress(),
+		btcNetwork: daemon.btcNetwork(),
 		myPositions,
 	};
 
@@ -226,6 +230,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			// Burn gBTC to redeem BTC to a Bitcoin address → a pending withdrawal.
 			await daemon.active().withdraw(String(body.amount), String(body.btcAddress));
 			return send(res, 200, { ok: true });
+		}
+		if (path === "/api/deposit/claim") {
+			// REAL deposit: verify a BTC txid paid the fund (via Esplora) → mint gBTC.
+			const credited = await daemon.claimDeposit(String(body.txid).trim(), daemon.wallet.active().pubHex);
+			return send(res, 200, { credited: credited.toString() });
+		}
+		if (path === "/api/withdrawals/process") {
+			// Build + threshold-sign + broadcast the pending withdrawals as one BTC tx.
+			const txid = await daemon.processWithdrawals();
+			return send(res, 200, { txid });
 		}
 		if (path === "/api/oracle/post") {
 			// Publish a signed BTC price. Only valid if the active account IS the oracle key.

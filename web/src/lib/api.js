@@ -17,8 +17,10 @@ export const api = {
 	setActive: (pubHex) => req("/accounts/active", "POST", { pubHex }),
 	// v1: BTC bull/bear
 	deposit: (amount) => req("/deposit", "POST", { amount }), // dev: mint test gBTC (bridge attestor)
+	claimDeposit: (txid) => req("/deposit/claim", "POST", { txid }), // REAL: verify a BTC txid → mint
 	transfer: (to, amount) => req("/transfer", "POST", { to, amount }),
 	withdraw: (amount, btcAddress) => req("/withdraw", "POST", { amount, btcAddress }),
+	processWithdrawals: () => req("/withdrawals/process", "POST", {}),
 	open: (instrument, margin, leverage) => req("/position/open", "POST", { instrument, margin, leverage }),
 	closePosition: (position) => req("/position/close", "POST", { position }),
 	liquidate: (position) => req("/position/liquidate", "POST", { position }),
