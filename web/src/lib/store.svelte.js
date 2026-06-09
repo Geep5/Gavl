@@ -8,8 +8,8 @@ export const store = $state({
 	error: null,
 	accounts: [],
 	active: null,
-	credit: {}, // { pubkey: amount } native-credit balances
-	market: null, // the single BTC market: { price, backingBps, skewBps, fundingRateBps, fundingPays, maxLeverage, poolAssets, owed, myCredit, myPositions, ... }
+	gbtc: {}, // { pubkey: amount } gBTC balances (1:1 claim on BTC in the custody fund)
+	market: null, // { price, backingBps, ..., myGbtc, reserves, gbtcOutstanding, pending, myPositions, ... }
 	consensus: null, // { enabled, vdf, mesh, network, peers, farming, tip, finalizedHeight, secPerAnchor, secPerAnchorMeasured }
 });
 
@@ -18,7 +18,7 @@ export async function refresh() {
 		const s = await api.state();
 		store.accounts = s.accounts;
 		store.active = s.active;
-		store.credit = s.credit ?? {};
+		store.gbtc = s.gbtc ?? {};
 		store.market = s.market ?? null;
 		store.consensus = s.consensus ?? null;
 		store.error = null;
@@ -47,9 +47,9 @@ export function startPolling(ms = 2000) {
 
 // ── lookups ──────────────────────────────────────────────────────
 
-/** Active account's native-credit balance (string). */
-export function myCredit() {
-	return store.market?.myCredit ?? store.credit[store.active] ?? "0";
+/** Active account's gBTC balance (string). */
+export function myGbtc() {
+	return store.market?.myGbtc ?? store.gbtc[store.active] ?? "0";
 }
 export function accountLabel(pubHex) {
 	const a = store.accounts.find((x) => x.pubHex === pubHex);

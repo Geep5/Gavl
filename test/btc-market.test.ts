@@ -1,6 +1,6 @@
 /**
- * Gavl v1 — BTC bull/bear through the protocol (computeView over signed writes).
- * Native credit, oracle-priced mark, pool counterparty, conservation.
+ * Gavl — BTC bull/bear through the protocol (computeView over signed writes).
+ * gBTC collateral (bridge-backed, 1:1), oracle-priced mark, pool counterparty.
  *
  *   node --test test/btc-market.test.ts
  */
@@ -11,45 +11,47 @@ import assert from "node:assert/strict";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
-import { computeView, creditOf, mark, BTC_ORACLE, FARM_REWARD } from "../src/market/btc.ts";
-import { oracleKeyPair } from "../src/market/oracle.ts";
+import { computeView, gbtcOf, mark, marketConserved, BTC_ORACLE, BRIDGE_ATTESTOR } from "../src/market/btc.ts";
+import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
 import { SIZE_SCALE } from "../src/perp/engine.ts";
 import { PARAMS, K } from "./helpers.ts";
 
+let depN = 0;
 function setup() {
 	const node = new GavlNode(new Ledger(PARAMS));
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
-	// an oracle account that holds the REAL BTC_ORACLE key — can post valid prices
-	const oracle = new Account({ node, params: PARAMS, k: K, now, keypair: oracleKeyPair() });
-	return { node, mk, oracle };
+	const oracle = new Account({ node, params: PARAMS, k: K, now, keypair: oracleKeyPair() }); // holds BTC_ORACLE
+	const attestor = new Account({ node, params: PARAMS, k: K, now, keypair: bridgeKeyPair() }); // holds BRIDGE_ATTESTOR
+	// fund an account with gBTC via a (verified) deposit attestation
+	const fund = (acct, amount) => attestor.attestDeposit("dep" + depN++ + ":0", acct.pubHex, amount);
+	return { node, mk, oracle, attestor, fund };
 }
 const view = (node) => computeView(node.ledger.allWrites(), { nowHeight: 1 });
 
-test("farm mints native credit; nobody else gets it", async () => {
-	const { node, mk } = setup();
+test("deposit mints gBTC 1:1; only the bridge attestor can mint", async () => {
+	const { node, mk, attestor, fund } = setup();
 	const a = mk();
-	await a.farm();
-	await a.farm();
-	assert.equal(creditOf(view(node), a.pubHex), FARM_REWARD * 2n);
+	assert.equal(attestor.pubHex, BRIDGE_ATTESTOR, "attestor holds the bridge key");
+	await fund(a, 2000n);
+	assert.equal(gbtcOf(view(node), a.pubHex), 2000n);
+	assert.equal(view(node).bridge.reserves, 2000n, "reserves track the deposit 1:1");
+	// a stranger cannot mint
+	await mk().attestDeposit("evil:0", a.pubHex, 9_999n);
+	assert.equal(gbtcOf(view(node), a.pubHex), 2000n, "non-attestor mint ignored");
+	assert.ok(marketConserved(view(node)));
 });
 
 test("oracle key sets the mark; a stranger's post is ignored; seq is monotonic", async () => {
 	const { node, mk, oracle } = setup();
 	assert.equal(oracle.pubHex, BTC_ORACLE, "the oracle account holds the BTC_ORACLE key");
-
-	// a non-oracle post is ignored
 	const stranger = mk();
 	await stranger.postPrice(BTC_ORACLE, 99999n, 0);
 	assert.equal(mark(view(node)), null, "non-oracle price ignored → no mark");
-
-	// the real oracle posts → mark is set
 	await oracle.postPrice(BTC_ORACLE, 50000n, 0);
 	assert.equal(mark(view(node)), 50000n, "oracle price becomes the mark");
-
-	// a stale/equal seq is rejected; a higher seq updates
-	await oracle.postPrice(BTC_ORACLE, 60000n, 0); // seq not greater → ignored
+	await oracle.postPrice(BTC_ORACLE, 60000n, 0); // stale seq
 	assert.equal(mark(view(node)), 50000n, "stale seq rejected");
 	await oracle.postPrice(BTC_ORACLE, 60000n, 1);
 	assert.equal(mark(view(node)), 60000n, "higher seq updates the mark");
@@ -57,121 +59,115 @@ test("oracle key sets the mark; a stranger's post is ignored; seq is monotonic",
 
 test("oracle.meta: the oracle discloses its sources on-chain; a stranger can't", async () => {
 	const { node, mk, oracle } = setup();
-	const stranger = mk();
 	const sources = [
 		{ endpoint: "https://api.coinbase.com/v2/prices/BTC-USD/spot", key: "data.amount" },
 		{ endpoint: "https://api.kraken.com/0/public/Ticker?pair=XBTUSD", key: "result.XXBTZUSD.c.0" },
 	];
-	// a stranger's disclosure is ignored
-	await stranger.postMeta(BTC_ORACLE, sources);
+	await mk().postMeta(BTC_ORACLE, sources); // stranger
 	assert.equal(view(node).oracle.sources.length, 0, "only the oracle key may disclose");
-	// the real oracle's disclosure folds into state (visible to every client)
 	await oracle.postMeta(BTC_ORACLE, sources);
-	const disclosed = view(node).oracle.sources;
-	assert.equal(disclosed.length, 2);
-	assert.equal(disclosed[0].endpoint, sources[0].endpoint);
-	assert.equal(disclosed[0].key, "data.amount");
-	// latest-wins: a new disclosure replaces it
+	assert.equal(view(node).oracle.sources.length, 2);
+	assert.equal(view(node).oracle.sources[0].key, "data.amount");
 	await oracle.postMeta(BTC_ORACLE, [sources[0]]);
 	assert.equal(view(node).oracle.sources.length, 1, "latest disclosure wins");
 });
 
 test("open a BULL position at the oracle mark; margin leaves balance → pool", async () => {
-	const { node, mk, oracle } = setup();
+	const { node, mk, oracle, fund } = setup();
 	const trader = mk();
-	await trader.farm();
-	await trader.farm(); // 2000 credit
-	await oracle.postPrice(BTC_ORACLE, 100n, 0); // BTC = 100
+	await fund(trader, 2000n);
+	await oracle.postPrice(BTC_ORACLE, 100n, 0);
 
-	const pid = await trader.open("BTC-BULL", 1000n, 2n); // margin 1000, 2× → notional 2000 @ 100
+	const pid = await trader.open("BTC-BULL", 1000n, 2n);
 	const v = view(node);
 	const p = v.positions.get(pid);
 	assert.ok(p, "position opened");
-	assert.equal(p.instrument, "BTC-BULL");
 	assert.equal(p.side, "buy");
-	assert.equal(p.size, (2000n * SIZE_SCALE) / 100n, "size = notional × SIZE_SCALE / mark (fixed-point)");
-	assert.equal(p.entry, 100n, "entry = oracle mark");
-	assert.equal(creditOf(v, trader.pubHex), 1000n, "margin escrowed into the pool");
-	assert.equal(v.pool.assets, 1000n, "pool holds the margin");
+	assert.equal(p.size, (2000n * SIZE_SCALE) / 100n, "size = notional × SIZE_SCALE / mark");
+	assert.equal(p.entry, 100n);
+	assert.equal(gbtcOf(v, trader.pubHex), 1000n, "margin escrowed into the pool");
+	assert.equal(v.pool.assets, 1000n);
+	assert.ok(marketConserved(v));
 });
 
-test("REALISTIC price: a small margin opens a fractional-BTC position (the scale fix)", async () => {
-	const { node, mk, oracle } = setup();
+test("REALISTIC price: a small margin opens a fractional-BTC position", async () => {
+	const { node, mk, oracle, fund } = setup();
 	const trader = mk();
 	const lp = mk();
-	await trader.farm(); // 1000 credit
-	for (let i = 0; i < 2; i++) await lp.farm(); // 2000
-	await lp.poolDeposit(1000n); // liquidity so a winner can be paid in full
-	await oracle.postPrice(BTC_ORACLE, 50000n, 0); // BTC = $50k
+	await fund(trader, 1000n);
+	await fund(lp, 2000n);
+	await lp.poolDeposit(1000n);
+	await oracle.postPrice(BTC_ORACLE, 50000n, 0);
 
-	const pid = await trader.open("BTC-BULL", 1000n, 1n); // 1000 credit at $50k → 0.02 BTC
+	const pid = await trader.open("BTC-BULL", 1000n, 1n);
 	const v = view(node);
-	const p = v.positions.get(pid);
-	assert.ok(p, "position opens even though margin (1000) ≪ price (50000)");
-	assert.equal(p.size, (1000n * SIZE_SCALE) / 50000n, "fractional size = 0.02 BTC in micro-units");
-	// a +10% move ($50k→$55k) yields +10% on the 1000 notional = +100
+	assert.equal(v.positions.get(pid).size, (1000n * SIZE_SCALE) / 50000n, "fractional 0.02 BTC");
 	await oracle.postPrice(BTC_ORACLE, 55000n, 1);
 	await trader.close(pid);
-	assert.equal(creditOf(view(node), trader.pubHex), 1100n, "margin 1000 + 100 profit on a 10% move");
+	assert.equal(gbtcOf(view(node), trader.pubHex), 1100n, "margin 1000 + 100 profit on a 10% move");
+	assert.ok(marketConserved(view(node)));
 });
 
-test("BULL profits when BTC rises: close returns margin + PnL, conserved", async () => {
-	const { node, mk, oracle } = setup();
+test("BULL profits when BTC rises: close returns margin + PnL, gBTC conserved", async () => {
+	const { node, mk, oracle, fund } = setup();
 	const bull = mk();
-	const liquidity = mk();
-	for (let i = 0; i < 4; i++) await bull.farm(); // 4000
-	for (let i = 0; i < 4; i++) await liquidity.farm(); // 4000 → seed the pool so it can pay a winner
-	await liquidity.poolDeposit(3000n);
+	const lp = mk();
+	await fund(bull, 4000n);
+	await fund(lp, 4000n);
+	await lp.poolDeposit(3000n);
 	await oracle.postPrice(BTC_ORACLE, 100n, 0);
 
-	const totalCredit = () => {
-		const v = view(node);
-		let t = v.pool.assets;
-		for (const a of v.credit.values()) t += a;
-		return t;
-	};
-	const before = totalCredit();
-
-	const pid = await bull.open("BTC-BULL", 1000n, 1n); // size = 1000/100 = 10
-	await oracle.postPrice(BTC_ORACLE, 150n, 1); // BTC +50% → PnL = (150-100)×10 = +500
+	const pid = await bull.open("BTC-BULL", 1000n, 1n);
+	await oracle.postPrice(BTC_ORACLE, 150n, 1); // +50% → PnL +500
 	await bull.close(pid);
 
 	const v = view(node);
 	assert.equal(v.positions.size, 0, "position closed");
-	assert.equal(creditOf(v, bull.pubHex), 3000n + 1500n, "got back margin 1000 + profit 500 (started 4000, staked 1000)");
-	assert.equal(totalCredit(), before, "credit conserved across the profitable close");
+	assert.equal(gbtcOf(v, bull.pubHex), 3000n + 1500n, "margin 1000 + profit 500 (started 4000, staked 1000)");
+	assert.ok(marketConserved(v), "gBTC fully backed throughout");
 });
 
 test("liquidation price matches the actual liquidation rule", async () => {
-	const { liquidationPrice, liquidatable, SIZE_SCALE } = await import("../src/perp/engine.ts");
-	// 2× long: margin 1000, entry 50000 → notional 2000 → size 0.04 BTC
+	const { liquidationPrice, liquidatable } = await import("../src/perp/engine.ts");
 	const longP = { id: "L", owner: "x", side: "buy", size: (2000n * SIZE_SCALE) / 50000n, entry: 50000n, margin: 1000n };
 	const Llong = liquidationPrice(longP);
 	assert.ok(Llong && Llong > 26_000n && Llong < 26_400n, `2× long liq ≈ 26.3k (got ${Llong})`);
-	assert.equal(liquidatable(longP, Llong - 1000n), true, "below the liq price → liquidatable");
-	assert.equal(liquidatable(longP, Llong + 1000n), false, "above the liq price → safe");
-
-	// 2× short: liquidates ABOVE entry (~71.4k)
+	assert.equal(liquidatable(longP, Llong - 1000n), true);
+	assert.equal(liquidatable(longP, Llong + 1000n), false);
 	const shortP = { id: "S", owner: "y", side: "sell", size: (2000n * SIZE_SCALE) / 50000n, entry: 50000n, margin: 1000n };
 	const Lshort = liquidationPrice(shortP);
 	assert.ok(Lshort && Lshort > 71_000n && Lshort < 71_600n, `2× short liq ≈ 71.4k (got ${Lshort})`);
-
-	// 1× long: fully collateralized → no liquidation
 	const oneX = { id: "O", owner: "z", side: "buy", size: (1000n * SIZE_SCALE) / 50000n, entry: 50000n, margin: 1000n };
 	assert.equal(liquidationPrice(oneX), null, "1× long has no liquidation price");
 });
 
-test("conservation: credit is only created by farm, never by the pool", async () => {
-	const { node, mk } = setup();
+test("CONSERVATION: gBTC only minted by attested deposit; 1:1 backed through trade", async () => {
+	const { node, mk, fund } = setup();
 	const a = mk();
 	const b = mk();
-	await a.farm();
-	await a.farm();
+	await fund(a, 2000n);
 	await a.transfer(b.pubHex, 500n);
-	await b.poolDeposit(300n); // moves credit into the pool
+	await b.poolDeposit(300n);
 	const v = view(node);
-	// total across balances + pool == total farmed (2 × reward); nothing minted
-	let total = v.pool.assets;
-	for (const amt of v.credit.values()) total += amt;
-	assert.equal(total, FARM_REWARD * 2n, "credit conserved across transfer + pool deposit");
+	assert.equal(gbtcOf(v, a.pubHex), 1500n);
+	assert.equal(gbtcOf(v, b.pubHex), 200n);
+	assert.equal(v.pool.assets, 300n);
+	assert.equal(v.bridge.reserves, 2000n, "reserves unchanged by trading");
+	assert.ok(marketConserved(v), "reserves == gBTC + pool + pending");
+});
+
+test("burn → withdraw: gBTC destroyed, reserves still back it until settled", async () => {
+	const { node, mk, attestor, fund } = setup();
+	const a = mk();
+	await fund(a, 1000n);
+	const w = await a.withdraw(600n, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+	let v = view(node);
+	assert.equal(gbtcOf(v, a.pubHex), 400n, "gBTC burned");
+	assert.equal(v.bridge.reserves, 1000n, "BTC still in reserves (pending payout)");
+	assert.ok(marketConserved(v));
+	// attestor settles after the BTC payout tx confirms → reserves drop
+	await attestor.settleWithdrawal(w.id);
+	v = view(node);
+	assert.equal(v.bridge.reserves, 400n, "BTC left the fund");
+	assert.ok(marketConserved(v));
 });

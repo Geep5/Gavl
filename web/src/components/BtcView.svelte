@@ -1,9 +1,9 @@
 <script>
-	// The whole product: go bullish or bearish on Bitcoin with native credit.
-	// Oracle-priced (mark = the BTC oracle), pool-as-counterparty, insolvency-
-	// possible (watch the backing bar), bounded leverage, funding as the solvency
-	// defense.
-	import { store, act, myCredit, short } from "../lib/store.svelte.js";
+	// The whole product: go bullish or bearish on Bitcoin with gBTC — a 1:1 claim on
+	// real BTC in the threshold-custody fund. Oracle-priced (mark = the BTC oracle),
+	// pool-as-counterparty, insolvency-possible (watch the backing bar), bounded
+	// leverage, funding as the solvency defense.
+	import { store, act, myGbtc, short } from "../lib/store.svelte.js";
 	import { api } from "../lib/api.js";
 
 	const m = $derived(store.market);
@@ -32,10 +32,17 @@
 		margin = "";
 		busy = false;
 	}
-	async function farm() {
+	async function getTestGbtc() {
 		busy = true;
-		await act(() => api.farm());
+		await act(() => api.deposit("100000")); // dev: mint 100k test gBTC (0.001 BTC)
 		busy = false;
+	}
+	let wAmt = $state("");
+	let wAddr = $state("");
+	async function withdraw() {
+		if (!wAmt || !wAddr) return;
+		await act(() => api.withdraw(wAmt, wAddr));
+		wAmt = "";
 	}
 	async function close(pid) {
 		await act(() => api.closePosition(pid));
@@ -75,12 +82,34 @@
 	</div>
 
 	<div class="wallet-card">
-		<div class="muted small">your credit</div>
-		<div class="credit">{fmt(myCredit())}</div>
-		<button class="ghost full" onclick={farm} disabled={busy}>{busy ? "…" : "＋ Farm credit"}</button>
-		<div class="muted tiny">native credit is earned by doing the proof-of-space-time work (v1 collateral)</div>
+		<div class="muted small">your gBTC</div>
+		<div class="credit">{fmt(myGbtc())}</div>
+		<button class="ghost full" onclick={getTestGbtc} disabled={busy}>{busy ? "…" : "＋ Get test gBTC"}</button>
+		<div class="muted tiny">
+			gBTC is a 1:1 claim on real BTC in the threshold-custody fund. <strong>Testnet:</strong> this mints via the bridge
+			attestor (real BTC-deposit detection is the next increment) — not yet real coins.
+		</div>
 	</div>
 </div>
+
+<!-- the custody fund: gBTC backed 1:1 by BTC reserves -->
+{#if m}
+	<div class="panel fund">
+		<h3>Custody fund <span class="muted small">· gBTC is a 1:1 claim on BTC held by a threshold quorum</span></h3>
+		<div class="fundrow">
+			<span class="muted">reserves (BTC in fund)</span><strong>{fmt(m.reserves)}</strong>
+		</div>
+		<div class="fundrow">
+			<span class="muted">gBTC outstanding</span><span>{fmt(m.gbtcOutstanding)}{Number(m.pending) > 0 ? ` · ${fmt(m.pending)} pending payout` : ""}</span>
+		</div>
+		<div class="muted tiny" style="margin-top:0.3rem">Every gBTC is backed by a satoshi in the fund — withdraw burns gBTC and a quorum signs the BTC payout (no one holds the key).</div>
+		<div class="depline" style="margin-top:0.5rem">
+			<input placeholder="gBTC to withdraw" bind:value={wAmt} inputmode="numeric" />
+			<input placeholder="your BTC address (bc1…)" bind:value={wAddr} />
+			<button class="ghost" onclick={withdraw} disabled={!wAmt || !wAddr}>Withdraw</button>
+		</div>
+	</div>
+{/if}
 
 <!-- the oracle(s) pricing this market — the v1 trust point, made visible -->
 <div class="panel oracles">
@@ -147,7 +176,7 @@
 	</div>
 	<div class="row">
 		<label class="f">
-			<span class="muted tiny">margin (credit)</span>
+			<span class="muted tiny">margin (gBTC)</span>
 			<input placeholder="0" bind:value={margin} inputmode="numeric" />
 		</label>
 		<label class="f lev">
@@ -158,7 +187,7 @@
 		</label>
 	</div>
 	{#if margin && priceNum}
-		<div class="muted tiny preview">≈ {(((Number(margin) * Number(leverage)) / priceNum)).toPrecision(3)} BTC exposure ({Number(margin) * Number(leverage)} credit notional)</div>
+		<div class="muted tiny preview">≈ {(((Number(margin) * Number(leverage)) / priceNum)).toPrecision(3)} BTC exposure ({Number(margin) * Number(leverage)} gBTC notional)</div>
 	{/if}
 	<button class="primary full {side === 'BTC-BULL' ? 'bull' : 'bear'}" onclick={open} disabled={busy || !margin || priceNum == null}>
 		{priceNum == null ? "waiting for price…" : side === "BTC-BULL" ? "Go Bullish" : "Go Bearish"}
@@ -205,7 +234,7 @@
 		<div class="funding" class:active={m.fundingRateBps !== 0}>⟳ {fundingText()} <span class="muted tiny">skew {(m.skewBps / 100).toFixed(0)}%</span></div>
 
 		<div class="depline">
-			<input placeholder="add credit as backing (earn funding)" bind:value={depAmt} inputmode="numeric" />
+			<input placeholder="add gBTC as backing (earn funding)" bind:value={depAmt} inputmode="numeric" />
 			<button class="ghost" onclick={deposit} disabled={!depAmt}>Deposit</button>
 		</div>
 		<p class="muted tiny disclaimer">
@@ -222,6 +251,8 @@
 	.ticker { font-size: 0.9rem; letter-spacing: 0.05em; font-weight: 700; }
 	.price { font-size: 2.6rem; font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; }
 	.credit { font-size: 1.8rem; font-weight: 700; font-variant-numeric: tabular-nums; margin: 0.1rem 0 0.5rem; }
+	.fundrow { display: flex; justify-content: space-between; font-size: 0.82rem; padding: 0.15rem 0; }
+	.fundrow strong { font-variant-numeric: tabular-nums; }
 	.small { font-size: 0.8rem; }
 	.tiny { font-size: 0.7rem; }
 

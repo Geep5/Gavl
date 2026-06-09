@@ -16,8 +16,9 @@ export const api = {
 	createAccount: (label) => req("/accounts", "POST", { label }),
 	setActive: (pubHex) => req("/accounts/active", "POST", { pubHex }),
 	// v1: BTC bull/bear
-	farm: () => req("/farm", "POST", {}),
+	deposit: (amount) => req("/deposit", "POST", { amount }), // dev: mint test gBTC (bridge attestor)
 	transfer: (to, amount) => req("/transfer", "POST", { to, amount }),
+	withdraw: (amount, btcAddress) => req("/withdraw", "POST", { amount, btcAddress }),
 	open: (instrument, margin, leverage) => req("/position/open", "POST", { instrument, margin, leverage }),
 	closePosition: (position) => req("/position/close", "POST", { position }),
 	liquidate: (position) => req("/position/liquidate", "POST", { position }),

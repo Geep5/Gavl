@@ -61,6 +61,11 @@ function addG(s: BridgeState, pubkey: string, v: bigint): void {
 	if (n === 0n) s.gbtc.delete(pubkey);
 	else s.gbtc.set(pubkey, n);
 }
+/** Low-level gBTC balance move (e.g. escrowing margin into the perp pool). Conserves
+ *  total only if the caller balances it elsewhere (the pool holds the other side). */
+export function addGbtc(s: BridgeState, pubkey: string, v: bigint): void {
+	addG(s, pubkey, v);
+}
 export function totalGbtc(s: BridgeState): bigint {
 	let t = 0n;
 	for (const v of s.gbtc.values()) t += v;

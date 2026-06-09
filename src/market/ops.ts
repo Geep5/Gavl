@@ -14,12 +14,16 @@
 export type Instrument = "BTC-BULL" | "BTC-BEAR";
 
 export type Op =
-	/** Native PoST-farmed credit minted to the writer for doing the cooldown work.
-	 *  v1's "money" — replaced by real-BTC deposits in Phase 4. amount is policy-fixed
-	 *  per write (validated in state), not caller-chosen. */
-	| { kind: "credit.farm" }
-	/** Send native credit to another account. */
-	| { kind: "credit.transfer"; to: string; amount: string }
+	/** Mint gBTC 1:1 from a VERIFIED BTC deposit. Only valid from the bridge attestor
+	 *  (committee) key; idempotent by `depositId` (the funding BTC outpoint). gBTC is
+	 *  the collateral — a 1:1 claim on real Bitcoin in the threshold-custody fund. */
+	| { kind: "bridge.deposit"; depositId: string; depositor: string; amount: string }
+	/** Send gBTC to another account. */
+	| { kind: "gbtc.transfer"; to: string; amount: string }
+	/** Burn gBTC to redeem BTC → a pending withdrawal paid to `btcAddress`. */
+	| { kind: "bridge.withdraw"; amount: string; btcAddress: string }
+	/** Attestor marks a withdrawal's BTC payout confirmed (reserves drop). */
+	| { kind: "bridge.settle"; withdrawalId: string }
 	/** A signed BTC price reading from the oracle. Authority = the oracle's key
 	 *  (checked in state); the webhook URL is only where it's published. Monotonic seq. */
 	| { kind: "oracle.post"; oracle: string; price: string; seq: number }
@@ -36,7 +40,7 @@ export type Op =
 	/** Add native credit to the shared pool backing (drains the unpaid queue). */
 	| { kind: "pool.deposit"; amount: string };
 
-const KINDS = new Set<string>(["credit.farm", "credit.transfer", "oracle.post", "oracle.meta", "position.open", "position.close", "position.liquidate", "pool.deposit"]);
+const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.settle", "oracle.post", "oracle.meta", "position.open", "position.close", "position.liquidate", "pool.deposit"]);
 
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);

@@ -178,7 +178,7 @@ test("adaptive producer idles when caught up, bursts after an action", async () 
 	// Phase 2: an action lands a write → producer must burst to finalize it.
 	let t = 0;
 	const actor = new Account({ node, params: PARAMS, k: K, now: () => ++t });
-	await actor.farm(); // new write → ledger heads advance
+	await actor.noop(); // new write → ledger heads advance
 	assert.equal(node.anchors.headsCovered(node.ledger.heads(), 1), false, "fresh write is not yet finalized");
 	// Wait until the burst buries it (or time out).
 	for (let i = 0; i < 100 && !node.anchors.headsCovered(node.ledger.heads(), 1); i++) {

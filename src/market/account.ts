@@ -10,7 +10,7 @@ import { Writer } from "../chain/writer.ts";
 import type { ChainParams, Write } from "../chain/writer.ts";
 import type { KeyPair } from "../det/ed25519.ts";
 import type { GavlNode } from "../sync/node.ts";
-import { computeView, finalizedView, creditOf } from "./btc.ts";
+import { computeView, finalizedView, gbtcOf } from "./btc.ts";
 import type { View } from "./btc.ts";
 import type { Op, Instrument } from "./ops.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
@@ -57,13 +57,24 @@ export class Account {
 		return this.produce(null);
 	}
 
-	/** Farm native credit (the PoST work is the issuance). Returns the write. */
-	farm(): Promise<Write> {
-		return this.produce({ kind: "credit.farm" });
+	/** Attest a VERIFIED BTC deposit → mints gBTC 1:1 (only valid as the bridge attestor key). */
+	attestDeposit(depositId: string, depositor: string, amount: bigint | number | string): Promise<Write> {
+		return this.produce({ kind: "bridge.deposit", depositId, depositor, amount: amountStr(amount) });
 	}
 
+	/** Send gBTC to another account. */
 	transfer(to: string, amount: bigint | number | string): Promise<Write> {
-		return this.produce({ kind: "credit.transfer", to, amount: amountStr(amount) });
+		return this.produce({ kind: "gbtc.transfer", to, amount: amountStr(amount) });
+	}
+
+	/** Burn gBTC to redeem BTC to `btcAddress` → a pending withdrawal. */
+	withdraw(amount: bigint | number | string, btcAddress: string): Promise<Write> {
+		return this.produce({ kind: "bridge.withdraw", amount: amountStr(amount), btcAddress });
+	}
+
+	/** Mark a withdrawal's BTC payout confirmed (only valid as the bridge attestor key). */
+	settleWithdrawal(withdrawalId: string): Promise<Write> {
+		return this.produce({ kind: "bridge.settle", withdrawalId });
 	}
 
 	/** Post a signed oracle price (only valid if this account IS the oracle key). */
@@ -101,7 +112,7 @@ export class Account {
 		return finalizedView(this.node.ledger.allWrites(), anchors, k);
 	}
 
-	credit(): bigint {
-		return creditOf(this.view(), this.pubHex);
+	gbtc(): bigint {
+		return gbtcOf(this.view(), this.pubHex);
 	}
 }

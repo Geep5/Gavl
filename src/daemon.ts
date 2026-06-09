@@ -22,7 +22,7 @@ import { GavlNode } from "./sync/node.ts";
 import { Account } from "./market/account.ts";
 import { computeView, finalizedView } from "./market/btc.ts";
 import type { View } from "./market/btc.ts";
-import { oracleKeyPair } from "./market/oracle.ts";
+import { oracleKeyPair, bridgeKeyPair } from "./market/oracle.ts";
 import { readPriceAggregate } from "./market/pricefeed.ts";
 import type { PriceSource, AggregateReading } from "./market/pricefeed.ts";
 import { Wallet } from "./wallet.ts";
@@ -408,6 +408,18 @@ export class Daemon {
 	 *  the average), or null if this node isn't publishing. Local metadata, never on-chain. */
 	oracleSource(): (AggregateReading & { at: number }) | null {
 		return this.lastOracleSource;
+	}
+
+	/**
+	 * DEV: mint test gBTC to `depositor` by attesting a synthetic deposit with the
+	 * bridge attestor key (which this dev node holds). This stands in for real
+	 * BTC-deposit detection (Phase 4 #1) — the gBTC is backed by a CLAIMED reserve,
+	 * not a real on-chain BTC tx. Clearly a testnet faucet until the watcher lands.
+	 */
+	private bridgeAcct?: Account;
+	async attestTestDeposit(depositor: string, amount: bigint | number | string): Promise<void> {
+		if (!this.bridgeAcct) this.bridgeAcct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: bridgeKeyPair(process.env.GAVL_BRIDGE_SEED) });
+		await this.bridgeAcct.attestDeposit(`test-${depositor.slice(0, 8)}-${this.now()}:0`, depositor, amount);
 	}
 
 	/** The channel/network this node is currently on. */

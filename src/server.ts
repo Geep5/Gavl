@@ -19,7 +19,8 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Daemon } from "./daemon.ts";
-import { mark, creditOf, BTC_ORACLE, MAX_LEVERAGE, skewBps, fundingRateBps } from "./market/btc.ts";
+import { mark, gbtcOf, BTC_ORACLE, MAX_LEVERAGE, skewBps, fundingRateBps } from "./market/btc.ts";
+import { totalGbtc, pendingTotal, backingBps as bridgeBackingBps } from "./custody/bridge.ts";
 import { backingBps, totalOwed } from "./perp/pool.ts";
 import { unrealizedPnl, liquidationPrice } from "./perp/engine.ts";
 import { DEFAULT_FUNDING } from "./perp/funding.ts";
@@ -68,9 +69,9 @@ function serializeState() {
 	const me = daemon.wallet.active().pubHex;
 	const m = mark(view); // the BTC oracle price (null until first post)
 
-	// credit balances: { pubkey: amount }
-	const credit: Record<string, string> = {};
-	for (const [pubkey, amt] of view.credit) credit[pubkey] = amt.toString();
+	// gBTC balances: { pubkey: amount } (1:1 claims on BTC in the custody fund)
+	const gbtc: Record<string, string> = {};
+	for (const [pubkey, amt] of view.bridge.gbtc) gbtc[pubkey] = amt.toString();
 
 	// my open positions (bull/bear), with live PnL at the current mark
 	const myPositions = [...view.positions.values()]
@@ -144,18 +145,22 @@ function serializeState() {
 		maxLeverage: Number(MAX_LEVERAGE),
 		poolAssets: view.pool.assets.toString(),
 		owed: totalOwed(view.pool).toString(),
-		backingBps: Number(backingBps(view.pool)), // 10000 = 100% backed; < 10000 = insolvent
+		backingBps: Number(backingBps(view.pool)), // perp-pool health (pay-when-able)
 		openPositions: view.positions.size,
 		skewBps: Number(skew), // +10000 all bull, −10000 all bear
 		fundingRateBps: Number(rate), // >0 bulls pay, <0 bears pay
 		fundingPays: rate > 0n ? "bulls" : rate < 0n ? "bears" : "none",
 		fundingEpochAnchors: DEFAULT_FUNDING.epochAnchors,
-		myCredit: creditOf(view, me).toString(),
+		// collateral = gBTC, a 1:1 claim on BTC in the custody fund
+		myGbtc: gbtcOf(view, me).toString(),
+		reserves: view.bridge.reserves.toString(), // BTC sats in the fund
+		gbtcOutstanding: (totalGbtc(view.bridge) + view.pool.assets).toString(),
+		pending: pendingTotal(view.bridge).toString(), // burned, awaiting BTC payout
 		myPositions,
 	};
 
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));
-	return { accounts, active: me, credit, market, consensus: daemon.consensus(), storage: daemon.storeStats() };
+	return { accounts, active: me, gbtc, market, consensus: daemon.consensus(), storage: daemon.storeStats() };
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -206,14 +211,20 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			daemon.wallet.setActive(String(body.pubHex));
 			return send(res, 200, { active: body.pubHex });
 		}
-		// ── v1: BTC bull/bear ──
-		if (path === "/api/farm") {
-			// Mint native credit by doing the PoST work (v1's "money"; real BTC in Phase 4).
-			await daemon.active().farm();
+		// ── BTC bull/bear (gBTC collateral) ──
+		if (path === "/api/deposit") {
+			// DEV: mint test gBTC via the bridge attestor (stands in for real BTC-deposit
+			// detection — the watcher is the next increment). Backed by a claimed reserve.
+			await daemon.attestTestDeposit(daemon.wallet.active().pubHex, String(body.amount ?? "100000"));
 			return send(res, 200, { ok: true });
 		}
 		if (path === "/api/transfer") {
 			await daemon.active().transfer(String(body.to), String(body.amount));
+			return send(res, 200, { ok: true });
+		}
+		if (path === "/api/withdraw") {
+			// Burn gBTC to redeem BTC to a Bitcoin address → a pending withdrawal.
+			await daemon.active().withdraw(String(body.amount), String(body.btcAddress));
 			return send(res, 200, { ok: true });
 		}
 		if (path === "/api/oracle/post") {

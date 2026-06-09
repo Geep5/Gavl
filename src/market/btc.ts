@@ -28,7 +28,9 @@ import type { Position } from "../perp/engine.ts";
 import { skewBps, fundingRateBps, fundingPayment, DEFAULT_FUNDING } from "../perp/funding.ts";
 import { finalizedOrdering } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
-import { oraclePubHex } from "./oracle.ts";
+import { oraclePubHex, bridgePubHex } from "./oracle.ts";
+import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal } from "../custody/bridge.ts";
+import type { BridgeState } from "../custody/bridge.ts";
 
 // ── consensus constants (every node must agree) ──────────────────
 
@@ -38,8 +40,9 @@ import { oraclePubHex } from "./oracle.ts";
  *  Override the seed (and thus this) via GAVL_ORACLE_SEED for a real deployment. */
 export const BTC_ORACLE = oraclePubHex(process.env.GAVL_ORACLE_SEED);
 
-/** Native credit minted per `credit.farm` write (policy-fixed, not caller-chosen). */
-export const FARM_REWARD = 1000n;
+/** The BTC bridge attestor (committee) key. Only it may mint gBTC from a verified
+ *  deposit or settle a withdrawal. v0 single signer; production = threshold committee. */
+export const BRIDGE_ATTESTOR = bridgePubHex(process.env.GAVL_BRIDGE_SEED);
 
 /** The two instruments → perp engine side. */
 const SIDE: Record<Instrument, "buy" | "sell"> = { "BTC-BULL": "buy", "BTC-BEAR": "sell" };
@@ -55,10 +58,11 @@ export interface OracleState {
 }
 
 export interface View {
-	/** Native-credit balances by pubkey. */
-	credit: Map<string, bigint>;
+	/** The BTC bridge: gBTC balances + BTC reserves + processed deposits + pending
+	 *  withdrawals. gBTC is the collateral — a 1:1 claim on real Bitcoin in the fund. */
+	bridge: BridgeState;
 	oracle: OracleState;
-	/** One shared pool backing both instruments (denominated in native credit). */
+	/** One shared pool backing both instruments (holds gBTC margin/liquidity). */
 	pool: Pool;
 	/** Open positions by id. Each carries its instrument (bull/bear). */
 	positions: Map<string, Position & { instrument: Instrument }>;
@@ -66,16 +70,19 @@ export interface View {
 	lastFundingHeight: number;
 }
 
-function bal(m: Map<string, bigint>, k: string): bigint {
-	return m.get(k) ?? 0n;
+/** Active gBTC balance of `pubkey`. */
+export function gbtcOf(view: View, pubkey: string): bigint {
+	return bridgeGbtcOf(view.bridge, pubkey);
 }
-function add(m: Map<string, bigint>, k: string, v: bigint): void {
-	const n = (m.get(k) ?? 0n) + v;
-	if (n === 0n) m.delete(k);
-	else m.set(k, n);
-}
-export function creditOf(view: View, pubkey: string): bigint {
-	return bal(view.credit, pubkey);
+
+/**
+ * The 1:1 backing invariant for the LIVE market: every gBTC — whether in a user
+ * balance, locked in the perp pool, or burned-and-pending — is backed by a satoshi
+ * in reserves. The perp engine only moves gBTC between balances and the pool, so it
+ * never breaks this.
+ */
+export function marketConserved(view: View): boolean {
+	return view.bridge.reserves === totalGbtc(view.bridge) + view.pool.assets + pendingTotal(view.bridge);
 }
 
 function parseAmount(s: string): bigint | null {
@@ -103,7 +110,7 @@ export interface ViewOptions {
 export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	const cmp = opts.order ?? cmpWrite;
 	const view: View = {
-		credit: new Map(),
+		bridge: emptyBridge(),
 		oracle: { id: BTC_ORACLE, price: null, seq: -1, sources: [] },
 		pool: emptyPool(),
 		positions: new Map(),
@@ -132,24 +139,36 @@ export function finalizedView(writes: Write[], anchors: AnchorChain, k: number):
 	return computeView(included, { order, nowHeight });
 }
 
-const balances = (view: View) => ({
-	get: (_token: string, pubkey: string) => bal(view.credit, pubkey),
-	add: (_token: string, pubkey: string, v: bigint) => add(view.credit, pubkey, v),
-});
-
 function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
 	switch (op.kind) {
-		case "credit.farm": {
-			// PoST already gated this write; mint the fixed reward to the farmer.
-			add(view.credit, w.writer, FARM_REWARD);
+		case "bridge.deposit": {
+			// Mint gBTC 1:1 from a VERIFIED BTC deposit — only the attestor (committee)
+			// may assert one. Idempotent by deposit outpoint. (How a deposit is verified —
+			// committee threshold-sig or SPV — is the bridge's trust input; see attestation.)
+			if (w.writer !== BRIDGE_ATTESTOR) return;
+			const amt = parseAmount(op.amount);
+			if (amt === null || typeof op.depositId !== "string" || typeof op.depositor !== "string") return;
+			mintFromDeposit(view.bridge, { depositId: op.depositId, depositor: op.depositor, amount: amt });
 			return;
 		}
-		case "credit.transfer": {
+		case "gbtc.transfer": {
 			const amt = parseAmount(op.amount);
 			if (amt === null || typeof op.to !== "string") return;
-			if (bal(view.credit, w.writer) < amt) return;
-			add(view.credit, w.writer, -amt);
-			add(view.credit, op.to, amt);
+			transferGbtc(view.bridge, w.writer, op.to, amt);
+			return;
+		}
+		case "bridge.withdraw": {
+			// Burn gBTC → a pending BTC withdrawal. The BTC leaves only on bridge.settle
+			// (after the threshold-signed payout tx confirms).
+			const amt = parseAmount(op.amount);
+			if (amt === null || typeof op.btcAddress !== "string") return;
+			requestWithdrawal(view.bridge, { id: w.id, owner: w.writer, amount: amt, btcAddress: op.btcAddress });
+			return;
+		}
+		case "bridge.settle": {
+			// The attestor marks a withdrawal's BTC payout confirmed → reserves drop.
+			if (w.writer !== BRIDGE_ATTESTOR || typeof op.withdrawalId !== "string") return;
+			completeWithdrawal(view.bridge, op.withdrawalId);
 			return;
 		}
 		case "oracle.post": {
@@ -183,9 +202,9 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
 			// possible even when price ≫ margin); notional = margin × leverage.
 			const size = (margin * leverage * SIZE_SCALE) / m;
 			if (size <= 0n) return;
-			if (bal(view.credit, w.writer) < margin) return;
-			add(view.credit, w.writer, -margin); // escrow credit → pool
-			lockMargin(view.pool, margin, (owner, amt) => add(view.credit, owner, amt));
+			if (gbtcOf(view, w.writer) < margin) return;
+			addGbtc(view.bridge, w.writer, -margin); // escrow gBTC → pool
+			lockMargin(view.pool, margin, (owner, amt) => addGbtc(view.bridge, owner, amt));
 			view.positions.set(w.id, { id: w.id, owner: w.writer, side: SIDE[op.instrument], size, entry: m, margin, instrument: op.instrument });
 			return;
 		}
@@ -205,11 +224,11 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
 				if (isLiq) {
 					const fee = (paidNow * LIQUIDATOR_FEE_BPS) / 10_000n;
 					if (fee > 0n) {
-						add(view.credit, w.writer, fee);
+						addGbtc(view.bridge, w.writer, fee);
 						toOwner -= fee;
 					}
 				}
-				add(view.credit, p.owner, toOwner);
+				addGbtc(view.bridge, p.owner, toOwner);
 			}
 			view.positions.delete(op.position);
 			return;
@@ -217,9 +236,9 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
 		case "pool.deposit": {
 			const amt = parseAmount(op.amount);
 			if (amt === null) return;
-			if (bal(view.credit, w.writer) < amt) return;
-			add(view.credit, w.writer, -amt);
-			poolDeposit(view.pool, amt, (owner, paid) => add(view.credit, owner, paid));
+			if (gbtcOf(view, w.writer) < amt) return;
+			addGbtc(view.bridge, w.writer, -amt);
+			poolDeposit(view.pool, amt, (owner, paid) => addGbtc(view.bridge, owner, paid));
 			return;
 		}
 	}
