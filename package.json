@@ -28,6 +28,7 @@
   "dependencies": {
     "@noble/curves": "^2.2.0",
     "@scure/base": "^2.2.0",
+    "@scure/btc-signer": "^2.2.0",
     "corestore": "^7.10.0",
     "hypercore": "^11.33.1",
     "hyperdht": "^6.32.0",
