@@ -32,11 +32,6 @@
 		margin = "";
 		busy = false;
 	}
-	async function getTestGbtc() {
-		busy = true;
-		await act(() => api.deposit("100000")); // dev: mint 100k test gBTC (0.001 BTC)
-		busy = false;
-	}
 	let wAmt = $state("");
 	let wAddr = $state("");
 	async function withdraw() {
@@ -101,10 +96,9 @@
 	<div class="wallet-card">
 		<div class="muted small">your gBTC</div>
 		<div class="credit">{fmt(myGbtc())}</div>
-		<button class="ghost full" onclick={getTestGbtc} disabled={busy}>{busy ? "…" : "＋ Get test gBTC"}</button>
 		<div class="muted tiny">
-			gBTC is a 1:1 claim on real BTC in the threshold-custody fund. <strong>Testnet:</strong> this mints via the bridge
-			attestor (real BTC-deposit detection is the next increment) — not yet real coins.
+			gBTC is a 1:1 claim on real BTC in the threshold-custody fund. To get gBTC, send
+			(testnet) BTC to the fund address below and claim it — every gBTC is backed by an on-chain satoshi.
 		</div>
 	</div>
 </div>
@@ -113,7 +107,17 @@
 {#if m}
 	<div class="panel fund">
 		<h3>Custody fund <span class="muted small">· gBTC is a 1:1 claim on real Bitcoin held by a threshold quorum</span></h3>
-		<div class="fundrow"><span class="muted">reserves (BTC in fund)</span><strong>{fmt(m.reserves)}</strong></div>
+		<div class="fundrow"><span class="muted">ledger reserves</span><strong>{fmt(m.reserves)}</strong></div>
+		<div class="fundrow">
+			<span class="muted">real BTC on-chain</span>
+			{#if m.onChainReserves == null}
+				<span class="muted">checking…</span>
+			{:else if m.reconciled}
+				<span class="recon-ok">{fmt(m.onChainReserves)} · ✓ reconciled</span>
+			{:else}
+				<span class="recon-bad">{fmt(m.onChainReserves)} · ⚠ under-backed by {fmt(m.shortfall)}</span>
+			{/if}
+		</div>
 		<div class="fundrow"><span class="muted">gBTC outstanding</span><span>{fmt(m.gbtcOutstanding)}{Number(m.pending) > 0 ? ` · ${fmt(m.pending)} pending payout` : ""}</span></div>
 
 		<!-- DEPOSIT: send real (testnet) BTC to the fund address, then claim by txid -->
@@ -280,6 +284,8 @@
 	.credit { font-size: 1.8rem; font-weight: 700; font-variant-numeric: tabular-nums; margin: 0.1rem 0 0.5rem; }
 	.fundrow { display: flex; justify-content: space-between; font-size: 0.82rem; padding: 0.15rem 0; }
 	.fundrow strong { font-variant-numeric: tabular-nums; }
+	.recon-ok { color: var(--green); font-variant-numeric: tabular-nums; }
+	.recon-bad { color: var(--red); font-weight: 600; font-variant-numeric: tabular-nums; }
 	.net-tag { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent); margin: 0.6rem 0 0.2rem; }
 	.addr { font-size: 0.72rem; word-break: break-all; background: var(--panel-2); padding: 0.4rem 0.5rem; border-radius: 6px; border: 1px solid var(--border); margin-bottom: 0.4rem; }
 	.small { font-size: 0.8rem; }

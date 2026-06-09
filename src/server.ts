@@ -137,6 +137,8 @@ function serializeState() {
 		},
 	];
 
+	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)
+	const onChainR = rsv != null ? rsv.sats : null;
 	const market = {
 		oracle: view.oracle.id,
 		oracles,
@@ -160,6 +162,11 @@ function serializeState() {
 		// the real Bitcoin custody fund: send (testnet) BTC here to deposit
 		fundAddress: daemon.fundAddress(),
 		btcNetwork: daemon.btcNetwork(),
+		// proof of reserves: real on-chain BTC vs the ledger's claimed reserves
+		onChainReserves: onChainR != null ? onChainR.toString() : null,
+		reconciled: onChainR != null ? onChainR >= view.bridge.reserves : null, // real BTC covers the ledger?
+		shortfall: onChainR != null ? (view.bridge.reserves > onChainR ? (view.bridge.reserves - onChainR).toString() : "0") : null,
+		reservesCheckedAgoMs: rsv != null ? Date.now() - rsv.at : null,
 		myPositions,
 	};
 
@@ -216,12 +223,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			return send(res, 200, { active: body.pubHex });
 		}
 		// ── BTC bull/bear (gBTC collateral) ──
-		if (path === "/api/deposit") {
-			// DEV: mint test gBTC via the bridge attestor (stands in for real BTC-deposit
-			// detection — the watcher is the next increment). Backed by a claimed reserve.
-			await daemon.attestTestDeposit(daemon.wallet.active().pubHex, String(body.amount ?? "100000"));
-			return send(res, 200, { ok: true });
-		}
 		if (path === "/api/transfer") {
 			await daemon.active().transfer(String(body.to), String(body.amount));
 			return send(res, 200, { ok: true });

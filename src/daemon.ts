@@ -337,6 +337,7 @@ export class Daemon {
 		if (opts.mesh) await this.joinMesh();
 
 		if (opts.publishOracle) this.startOraclePublisher(opts.publishOracle);
+		this.startReserveWatch(); // proof-of-reserves polling
 
 		if (opts.farm) {
 			const farmer = generateKeyPair();
@@ -416,22 +417,14 @@ export class Daemon {
 		return this.lastOracleSource;
 	}
 
-	/**
-	 * DEV: mint test gBTC to `depositor` by attesting a synthetic deposit with the
-	 * bridge attestor key (which this dev node holds). This stands in for real
-	 * BTC-deposit detection — the gBTC is backed by a CLAIMED reserve, not a real
-	 * on-chain BTC tx. Clearly a testnet faucet; prefer claimDeposit for real coins.
-	 */
+	// ── real-BTC bridge (testnet) ────────────────────────────────────
+
+	/** The bridge attestor account (mints from verified deposits, settles withdrawals). */
 	private bridgeAcct?: Account;
 	private attestor(): Account {
 		if (!this.bridgeAcct) this.bridgeAcct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: bridgeKeyPair(process.env.GAVL_BRIDGE_SEED) });
 		return this.bridgeAcct;
 	}
-	async attestTestDeposit(depositor: string, amount: bigint | number | string): Promise<void> {
-		await this.attestor().attestDeposit(`test-${depositor.slice(0, 8)}-${this.now()}:0`, depositor, amount);
-	}
-
-	// ── real-BTC bridge (testnet) ────────────────────────────────────
 
 	/** The threshold-custody fund key. TESTNET single-operator (this node holds all
 	 *  shares, deterministic from GAVL_FUND_SEED). Production = distributed DKG. */
@@ -453,6 +446,33 @@ export class Daemon {
 	/** The fund's Bitcoin deposit address — send real (testnet) BTC here. */
 	fundAddress(): string {
 		return deriveFundAddress(this.fundKey(), this.btcNetwork());
+	}
+
+	/**
+	 * PROOF OF RESERVES: the REAL confirmed BTC in the fund (sum of on-chain UTXOs),
+	 * cached + refreshed on a timer so reads are sync. Compared against the ledger's
+	 * `reserves` to detect under-backing (the safety check a custodial bridge must run).
+	 */
+	private onChainReserves: { sats: bigint; at: number } | null = null;
+	private reserveTimer?: ReturnType<typeof setInterval>;
+	async refreshOnChainReserves(): Promise<void> {
+		try {
+			const esplora = this.esplora();
+			const utxos = await esplora.utxos(this.fundAddress());
+			let sats = 0n;
+			for (const u of utxos) if (u.status.confirmed) sats += BigInt(u.value);
+			this.onChainReserves = { sats, at: Date.now() };
+		} catch {
+			/* network hiccup — keep the last reading */
+		}
+	}
+	onChainReservesCached(): { sats: bigint; at: number } | null {
+		return this.onChainReserves;
+	}
+	private startReserveWatch(): void {
+		if (this.reserveTimer) return; // once
+		void this.refreshOnChainReserves();
+		this.reserveTimer = setInterval(() => void this.refreshOnChainReserves(), 30_000);
 	}
 
 	/**
