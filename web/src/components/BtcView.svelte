@@ -96,6 +96,9 @@
 	<div class="wallet-card">
 		<div class="muted small">your gBTC</div>
 		<div class="credit">{fmt(myGbtc())}</div>
+		{#if m && Number(m.myOwed) > 0}
+			<div class="owed">⏳ +{fmt(m.myOwed)} profit owed to you <span class="muted tiny">— recorded, awaiting a counterparty to fund it (pays automatically when the pool has gBTC)</span></div>
+		{/if}
 		<div class="muted tiny">
 			gBTC is a 1:1 claim on real BTC in the threshold-custody fund. To get gBTC, send
 			(testnet) BTC to the fund address below and claim it — every gBTC is backed by an on-chain satoshi.
@@ -282,6 +285,7 @@
 	.ticker { font-size: 0.9rem; letter-spacing: 0.05em; font-weight: 700; }
 	.price { font-size: 2.6rem; font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; }
 	.credit { font-size: 1.8rem; font-weight: 700; font-variant-numeric: tabular-nums; margin: 0.1rem 0 0.5rem; }
+	.owed { font-size: 0.78rem; color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); border: 1px solid var(--accent); border-radius: 6px; padding: 0.4rem 0.55rem; margin-bottom: 0.5rem; line-height: 1.4; }
 	.fundrow { display: flex; justify-content: space-between; font-size: 0.82rem; padding: 0.15rem 0; }
 	.fundrow strong { font-variant-numeric: tabular-nums; }
 	.recon-ok { color: var(--green); font-variant-numeric: tabular-nums; }

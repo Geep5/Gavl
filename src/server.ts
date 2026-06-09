@@ -139,6 +139,9 @@ function serializeState() {
 
 	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)
 	const onChainR = rsv != null ? rsv.sats : null;
+	// pay-when-able winnings queued to the active account (profit recorded but unpaid
+	// until the pool has funds — i.e. a counterparty/LP). Surfaced so wins aren't invisible.
+	const myOwed = view.pool.queue.filter((c) => c.owner === me).reduce((a, c) => a + c.amount, 0n);
 	const market = {
 		oracle: view.oracle.id,
 		oracles,
@@ -155,6 +158,7 @@ function serializeState() {
 		fundingEpochAnchors: DEFAULT_FUNDING.epochAnchors,
 		// collateral = gBTC, a 1:1 claim on BTC in the custody fund
 		myGbtc: gbtcOf(view, me).toString(),
+		myOwed: myOwed.toString(), // queued profit owed to you (awaiting a counterparty)
 		reserves: view.bridge.reserves.toString(), // BTC sats in the fund
 		gbtcOutstanding: (totalGbtc(view.bridge) + view.pool.assets).toString(),
 		pending: pendingTotal(view.bridge).toString(), // burned, awaiting BTC payout
