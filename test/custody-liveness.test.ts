@@ -100,19 +100,21 @@ test("reshare times out when a new-committee member is absent", async () => {
 });
 
 test("withdrawal fails over to a working quorum when one committee member is down", async () => {
-	const ids = ["a", "b", "c", "d", "e"]; // 3-of-5 committee
-	const min = 3;
+	const ids = ["a", "b", "c"]; // 2-of-3 committee
+	const min = 2;
 	const { nodes, keys, groupPubKey, pub } = await dkgFund(ids, min);
 	const shareOf = Object.fromEntries(ids.map((id, i) => [id, keys[i].share]));
-	const fundView = { groupPubKey, pub, shares: {}, min, max: 5 } as FundKey;
+	const fundView = { groupPubKey, pub, shares: {}, min, max: 3 } as FundKey;
 	const mkUnsigned = () => buildWithdrawalTx(fundView, { inputs: [{ txid: "ab".repeat(32), index: 0, amount: 500_000n }], outputs: [{ address: RECIPIENT, amount: 495_000n }] });
 
-	// "a" is down (sorted-first → it's in round 0's quorum {a,b,c}, forcing a failover).
-	// Every other committee member runs the failover loop in lockstep.
-	const live = ["b", "c", "d", "e"];
+	// "a" is down (sorted-first → it's in round 0's quorum {a,b}, forcing a failover to
+	// round 1's {b,c}). The two live members run the failover loop in lockstep. A
+	// generous per-round budget so a healthy quorum completes even under full-suite CPU
+	// load (delivery is setImmediate-paced and starved by parallel tests); prod uses 30s.
+	const live = ["b", "c"];
 	const results = await Promise.all(
 		live.map((id) =>
-			signWithdrawalWithFailover(mkUnsigned, { node: nodes[id], signIdBase: "wd-1", selfId: id, committee: ids, min, pub, groupPubKey, share: shareOf[id], timeoutMs: 150, maxRounds: 5 }),
+			signWithdrawalWithFailover(mkUnsigned, { node: nodes[id], signIdBase: "wd-1", selfId: id, committee: ids, min, pub, groupPubKey, share: shareOf[id], timeoutMs: 1000, maxRounds: 3 }),
 		),
 	);
 

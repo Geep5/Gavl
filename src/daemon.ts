@@ -31,7 +31,9 @@ import type { StoredShare } from "./custody/share-store.ts";
 import { fundAddress as deriveFundAddress } from "./custody/bitcoin.ts";
 import { depositAddress } from "./custody/deposit.ts";
 import { buildWithdrawalTx, signWithdrawalTx } from "./custody/btctx.ts";
-import { signWithdrawalDistributed } from "./custody/withdraw-ceremony.ts";
+import { signWithdrawalWithFailover } from "./custody/withdraw-ceremony.ts";
+import { CommitteeRotation } from "./custody/rotation.ts";
+import type { AnchorView } from "./custody/epoch.ts";
 import { Esplora } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
 import { readPriceAggregate } from "./market/pricefeed.ts";
@@ -50,13 +52,15 @@ import { Plot } from "./pos/space.ts";
 import { SwarmTransport } from "./sync/swarm.ts";
 import { KnownPeers } from "./sync/known-peers.ts";
 import { BootstrapList } from "./sync/bootstrap.ts";
-import { generateKeyPair } from "./det/ed25519.ts";
-import { toHex } from "./det/canonical.ts";
+import { generateKeyPair, keyPairFromSeed } from "./det/ed25519.ts";
+import type { KeyPair } from "./det/ed25519.ts";
+import { toHex, fromHex } from "./det/canonical.ts";
 import { WriteStore } from "./store/store.ts";
 import { KeepAllPolicy, MinePolicy } from "./store/policy.ts";
 import type { PersistPolicy } from "./store/policy.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 
 export type SpaceMode = "standin" | "chiapos";
 
@@ -88,6 +92,26 @@ export interface DaemonOptions {
 		persist?: "all" | "mine";
 		/** Or supply a custom policy directly (overrides `persist`). */
 		policy?: PersistPolicy;
+	};
+	/**
+	 * Threshold-custody mode. "seed" (default) = single-operator testnet fund from
+	 * GAVL_FUND_SEED. "committee" = autonomous epoch-driven custody: the fund key is
+	 * DKG'd across a PoST-weighted committee sampled from the anchor chain and reshared
+	 * to a fresh committee each epoch, no node ever holding it whole. Needs farming on
+	 * (the node's stable producer key is its committee id).
+	 */
+	custody?: {
+		mode?: "seed" | "committee";
+		/** Anchors per custody epoch (default 16). */
+		epochLength?: number;
+		/** Desired committee size, clamped to eligible producers (default 5). */
+		size?: number;
+		/** Min eligible producers before committee custody activates (default 3). */
+		minCommittee?: number;
+		/** Per-ceremony timeout in ms (default 30s). */
+		ceremonyTimeoutMs?: number;
+		/** Membership lookback in anchors (default: all). */
+		windowAnchors?: number;
 	};
 }
 
@@ -127,6 +151,9 @@ export class Daemon {
 	private readonly k: number;
 	private readonly spaceMode: SpaceMode;
 	private readonly plotDir: string;
+	/** Root for node-local custody secrets (share + producer key), beside the wallet —
+	 *  so a distinct walletDir fully isolates a node (multiple nodes on one machine). */
+	private readonly dataDir: string;
 	private readonly accounts = new Map<string, Account>();
 	private clock = 0;
 
@@ -138,6 +165,10 @@ export class Daemon {
 	private readonly targetSecPerAnchor: number;
 	private store?: WriteStore;
 	private readonly storeOpts?: DaemonOptions["store"];
+	private readonly custodyOpts: NonNullable<DaemonOptions["custody"]>;
+	private producerKeyCache?: KeyPair;
+	private custodyAcct?: Account;
+	private rotation?: CommitteeRotation;
 	/** Kept so a channel switch can rebuild ledger/anchors/store identically. */
 	private readonly verifier: SpaceVerifier;
 	private readonly schedule?: RetargetSchedule;
@@ -158,7 +189,9 @@ export class Daemon {
 		this.targetSecPerAnchor = opts.targetSecPerAnchor ?? 60;
 		this.spaceMode = opts.space ?? "standin";
 		this.plotDir = opts.plotDir ?? join(homedir(), ".gavl", "plots");
+		this.dataDir = opts.walletDir ?? join(homedir(), ".gavl");
 		this.storeOpts = opts.store;
+		this.custodyOpts = opts.custody ?? {};
 		this.schedule = opts.schedule;
 		this.network = opts.network ?? "gavl";
 		this.bootstrap = new BootstrapList(undefined, opts.bootstrapEnv);
@@ -180,7 +213,19 @@ export class Daemon {
 				this.anchorTimes.push({ height: tip.height, at: Date.now() });
 				if (this.anchorTimes.length > 32) this.anchorTimes.shift(); // keep a small window
 			}
+			this.driveRotation(); // advance the custody epoch loop on each finality move
 		};
+	}
+
+	/** Feed the finalized chain to the custody rotation loop (no-op unless committee
+	 *  mode is active). Non-reentrant + one-shot per epoch, so calling on every tip is cheap. */
+	private driveRotation(): void {
+		const rot = this.rotation;
+		const anchors = this.node.anchors;
+		if (!rot || !anchors) return;
+		const finalAnchor = anchors.finalized(this.finalityDepth);
+		if (!finalAnchor) return;
+		void rot.onFinalized(anchors.chainTo(finalAnchor) as AnchorView[]);
 	}
 
 	/**
@@ -286,6 +331,33 @@ export class Daemon {
 		return this.node.anchors?.finalized(this.finalityDepth)?.height ?? null;
 	}
 
+	/** Custody status for the UI/operator: the mode, the autonomous loop's epoch, the
+	 *  on-chain fund key/address, and whether THIS node currently holds a committee share. */
+	custodyStatus(): {
+		mode: "seed" | "committee";
+		epoch: number;
+		fundKeyOnChain: string | null;
+		fundAddress: string | null;
+		committeeId: string | null;
+		holdsShare: boolean;
+		committee: string[] | null;
+		threshold: number | null;
+	} {
+		const cs = this.committeeShare();
+		const committee = this.committeeMode();
+		const onchain = committee ? this.view().custody.fundKey : null;
+		return {
+			mode: committee ? "committee" : "seed",
+			epoch: this.rotation?.epoch ?? -1,
+			fundKeyOnChain: onchain,
+			fundAddress: committee ? (onchain ? this.fundAddress() : null) : this.fundAddress(),
+			committeeId: committee ? this.producerId() : null,
+			holdsShare: !!cs,
+			committee: cs?.participants ?? null,
+			threshold: cs?.min ?? null,
+		};
+	}
+
 	consensus(): ConsensusStatus {
 		const tip = this.node.anchorTip();
 		const finalized = this.node.anchors?.finalized(this.finalityDepth) ?? null;
@@ -345,7 +417,9 @@ export class Daemon {
 		this.startReserveWatch(); // proof-of-reserves polling
 
 		if (opts.farm) {
-			const farmer = generateKeyPair();
+			// Stable producer identity (persisted) so this node is the SAME committee
+			// candidate across reboots — its anchor-producer pubkey IS its committee id.
+			const farmer = this.committeeMode() ? this.producerKey() : generateKeyPair();
 			let prover: SpaceProver;
 			if (this.spaceMode === "chiapos") {
 				// Real disk cost: plot the farmer's chiapos plot (slow the first time, then cached).
@@ -357,6 +431,7 @@ export class Daemon {
 			}
 			this.producer = new Producer({ node: this.node, keypair: farmer, prover, params: this.params });
 			this.farming = true;
+			if (this.committeeMode()) this.startCommitteeCustody();
 			// Adaptive: farm hard while there are unfinalized writes to bury, then drop
 			// to a slow heartbeat when idle — work tracks activity instead of running
 			// flat-out. busyPaceMs keeps the event loop (HTTP, gossip) responsive.
@@ -367,6 +442,38 @@ export class Daemon {
 				heartbeatMs: this.heartbeatMs,
 			});
 		}
+	}
+
+	/** Stand up the autonomous custody loop: it watches finality (via node.onTip →
+	 *  driveRotation) and runs genesis DKG / per-epoch reshare across the PoST-weighted
+	 *  committee sampled from the chain. The fund key is published on-chain at genesis. */
+	private startCommitteeCustody(): void {
+		if (this.rotation) return;
+		this.rotation = new CommitteeRotation({
+			node: this.node,
+			selfId: this.producerId(),
+			epochLength: this.custodyOpts.epochLength ?? 16,
+			size: this.custodyOpts.size ?? 5,
+			minCommittee: this.custodyOpts.minCommittee ?? 3,
+			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
+			windowAnchors: this.custodyOpts.windowAnchors,
+			groupKey: () => {
+				const hex = this.view().custody.fundKey;
+				return hex ? fromHex(hex) : null;
+			},
+			publishFund: (key, epoch) => void this.custodyAccount().announceFund(toHex(key), epoch).catch(() => {}),
+			loadShare: () => this.committeeShare(),
+			saveShare: (s) => saveShare(this.sharePath(), s),
+			clearShare: () => {
+				try {
+					rmSync(this.sharePath(), { force: true }); // rotated out → the share is dead; remove it
+				} catch {
+					/* best effort */
+				}
+			},
+			log: (m) => console.log(m),
+		});
+		console.log(`  custody: committee mode (epochLength ${this.custodyOpts.epochLength ?? 16}, size ${this.custodyOpts.size ?? 5}); id ${this.producerId().slice(0, 16)}…`);
 	}
 
 	/**
@@ -431,27 +538,73 @@ export class Daemon {
 		return this.bridgeAcct;
 	}
 
-	/** The threshold-custody fund key. TESTNET single-operator (this node holds all
-	 *  shares, deterministic from GAVL_FUND_SEED). Production = distributed DKG, where
-	 *  this node holds only its OWN share — see runCommitteeDkg / committeeShare. */
+	/** Whether autonomous committee custody is enabled (vs single-operator seed fund). */
+	private committeeMode(): boolean {
+		return this.custodyOpts.mode === "committee";
+	}
+
+	/** The threshold-custody fund key. In committee mode the group key is the ON-CHAIN
+	 *  published one (so any node — even one holding no share — derives the right
+	 *  address); if this node holds the matching share, pub/min are exposed for
+	 *  co-signing. Else TESTNET single-operator from GAVL_FUND_SEED. The FundKey never
+	 *  carries gathered shares — spending always goes through the distributed ceremony. */
 	private fundKeyCache?: FundKey;
 	private fundKey(): FundKey {
-		// Committee path: this node holds only its own share, so the FundKey carries the
-		// group key (for addresses) with NO gathered shares — spending goes through the
-		// distributed signing ceremony, not fundKey().shares.
 		const cs = this.committeeShare();
-		if (cs) return { groupPubKey: cs.groupPubKey, pub: cs.pub, shares: {}, min: cs.min, max: cs.participants.length };
+		if (this.committeeMode()) {
+			const onchain = this.view().custody.fundKey;
+			if (onchain) {
+				const groupPubKey = fromHex(onchain);
+				if (cs && toHex(cs.groupPubKey) === onchain) return { groupPubKey, pub: cs.pub, shares: {}, min: cs.min, max: cs.participants.length };
+				return { groupPubKey, pub: {} as FundKey["pub"], shares: {}, min: 0, max: 0 }; // address-only (no share here)
+			}
+			if (cs) return { groupPubKey: cs.groupPubKey, pub: cs.pub, shares: {}, min: cs.min, max: cs.participants.length }; // genesis announce not seen yet
+			// pre-genesis: fall through to the bootstrap seed fund so the node still has an address
+		} else if (cs) {
+			return { groupPubKey: cs.groupPubKey, pub: cs.pub, shares: {}, min: cs.min, max: cs.participants.length };
+		}
 		if (!this.fundKeyCache) this.fundKeyCache = fundKeyFromSeed(2, 3, process.env.GAVL_FUND_SEED ?? "gavl-testnet-fund-v1");
 		return this.fundKeyCache;
 	}
 
 	/** Path to THIS node's persisted committee share (secret, node-local). */
 	private sharePath(): string {
-		return join(homedir(), ".gavl", "custody", "share.json");
+		return join(this.dataDir, "custody", "share.json");
 	}
-	/** This node's committee share if it has completed a distributed DKG, else null. */
+	/** This node's committee share if it holds one (from DKG or a reshare), else null. */
 	committeeShare(): StoredShare | null {
 		return loadShare(this.sharePath());
+	}
+
+	/** This node's STABLE anchor-producer key (persisted) — also its committee identity.
+	 *  A fresh key each boot would make the node a different committee candidate every
+	 *  restart and forfeit its seat/share, so it's pinned to disk like the wallet seed. */
+	private producerKeyPath(): string {
+		return join(this.dataDir, "custody", "farmer.json");
+	}
+	private producerKey(): KeyPair {
+		if (this.producerKeyCache) return this.producerKeyCache;
+		const path = this.producerKeyPath();
+		if (existsSync(path)) {
+			this.producerKeyCache = keyPairFromSeed(fromHex(JSON.parse(readFileSync(path, "utf8")).seed));
+		} else {
+			const kp = generateKeyPair();
+			mkdirSync(join(this.dataDir, "custody"), { recursive: true });
+			writeFileSync(path, JSON.stringify({ seed: toHex(kp.privateKey) }), { mode: 0o600 }); // privateKey IS the 32-byte seed
+			this.producerKeyCache = kp;
+		}
+		return this.producerKeyCache;
+	}
+
+	/** This node's committee id (stable producer pubkey hex). */
+	producerId(): string {
+		return toHex(this.producerKey().publicKey);
+	}
+
+	/** Account bound to the producer key — used to announce the fund key on-chain. */
+	private custodyAccount(): Account {
+		if (!this.custodyAcct) this.custodyAcct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: this.producerKey() });
+		return this.custodyAcct;
 	}
 
 	/**
@@ -569,24 +722,36 @@ export class Daemon {
 		if (change > 0n) payouts.push({ address: this.fundAddress(), amount: change });
 
 		// Deterministic tx so every committee member builds byte-identical bytes (and the
-		// ceremony converges): canonical input + output ordering.
+		// ceremony converges): canonical input + output ordering. A thunk so the failover
+		// signer can rebuild it each round (finalizing a PSBT consumes it).
 		inputs.sort((a, b) => (a.txid === b.txid ? a.index - b.index : a.txid < b.txid ? -1 : 1));
 		payouts.sort((a, b) => (a.address === b.address ? Number(a.amount - b.amount) : a.address < b.address ? -1 : 1));
-		const unsigned = buildWithdrawalTx(this.fundKey(), { inputs, outputs: payouts, network: this.btcNetwork() });
+		const mkUnsigned = () => buildWithdrawalTx(this.fundKey(), { inputs, outputs: payouts, network: this.btcNetwork() });
 
 		const cs = this.committeeShare();
 		let hex: string;
 		if (cs) {
-			// Committee path: co-sign over the live transport with this node's share only.
-			// The deterministic quorum (sorted first `min`) runs the ceremony; members
-			// outside it abstain. Live multi-node convergence is the deployment validation.
-			const quorumIds = [...cs.participants].sort().slice(0, cs.min);
-			if (!quorumIds.includes(cs.selfId)) return null; // not a signer for this round
-			const signed = await signWithdrawalDistributed(unsigned, { node: this.node, signIdBase: pending.map((w) => w.id).join(","), selfId: cs.selfId, quorum: quorumIds, pub: cs.pub, groupPubKey: cs.groupPubKey, share: cs.share });
+			// Committee path: co-sign over the live transport with this node's share only,
+			// with quorum FAILOVER — every committee member runs the loop in lockstep, so an
+			// offline member just rotates the quorum instead of blocking the withdrawal. The
+			// winning quorum's members each converge on (and can broadcast) the identical tx.
+			const signed = await signWithdrawalWithFailover(mkUnsigned, {
+				node: this.node,
+				signIdBase: pending.map((w) => w.id).join(","),
+				selfId: cs.selfId,
+				committee: cs.participants,
+				min: cs.min,
+				pub: cs.pub,
+				groupPubKey: cs.groupPubKey,
+				share: cs.share,
+				timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
+			});
+			if (!signed) return null; // no quorum formed this round — retried on the next attempt
 			hex = signed.hex;
 		} else {
-			const quorum = Object.fromEntries(Object.entries(this.fundKey().shares).slice(0, this.fundKey().min));
-			hex = signWithdrawalTx(unsigned, this.fundKey(), quorum).hex;
+			const fk = this.fundKey();
+			const quorum = Object.fromEntries(Object.entries(fk.shares).slice(0, fk.min));
+			hex = signWithdrawalTx(mkUnsigned(), fk, quorum).hex;
 		}
 		const txid = await esplora.broadcast(hex);
 		for (const w of pending) await this.attestor().settleWithdrawal(w.id);
@@ -693,8 +858,12 @@ export class Daemon {
 		this.store = undefined;
 		this.anchorTimes.length = 0; // reset cadence samples for the new chain
 
-		// 2. Fresh ledger + anchor chain — a clean economy for the new channel.
+		// 2. Fresh ledger + anchor chain — a clean economy for the new channel. The custody
+		//    loop + accounts referenced the OLD node, so drop them; startConsensus rebuilds
+		//    the rotation against the new node when farming.
 		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, this.verifier, { schedule: this.schedule, finalityDepth: this.finalityDepth }));
+		this.rotation = undefined;
+		this.custodyAcct = undefined;
 		this.wireTipCadence();
 		this.accounts.clear();
 		for (const wa of this.wallet.list()) this.bind(wa); // same identities, new node

@@ -38,9 +38,15 @@ export type Op =
 	/** Liquidate an underwater position (anyone; earns a fee). */
 	| { kind: "position.liquidate"; position: string }
 	/** Add native credit to the shared pool backing (drains the unpaid queue). */
-	| { kind: "pool.deposit"; amount: string };
+	| { kind: "pool.deposit"; amount: string }
+	/** Announce the threshold-custody fund's group key on-chain, established by the
+	 *  epoch-0 genesis DKG. FIRST write wins and is IMMUTABLE — so every node + client
+	 *  learns the one permanent fund address, and rotations never change it. (v1 trusts
+	 *  the first announcer; proving it came from a real committee DKG is future work,
+	 *  alongside gate #4 non-public keys.) */
+	| { kind: "custody.fund"; groupKey: string; epoch: number };
 
-const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.settle", "oracle.post", "oracle.meta", "position.open", "position.close", "position.liquidate", "pool.deposit"]);
+const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.settle", "oracle.post", "oracle.meta", "position.open", "position.close", "position.liquidate", "pool.deposit", "custody.fund"]);
 
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);

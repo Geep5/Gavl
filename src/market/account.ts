@@ -87,6 +87,12 @@ export class Account {
 		return this.produce({ kind: "oracle.meta", oracle, sources });
 	}
 
+	/** Announce the threshold-custody fund's group key on-chain (genesis). First write
+	 *  wins and is immutable — every node + client then derives the permanent address. */
+	announceFund(groupKey: string, epoch: number): Promise<Write> {
+		return this.produce({ kind: "custody.fund", groupKey, epoch });
+	}
+
 	/** Open a bull/bear position with `margin` credit at `leverage` (≤5×). Returns position id. */
 	async open(instrument: Instrument, margin: bigint | number | string, leverage: bigint | number | string = 1): Promise<string> {
 		return (await this.produce({ kind: "position.open", instrument, margin: amountStr(margin), leverage: amountStr(leverage) })).id;

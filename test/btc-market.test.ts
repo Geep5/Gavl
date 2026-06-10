@@ -72,6 +72,29 @@ test("oracle.meta: the oracle discloses its sources on-chain; a stranger can't",
 	assert.equal(view(node).oracle.sources.length, 1, "latest disclosure wins");
 });
 
+test("custody.fund: the committee fund key is announced on-chain, first-wins + immutable", async () => {
+	const node = new GavlNode(new Ledger(PARAMS));
+	let t = 0;
+	const now = () => ++t; // shared clock → fold order matches submit order
+	const acct = () => new Account({ node, params: PARAMS, k: K, now });
+	assert.equal(view(node).custody.fundKey, null, "no fund until announced");
+	const a = acct();
+	const real = "02" + "11".repeat(32); // a 33-byte compressed-pubkey-shaped hex
+	await a.announceFund(real, 1);
+	assert.equal(view(node).custody.fundKey, real, "genesis announce sets the fund key");
+	assert.equal(view(node).custody.epoch, 1);
+	// any later announce — even a different key, from anyone — can never move the address
+	await acct().announceFund("03" + "22".repeat(32), 2);
+	await a.announceFund("03" + "33".repeat(32), 5);
+	assert.equal(view(node).custody.fundKey, real, "immutable: the first-folded announce wins");
+	assert.equal(view(node).custody.epoch, 1);
+	// malformed announce ignored
+	const n2 = new GavlNode(new Ledger(PARAMS));
+	let t2 = 0;
+	await new Account({ node: n2, params: PARAMS, k: K, now: () => ++t2 }).announceFund("not-hex!!", 1);
+	assert.equal(computeView(n2.ledger.allWrites()).custody.fundKey, null, "non-hex key rejected");
+});
+
 test("open a BULL position at the oracle mark; margin leaves balance → pool", async () => {
 	const { node, mk, oracle, fund } = setup();
 	const trader = mk();

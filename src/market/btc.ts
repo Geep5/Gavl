@@ -57,11 +57,21 @@ export interface OracleState {
 	sources: { endpoint: string; key: string }[];
 }
 
+export interface CustodyState {
+	/** The threshold-custody fund's group key (hex), or null until genesis announces it.
+	 *  The Taproot deposit address derives from this; it is permanent (set once). */
+	fundKey: string | null;
+	/** The epoch the fund was established in (−1 until announced). */
+	epoch: number;
+}
+
 export interface View {
 	/** The BTC bridge: gBTC balances + BTC reserves + processed deposits + pending
 	 *  withdrawals. gBTC is the collateral — a 1:1 claim on real Bitcoin in the fund. */
 	bridge: BridgeState;
 	oracle: OracleState;
+	/** The threshold-custody fund key, announced on-chain at genesis (committee mode). */
+	custody: CustodyState;
 	/** One shared pool backing both instruments (holds gBTC margin/liquidity). */
 	pool: Pool;
 	/** Open positions by id. Each carries its instrument (bull/bear). */
@@ -112,6 +122,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	const view: View = {
 		bridge: emptyBridge(),
 		oracle: { id: BTC_ORACLE, price: null, seq: -1, sources: [] },
+		custody: { fundKey: null, epoch: -1 },
 		pool: emptyPool(),
 		positions: new Map(),
 		lastFundingHeight: -1,
@@ -187,6 +198,16 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
 			if (op.oracle !== view.oracle.id || w.writer !== view.oracle.id) return;
 			if (!Array.isArray(op.sources)) return;
 			view.oracle.sources = op.sources.filter((s) => s && typeof s.endpoint === "string" && typeof s.key === "string").map((s) => ({ endpoint: s.endpoint, key: s.key }));
+			return;
+		}
+		case "custody.fund": {
+			// First announce wins and is IMMUTABLE — the fund address is permanent, so a
+			// later (or conflicting) announce can never move it. Every genesis committee
+			// member posts the same key; whichever lands first sticks.
+			if (view.custody.fundKey !== null) return;
+			if (typeof op.groupKey !== "string" || !/^[0-9a-f]+$/.test(op.groupKey) || typeof op.epoch !== "number") return;
+			view.custody.fundKey = op.groupKey;
+			view.custody.epoch = op.epoch;
 			return;
 		}
 		case "position.open": {
