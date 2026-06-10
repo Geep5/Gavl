@@ -55,7 +55,7 @@ test("a quorum co-signs a withdrawal tx over the mesh → identical signed tx, n
 	assert.ok(/^[0-9a-f]+$/.test(results[0].hex), "valid tx hex");
 });
 
-test("a per-user deposit input is rejected (distributed tweaked signing is the next increment)", async () => {
+test("a per-user DEPOSIT input is co-signed distributedly (tweaked) — base + deposit in one tx", async () => {
 	const ids = ["x", "y", "z"];
 	const net = new MemoryNetwork();
 	const nodes = Object.fromEntries(ids.map((id) => [id, new GavlNode(new Ledger(PARAMS))]));
@@ -64,11 +64,27 @@ test("a per-user deposit input is rejected (distributed tweaked signing is the n
 	const ds = dkg.map((c) => c.start());
 	await net.idle();
 	const keys = await Promise.all(ds);
-	const fundView = { groupPubKey: keys[0].groupPubKey, pub: keys[0].pub, shares: {}, min: 2, max: 3 } as FundKey;
-	const unsigned = buildWithdrawalTx(fundView, { inputs: [{ txid: "cd".repeat(32), index: 0, amount: 100_000n, owner: "someuser" }], outputs: [{ address: RECIPIENT, amount: 99_000n }] });
-	await assert.rejects(
-		signWithdrawalDistributed(unsigned, { node: nodes.x, signIdBase: "w", selfId: "x", quorum: ["x", "y"], pub: keys[0].pub, groupPubKey: keys[0].groupPubKey, share: keys[0].share }),
-		/per-user deposit/,
-		"rejects per-user deposit inputs for now",
-	);
+	const groupPubKey = keys[0].groupPubKey;
+	const pub = keys[0].pub;
+	const fundView = { groupPubKey, pub, shares: {}, min: 2, max: 3 } as FundKey;
+
+	const depositor = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"; // a sample user pubkey
+	// one base-fund input + one per-user deposit input, in a single withdrawal
+	const mkUnsigned = () =>
+		buildWithdrawalTx(fundView, {
+			inputs: [
+				{ txid: "aa".repeat(32), index: 0, amount: 100_000n }, // base
+				{ txid: "bb".repeat(32), index: 1, amount: 150_000n, owner: depositor }, // per-user deposit
+			],
+			outputs: [{ address: RECIPIENT, amount: 245_000n }],
+		});
+
+	const quorum = ["x", "y"];
+	const signed = quorum.map((id) => signWithdrawalDistributed(mkUnsigned(), { node: nodes[id], signIdBase: "wd", selfId: id, quorum, pub, groupPubKey, share: keys[ids.indexOf(id)].share }));
+	await net.idle();
+	const results = await Promise.all(signed);
+	// both committee members converge on the identical signed tx (base + deposit inputs)
+	assert.equal(results[0].txid, results[1].txid, "same txid");
+	assert.equal(results[0].hex, results[1].hex, "byte-identical signed tx (base + deposit)");
+	assert.equal(results[0].txid.length, 64);
 });

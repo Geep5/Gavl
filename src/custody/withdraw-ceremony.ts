@@ -12,15 +12,17 @@
  * handler at a time). The per-input `signId` keeps stray messages from other inputs
  * filtered out, so members stay in lockstep.
  *
- * SCOPE: BASE-fund-key inputs (the consolidated fund). Per-user DEPOSIT inputs need
- * distributed TWEAKED signing (each signer applies the public deposit tweak to its
- * share before the ceremony) — the immediate follow-on; we reject them here rather
- * than produce a wrong signature.
+ * Handles BOTH base-fund-key inputs and per-user DEPOSIT inputs: a deposit input is
+ * co-signed for its tweaked deposit key — each member applies the public per-user
+ * tweak to its OWN share (deterministic, so they stay consistent) and the ceremony
+ * runs over the tweaked package. So the committee can distributedly spend any fund
+ * UTXO — base or deposit — without ever gathering shares.
  */
 
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { SignCoordinator } from "./sign-coordinator.ts";
 import { taprootOutputKey } from "./bitcoin.ts";
+import { depositOutputKey, depositSigningContext } from "./deposit.ts";
 import type { UnsignedWithdrawal } from "./btctx.ts";
 import type { PublicPackage, Share } from "./threshold.ts";
 import type { GavlNode } from "../sync/node.ts";
@@ -42,19 +44,23 @@ export interface CommitteeSigner {
  * or if a produced signature doesn't verify against the fund key.
  */
 export async function signWithdrawalDistributed(unsigned: UnsignedWithdrawal, s: CommitteeSigner): Promise<{ hex: string; txid: string }> {
-	const fundKey = taprootOutputKey(s.groupPubKey);
 	for (let i = 0; i < unsigned.sighashes.length; i++) {
-		if (unsigned.owners[i] !== undefined) throw new Error(`input ${i} is a per-user deposit — distributed tweaked signing is the next increment`);
+		const owner = unsigned.owners[i];
+		// Base input → this node's share + the fund key. Deposit input → this node's
+		// TWEAKED share + tweaked package + the deposit key (every member tweaks
+		// identically from the public per-user tweak).
+		const ctx = owner === undefined ? { share: s.share, pub: s.pub } : depositSigningContext(s.groupPubKey, s.pub, owner, s.share);
+		const expectedKey = owner === undefined ? taprootOutputKey(s.groupPubKey) : depositOutputKey(s.groupPubKey, owner);
 		const coord = new SignCoordinator(s.node, {
 			signId: `${s.signIdBase}:${i}`,
 			selfId: s.selfId,
 			quorum: s.quorum,
-			pub: s.pub,
-			share: s.share,
+			pub: ctx.pub,
+			share: ctx.share,
 			message: unsigned.sighashes[i],
 		});
 		const sig = await coord.start(); // resolves once the quorum's shares aggregate
-		if (!schnorr.verify(sig, unsigned.sighashes[i], fundKey)) throw new Error(`committee signature invalid for input ${i}`);
+		if (!schnorr.verify(sig, unsigned.sighashes[i], expectedKey)) throw new Error(`committee signature invalid for input ${i}`);
 		unsigned.tx.updateInput(i, { tapKeySig: sig });
 	}
 	unsigned.tx.finalize();

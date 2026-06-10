@@ -113,3 +113,17 @@ export function signDepositSpend(fundKey: FundKey, userPubHex: string, quorumSha
 	for (const [k, s] of Object.entries(quorumShares)) tweakedShares[k] = tweakShare(s, t, oddY);
 	return thresholdSign(sighash, tweakedPub, tweakedShares);
 }
+
+/**
+ * The per-signer view for DISTRIBUTED signing of a user's deposit UTXO: this node's
+ * tweaked share + the tweaked public package (group key = the deposit key). The
+ * tweak is public + deterministic, so every committee member computes the identical
+ * pub and tweaks its OWN share — then a normal signing ceremony over these produces a
+ * BIP340 signature valid against `depositOutputKey(fund, user)`. (Distributed analog
+ * of signDepositSpend: each member holds only its own tweaked share.)
+ */
+export function depositSigningContext(groupPubKey: Uint8Array, pub: PublicPackage, userPubHex: string, share: Share): { share: Share; pub: PublicPackage } {
+	const t = depositTweak(groupPubKey, userPubHex);
+	const oddY = Pt.fromHex(hex(groupPubKey)).add(Pt.BASE.multiply(t)).toBytes(true)[0] === 0x03;
+	return { share: tweakShare(share, t, oddY), pub: tweakPub(pub, t, oddY) };
+}
