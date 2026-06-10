@@ -31,6 +31,7 @@ import { taprootOutputKey } from "./bitcoin.ts";
 import { depositOutputKey, depositSigningContext } from "./deposit.ts";
 import type { UnsignedWithdrawal } from "./btctx.ts";
 import type { PublicPackage, Share } from "./threshold.ts";
+import type { CeremonyAuth } from "./ceremony-auth.ts";
 import type { GavlNode } from "../sync/node.ts";
 
 export interface CommitteeSigner {
@@ -42,6 +43,7 @@ export interface CommitteeSigner {
 	groupPubKey: Uint8Array;
 	share: Share; // THIS node's share — never leaves
 	timeoutMs?: number; // per-input ceremony budget; omit → wait indefinitely (tests)
+	auth?: CeremonyAuth; // authenticate ceremony messages (signed `from`)
 }
 
 /**
@@ -66,6 +68,7 @@ export async function signWithdrawalDistributed(unsigned: UnsignedWithdrawal, s:
 			share: ctx.share,
 			message: unsigned.sighashes[i],
 			timeoutMs: s.timeoutMs,
+			auth: s.auth,
 		});
 		const sig = await coord.start(); // resolves once the quorum's shares aggregate
 		if (!schnorr.verify(sig, unsigned.sighashes[i], expectedKey)) throw new Error(`committee signature invalid for input ${i}`);
@@ -86,6 +89,7 @@ export interface FailoverSigner {
 	share: Share; // THIS node's share
 	timeoutMs: number; // per-round budget
 	maxRounds?: number; // default committee.length
+	auth?: CeremonyAuth; // authenticate ceremony messages (signed `from`)
 }
 
 /**
@@ -114,6 +118,7 @@ export async function signWithdrawalWithFailover(buildUnsigned: () => UnsignedWi
 					groupPubKey: s.groupPubKey,
 					share: s.share,
 					timeoutMs: s.timeoutMs,
+					auth: s.auth,
 				});
 			} catch (e) {
 				if (!isCeremonyTimeout(e)) throw e; // a real signing fault → surface it; a timeout → rotate

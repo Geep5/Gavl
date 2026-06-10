@@ -28,6 +28,7 @@ import type { GavlNode, Connection } from "../sync/node.ts";
 import type { DkgWire } from "../sync/messages.ts";
 import { toJsonSafe as enc, fromJsonSafe as dec } from "./u8json.ts";
 import { CeremonyTimeout } from "./ceremony.ts";
+import type { CeremonyAuth } from "./ceremony-auth.ts";
 
 export interface DkgResult {
 	share: Share; // THIS node's threshold share — stays local
@@ -50,9 +51,9 @@ export class DkgCoordinator {
 	private resolve!: (r: DkgResult) => void;
 	private reject!: (e: Error) => void;
 	private readonly node: GavlNode;
-	private readonly opts: { session: string; selfId: string; participants: string[]; min: number; timeoutMs?: number };
+	private readonly opts: { session: string; selfId: string; participants: string[]; min: number; timeoutMs?: number; auth?: CeremonyAuth };
 
-	constructor(node: GavlNode, opts: { session: string; selfId: string; participants: string[]; min: number; timeoutMs?: number }) {
+	constructor(node: GavlNode, opts: { session: string; selfId: string; participants: string[]; min: number; timeoutMs?: number; auth?: CeremonyAuth }) {
 		this.node = node;
 		this.opts = opts;
 		this.max = opts.participants.length;
@@ -79,7 +80,7 @@ export class DkgCoordinator {
 			// Round 1: broadcast my public commitment.
 			const pkg = this.session.round1();
 			this.r1.set(this.selfFid, pkg);
-			this.node.dkgBroadcast({ d: "round1", session: this.opts.session, from: this.opts.selfId, pkg: enc(pkg) });
+			this.node.dkgBroadcast(this.stamp({ d: "round1", session: this.opts.session, from: this.opts.selfId, pkg: enc(pkg) }));
 			this.maybeRound2();
 		});
 	}
@@ -102,8 +103,14 @@ export class DkgCoordinator {
 		this.reject(new CeremonyTimeout("dkg", this.missing()));
 	}
 
+	/** Sign an outgoing message as this node's committee id (no-op without auth). */
+	private stamp<T extends object>(m: T): T {
+		return this.opts.auth ? this.opts.auth.stamp(m) : m;
+	}
+
 	private onWire(conn: Connection, m: DkgWire): void {
 		if (this.settled || m.session !== this.opts.session) return; // settled, or not our ceremony
+		if (this.opts.auth && !this.opts.auth.ok(m)) return; // unauthenticated/forged `from` → drop
 		if (m.d === "round1") {
 			if (m.from === this.opts.selfId) return; // own echo (shouldn't happen on broadcast)
 			const fid = this.fidOf.get(m.from);
@@ -131,7 +138,7 @@ export class DkgCoordinator {
 			const pid = this.idOfFid.get(recipientFid);
 			const conn = pid ? this.connOf.get(pid) : undefined;
 			// Point-to-point over the recipient's own connection — never broadcast.
-			if (pid && conn) this.node.dkgReply(conn, { d: "round2", session: this.opts.session, from: this.opts.selfId, to: pid, share: enc(shares[recipientFid]) });
+			if (pid && conn) this.node.dkgReply(conn, this.stamp({ d: "round2", session: this.opts.session, from: this.opts.selfId, to: pid, share: enc(shares[recipientFid]) }));
 		}
 		this.maybeRound3();
 	}

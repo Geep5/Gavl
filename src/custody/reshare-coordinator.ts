@@ -27,6 +27,7 @@ import { dealAtIds } from "./reshare.ts";
 import { fid, fidScalar } from "./committee.ts";
 import { toJsonSafe as enc, fromJsonSafe as dec } from "./u8json.ts";
 import { CeremonyTimeout } from "./ceremony.ts";
+import type { CeremonyAuth } from "./ceremony-auth.ts";
 import type { PublicPackage, Share } from "./threshold.ts";
 import type { GavlNode, Connection } from "../sync/node.ts";
 import type { ReshareWire } from "../sync/messages.ts";
@@ -42,7 +43,7 @@ export interface ReshareResult {
 
 export class ReshareCoordinator {
 	private readonly node: GavlNode;
-	private readonly o: { session: string; selfId: string; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupPubKey: Uint8Array; oldShare?: Share; timeoutMs?: number };
+	private readonly o: { session: string; selfId: string; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupPubKey: Uint8Array; oldShare?: Share; timeoutMs?: number; auth?: CeremonyAuth };
 	private readonly connOf = new Map<string, Connection>(); // peer id → connection
 	private readonly subsForMe = new Map<string, bigint>(); // old sender id → sub-share scalar (new-member role)
 	private readonly vshares = new Map<string, Uint8Array>(); // new member id → verifying share
@@ -53,10 +54,15 @@ export class ReshareCoordinator {
 	private resolve!: (r: ReshareResult) => void;
 	private reject!: (e: Error) => void;
 
-	constructor(node: GavlNode, opts: { session: string; selfId: string; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupPubKey: Uint8Array; oldShare?: Share; timeoutMs?: number }) {
+	constructor(node: GavlNode, opts: { session: string; selfId: string; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupPubKey: Uint8Array; oldShare?: Share; timeoutMs?: number; auth?: CeremonyAuth }) {
 		this.node = node;
 		this.o = opts;
 		this.node.onReshare = (conn, m) => this.onWire(conn, m);
+	}
+
+	/** Sign an outgoing message as this node's committee id (no-op without auth). */
+	private stamp<T extends object>(m: T): T {
+		return this.o.auth ? this.o.auth.stamp(m) : m;
 	}
 
 	private isNew(): boolean {
@@ -72,7 +78,7 @@ export class ReshareCoordinator {
 			this.reject = rej;
 			if (this.o.timeoutMs !== undefined) this.timer = setTimeout(() => this.fail(), this.o.timeoutMs);
 			// Announce so peers learn our connection (old members route sub-shares by it).
-			this.node.reshareBroadcast({ r: "hello", session: this.o.session, from: this.o.selfId });
+			this.node.reshareBroadcast(this.stamp({ r: "hello", session: this.o.session, from: this.o.selfId }));
 			this.maybeSendSubs();
 		});
 	}
@@ -94,6 +100,7 @@ export class ReshareCoordinator {
 
 	private onWire(conn: Connection, m: ReshareWire): void {
 		if (this.settled || m.session !== this.o.session) return;
+		if (this.o.auth && !this.o.auth.ok(m)) return; // unauthenticated/forged `from` → drop
 		if (m.r === "hello") {
 			if (m.from !== this.o.selfId) this.connOf.set(m.from, conn);
 			this.maybeSendSubs();
@@ -130,7 +137,7 @@ export class ReshareCoordinator {
 				this.subsForMe.set(this.o.selfId, y); // my own contribution to my own share
 			} else {
 				const conn = this.connOf.get(recipientId);
-				if (conn) this.node.reshareReply(conn, { r: "sub", session: this.o.session, from: this.o.selfId, to: recipientId, share: enc(Fn.toBytes(y)) });
+				if (conn) this.node.reshareReply(conn, this.stamp({ r: "sub", session: this.o.session, from: this.o.selfId, to: recipientId, share: enc(Fn.toBytes(y)) }));
 			}
 		});
 		this.maybeCombine();
@@ -146,7 +153,7 @@ export class ReshareCoordinator {
 		this.myNewY = y;
 		const vshare = Pt.BASE.multiply(y).toBytes(true); // g^newShare
 		this.vshares.set(this.o.selfId, vshare);
-		this.node.reshareBroadcast({ r: "vshare", session: this.o.session, from: this.o.selfId, v: enc(vshare) });
+		this.node.reshareBroadcast(this.stamp({ r: "vshare", session: this.o.session, from: this.o.selfId, v: enc(vshare) }));
 		this.maybeFinish();
 	}
 	private myNewY: bigint | null = null;

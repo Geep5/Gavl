@@ -43,9 +43,9 @@ export type SyncMessage =
  */
 export type DkgWire =
 	/** Round 1: broadcast a public commitment + proof-of-knowledge. `from` = participant id. */
-	| { d: "round1"; session: string; from: string; pkg: unknown }
+	| { d: "round1"; session: string; from: string; pkg: unknown; sig?: string }
 	/** Round 2: a secret share from `from` addressed to participant `to`. Point-to-point. */
-	| { d: "round2"; session: string; from: string; to: string; share: unknown };
+	| { d: "round2"; session: string; from: string; to: string; share: unknown; sig?: string };
 
 /**
  * Distributed SIGNING ceremony payloads. A quorum co-signs a message using each
@@ -54,9 +54,9 @@ export type DkgWire =
  */
 export type SignWire =
 	/** Round 1: a signer's nonce commitments for `sign` over `msg` (hex). `from` = signer id. */
-	| { s: "commit"; sign: string; from: string; commit: unknown }
+	| { s: "commit"; sign: string; from: string; commit: unknown; sig?: string }
 	/** Round 2: a signer's signature share (safe to broadcast — useless without a quorum). */
-	| { s: "share"; sign: string; from: string; share: unknown };
+	| { s: "share"; sign: string; from: string; share: unknown; sig?: string };
 
 /**
  * Committee RESHARE ceremony payloads — rotate the fund key to a new committee
@@ -66,8 +66,8 @@ export type SignWire =
  */
 export type ReshareWire =
 	/** Announce participation so peers learn id→connection (for routing sub-shares). */
-	| { r: "hello"; session: string; from: string }
+	| { r: "hello"; session: string; from: string; sig?: string }
 	/** SECRET sub-share from an old member `from` to a new member `to`. Point-to-point. */
-	| { r: "sub"; session: string; from: string; to: string; share: unknown }
+	| { r: "sub"; session: string; from: string; to: string; share: unknown; sig?: string }
 	/** A new member's verifying share g^newShare (public). */
-	| { r: "vshare"; session: string; from: string; v: unknown };
+	| { r: "vshare"; session: string; from: string; v: unknown; sig?: string };

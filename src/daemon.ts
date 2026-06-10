@@ -33,6 +33,8 @@ import { depositAddress } from "./custody/deposit.ts";
 import { buildWithdrawalTx, signWithdrawalTx } from "./custody/btctx.ts";
 import { signWithdrawalWithFailover } from "./custody/withdraw-ceremony.ts";
 import { CommitteeRotation } from "./custody/rotation.ts";
+import { makeCeremonyAuth } from "./custody/ceremony-auth.ts";
+import type { CeremonyAuth } from "./custody/ceremony-auth.ts";
 import type { AnchorView } from "./custody/epoch.ts";
 import { Esplora } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
@@ -457,6 +459,7 @@ export class Daemon {
 			minCommittee: this.custodyOpts.minCommittee ?? 3,
 			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
 			windowAnchors: this.custodyOpts.windowAnchors,
+			auth: this.ceremonyAuth(),
 			groupKey: () => {
 				const hex = this.view().custody.fundKey;
 				return hex ? fromHex(hex) : null;
@@ -607,6 +610,14 @@ export class Daemon {
 		return this.custodyAcct;
 	}
 
+	/** Authenticates this node's ceremony messages (signs as its committee id = producer
+	 *  pubkey) and verifies peers' — so an impersonator on the committee topic is dropped. */
+	private ceremonyAuthCache?: CeremonyAuth;
+	private ceremonyAuth(): CeremonyAuth {
+		if (!this.ceremonyAuthCache) this.ceremonyAuthCache = makeCeremonyAuth(this.producerKey().privateKey);
+		return this.ceremonyAuthCache;
+	}
+
 	/**
 	 * Run the distributed committee DKG over the LIVE node transport with the
 	 * configured committee, then persist THIS node's share (the key is generated
@@ -707,7 +718,10 @@ export class Daemon {
 	 * txid, or null if there's nothing pending / insufficient confirmed UTXOs.
 	 */
 	async processWithdrawals(feeSats = 1_000n): Promise<string | null> {
-		const pending = this.view().bridge.pending;
+		// Sign only FINALIZED withdrawals in committee mode: each member builds from its
+		// own finalized view, so a reorg can't desync "BTC sent" from "gBTC burned", and
+		// members agree on a stable pending set (finalized state is consensus).
+		const pending = (this.committeeMode() ? this.finalView() : this.view()).bridge.pending;
 		if (pending.length === 0) return null;
 		const esplora = this.esplora();
 		const tip = await esplora.tipHeight();
@@ -719,7 +733,19 @@ export class Daemon {
 		const outSum = payouts.reduce((a, p) => a + p.amount, 0n);
 		if (inputs.length === 0 || inSum < outSum + feeSats) return null; // not enough confirmed BTC yet
 		const change = inSum - outSum - feeSats;
-		if (change > 0n) payouts.push({ address: this.fundAddress(), amount: change });
+		const fundAddr = this.fundAddress();
+		if (change > 0n) payouts.push({ address: fundAddr, amount: change });
+
+		// SIGNING POLICY (the honest-member veto): the tx may pay ONLY the finalized
+		// owner-signed withdrawals — each to the address THAT OWNER put in their signed
+		// burn — plus change back to the fund. Every member enforces this from its own
+		// view before contributing a share, so redirecting or fabricating a spend needs a
+		// corrupted THRESHOLD, never one bad actor or a malicious tx-builder.
+		const requested = new Set(pending.map((w) => w.btcAddress));
+		for (const p of payouts) {
+			if (p.address === fundAddr) continue; // change back to the fund
+			if (!requested.has(p.address)) throw new Error(`withdrawal policy: refusing to pay ${p.address} — not a finalized request`);
+		}
 
 		// Deterministic tx so every committee member builds byte-identical bytes (and the
 		// ceremony converges): canonical input + output ordering. A thunk so the failover
@@ -745,6 +771,7 @@ export class Daemon {
 				groupPubKey: cs.groupPubKey,
 				share: cs.share,
 				timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
+				auth: this.ceremonyAuth(),
 			});
 			if (!signed) return null; // no quorum formed this round — retried on the next attempt
 			hex = signed.hex;

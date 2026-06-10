@@ -24,10 +24,11 @@ import type { GavlNode } from "../sync/node.ts";
 import type { SignWire } from "../sync/messages.ts";
 import { toJsonSafe as enc, fromJsonSafe as dec } from "./u8json.ts";
 import { CeremonyTimeout } from "./ceremony.ts";
+import type { CeremonyAuth } from "./ceremony-auth.ts";
 
 export class SignCoordinator {
 	private readonly node: GavlNode;
-	private readonly opts: { signId: string; selfId: string; quorum: string[]; pub: PublicPackage; share: Share; message: Uint8Array; timeoutMs?: number };
+	private readonly opts: { signId: string; selfId: string; quorum: string[]; pub: PublicPackage; share: Share; message: Uint8Array; timeoutMs?: number; auth?: CeremonyAuth };
 	private readonly selfFid: string;
 	private readonly fidOf = new Map<string, string>(); // signer id → FROST identifier
 	private readonly idOfFid = new Map<string, string>(); // FROST identifier → signer id (for `missing`)
@@ -41,7 +42,7 @@ export class SignCoordinator {
 	private resolve!: (sig: Uint8Array) => void;
 	private reject!: (e: Error) => void;
 
-	constructor(node: GavlNode, opts: { signId: string; selfId: string; quorum: string[]; pub: PublicPackage; share: Share; message: Uint8Array; timeoutMs?: number }) {
+	constructor(node: GavlNode, opts: { signId: string; selfId: string; quorum: string[]; pub: PublicPackage; share: Share; message: Uint8Array; timeoutMs?: number; auth?: CeremonyAuth }) {
 		this.node = node;
 		this.opts = opts;
 		this.quorumN = opts.quorum.length;
@@ -65,7 +66,7 @@ export class SignCoordinator {
 			const c = FROST.commit(this.opts.share);
 			this.nonces = c.nonces;
 			this.commits.set(this.selfFid, c.commitments);
-			this.node.signBroadcast({ s: "commit", sign: this.opts.signId, from: this.opts.selfId, commit: enc(c.commitments) });
+			this.node.signBroadcast(this.stamp({ s: "commit", sign: this.opts.signId, from: this.opts.selfId, commit: enc(c.commitments) }));
 			this.maybeSignShare();
 		});
 	}
@@ -86,8 +87,14 @@ export class SignCoordinator {
 		this.reject(new CeremonyTimeout("sign", this.missing()));
 	}
 
+	/** Sign an outgoing message as this node's committee id (no-op without auth). */
+	private stamp<T extends object>(m: T): T {
+		return this.opts.auth ? this.opts.auth.stamp(m) : m;
+	}
+
 	private onWire(m: SignWire): void {
 		if (this.settled || m.sign !== this.opts.signId) return;
+		if (this.opts.auth && !this.opts.auth.ok(m)) return; // unauthenticated/forged `from` → drop
 		const fid = this.fidOf.get(m.from);
 		if (!fid) return; // not a quorum member
 		if (m.s === "commit") {
@@ -110,7 +117,7 @@ export class SignCoordinator {
 		this.sentShare = true;
 		const sigShare = FROST.signShare(this.opts.share, this.opts.pub, this.nonces!, this.commitmentList() as never, this.opts.message);
 		this.shares.set(this.selfFid, sigShare);
-		this.node.signBroadcast({ s: "share", sign: this.opts.signId, from: this.opts.selfId, share: enc(sigShare) });
+		this.node.signBroadcast(this.stamp({ s: "share", sign: this.opts.signId, from: this.opts.selfId, share: enc(sigShare) }));
 		this.maybeAggregate();
 	}
 

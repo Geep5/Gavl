@@ -37,6 +37,7 @@ import { committeeForEpoch, epochOf } from "./epoch.ts";
 import type { AnchorView, EpochCommittee } from "./epoch.ts";
 import { quorumForRound } from "./committee.ts";
 import { isCeremonyTimeout } from "./ceremony.ts";
+import type { CeremonyAuth } from "./ceremony-auth.ts";
 import type { StoredShare } from "./share-store.ts";
 import type { GavlNode } from "../sync/node.ts";
 
@@ -51,6 +52,8 @@ export interface RotationConfig {
 	minCommittee?: number;
 	/** Membership lookback in anchors (default: all below the boundary). */
 	windowAnchors?: number;
+	/** Authenticates ceremony messages (signs as this node's committee id, verifies peers'). */
+	auth?: CeremonyAuth;
 	/** The network-known fund group key (on-chain published), or null if no fund yet. */
 	groupKey: () => Uint8Array | null;
 	/** Publish the freshly-DKG'd fund key on-chain (so every node + client learns it). */
@@ -122,7 +125,7 @@ export class CommitteeRotation {
 	private async genesis(next: EpochCommittee, epoch: number): Promise<void> {
 		if (this.c.loadShare()) return; // already hold a share (key publish just hasn't propagated)
 		this.log(`epoch ${epoch}: genesis DKG among ${next.committee.length} (min ${next.min})`);
-		const coord = new DkgCoordinator(this.c.node, { session: `custody-epoch-${epoch}`, selfId: this.c.selfId, participants: next.committee, min: next.min, timeoutMs: this.c.timeoutMs });
+		const coord = new DkgCoordinator(this.c.node, { session: `custody-epoch-${epoch}`, selfId: this.c.selfId, participants: next.committee, min: next.min, timeoutMs: this.c.timeoutMs, auth: this.c.auth });
 		try {
 			const r = await coord.start();
 			this.c.saveShare({ ...r, session: `custody-epoch-${epoch}`, selfId: this.c.selfId, participants: next.committee, min: next.min, epoch });
@@ -164,6 +167,7 @@ export class CommitteeRotation {
 			groupPubKey: key,
 			oldShare: canHandOff && stored ? stored.share : undefined,
 			timeoutMs: this.c.timeoutMs,
+			auth: this.c.auth,
 		});
 		try {
 			const r = await coord.start();
