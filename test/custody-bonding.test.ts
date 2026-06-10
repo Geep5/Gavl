@@ -14,7 +14,7 @@ import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
 import { computeView, gbtcOf, marketConserved } from "../src/market/btc.ts";
 import { bridgeKeyPair } from "../src/market/oracle.ts";
-import { bondedTotal } from "../src/custody/bridge.ts";
+import { bondedTotal, UNBOND_DELAY } from "../src/custody/bridge.ts";
 import { committeeForEpoch } from "../src/custody/epoch.ts";
 import type { AnchorView } from "../src/custody/epoch.ts";
 import { PARAMS, K } from "./helpers.ts";
@@ -28,7 +28,7 @@ function setup() {
 }
 const view = (node: GavlNode) => computeView(node.ledger.allWrites());
 
-test("bond locks free gBTC (still backed); unbond releases it; can't over-bond", async () => {
+test("bond locks free gBTC (still backed, unwithdrawable); over-bond rejected", async () => {
 	const { node, acct } = setup();
 	const me = acct();
 	await acct(bridgeKeyPair()).attestDeposit("d:0", me.pubHex, 10_000n); // seed-mint 10k to me
@@ -40,20 +40,35 @@ test("bond locks free gBTC (still backed); unbond releases it; can't over-bond",
 	assert.equal(bondedTotal(view(node).bridge), 6000n);
 	assert.ok(marketConserved(view(node)), "bonded gBTC is still 1:1-backed (conservation holds)");
 
-	// can't bond more than the free balance
-	await me.bond(99_999n);
+	await me.bond(99_999n); // can't bond more than the free balance
 	assert.equal(view(node).bridge.bonds.get(me.pubHex), 6000n, "over-bond rejected");
 
-	await me.unbond(2000n);
-	assert.equal(gbtcOf(view(node), me.pubHex), 6000n, "unbonded gBTC returns to free");
-	assert.equal(view(node).bridge.bonds.get(me.pubHex), 4000n);
-	assert.ok(marketConserved(view(node)));
-
-	// bonded gBTC is locked: a withdrawal can't spend it (only the 6k free covers it)
-	await me.withdraw(7000n, "tb1qexamplexxxxxxxxxxxxxxxxxxxxxxxxxxxx");
-	assert.equal(view(node).bridge.pending.length, 0, "can't withdraw more than the FREE balance");
-	await me.withdraw(6000n, "tb1qexamplexxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+	// bonded gBTC is locked: only the 4k free covers a withdrawal
+	await me.withdraw(5000n, "tb1qexamplexxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+	assert.equal(view(node).bridge.pending.length, 0, "can't withdraw bonded gBTC");
+	await me.withdraw(4000n, "tb1qexamplexxxxxxxxxxxxxxxxxxxxxxxxxxxx");
 	assert.equal(view(node).bridge.pending.length, 1, "free balance withdraws fine");
+});
+
+test("unbond is delayed: still locked + slashable until it matures, then spendable", async () => {
+	const { node, acct } = setup();
+	const me = acct();
+	await acct(bridgeKeyPair()).attestDeposit("d:0", me.pubHex, 10_000n);
+	await me.bond(6000n); // free 4k, bonded 6k
+	const ub = await me.unbond(2000n);
+
+	// the 2k left the ACTIVE bond but is NOT free yet — it's unbonding (still slashable)
+	assert.equal(view(node).bridge.bonds.get(me.pubHex), 4000n, "active bond drops");
+	assert.equal(view(node).bridge.unbonding.get(me.pubHex)?.amount, 2000n, "…into unbonding");
+	assert.equal(gbtcOf(view(node), me.pubHex), 4000n, "still not spendable");
+	assert.ok(marketConserved(view(node)), "still conserved (unbonding counts as bonded)");
+
+	// once the delay matures on the anchor clock, it returns to free gBTC. The unbond was
+	// certified at height 0 (bornAt); at a nowHeight past 0 + UNBOND_DELAY it releases.
+	const matured = computeView(node.ledger.allWrites(), { nowHeight: UNBOND_DELAY + 100, bornAt: new Map([[ub.id, 0]]) });
+	assert.equal(gbtcOf(matured, me.pubHex), 6000n, "matured unbond is spendable again");
+	assert.ok(!matured.bridge.unbonding.has(me.pubHex), "unbonding cleared");
+	assert.ok(marketConserved(matured));
 });
 
 // a chain where heights 0..15 are produced by p0..p4 round-robin → all 5 are eligible

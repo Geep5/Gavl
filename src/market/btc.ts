@@ -29,8 +29,9 @@ import { skewBps, fundingRateBps, fundingPayment, DEFAULT_FUNDING } from "../per
 import { finalizedOrdering } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import { oraclePubHex, bridgePubHex } from "./oracle.ts";
-import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, unbond } from "../custody/bridge.ts";
+import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
+import { equivocationCulprit } from "../custody/slashing.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "../custody/attestation.ts";
 import { fromHex } from "../det/canonical.ts";
@@ -139,6 +140,10 @@ export interface ViewOptions {
 	order?: (a: Write, b: Write) => number;
 	/** Anchor-clock "now" — drives funding + (later) mark finality. */
 	nowHeight?: number;
+	/** Per-write certifying-anchor height (from finalizedOrdering) — the STABLE height a
+	 *  write happened at, used for height-timed effects (unbond maturity) that must not
+	 *  drift as the fold's global `nowHeight` advances. */
+	bornAt?: Map<string, number>;
 }
 
 export function computeView(writes: Write[], opts: ViewOptions = {}): View {
@@ -151,10 +156,15 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 		positions: new Map(),
 		lastFundingHeight: -1,
 	};
+	const nowHeight = opts.nowHeight ?? 0;
 	for (const w of [...writes].sort(cmp)) {
 		const op = w.payload as Op | null;
-		if (isOp(op)) applyOp(view, w, op, opts.nowHeight ?? 0);
+		// Effects timed by height (unbond maturity) use the write's STABLE certifying
+		// height (bornAt) so they don't drift as the global nowHeight advances; others
+		// use nowHeight (the current anchor clock).
+		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight);
 	}
+	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
 	return view;
 }
 
@@ -169,12 +179,12 @@ export function mark(view: View): bigint | null {
  * consensus never imports app state; the app calls consensus.
  */
 export function finalizedView(writes: Write[], anchors: AnchorChain, k: number): View {
-	const { included, order, nowHeight } = finalizedOrdering(writes, anchors, k);
+	const { included, order, bornAt, nowHeight } = finalizedOrdering(writes, anchors, k);
 	if (nowHeight === null) return computeView([]);
-	return computeView(included, { order, nowHeight });
+	return computeView(included, { order, nowHeight, bornAt });
 }
 
-function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
+function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized by the committee
@@ -310,9 +320,17 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
 			return;
 		}
 		case "custody.unbond": {
-			// Release bonded gBTC back to spendable.
+			// Begin releasing bonded gBTC. Matures at the request's CERTIFIED height +
+			// UNBOND_DELAY (stable across replays); slashable until then.
 			const amt = parseAmount(op.amount);
-			if (amt !== null) unbond(view.bridge, w.writer, amt);
+			if (amt !== null) requestUnbond(view.bridge, w.writer, amt, bornHeight);
+			return;
+		}
+		case "custody.slash": {
+			// Permissionless: verify the equivocation proof, then award the culprit's bond
+			// to the submitter (a bounty). A forged/invalid proof is a no-op.
+			const culprit = equivocationCulprit(op.a, op.b);
+			if (culprit) slash(view.bridge, culprit, w.writer);
 			return;
 		}
 	}

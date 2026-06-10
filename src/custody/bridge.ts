@@ -62,12 +62,20 @@ export interface BridgeState {
 	 *  gBTC is locked: not spendable/transferable, but still 1:1-backed (counted in
 	 *  conservation). */
 	bonds: Map<string, bigint>;
+	/** Bonds being withdrawn (pubkey → {amount, releaseHeight}). Still SLASHABLE (so a
+	 *  caught equivocator can't dodge by unbonding) and not weighted; released to free
+	 *  gBTC once the anchor clock passes releaseHeight. */
+	unbonding: Map<string, { amount: bigint; releaseHeight: number }>;
 	mintedTotal: bigint; // audit: lifetime minted
 	paidOut: bigint; // audit: lifetime BTC paid out
 }
 
+/** Anchors a bond must wait after unbonding before it's spendable — long enough for a
+ *  slash proof for any in-flight equivocation to land first. */
+export const UNBOND_DELAY = 16;
+
 export function emptyBridge(): BridgeState {
-	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), mintedTotal: 0n, paidOut: 0n };
+	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), unbonding: new Map(), mintedTotal: 0n, paidOut: 0n };
 }
 
 export function gbtcOf(s: BridgeState, pubkey: string): bigint {
@@ -94,10 +102,11 @@ export function pendingTotal(s: BridgeState): bigint {
 	return t;
 }
 
-/** Total gBTC locked as committee bonds (still backed, just not spendable). */
+/** Total gBTC locked as committee bonds — active + still-slashable unbonding (all backed). */
 export function bondedTotal(s: BridgeState): bigint {
 	let t = 0n;
 	for (const v of s.bonds.values()) t += v;
+	for (const u of s.unbonding.values()) t += u.amount;
 	return t;
 }
 
@@ -110,20 +119,49 @@ export function bond(s: BridgeState, pubkey: string, amount: bigint): boolean {
 	return true;
 }
 
-/** Unbond `amount` back to free gBTC. No-op if the bond can't cover it. (v1: immediate;
- *  an unbonding DELAY — so a caught equivocator can't dodge a slash — lands with slashing.) */
-export function unbond(s: BridgeState, pubkey: string, amount: bigint): boolean {
+/** Begin unbonding `amount`: it leaves the active (weighted) bond but stays SLASHABLE
+ *  until `nowHeight + UNBOND_DELAY`, then releases to free gBTC. No-op if the active bond
+ *  can't cover it. */
+export function requestUnbond(s: BridgeState, pubkey: string, amount: bigint, nowHeight: number): boolean {
 	const cur = s.bonds.get(pubkey) ?? 0n;
 	if (amount <= 0n || cur < amount) return false;
 	const rest = cur - amount;
 	if (rest === 0n) s.bonds.delete(pubkey);
 	else s.bonds.set(pubkey, rest);
-	addG(s, pubkey, amount); // back to free balance
+	const u = s.unbonding.get(pubkey) ?? { amount: 0n, releaseHeight: 0 };
+	s.unbonding.set(pubkey, { amount: u.amount + amount, releaseHeight: Math.max(u.releaseHeight, nowHeight + UNBOND_DELAY) });
 	return true;
 }
 
+/** Release matured unbonding (releaseHeight ≤ nowHeight) back to free gBTC. Called at the
+ *  end of the fold, so it happens deterministically on the anchor clock. */
+export function releaseMatured(s: BridgeState, nowHeight: number): void {
+	for (const [pubkey, u] of [...s.unbonding]) {
+		if (u.releaseHeight <= nowHeight) {
+			addG(s, pubkey, u.amount);
+			s.unbonding.delete(pubkey);
+		}
+	}
+}
+
+/** What's slashable for `pubkey`: its active bond + any still-unbonding amount. */
+export function slashable(s: BridgeState, pubkey: string): bigint {
+	return (s.bonds.get(pubkey) ?? 0n) + (s.unbonding.get(pubkey)?.amount ?? 0n);
+}
+
+/** Slash `culprit`'s ENTIRE bond (active + unbonding) to `beneficiary` (the slasher's
+ *  bounty — keeps conservation + incentivizes enforcement). No-op if nothing to slash. */
+export function slash(s: BridgeState, culprit: string, beneficiary: string): bigint {
+	const amt = slashable(s, culprit);
+	if (amt <= 0n) return 0n;
+	s.bonds.delete(culprit);
+	s.unbonding.delete(culprit);
+	addG(s, beneficiary, amt); // → the slasher's free balance
+	return amt;
+}
+
 /** The 1:1 backing invariant — reserves account for exactly the outstanding claims
- *  (free + bonded gBTC + burned-pending). Bonded gBTC is still a claim on reserves. */
+ *  (free + bonded/unbonding gBTC + burned-pending). Bonded gBTC is still a claim. */
 export function conserved(s: BridgeState): boolean {
 	return s.reserves === totalGbtc(s) + bondedTotal(s) + pendingTotal(s);
 }

@@ -53,8 +53,13 @@ export type Op =
 	/** Lock gBTC as a custody-committee BOND — your committee selection WEIGHT, and
 	 *  SLASHABLE on a proven fault. Bonded gBTC is locked (unspendable) but still backed. */
 	| { kind: "custody.bond"; amount: string }
-	/** Release bonded gBTC back to spendable. */
+	/** Begin releasing bonded gBTC (matures after a delay; still slashable meanwhile). */
 	| { kind: "custody.unbond"; amount: string }
+	/** Slash a committee member's bond with a fraud proof: two conflicting ceremony
+	 *  messages (`a`, `b`) it signed for the same slot. Permissionless — the fold verifies
+	 *  the proof and awards the bond to the submitter. No authority needed; a forged proof
+	 *  does nothing. */
+	| { kind: "custody.slash"; a: unknown; b: unknown }
 	/** Announce the threshold-custody fund's group key on-chain, established by the
 	 *  epoch-0 genesis DKG. FIRST write wins and is IMMUTABLE — so every node + client
 	 *  learns the one permanent fund address, and rotations never change it. (v1 trusts
@@ -62,7 +67,7 @@ export type Op =
 	 *  alongside gate #4 non-public keys.) */
 	| { kind: "custody.fund"; groupKey: string; epoch: number };
 
-const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "oracle.post", "oracle.meta", "position.open", "position.close", "position.liquidate", "pool.deposit", "custody.fund", "custody.bond", "custody.unbond"]);
+const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "oracle.post", "oracle.meta", "position.open", "position.close", "position.liquidate", "pool.deposit", "custody.fund", "custody.bond", "custody.unbond", "custody.slash"]);
 
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);
