@@ -74,6 +74,17 @@ export class Account {
 		return this.produce({ kind: "bridge.withdraw", amount: amountStr(amount), btcAddress });
 	}
 
+	/** Request that a verified BTC deposit be minted — the on-chain trigger every
+	 *  committee member acts on (verify + co-sign the mint). Anyone may post it. */
+	claim(depositId: string, depositor: string): Promise<Write> {
+		return this.produce({ kind: "bridge.claim", depositId, depositor });
+	}
+
+	/** Announce a withdrawal's payout txid → marks it in flight (committee stops re-signing). */
+	announceBroadcast(withdrawalId: string, txid: string): Promise<Write> {
+		return this.produce({ kind: "bridge.broadcast", withdrawalId, txid });
+	}
+
 	/** Mark a withdrawal's BTC payout confirmed. `sig` (committee threshold sig over the
 	 *  settle digest) authorizes it in committee mode; without it, the legacy attestor key. */
 	settleWithdrawal(withdrawalId: string, sig?: string): Promise<Write> {

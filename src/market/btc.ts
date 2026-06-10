@@ -29,7 +29,7 @@ import { skewBps, fundingRateBps, fundingPayment, DEFAULT_FUNDING } from "../per
 import { finalizedOrdering } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import { oraclePubHex, bridgePubHex } from "./oracle.ts";
-import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal } from "../custody/bridge.ts";
+import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "../custody/attestation.ts";
@@ -198,6 +198,20 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
 			const amt = parseAmount(op.amount);
 			if (amt === null || typeof op.btcAddress !== "string") return;
 			requestWithdrawal(view.bridge, { id: w.id, owner: w.writer, amount: amt, btcAddress: op.btcAddress });
+			return;
+		}
+		case "bridge.claim": {
+			// A request to mint a verified deposit — the on-chain trigger. No authority:
+			// it only ever credits the per-user-address owner, and the committee verifies
+			// the deposit on-chain before minting, so a bogus claim mints nothing.
+			if (typeof op.depositId !== "string" || typeof op.depositor !== "string") return;
+			recordClaim(view.bridge, op.depositId, op.depositor);
+			return;
+		}
+		case "bridge.broadcast": {
+			// A withdrawal's payout txid → marks it in flight (committee stops re-signing).
+			if (typeof op.withdrawalId !== "string" || typeof op.txid !== "string") return;
+			recordBroadcast(view.bridge, op.withdrawalId, op.txid);
 			return;
 		}
 		case "bridge.settle": {

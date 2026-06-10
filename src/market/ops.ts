@@ -23,6 +23,15 @@ export type Op =
 	| { kind: "gbtc.transfer"; to: string; amount: string }
 	/** Burn gBTC to redeem BTC → a pending withdrawal paid to `btcAddress`. */
 	| { kind: "bridge.withdraw"; amount: string; btcAddress: string }
+	/** Request that a verified BTC deposit be minted — the on-chain TRIGGER that tells
+	 *  every committee member to check `depositId` on-chain and co-sign the mint. No
+	 *  authority needed: it only credits the per-user-address owner, and a bogus claim
+	 *  fails everyone's verification. */
+	| { kind: "bridge.claim"; depositId: string; depositor: string }
+	/** Announce a withdrawal's payout txid — marks it IN FLIGHT so the committee stops
+	 *  re-signing and instead watches that txid for confirmation. Informational; members
+	 *  verify the txid actually pays the withdrawal before settling. */
+	| { kind: "bridge.broadcast"; withdrawalId: string; txid: string }
 	/** Mark a withdrawal's BTC payout confirmed (reserves drop). Attestor key (seed) OR
 	 *  a committee threshold signature over the settle digest (committee mode, `sig`). */
 	| { kind: "bridge.settle"; withdrawalId: string; sig?: string }
@@ -48,7 +57,7 @@ export type Op =
 	 *  alongside gate #4 non-public keys.) */
 	| { kind: "custody.fund"; groupKey: string; epoch: number };
 
-const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.settle", "oracle.post", "oracle.meta", "position.open", "position.close", "position.liquidate", "pool.deposit", "custody.fund"]);
+const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "oracle.post", "oracle.meta", "position.open", "position.close", "position.liquidate", "pool.deposit", "custody.fund"]);
 
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);

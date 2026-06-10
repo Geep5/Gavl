@@ -48,12 +48,20 @@ export interface BridgeState {
 	/** Every pubkey that has ever deposited — its per-user deposit address may hold
 	 *  fund BTC, so reserves + withdrawals scan these. */
 	depositors: Set<string>;
+	/** Deposit-mint REQUESTS (depositId → depositor) — the on-chain trigger that tells
+	 *  every committee member to verify this deposit on-chain and co-sign the mint. A
+	 *  request whose depositId is already `processed` is satisfied. */
+	claims: Map<string, string>;
+	/** Withdrawal payout txids (withdrawalId → btc txid) — posted once the committee has
+	 *  signed + broadcast the payout. Marks a withdrawal IN FLIGHT so members stop
+	 *  re-signing it and instead watch that txid for confirmation, then co-sign settle. */
+	broadcasts: Map<string, string>;
 	mintedTotal: bigint; // audit: lifetime minted
 	paidOut: bigint; // audit: lifetime BTC paid out
 }
 
 export function emptyBridge(): BridgeState {
-	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), mintedTotal: 0n, paidOut: 0n };
+	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), mintedTotal: 0n, paidOut: 0n };
 }
 
 export function gbtcOf(s: BridgeState, pubkey: string): bigint {
@@ -135,6 +143,41 @@ export function requestWithdrawal(s: BridgeState, w: PendingWithdrawal): boolean
 /** The Bitcoin outputs needed to settle all pending withdrawals (feed to btctx). */
 export function withdrawalPayouts(s: BridgeState): { address: string; amount: bigint }[] {
 	return s.pending.map((w) => ({ address: w.btcAddress, amount: w.amount }));
+}
+
+// ── autonomous co-signing triggers (the work the committee picks up off-chain) ──
+
+/** Record a deposit-mint request (the on-chain trigger). Idempotent by depositId. */
+export function recordClaim(s: BridgeState, depositId: string, depositor: string): void {
+	if (!s.claims.has(depositId)) s.claims.set(depositId, depositor);
+}
+
+/** Record a withdrawal's payout txid → marks it in flight (stop re-signing). */
+export function recordBroadcast(s: BridgeState, withdrawalId: string, txid: string): void {
+	if (!s.broadcasts.has(withdrawalId)) s.broadcasts.set(withdrawalId, txid);
+}
+
+/** Outstanding deposit-mint requests: a claim whose depositId hasn't been minted yet.
+ *  Every committee member scans these, verifies the deposit on-chain, and co-signs. */
+export function pendingClaims(s: BridgeState): { depositId: string; depositor: string }[] {
+	const out: { depositId: string; depositor: string }[] = [];
+	for (const [depositId, depositor] of s.claims) if (!s.processed.has(depositId)) out.push({ depositId, depositor });
+	return out;
+}
+
+/** Pending withdrawals with NO payout broadcast yet — the committee should sign these. */
+export function unsentWithdrawals(s: BridgeState): PendingWithdrawal[] {
+	return s.pending.filter((w) => !s.broadcasts.has(w.id));
+}
+
+/** Pending withdrawals already broadcast — watch their txid for confirmation, then settle. */
+export function inFlightWithdrawals(s: BridgeState): { withdrawal: PendingWithdrawal; txid: string }[] {
+	const out: { withdrawal: PendingWithdrawal; txid: string }[] = [];
+	for (const w of s.pending) {
+		const txid = s.broadcasts.get(w.id);
+		if (txid) out.push({ withdrawal: w, txid });
+	}
+	return out;
 }
 
 /**
