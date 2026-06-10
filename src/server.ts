@@ -53,13 +53,31 @@ const NETWORK = process.env.GAVL_NETWORK ?? "gavl";
 const MESH = process.env.GAVL_MESH !== "0";
 const FARM = process.env.GAVL_FARM !== "0";
 
+// Threshold-custody mode. GAVL_CUSTODY=committee turns on the autonomous epoch-driven
+// committee (DKG at genesis, reshare each epoch, no node holding the key); default
+// "seed" is the single-operator testnet fund. GAVL_DATA_DIR isolates a node's wallet +
+// custody secrets — REQUIRED to run several nodes on one machine (give each its own).
+const CUSTODY = process.env.GAVL_CUSTODY === "committee" ? "committee" : "seed";
+const DATA_DIR = process.env.GAVL_DATA_DIR; // undefined → ~/.gavl
+
 const daemon = new Daemon({
 	network: NETWORK,
+	walletDir: DATA_DIR,
 	bootstrapEnv: process.env.GAVL_BOOTSTRAP, // comma-separated host:port custom DHT entry nodes
 	space: SPACE,
 	schedule: RETARGET ? { base: 20n, targetIters: TARGET_ITERS, epoch: 4, window: 8, maxStep: 4n } : undefined,
 	heartbeatMs: HEARTBEAT_MS,
-	store: PERSIST === "off" ? undefined : { persist: PERSIST === "mine" ? "mine" : "all" },
+	store: PERSIST === "off" ? undefined : { dir: DATA_DIR ? `${DATA_DIR}/store` : undefined, persist: PERSIST === "mine" ? "mine" : "all" },
+	custody:
+		CUSTODY === "committee"
+			? {
+					mode: "committee",
+					epochLength: Number(process.env.GAVL_CUSTODY_EPOCH ?? "16"),
+					size: Number(process.env.GAVL_CUSTODY_SIZE ?? "5"),
+					minCommittee: Number(process.env.GAVL_CUSTODY_MIN ?? "3"),
+					ceremonyTimeoutMs: Number(process.env.GAVL_CUSTODY_TIMEOUT_MS ?? "30000"),
+				}
+			: undefined,
 });
 
 // ── View → JSON (Maps + BigInts → plain, string amounts) ─────────
@@ -177,7 +195,7 @@ function serializeState() {
 	};
 
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));
-	return { accounts, active: me, gbtc, market, consensus: daemon.consensus(), storage: daemon.storeStats() };
+	return { accounts, active: me, gbtc, market, consensus: daemon.consensus(), custody: daemon.custodyStatus(), storage: daemon.storeStats() };
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -399,6 +417,10 @@ createServer((req, res) => {
 	await daemon.startConsensus({ network: NETWORK, mesh: MESH, farm: FARM, publishOracle });
 	const c = daemon.consensus();
 	console.log(`  → mesh ${c.mesh ? "joined" : "off"}, ${c.peers} peer(s), farming ${c.farming ? "live" : "off"}`);
+	if (CUSTODY === "committee") {
+		const cu = daemon.custodyStatus();
+		console.log(`  custody: committee mode — id ${cu.committeeId?.slice(0, 16)}… ; fund ${cu.fundAddress ?? "(pending genesis)"}`);
+	}
 });
 
 process.on("SIGINT", async () => {
