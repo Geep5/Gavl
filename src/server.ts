@@ -256,7 +256,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		}
 		if (path === "/api/deposit/claim") {
 			// REAL deposit: verify a BTC txid paid the fund (via Esplora) → mint gBTC.
-			const credited = await daemon.claimDeposit(String(body.txid).trim(), daemon.wallet.active().pubHex);
+			const txid = String(body.txid ?? "").trim();
+			// Validate the txid shape before hitting Esplora — a malformed id makes Esplora
+			// 400 with a cryptic "esplora tx: HTTP 400". A txid is 64 hex chars.
+			if (!/^[0-9a-fA-F]{64}$/.test(txid)) {
+				throw new Error(`txid must be 64 hex characters (got ${txid.length}) — paste the full Bitcoin transaction id`);
+			}
+			const credited = await daemon.claimDeposit(txid, daemon.wallet.active().pubHex);
 			return send(res, 200, { credited: credited.toString() });
 		}
 		if (path === "/api/withdrawals/process") {
