@@ -55,6 +55,18 @@ export function selectCommittee(members: Member[], vdfBeaconHex: string, size: n
 }
 
 /**
+ * The rendezvous topic for epoch `epoch`'s committee on `network`. Every committee
+ * member computes the identical name and joins it, so the small committee forms a
+ * direct sub-mesh for the ceremonies even when the 100+-node main mesh is sparse and
+ * its members aren't otherwise directly connected. Derived from PUBLIC info (network +
+ * epoch) — anyone could join, but ceremony-message authentication blocks impersonation
+ * and FROST keeps shares secret from eavesdroppers, so an open topic is fine.
+ */
+export function committeeTopic(network: string, epoch: number): string {
+	return `gavl-committee:${network}:${epoch}`;
+}
+
+/**
  * The signing quorum to try on attempt `round` — a deterministic `min`-member window
  * over the sorted committee, sliding by one each round. Round 0 is the first `min`;
  * each subsequent round rotates a fresh member in and the oldest out, so a single

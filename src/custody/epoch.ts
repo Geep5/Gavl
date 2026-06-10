@@ -63,6 +63,24 @@ export function thresholdFor(size: number): number {
 }
 
 /**
+ * Which of `epochs` this node (`selfId`) is on the committee for, given the anchor
+ * chain (oldest→newest). Used to decide which per-epoch committee sub-swarm topics to
+ * join: a node pre-connects to its committee's sub-mesh for the epoch about to run.
+ * Connectivity, not consensus — so it's fine to compute over the optimistic chain and
+ * a couple of candidate epochs (current + next); extra/missed topics are harmless.
+ */
+export function committeeEpochsFor(chain: AnchorView[], selfId: string, epochs: number[], opts: { epochLength: number; size: number; minCommittee?: number; windowAnchors?: number }): number[] {
+	const minC = opts.minCommittee ?? 1;
+	const out: number[] = [];
+	for (const e of epochs) {
+		if (e < 1) continue;
+		const c = committeeForEpoch(chain, e, opts);
+		if (c && c.committee.length >= minC && c.committee.includes(selfId)) out.push(e);
+	}
+	return out;
+}
+
+/**
  * Derive epoch `epoch`'s committee from the finalized chain (oldest→newest). Returns
  * null until the boundary anchor (height epoch·epochLength) is present in the chain —
  * i.e. the epoch isn't selectable yet. `size` is the desired committee size (clamped

@@ -35,7 +35,9 @@ import { signWithdrawalWithFailover } from "./custody/withdraw-ceremony.ts";
 import { CommitteeRotation } from "./custody/rotation.ts";
 import { makeCeremonyAuth } from "./custody/ceremony-auth.ts";
 import type { CeremonyAuth } from "./custody/ceremony-auth.ts";
+import { committeeEpochsFor, epochOf } from "./custody/epoch.ts";
 import type { AnchorView } from "./custody/epoch.ts";
+import { committeeTopic } from "./custody/committee.ts";
 import { Esplora } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
 import { readPriceAggregate } from "./market/pricefeed.ts";
@@ -216,6 +218,7 @@ export class Daemon {
 				if (this.anchorTimes.length > 32) this.anchorTimes.shift(); // keep a small window
 			}
 			this.driveRotation(); // advance the custody epoch loop on each finality move
+			this.maintainCommitteeTopics(); // keep this node joined to its committee's sub-swarm
 		};
 	}
 
@@ -228,6 +231,32 @@ export class Daemon {
 		const finalAnchor = anchors.finalized(this.finalityDepth);
 		if (!finalAnchor) return;
 		void rot.onFinalized(anchors.chainTo(finalAnchor) as AnchorView[]);
+	}
+
+	/**
+	 * Join the committee sub-swarm topic(s) this node belongs to (and leave the rest),
+	 * so the small committee forms a DIRECT sub-mesh for the ceremonies independent of
+	 * the sparse 100+-node main mesh. Computed over the optimistic chain for the current
+	 * + just-finalized epochs, so a node pre-connects BEFORE its ceremony fires. This is
+	 * connectivity only — ceremony membership stays finalized-deterministic. No-op unless
+	 * committee mode + a live transport.
+	 */
+	private maintainCommitteeTopics(): void {
+		if (!this.committeeMode() || !this.transport) return;
+		const anchors = this.node.anchors;
+		const tip = anchors?.tip();
+		if (!anchors || !tip) return;
+		const chain = anchors.chainTo(tip) as AnchorView[];
+		const epochLength = this.custodyOpts.epochLength ?? 16;
+		const finEpoch = epochOf(anchors.finalized(this.finalityDepth)?.height ?? 0, epochLength);
+		const optEpoch = epochOf(tip.height, epochLength);
+		const mine = committeeEpochsFor(chain, this.producerId(), [finEpoch, optEpoch], {
+			epochLength,
+			size: this.custodyOpts.size ?? 5,
+			minCommittee: this.custodyOpts.minCommittee ?? 3,
+			windowAnchors: this.custodyOpts.windowAnchors,
+		});
+		void this.transport.setCommitteeTopics(mine.map((e) => committeeTopic(this.network, e)));
 	}
 
 	/**
@@ -344,6 +373,7 @@ export class Daemon {
 		holdsShare: boolean;
 		committee: string[] | null;
 		threshold: number | null;
+		subSwarmTopics: string[];
 	} {
 		const cs = this.committeeShare();
 		const committee = this.committeeMode();
@@ -357,6 +387,7 @@ export class Daemon {
 			holdsShare: !!cs,
 			committee: cs?.participants ?? null,
 			threshold: cs?.min ?? null,
+			subSwarmTopics: this.transport?.committeeTopicNames() ?? [],
 		};
 	}
 

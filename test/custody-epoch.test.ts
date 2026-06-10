@@ -8,8 +8,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { committeeForEpoch, epochOf, epochBoundary, thresholdFor } from "../src/custody/epoch.ts";
+import { committeeForEpoch, committeeEpochsFor, epochOf, epochBoundary, thresholdFor } from "../src/custody/epoch.ts";
 import type { AnchorView } from "../src/custody/epoch.ts";
+import { committeeTopic } from "../src/custody/committee.ts";
 
 /** A chain where height h is produced by `producerAt(h)`, beacon = "vdf-<h>". */
 function chain(n: number, producerAt: (h: number) => string): AnchorView[] {
@@ -84,4 +85,21 @@ test("the lookback window ages out long-departed producers", () => {
 	assert.ok(!windowed.members.some((m) => m.id === "old"), "old farmer aged out of the window");
 	const unbounded = committeeForEpoch(c, 4, { epochLength: 8, size: 4 })!;
 	assert.ok(unbounded.members.some((m) => m.id === "old"), "without a window, old still counts");
+});
+
+test("committeeEpochsFor reports exactly the epochs a node is on the committee for", () => {
+	const c = chain(24, (h) => "p" + (h % 5)); // 5 producers across heights 0..23
+	const e2 = committeeForEpoch(c, 2, { epochLength: 8, size: 3 })!.committee; // boundary 16
+	const member = e2[0];
+	const outsider = ["p0", "p1", "p2", "p3", "p4"].find((p) => !e2.includes(p))!;
+	const opts = { epochLength: 8, size: 3, minCommittee: 3 };
+	assert.deepEqual(committeeEpochsFor(c, member, [2], opts), [2], "a member's epoch is reported");
+	assert.deepEqual(committeeEpochsFor(c, outsider, [2], opts), [], "a non-member's is not");
+	assert.deepEqual(committeeEpochsFor(c, member, [0, 99], opts), [], "epoch 0 and not-yet-finalized epochs are skipped");
+});
+
+test("committeeTopic is deterministic and distinct per network/epoch", () => {
+	assert.equal(committeeTopic("gavl", 7), committeeTopic("gavl", 7), "same inputs → same topic");
+	assert.notEqual(committeeTopic("gavl", 7), committeeTopic("gavl", 8), "different epoch → different topic");
+	assert.notEqual(committeeTopic("gavl", 7), committeeTopic("other", 7), "different network → different topic");
 });

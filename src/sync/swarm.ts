@@ -86,6 +86,8 @@ export class SwarmTransport {
 	/** node-key hex (hex of a connected peer's DHT/Noise public key) → connection count. */
 	private readonly peerKeys = new Map<string, number>();
 	private topicHex: string | null = null;
+	/** Extra (committee sub-swarm) topic name → topic buffer, so we can leave on rotation. */
+	private readonly extraTopics = new Map<string, Buffer>();
 
 	constructor(node: GavlNode, opts: SwarmOptions = {}) {
 		this.node = node;
@@ -126,6 +128,38 @@ export class SwarmTransport {
 		const discovery = this.swarm.join(topic, { server: true, client: true });
 		await discovery.flushed();
 		await this.swarm.flush();
+	}
+
+	/**
+	 * Join EXACTLY the committee sub-swarm topics named in `names`, leaving any others
+	 * previously joined. The committee is small, so these give its members a direct
+	 * sub-mesh for the ceremonies even when the main mesh is sparse (100+ nodes) and
+	 * they aren't otherwise directly connected. Connections from any topic flow to the
+	 * same node, so ceremony broadcasts reach committee peers once discovered. Idempotent;
+	 * joins proceed in the background (we don't block on discovery).
+	 */
+	async setCommitteeTopics(names: string[]): Promise<void> {
+		const want = new Set(names);
+		for (const [name, topic] of [...this.extraTopics]) {
+			if (want.has(name)) continue;
+			this.extraTopics.delete(name); // rotated out of this committee → stop rendezvousing there
+			try {
+				await this.swarm.leave(topic);
+			} catch {
+				/* ignore */
+			}
+		}
+		for (const name of want) {
+			if (this.extraTopics.has(name)) continue;
+			const topic = Buffer.from(sha256(name));
+			this.extraTopics.set(name, topic);
+			this.swarm.join(topic, { server: true, client: true }); // discovery runs in the background
+		}
+	}
+
+	/** Currently-joined committee sub-swarm topic names (for status). */
+	committeeTopicNames(): string[] {
+		return [...this.extraTopics.keys()];
 	}
 
 	/**
