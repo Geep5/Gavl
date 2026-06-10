@@ -25,6 +25,9 @@ import type { View } from "./market/btc.ts";
 import { oracleKeyPair, bridgeKeyPair } from "./market/oracle.ts";
 import { fundKeyFromSeed } from "./custody/threshold.ts";
 import type { FundKey } from "./custody/threshold.ts";
+import { DkgCoordinator } from "./custody/dkg-coordinator.ts";
+import { saveShare, loadShare } from "./custody/share-store.ts";
+import type { StoredShare } from "./custody/share-store.ts";
 import { fundAddress as deriveFundAddress } from "./custody/bitcoin.ts";
 import { depositAddress } from "./custody/deposit.ts";
 import { buildWithdrawalTx, signWithdrawalTx } from "./custody/btctx.ts";
@@ -428,11 +431,38 @@ export class Daemon {
 	}
 
 	/** The threshold-custody fund key. TESTNET single-operator (this node holds all
-	 *  shares, deterministic from GAVL_FUND_SEED). Production = distributed DKG. */
+	 *  shares, deterministic from GAVL_FUND_SEED). Production = distributed DKG, where
+	 *  this node holds only its OWN share — see runCommitteeDkg / committeeShare. */
 	private fundKeyCache?: FundKey;
 	private fundKey(): FundKey {
 		if (!this.fundKeyCache) this.fundKeyCache = fundKeyFromSeed(2, 3, process.env.GAVL_FUND_SEED ?? "gavl-testnet-fund-v1");
 		return this.fundKeyCache;
+	}
+
+	/** Path to THIS node's persisted committee share (secret, node-local). */
+	private sharePath(): string {
+		return join(homedir(), ".gavl", "custody", "share.json");
+	}
+	/** This node's committee share if it has completed a distributed DKG, else null. */
+	committeeShare(): StoredShare | null {
+		return loadShare(this.sharePath());
+	}
+
+	/**
+	 * Run the distributed committee DKG over the LIVE node transport with the
+	 * configured committee, then persist THIS node's share (the key is generated
+	 * across the committee — no node ever holds it whole). Operator-triggered once
+	 * all committee members are connected. `selfId` must be this node's committee id.
+	 *
+	 * NOTE: the ceremony is proven over the in-memory transport (which mimics the
+	 * wire); running it across real hyperdht daemons is a live-deployment step. This
+	 * wires the proven coordinator onto `this.node`'s real connections.
+	 */
+	async runCommitteeDkg(opts: { session: string; selfId: string; participants: string[]; min: number }): Promise<string> {
+		const coord = new DkgCoordinator(this.node, opts);
+		const result = await coord.start();
+		saveShare(this.sharePath(), { ...result, session: opts.session, participants: opts.participants, min: opts.min });
+		return deriveFundAddress({ groupPubKey: result.groupPubKey, pub: result.pub, shares: {}, min: opts.min, max: opts.participants.length }, this.btcNetwork());
 	}
 	private esploraCache?: Esplora;
 	private esplora(): Esplora {

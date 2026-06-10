@@ -26,30 +26,7 @@ import { DkgSession } from "./dkg-session.ts";
 import type { PublicPackage, Share } from "./threshold.ts";
 import type { GavlNode, Connection } from "../sync/node.ts";
 import type { DkgWire } from "../sync/messages.ts";
-
-// ── JSON-safe encoding for FROST's binary (Uint8Array ↔ {$u8: hex}) ──
-function enc(v: unknown): unknown {
-	if (v instanceof Uint8Array) return { $u8: Buffer.from(v).toString("hex") };
-	if (Array.isArray(v)) return v.map(enc);
-	if (v && typeof v === "object") {
-		const out: Record<string, unknown> = {};
-		for (const k of Object.keys(v as object)) out[k] = enc((v as Record<string, unknown>)[k]);
-		return out;
-	}
-	return v;
-}
-function dec(v: unknown): unknown {
-	if (v && typeof v === "object" && "$u8" in (v as object) && typeof (v as { $u8: unknown }).$u8 === "string") {
-		return Uint8Array.from(Buffer.from((v as { $u8: string }).$u8, "hex"));
-	}
-	if (Array.isArray(v)) return v.map(dec);
-	if (v && typeof v === "object") {
-		const out: Record<string, unknown> = {};
-		for (const k of Object.keys(v as object)) out[k] = dec((v as Record<string, unknown>)[k]);
-		return out;
-	}
-	return v;
-}
+import { toJsonSafe as enc, fromJsonSafe as dec } from "./u8json.ts";
 
 export interface DkgResult {
 	share: Share; // THIS node's threshold share — stays local
