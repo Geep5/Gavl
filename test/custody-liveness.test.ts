@@ -18,10 +18,12 @@ import { GavlNode } from "../src/sync/node.ts";
 import { MemoryNetwork } from "../src/sync/memory.ts";
 import { DkgCoordinator } from "../src/custody/dkg-coordinator.ts";
 import { SignCoordinator } from "../src/custody/sign-coordinator.ts";
-import { ReshareCoordinator } from "../src/custody/reshare-coordinator.ts";
+import { ReshareCoordinator, reshareWithFailover } from "../src/custody/reshare-coordinator.ts";
 import { signWithdrawalWithFailover } from "../src/custody/withdraw-ceremony.ts";
 import { buildWithdrawalTx } from "../src/custody/btctx.ts";
 import { isCeremonyTimeout } from "../src/custody/ceremony.ts";
+import { verify } from "../src/custody/threshold.ts";
+import { taprootOutputKey, verifyWithdrawal } from "../src/custody/bitcoin.ts";
 import type { FundKey } from "../src/custody/threshold.ts";
 import { sha256 } from "../src/det/canonical.ts";
 import { PARAMS } from "./helpers.ts";
@@ -128,4 +130,56 @@ test("withdrawal fails over to a working quorum when one committee member is dow
 	// against the fund key inside the ceremony; convergence + a 64-char txid confirm it.
 	assert.equal(signed[0].txid.length, 64);
 	assert.ok(/^[0-9a-f]+$/.test(signed[0].hex), "valid tx hex");
+});
+
+test("reshare fails over to a working OLD quorum when an old-quorum member is down", async () => {
+	const oldCommittee = ["a", "b", "c", "d", "e"]; // 3-of-5 fund
+	const oldMin = 3;
+	const newCommittee = ["f", "g", "h"];
+	const newMin = 2;
+	// one mesh holds everyone; the old committee DKGs the fund, then we reshare to the new
+	const allIds = [...oldCommittee, ...newCommittee];
+	const { net, nodes } = fullMesh(allIds);
+	const dkg = oldCommittee.map((id) => new DkgCoordinator(nodes[id], { session: "old-fund", selfId: id, participants: oldCommittee, min: oldMin }));
+	const ds = dkg.map((c) => c.start());
+	await net.idle();
+	const oldKeys = await Promise.all(ds);
+	const groupPubKey = oldKeys[0].groupPubKey;
+	const oldShareOf = Object.fromEntries(oldCommittee.map((id, i) => [id, oldKeys[i].share]));
+
+	// "a" is DOWN — it's in round 0's old quorum {a,b,c}, forcing a failover to {b,c,d}.
+	// The present old members + the whole new committee run the loop in lockstep.
+	const present = ["b", "c", "d", "e", ...newCommittee];
+	const results = await Promise.all(
+		present.map((id) =>
+			reshareWithFailover({
+				node: nodes[id],
+				sessionBase: "rot-1",
+				selfId: id,
+				prevCommittee: oldCommittee,
+				oldMin,
+				newCommittee,
+				newMin,
+				groupPubKey,
+				oldShare: oldShareOf[id], // undefined for new-only members f/g/h
+				timeoutMs: 1000, // generous so a healthy round completes under full-suite load
+				maxRounds: 3, // round 0 {a,b,c} fails (a down) → round 1 {b,c,d} succeeds; bounds the tail
+			}),
+		),
+	);
+
+	// the new committee got shares for the SAME group key despite "a" being down
+	const byId = Object.fromEntries(present.map((id, i) => [id, results[i]]));
+	for (const id of newCommittee) assert.ok(byId[id]?.share, `${id} rotated in via the fallback quorum`);
+	const pub = byId["f"]!.pub;
+
+	// the new 2-of-3 signs for the original key → Bitcoin accepts at the unchanged address
+	const sighash = sha256("after reshare failover");
+	const quorum = ["f", "g"];
+	const signers = quorum.map((id) => new SignCoordinator(nodes[id], { signId: "post", selfId: id, quorum, pub, share: byId[id]!.share!, message: sighash }));
+	const ss = signers.map((s) => s.start());
+	await net.idle();
+	const [sig] = await Promise.all(ss);
+	assert.equal(verify(sig, sighash, groupPubKey), true, "rotated committee signs for the original key");
+	assert.equal(verifyWithdrawal(sig, sighash, taprootOutputKey(groupPubKey)), true, "Bitcoin accepts it — address unchanged");
 });

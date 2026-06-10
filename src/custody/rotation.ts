@@ -32,10 +32,9 @@
  */
 
 import { DkgCoordinator } from "./dkg-coordinator.ts";
-import { ReshareCoordinator } from "./reshare-coordinator.ts";
+import { reshareWithFailover } from "./reshare-coordinator.ts";
 import { committeeForEpoch, epochOf } from "./epoch.ts";
 import type { AnchorView, EpochCommittee } from "./epoch.ts";
-import { quorumForRound } from "./committee.ts";
 import { isCeremonyTimeout } from "./ceremony.ts";
 import type { CeremonyAuth } from "./ceremony-auth.ts";
 import type { StoredShare } from "./share-store.ts";
@@ -148,39 +147,41 @@ export class CommitteeRotation {
 		}
 		if (sameSet(prev.committee, next.committee)) return; // membership unchanged across the boundary
 
-		const oldQuorum = quorumForRound(prev.committee, prev.min, 0);
 		const stored = this.c.loadShare();
-		// We can hand off iff we hold a CURRENT share for exactly the previous committee.
-		const canHandOff = !!stored && oldQuorum.includes(this.c.selfId) && sameSet(stored.participants, prev.committee);
-		if (!canHandOff && !inNew) {
+		// We can hand off iff we hold a CURRENT share for exactly the previous committee
+		// (the failover loop decides which rounds we're actually in the old quorum).
+		const holdsPrev = !!stored && sameSet(stored.participants, prev.committee);
+		if (!holdsPrev && !inNew) {
 			this.log(`epoch ${epoch}: rotation we're not part of — standing by`);
 			return;
 		}
 
 		this.log(`epoch ${epoch}: reshare ${prev.committee.length}→${next.committee.length} (new min ${next.min})`);
-		const coord = new ReshareCoordinator(this.c.node, {
-			session: `custody-epoch-${epoch}`,
+		// OLD-quorum failover: if a selected old member is offline, roll to the next quorum
+		// (in lockstep on every participant) instead of stalling until next epoch.
+		const r = await reshareWithFailover({
+			node: this.c.node,
+			sessionBase: `custody-epoch-${epoch}`,
 			selfId: this.c.selfId,
-			oldQuorum,
+			prevCommittee: prev.committee,
+			oldMin: prev.min,
 			newCommittee: next.committee,
 			newMin: next.min,
 			groupPubKey: key,
-			oldShare: canHandOff && stored ? stored.share : undefined,
+			oldShare: holdsPrev && stored ? stored.share : undefined,
 			timeoutMs: this.c.timeoutMs,
 			auth: this.c.auth,
 		});
-		try {
-			const r = await coord.start();
-			if (inNew && r.share) {
-				this.c.saveShare({ share: r.share, pub: r.pub, groupPubKey: r.groupPubKey, session: `custody-epoch-${epoch}`, selfId: this.c.selfId, participants: next.committee, min: next.min, epoch });
-				this.log(`epoch ${epoch}: rotated in (same address)`);
-			} else {
-				this.c.clearShare(); // rotated out — discard the now-dead share
-				this.log(`epoch ${epoch}: rotated out — share discarded`);
-			}
-		} catch (e) {
-			if (!isCeremonyTimeout(e)) throw e;
-			this.log(`epoch ${epoch}: reshare timed out (waiting on ${e.missing.join(", ") || "?"}); keeping current share, retry next epoch`);
+		if (!r) {
+			this.log(`epoch ${epoch}: reshare couldn't form an old quorum; keeping current share, retry next epoch`);
+			return;
+		}
+		if (inNew && r.share) {
+			this.c.saveShare({ share: r.share, pub: r.pub, groupPubKey: r.groupPubKey, session: `custody-epoch-${epoch}`, selfId: this.c.selfId, participants: next.committee, min: next.min, epoch });
+			this.log(`epoch ${epoch}: rotated in (same address)`);
+		} else {
+			this.c.clearShare(); // rotated out — discard the now-dead share
+			this.log(`epoch ${epoch}: rotated out — share discarded`);
 		}
 	}
 

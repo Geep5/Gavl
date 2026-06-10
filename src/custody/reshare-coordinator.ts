@@ -24,9 +24,9 @@
 import { schnorr_FROST as FROST, secp256k1 } from "@noble/curves/secp256k1.js";
 import { lagrangeAtZero, mod, SECP256K1_N } from "./shamir.ts";
 import { dealAtIds } from "./reshare.ts";
-import { fid, fidScalar } from "./committee.ts";
+import { fid, fidScalar, quorumForRound } from "./committee.ts";
 import { toJsonSafe as enc, fromJsonSafe as dec } from "./u8json.ts";
-import { CeremonyTimeout } from "./ceremony.ts";
+import { CeremonyTimeout, isCeremonyTimeout } from "./ceremony.ts";
 import type { CeremonyAuth } from "./ceremony-auth.ts";
 import type { PublicPackage, Share } from "./threshold.ts";
 import type { GavlNode, Connection } from "../sync/node.ts";
@@ -171,4 +171,61 @@ export class ReshareCoordinator {
 		if (this.timer) clearTimeout(this.timer);
 		this.resolve({ share, pub, groupPubKey: this.o.groupPubKey });
 	}
+}
+
+export interface ReshareFailoverOpts {
+	node: GavlNode;
+	sessionBase: string; // unique per rotation (e.g. custody-epoch-N)
+	selfId: string; // this node's committee id
+	prevCommittee: string[]; // the OLD committee (any oldMin-subset can hand off)
+	oldMin: number; // the old committee's threshold
+	newCommittee: string[];
+	newMin: number;
+	groupPubKey: Uint8Array;
+	oldShare?: Share; // this node's PREV-committee share, if it holds one
+	timeoutMs: number; // per-round budget
+	maxRounds?: number; // default prevCommittee.length
+	auth?: CeremonyAuth;
+}
+
+/**
+ * Reshare with OLD-quorum failover — the rotation analog of signWithdrawalWithFailover.
+ * A reshare needs `oldMin` of the previous committee online to hand off their shares; if
+ * a selected old member is down the ceremony stalls. So every participant runs this loop
+ * in lockstep: each round, `quorumForRound(prevCommittee, oldMin, round)` picks the same
+ * old quorum on every node, that quorum provides shares while the new committee receives,
+ * and if it can't complete (an old member offline) everyone rolls to the next quorum.
+ * New-committee members participate every round; old members outside the round's quorum
+ * wait it out. Returns this node's reshare result (its new share if it's in the new
+ * committee), or null if no old quorum could be formed in `maxRounds`.
+ */
+export async function reshareWithFailover(o: ReshareFailoverOpts): Promise<ReshareResult | null> {
+	const rounds = o.maxRounds ?? o.prevCommittee.length;
+	const iAmNew = o.newCommittee.includes(o.selfId);
+	for (let round = 0; round < rounds; round++) {
+		const oldQuorum = quorumForRound(o.prevCommittee, o.oldMin, round);
+		const iAmOld = oldQuorum.includes(o.selfId) && !!o.oldShare;
+		if (iAmOld || iAmNew) {
+			try {
+				const coord = new ReshareCoordinator(o.node, {
+					session: `${o.sessionBase}#${round}`, // round in the session → no cross-round message bleed
+					selfId: o.selfId,
+					oldQuorum,
+					newCommittee: o.newCommittee,
+					newMin: o.newMin,
+					groupPubKey: o.groupPubKey,
+					oldShare: iAmOld ? o.oldShare : undefined,
+					timeoutMs: o.timeoutMs,
+					auth: o.auth,
+				});
+				return await coord.start();
+			} catch (e) {
+				if (!isCeremonyTimeout(e)) throw e; // a real fault → surface it; a timeout → rotate the old quorum
+			}
+		} else {
+			// Bystander this round (old member not in the quorum): wait it out to stay in lockstep.
+			await new Promise((r) => setTimeout(r, o.timeoutMs));
+		}
+	}
+	return null; // too many old members down to form any quorum within maxRounds
 }
