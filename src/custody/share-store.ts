@@ -24,6 +24,10 @@ export interface StoredShare extends DkgResult {
 	selfId: string; // THIS node's committee id
 	participants: string[]; // committee member ids (who to run signing with)
 	min: number; // signing threshold
+	/** The custody epoch this share belongs to (set by epoch-driven rotation). A share
+	 *  from an older epoch than the network's current one is stale — its holder was
+	 *  rotated out and can no longer participate as an old member in the next reshare. */
+	epoch?: number;
 }
 
 /** Write this node's share to `path` (creating parent dirs). Overwrites. */
