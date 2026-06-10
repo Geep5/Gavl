@@ -16,7 +16,7 @@
  * runs over an in-memory link (tests) or a real Hyperswarm socket (the mesh).
  */
 
-import type { SyncMessage, DkgWire } from "./messages.ts";
+import type { SyncMessage, DkgWire, SignWire } from "./messages.ts";
 import type { Write } from "../chain/writer.ts";
 import { Ledger } from "../ledger/ledger.ts";
 import type { Heads } from "../ledger/ledger.ts";
@@ -154,6 +154,10 @@ export class GavlNode {
 				this.onDkg?.(conn, m.m);
 				return;
 			}
+			case "sign": {
+				this.onSign?.(m.m); // signing ceremony is broadcast-only (no secrets cross)
+				return;
+			}
 		}
 	}
 
@@ -167,6 +171,14 @@ export class GavlNode {
 	/** Send a DKG message to ONE peer over its own connection (round-2 secret share). */
 	dkgReply(conn: Connection, m: DkgWire): void {
 		conn.send({ t: "dkg", m });
+	}
+
+	// ── signing ceremony transport (used by custody/sign-coordinator) ──
+	/** Registered by a SignCoordinator to receive signing-ceremony messages. */
+	onSign?: (m: SignWire) => void;
+	/** Broadcast a signing message (nonce commitment / sig share — both public). */
+	signBroadcast(m: SignWire): void {
+		this.broadcast({ t: "sign", m });
 	}
 
 	private async ingestAnchors(conn: Connection, anchors: Anchor[]): Promise<void> {

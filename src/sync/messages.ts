@@ -29,7 +29,9 @@ export type SyncMessage =
 	| { t: "anchor-chain"; anchors: Anchor[] }
 	// ── distributed key generation (custody committee ceremony) ──
 	/** A DKG ceremony message, routed to the node's registered DKG coordinator. */
-	| { t: "dkg"; m: DkgWire };
+	| { t: "dkg"; m: DkgWire }
+	/** A signing ceremony message, routed to the node's registered signing coordinator. */
+	| { t: "sign"; m: SignWire };
 
 /**
  * DKG ceremony payloads. `pkg`/`share` are FROST structures pre-encoded JSON-safe
@@ -42,3 +44,14 @@ export type DkgWire =
 	| { d: "round1"; session: string; from: string; pkg: unknown }
 	/** Round 2: a secret share from `from` addressed to participant `to`. Point-to-point. */
 	| { d: "round2"; session: string; from: string; to: string; share: unknown };
+
+/**
+ * Distributed SIGNING ceremony payloads. A quorum co-signs a message using each
+ * member's own share — only public NONCE COMMITMENTS and SIGNATURE SHARES cross the
+ * wire (never the share itself). All broadcast: nothing here is secret.
+ */
+export type SignWire =
+	/** Round 1: a signer's nonce commitments for `sign` over `msg` (hex). `from` = signer id. */
+	| { s: "commit"; sign: string; from: string; commit: unknown }
+	/** Round 2: a signer's signature share (safe to broadcast — useless without a quorum). */
+	| { s: "share"; sign: string; from: string; share: unknown };
