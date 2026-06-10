@@ -13,6 +13,11 @@ export const store = $state({
 	consensus: null, // { enabled, vdf, mesh, network, peers, farming, tip, finalizedHeight, secPerAnchor, secPerAnchorMeasured }
 });
 
+// Whether the current store.error came from refresh() (a connection problem) —
+// only those may be cleared by a later successful poll. Action errors stay
+// visible until the next action, instead of being wiped by the 2s poll.
+let errorFromRefresh = false;
+
 export async function refresh() {
 	try {
 		const s = await api.state();
@@ -21,23 +26,31 @@ export async function refresh() {
 		store.gbtc = s.gbtc ?? {};
 		store.market = s.market ?? null;
 		store.consensus = s.consensus ?? null;
-		store.error = null;
+		if (errorFromRefresh) {
+			store.error = null;
+			errorFromRefresh = false;
+		}
 	} catch (e) {
 		store.error = String(e.message ?? e);
+		errorFromRefresh = true;
 	} finally {
 		store.loading = false;
 	}
 }
 
-/** Run an action then refresh; surfaces errors into the store. */
+/** Run an action then refresh; surfaces errors into the store. Returns true on success. */
 export async function act(fn) {
 	try {
 		store.error = null;
 		await fn();
+		await refresh();
+		return true;
 	} catch (e) {
+		await refresh();
 		store.error = String(e.message ?? e);
+		errorFromRefresh = false;
+		return false;
 	}
-	await refresh();
 }
 
 export function startPolling(ms = 2000) {

@@ -19,7 +19,7 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Daemon } from "./daemon.ts";
-import { mark, gbtcOf, BTC_ORACLE, MAX_LEVERAGE, skewBps, fundingRateBps } from "./market/btc.ts";
+import { mark, gbtcOf, BTC_ORACLE, MAX_LEVERAGE, skewBps, fundingRateBps, parseAmount, leverageOk } from "./market/btc.ts";
 import { totalGbtc, pendingTotal, backingBps as bridgeBackingBps } from "./custody/bridge.ts";
 import { backingBps, totalOwed } from "./perp/pool.ts";
 import { unrealizedPnl, liquidationPrice } from "./perp/engine.ts";
@@ -186,6 +186,20 @@ function send(res: ServerResponse, status: number, body: unknown): void {
 	res.end(json);
 }
 
+/**
+ * UX guard: mirror the fold's spend checks so a doomed write 400s with a reason
+ * instead of folding to a silent no-op (the fold drops invalid ops without error,
+ * which looks like a dead button in the UI). The fold stays authoritative — this
+ * is feedback, not a security boundary.
+ */
+function requireSpendable(amountStr: string, label: string): bigint {
+	const amt = parseAmount(amountStr);
+	if (amt === null) throw new Error(`${label} must be a positive whole number of gBTC`);
+	const have = gbtcOf(daemon.view(), daemon.wallet.active().pubHex);
+	if (have < amt) throw new Error(`insufficient gBTC: you have ${have}, need ${amt} — deposit BTC to the fund and claim it first`);
+	return amt;
+}
+
 function readBody(req: IncomingMessage): Promise<any> {
 	return new Promise((resolve, reject) => {
 		let data = "";
@@ -228,11 +242,15 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		}
 		// ── BTC bull/bear (gBTC collateral) ──
 		if (path === "/api/transfer") {
+			if (!String(body.to ?? "").trim()) throw new Error("recipient pubkey required");
+			requireSpendable(String(body.amount), "amount");
 			await daemon.active().transfer(String(body.to), String(body.amount));
 			return send(res, 200, { ok: true });
 		}
 		if (path === "/api/withdraw") {
 			// Burn gBTC to redeem BTC to a Bitcoin address → a pending withdrawal.
+			if (!String(body.btcAddress ?? "").trim()) throw new Error("BTC address required");
+			requireSpendable(String(body.amount), "amount");
 			await daemon.active().withdraw(String(body.amount), String(body.btcAddress));
 			return send(res, 200, { ok: true });
 		}
@@ -253,6 +271,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		}
 		if (path === "/api/position/open") {
 			// instrument: "BTC-BULL" | "BTC-BEAR"; margin in credit; leverage ≤ MAX_LEVERAGE.
+			if (mark(daemon.view()) === null) throw new Error("no oracle price yet — wait for the oracle's first post");
+			const lev = parseAmount(String(body.leverage ?? "1"));
+			if (lev === null || !leverageOk(lev)) throw new Error(`leverage must be a whole number from 1 to ${MAX_LEVERAGE}`);
+			requireSpendable(String(body.margin), "margin");
 			const id = await daemon.active().open(body.instrument === "BTC-BEAR" ? "BTC-BEAR" : "BTC-BULL", String(body.margin), String(body.leverage ?? "1"));
 			return send(res, 200, { id });
 		}
@@ -265,6 +287,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			return send(res, 200, { ok: true });
 		}
 		if (path === "/api/pool/deposit") {
+			requireSpendable(String(body.amount), "amount");
 			await daemon.active().poolDeposit(String(body.amount));
 			return send(res, 200, { ok: true });
 		}

@@ -85,7 +85,7 @@ export function marketConserved(view: View): boolean {
 	return view.bridge.reserves === totalGbtc(view.bridge) + view.pool.assets + pendingTotal(view.bridge);
 }
 
-function parseAmount(s: string): bigint | null {
+export function parseAmount(s: string): bigint | null {
 	if (typeof s !== "string" || !/^[0-9]+$/.test(s)) return null;
 	try {
 		const n = BigInt(s);
@@ -248,7 +248,7 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
 const MAINTENANCE_BPS = 500n;
 const LIQUIDATOR_FEE_BPS = 100n;
 export const MAX_LEVERAGE = 5n;
-function leverageOk(l: bigint): boolean {
+export function leverageOk(l: bigint): boolean {
 	return l >= 1n && l <= MAX_LEVERAGE;
 }
 

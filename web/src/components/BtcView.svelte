@@ -28,16 +28,16 @@
 	async function open() {
 		if (!margin || Number(margin) <= 0) return;
 		busy = true;
-		await act(() => api.open(side, margin, leverage));
-		margin = "";
+		const ok = await act(() => api.open(side, margin, leverage));
+		if (ok) margin = ""; // keep the form on failure so the user can correct it
 		busy = false;
 	}
 	let wAmt = $state("");
 	let wAddr = $state("");
 	async function withdraw() {
 		if (!wAmt || !wAddr) return;
-		await act(() => api.withdraw(wAmt, wAddr));
-		wAmt = "";
+		const ok = await act(() => api.withdraw(wAmt, wAddr));
+		if (ok) wAmt = "";
 	}
 	let claimTxid = $state("");
 	let claimMsg = $state("");
