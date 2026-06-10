@@ -26,4 +26,19 @@ export type SyncMessage =
 	/** Ask for a peer's tip chain from `fromHeight` upward. */
 	| { t: "anchor-want"; fromHeight: number }
 	/** Serve anchors along the tip chain. */
-	| { t: "anchor-chain"; anchors: Anchor[] };
+	| { t: "anchor-chain"; anchors: Anchor[] }
+	// ── distributed key generation (custody committee ceremony) ──
+	/** A DKG ceremony message, routed to the node's registered DKG coordinator. */
+	| { t: "dkg"; m: DkgWire };
+
+/**
+ * DKG ceremony payloads. `pkg`/`share` are FROST structures pre-encoded JSON-safe
+ * (Uint8Arrays → hex markers) so they survive the wire. A `round2` share is a SECRET
+ * addressed to one recipient and MUST be sent over that peer's own (encrypted)
+ * connection — never broadcast.
+ */
+export type DkgWire =
+	/** Round 1: broadcast a public commitment + proof-of-knowledge. `from` = participant id. */
+	| { d: "round1"; session: string; from: string; pkg: unknown }
+	/** Round 2: a secret share from `from` addressed to participant `to`. Point-to-point. */
+	| { d: "round2"; session: string; from: string; to: string; share: unknown };

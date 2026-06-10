@@ -16,7 +16,7 @@
  * runs over an in-memory link (tests) or a real Hyperswarm socket (the mesh).
  */
 
-import type { SyncMessage } from "./messages.ts";
+import type { SyncMessage, DkgWire } from "./messages.ts";
 import type { Write } from "../chain/writer.ts";
 import { Ledger } from "../ledger/ledger.ts";
 import type { Heads } from "../ledger/ledger.ts";
@@ -147,7 +147,26 @@ export class GavlNode {
 				this.anchorQueue = this.anchorQueue.then(() => this.ingestAnchors(conn, anchors)).catch(() => {});
 				return;
 			}
+			case "dkg": {
+				// Hand the ceremony message to the registered coordinator, WITH the
+				// connection it arrived on — so the coordinator can reply point-to-point
+				// (round-2 secret shares ride the sender's own encrypted connection).
+				this.onDkg?.(conn, m.m);
+				return;
+			}
 		}
+	}
+
+	// ── DKG ceremony transport (used by custody/dkg-coordinator) ─────
+	/** Registered by a DkgCoordinator to receive ceremony messages + their connection. */
+	onDkg?: (conn: Connection, m: DkgWire) => void;
+	/** Broadcast a DKG message to all peers (round 1). */
+	dkgBroadcast(m: DkgWire): void {
+		this.broadcast({ t: "dkg", m });
+	}
+	/** Send a DKG message to ONE peer over its own connection (round-2 secret share). */
+	dkgReply(conn: Connection, m: DkgWire): void {
+		conn.send({ t: "dkg", m });
 	}
 
 	private async ingestAnchors(conn: Connection, anchors: Anchor[]): Promise<void> {

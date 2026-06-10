@@ -47,10 +47,11 @@ export class DkgSession {
 	private groupPub: PublicPackage | null = null;
 	private step: 0 | 1 | 2 | 3 = 0;
 
-	/** `index` is this participant's seat number (1..max). */
-	constructor(index: number, signers: Signers) {
+	/** Identify this participant by a seat number (1..max) OR a FROST identifier
+	 *  string (e.g. derived from a node's network identity, for the live mesh). */
+	constructor(idOrIndex: number | string, signers: Signers) {
 		this.signers = signers;
-		this.id = FROST.Identifier.fromNumber(index);
+		this.id = typeof idOrIndex === "number" ? FROST.Identifier.fromNumber(idOrIndex) : idOrIndex;
 	}
 
 	/** Round 1: sample our polynomial, stash the secret, return the public package to BROADCAST. */
