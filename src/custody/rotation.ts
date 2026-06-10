@@ -51,6 +51,9 @@ export interface RotationConfig {
 	minCommittee?: number;
 	/** Membership lookback in anchors (default: all below the boundary). */
 	windowAnchors?: number;
+	/** Finalized committee bonds (pubkey → bonded gBTC). When set, selection is
+	 *  STAKE-weighted (gate #3): only bonded producers are eligible, weighted by bond. */
+	bonds?: () => Map<string, bigint>;
 	/** Authenticates ceremony messages (signs as this node's committee id, verifies peers'). */
 	auth?: CeremonyAuth;
 	/** The network-known fund group key (on-chain published), or null if no fund yet. */
@@ -106,7 +109,7 @@ export class CommitteeRotation {
 	}
 
 	private epochCommittee(finalized: AnchorView[], epoch: number): EpochCommittee | null {
-		return committeeForEpoch(finalized, epoch, { epochLength: this.c.epochLength, size: this.c.size, windowAnchors: this.c.windowAnchors });
+		return committeeForEpoch(finalized, epoch, { epochLength: this.c.epochLength, size: this.c.size, windowAnchors: this.c.windowAnchors, bonds: this.c.bonds?.() });
 	}
 
 	private async actOnEpoch(finalized: AnchorView[], epoch: number): Promise<void> {

@@ -120,6 +120,9 @@ export interface DaemonOptions {
 		ceremonyTimeoutMs?: number;
 		/** Membership lookback in anchors (default: all). */
 		windowAnchors?: number;
+		/** Gate #3: stake-weight committee selection by bonded gBTC (only bonded producers
+		 *  are eligible). Off → weight by anchors produced (the pre-bonding model). */
+		bonded?: boolean;
 	};
 }
 
@@ -260,6 +263,7 @@ export class Daemon {
 			size: this.custodyOpts.size ?? 5,
 			minCommittee: this.custodyOpts.minCommittee ?? 3,
 			windowAnchors: this.custodyOpts.windowAnchors,
+			bonds: this.custodyOpts.bonded ? this.finalView().bridge.bonds : undefined,
 		});
 		void this.transport.setCommitteeTopics(mine.map((e) => committeeTopic(this.network, e)));
 	}
@@ -379,21 +383,37 @@ export class Daemon {
 		committee: string[] | null;
 		threshold: number | null;
 		subSwarmTopics: string[];
+		bonded: boolean;
+		myBond: string;
 	} {
 		const cs = this.committeeShare();
 		const committee = this.committeeMode();
 		const onchain = committee ? this.view().custody.fundKey : null;
+		const id = committee ? this.producerId() : null;
 		return {
 			mode: committee ? "committee" : "seed",
 			epoch: this.rotation?.epoch ?? -1,
 			fundKeyOnChain: onchain,
 			fundAddress: committee ? (onchain ? this.fundAddress() : null) : this.fundAddress(),
-			committeeId: committee ? this.producerId() : null,
+			committeeId: id,
 			holdsShare: !!cs,
 			committee: cs?.participants ?? null,
 			threshold: cs?.min ?? null,
 			subSwarmTopics: this.transport?.committeeTopicNames() ?? [],
+			bonded: !!this.custodyOpts.bonded, // stake-weighted selection on?
+			myBond: (id ? this.view().bridge.bonds.get(id) ?? 0n : 0n).toString(),
 		};
+	}
+
+	/** Lock `amount` gBTC at THIS node's committee identity as a bond (stake-weighted
+	 *  selection; slashable). The gBTC must already sit at producerId() — fund it with a
+	 *  gbtc.transfer first. Returns the bond write id. */
+	async bondCustody(amount: bigint): Promise<string> {
+		return (await this.custodyAccount().bond(amount)).id;
+	}
+	/** Release `amount` of this node's bond back to spendable gBTC. */
+	async unbondCustody(amount: bigint): Promise<string> {
+		return (await this.custodyAccount().unbond(amount)).id;
 	}
 
 	consensus(): ConsensusStatus {
@@ -495,6 +515,7 @@ export class Daemon {
 			minCommittee: this.custodyOpts.minCommittee ?? 3,
 			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
 			windowAnchors: this.custodyOpts.windowAnchors,
+			bonds: this.custodyOpts.bonded ? () => this.finalView().bridge.bonds : undefined, // stake-weighted selection
 			auth: this.ceremonyAuth(),
 			groupKey: () => {
 				const hex = this.view().custody.fundKey;

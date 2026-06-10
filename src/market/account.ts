@@ -85,6 +85,16 @@ export class Account {
 		return this.produce({ kind: "bridge.broadcast", withdrawalId, txid });
 	}
 
+	/** Lock gBTC as a custody-committee bond (selection weight; slashable). */
+	bond(amount: bigint | number | string): Promise<Write> {
+		return this.produce({ kind: "custody.bond", amount: amountStr(amount) });
+	}
+
+	/** Release bonded gBTC back to spendable. */
+	unbond(amount: bigint | number | string): Promise<Write> {
+		return this.produce({ kind: "custody.unbond", amount: amountStr(amount) });
+	}
+
 	/** Mark a withdrawal's BTC payout confirmed. `sig` (committee threshold sig over the
 	 *  settle digest) authorizes it in committee mode; without it, the legacy attestor key. */
 	settleWithdrawal(withdrawalId: string, sig?: string): Promise<Write> {

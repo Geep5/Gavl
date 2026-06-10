@@ -29,7 +29,7 @@ import { skewBps, fundingRateBps, fundingPayment, DEFAULT_FUNDING } from "../per
 import { finalizedOrdering } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import { oraclePubHex, bridgePubHex } from "./oracle.ts";
-import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast } from "../custody/bridge.ts";
+import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, unbond } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "../custody/attestation.ts";
@@ -95,7 +95,7 @@ export function gbtcOf(view: View, pubkey: string): bigint {
  * never breaks this.
  */
 export function marketConserved(view: View): boolean {
-	return view.bridge.reserves === totalGbtc(view.bridge) + view.pool.assets + pendingTotal(view.bridge);
+	return view.bridge.reserves === totalGbtc(view.bridge) + bondedTotal(view.bridge) + view.pool.assets + pendingTotal(view.bridge);
 }
 
 export function parseAmount(s: string): bigint | null {
@@ -301,6 +301,18 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
 			if (gbtcOf(view, w.writer) < amt) return;
 			addGbtc(view.bridge, w.writer, -amt);
 			poolDeposit(view.pool, amt, (owner, paid) => addGbtc(view.bridge, owner, paid));
+			return;
+		}
+		case "custody.bond": {
+			// Lock the writer's free gBTC as a committee bond (its selection weight, slashable).
+			const amt = parseAmount(op.amount);
+			if (amt !== null) bond(view.bridge, w.writer, amt);
+			return;
+		}
+		case "custody.unbond": {
+			// Release bonded gBTC back to spendable.
+			const amt = parseAmount(op.amount);
+			if (amt !== null) unbond(view.bridge, w.writer, amt);
 			return;
 		}
 	}

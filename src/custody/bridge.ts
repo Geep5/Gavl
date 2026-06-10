@@ -56,12 +56,18 @@ export interface BridgeState {
 	 *  signed + broadcast the payout. Marks a withdrawal IN FLIGHT so members stop
 	 *  re-signing it and instead watch that txid for confirmation, then co-sign settle. */
 	broadcasts: Map<string, string>;
+	/** Committee BONDS (pubkey → locked gBTC). A node bonds gBTC to be eligible for the
+	 *  custody committee; the bond is its selection WEIGHT and is SLASHABLE on a proven
+	 *  fault — so capturing a threshold of seats costs (and risks) real stake. Bonded
+	 *  gBTC is locked: not spendable/transferable, but still 1:1-backed (counted in
+	 *  conservation). */
+	bonds: Map<string, bigint>;
 	mintedTotal: bigint; // audit: lifetime minted
 	paidOut: bigint; // audit: lifetime BTC paid out
 }
 
 export function emptyBridge(): BridgeState {
-	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), mintedTotal: 0n, paidOut: 0n };
+	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), mintedTotal: 0n, paidOut: 0n };
 }
 
 export function gbtcOf(s: BridgeState, pubkey: string): bigint {
@@ -88,13 +94,42 @@ export function pendingTotal(s: BridgeState): bigint {
 	return t;
 }
 
-/** The 1:1 backing invariant — reserves account for exactly the outstanding claims. */
+/** Total gBTC locked as committee bonds (still backed, just not spendable). */
+export function bondedTotal(s: BridgeState): bigint {
+	let t = 0n;
+	for (const v of s.bonds.values()) t += v;
+	return t;
+}
+
+/** Bond `amount` of `pubkey`'s FREE gBTC as a committee bond (locked). No-op if it
+ *  can't cover it. The gBTC stays 1:1-backed; it just moves free → bonded. */
+export function bond(s: BridgeState, pubkey: string, amount: bigint): boolean {
+	if (amount <= 0n || gbtcOf(s, pubkey) < amount) return false;
+	addG(s, pubkey, -amount); // out of free balance
+	s.bonds.set(pubkey, (s.bonds.get(pubkey) ?? 0n) + amount);
+	return true;
+}
+
+/** Unbond `amount` back to free gBTC. No-op if the bond can't cover it. (v1: immediate;
+ *  an unbonding DELAY — so a caught equivocator can't dodge a slash — lands with slashing.) */
+export function unbond(s: BridgeState, pubkey: string, amount: bigint): boolean {
+	const cur = s.bonds.get(pubkey) ?? 0n;
+	if (amount <= 0n || cur < amount) return false;
+	const rest = cur - amount;
+	if (rest === 0n) s.bonds.delete(pubkey);
+	else s.bonds.set(pubkey, rest);
+	addG(s, pubkey, amount); // back to free balance
+	return true;
+}
+
+/** The 1:1 backing invariant — reserves account for exactly the outstanding claims
+ *  (free + bonded gBTC + burned-pending). Bonded gBTC is still a claim on reserves. */
 export function conserved(s: BridgeState): boolean {
-	return s.reserves === totalGbtc(s) + pendingTotal(s);
+	return s.reserves === totalGbtc(s) + bondedTotal(s) + pendingTotal(s);
 }
 /** Backing ratio in bps (10000 = fully 1:1 backed). Always 10000 if the invariant holds. */
 export function backingBps(s: BridgeState): bigint {
-	const owed = totalGbtc(s) + pendingTotal(s);
+	const owed = totalGbtc(s) + bondedTotal(s) + pendingTotal(s);
 	return owed === 0n ? 10_000n : (s.reserves * 10_000n) / owed;
 }
 

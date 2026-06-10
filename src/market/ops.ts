@@ -50,6 +50,11 @@ export type Op =
 	| { kind: "position.liquidate"; position: string }
 	/** Add native credit to the shared pool backing (drains the unpaid queue). */
 	| { kind: "pool.deposit"; amount: string }
+	/** Lock gBTC as a custody-committee BOND — your committee selection WEIGHT, and
+	 *  SLASHABLE on a proven fault. Bonded gBTC is locked (unspendable) but still backed. */
+	| { kind: "custody.bond"; amount: string }
+	/** Release bonded gBTC back to spendable. */
+	| { kind: "custody.unbond"; amount: string }
 	/** Announce the threshold-custody fund's group key on-chain, established by the
 	 *  epoch-0 genesis DKG. FIRST write wins and is IMMUTABLE — so every node + client
 	 *  learns the one permanent fund address, and rotations never change it. (v1 trusts
@@ -57,7 +62,7 @@ export type Op =
 	 *  alongside gate #4 non-public keys.) */
 	| { kind: "custody.fund"; groupKey: string; epoch: number };
 
-const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "oracle.post", "oracle.meta", "position.open", "position.close", "position.liquidate", "pool.deposit", "custody.fund"]);
+const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "oracle.post", "oracle.meta", "position.open", "position.close", "position.liquidate", "pool.deposit", "custody.fund", "custody.bond", "custody.unbond"]);
 
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);

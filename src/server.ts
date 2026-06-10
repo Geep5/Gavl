@@ -76,6 +76,7 @@ const daemon = new Daemon({
 					size: Number(process.env.GAVL_CUSTODY_SIZE ?? "5"),
 					minCommittee: Number(process.env.GAVL_CUSTODY_MIN ?? "3"),
 					ceremonyTimeoutMs: Number(process.env.GAVL_CUSTODY_TIMEOUT_MS ?? "30000"),
+					bonded: process.env.GAVL_CUSTODY_BONDED === "1", // gate #3: stake-weight selection by bonded gBTC
 				}
 			: undefined,
 });
@@ -289,6 +290,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			// Build + threshold-sign + broadcast the pending withdrawals as one BTC tx.
 			const txid = await daemon.processWithdrawals();
 			return send(res, 200, { txid });
+		}
+		if (path === "/api/custody/bond") {
+			// Lock gBTC at THIS node's committee identity as a bond (gate #3 stake weight).
+			// Fund producerId() with a gbtc.transfer first.
+			const amt = parseAmount(String(body.amount));
+			if (amt === null) throw new Error("amount must be a positive integer");
+			return send(res, 200, { id: await daemon.bondCustody(amt) });
+		}
+		if (path === "/api/custody/unbond") {
+			const amt = parseAmount(String(body.amount));
+			if (amt === null) throw new Error("amount must be a positive integer");
+			return send(res, 200, { id: await daemon.unbondCustody(amt) });
 		}
 		if (path === "/api/oracle/post") {
 			// Publish a signed BTC price. Only valid if the active account IS the oracle key.

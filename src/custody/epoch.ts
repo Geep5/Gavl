@@ -69,7 +69,7 @@ export function thresholdFor(size: number): number {
  * Connectivity, not consensus — so it's fine to compute over the optimistic chain and
  * a couple of candidate epochs (current + next); extra/missed topics are harmless.
  */
-export function committeeEpochsFor(chain: AnchorView[], selfId: string, epochs: number[], opts: { epochLength: number; size: number; minCommittee?: number; windowAnchors?: number }): number[] {
+export function committeeEpochsFor(chain: AnchorView[], selfId: string, epochs: number[], opts: { epochLength: number; size: number; minCommittee?: number; windowAnchors?: number; bonds?: Map<string, bigint> }): number[] {
 	const minC = opts.minCommittee ?? 1;
 	const out: number[] = [];
 	for (const e of epochs) {
@@ -86,22 +86,32 @@ export function committeeEpochsFor(chain: AnchorView[], selfId: string, epochs: 
  * i.e. the epoch isn't selectable yet. `size` is the desired committee size (clamped
  * to the eligible count); `windowAnchors` bounds how far back membership looks
  * (default: all anchors below the boundary), so long-departed farmers age out.
+ *
+ * `bonds` (gate #3) makes selection STAKE-weighted: when provided, a producer is
+ * eligible only if it has bonded gBTC, and its weight is its bond (not its anchor
+ * count) — so an attacker must acquire a large bonded fraction (real, slashable stake)
+ * to capture a threshold of seats. Anchor production stays the Sybil/liveness gate
+ * (you must be a live farmer to be eligible at all). Without `bonds`, weight is anchor
+ * count (the pre-bonding model + the no-bonding tests).
  */
-export function committeeForEpoch(finalized: AnchorView[], epoch: number, opts: { epochLength: number; size: number; windowAnchors?: number }): EpochCommittee | null {
+export function committeeForEpoch(finalized: AnchorView[], epoch: number, opts: { epochLength: number; size: number; windowAnchors?: number; bonds?: Map<string, bigint> }): EpochCommittee | null {
 	const boundary = epochBoundary(epoch, opts.epochLength);
 	const beaconAnchor = finalized.find((a) => a.height === boundary);
 	if (!beaconAnchor) return null; // boundary not finalized yet → not selectable
 
-	// Tally producers of anchors strictly below the boundary (within the window) →
-	// weight = anchors produced. Genesis (height 0) counts like any other.
+	// Producers of anchors strictly below the boundary (within the window) are the
+	// eligible set (proved space-time / liveness). Genesis (height 0) counts like any other.
 	const lo = opts.windowAnchors === undefined ? 0 : Math.max(0, boundary - opts.windowAnchors);
-	const weight = new Map<string, bigint>();
+	const produced = new Map<string, bigint>();
 	for (const a of finalized) {
 		if (a.height >= boundary || a.height < lo) continue;
-		weight.set(a.producer, (weight.get(a.producer) ?? 0n) + 1n);
+		produced.set(a.producer, (produced.get(a.producer) ?? 0n) + 1n);
 	}
-	// Deterministic member order (the sampler is order-independent, but keep it stable).
-	const members: Member[] = [...weight.entries()].sort((x, y) => (x[0] < y[0] ? -1 : 1)).map(([id, w]) => ({ id, weight: w }));
+	// Weight = bonded stake (if bonding is on, bonded producers only) else anchors produced.
+	const members: Member[] = [...produced.keys()]
+		.sort()
+		.map((id) => ({ id, weight: opts.bonds ? (opts.bonds.get(id) ?? 0n) : produced.get(id)! }))
+		.filter((m) => m.weight > 0n);
 	if (members.length === 0) return { epoch, beacon: beaconAnchor.time.output, members, committee: [], min: 0 };
 
 	const size = Math.min(opts.size, members.length);
