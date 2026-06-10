@@ -16,7 +16,7 @@
  * runs over an in-memory link (tests) or a real Hyperswarm socket (the mesh).
  */
 
-import type { SyncMessage, DkgWire, SignWire } from "./messages.ts";
+import type { SyncMessage, DkgWire, SignWire, ReshareWire } from "./messages.ts";
 import type { Write } from "../chain/writer.ts";
 import { Ledger } from "../ledger/ledger.ts";
 import type { Heads } from "../ledger/ledger.ts";
@@ -158,6 +158,10 @@ export class GavlNode {
 				this.onSign?.(m.m); // signing ceremony is broadcast-only (no secrets cross)
 				return;
 			}
+			case "reshare": {
+				this.onReshare?.(conn, m.m); // sub-shares are point-to-point → needs the conn
+				return;
+			}
 		}
 	}
 
@@ -179,6 +183,18 @@ export class GavlNode {
 	/** Broadcast a signing message (nonce commitment / sig share — both public). */
 	signBroadcast(m: SignWire): void {
 		this.broadcast({ t: "sign", m });
+	}
+
+	// ── reshare ceremony transport (used by custody/reshare-coordinator) ──
+	/** Registered by a ReshareCoordinator; receives reshare messages + their connection. */
+	onReshare?: (conn: Connection, m: ReshareWire) => void;
+	/** Broadcast a reshare message (hello / verifying share — both public). */
+	reshareBroadcast(m: ReshareWire): void {
+		this.broadcast({ t: "reshare", m });
+	}
+	/** Send a reshare message to ONE peer over its connection (secret sub-share). */
+	reshareReply(conn: Connection, m: ReshareWire): void {
+		conn.send({ t: "reshare", m });
 	}
 
 	private async ingestAnchors(conn: Connection, anchors: Anchor[]): Promise<void> {

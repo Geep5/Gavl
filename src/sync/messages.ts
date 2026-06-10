@@ -31,7 +31,9 @@ export type SyncMessage =
 	/** A DKG ceremony message, routed to the node's registered DKG coordinator. */
 	| { t: "dkg"; m: DkgWire }
 	/** A signing ceremony message, routed to the node's registered signing coordinator. */
-	| { t: "sign"; m: SignWire };
+	| { t: "sign"; m: SignWire }
+	/** A reshare ceremony message, routed to the node's registered reshare coordinator. */
+	| { t: "reshare"; m: ReshareWire };
 
 /**
  * DKG ceremony payloads. `pkg`/`share` are FROST structures pre-encoded JSON-safe
@@ -55,3 +57,17 @@ export type SignWire =
 	| { s: "commit"; sign: string; from: string; commit: unknown }
 	/** Round 2: a signer's signature share (safe to broadcast — useless without a quorum). */
 	| { s: "share"; sign: string; from: string; share: unknown };
+
+/**
+ * Committee RESHARE ceremony payloads — rotate the fund key to a new committee
+ * (same group key). An old member's `sub` carries a SECRET sub-share to one new
+ * member (point-to-point, like DKG round-2); a new member's `vshare` is its public
+ * verifying share (broadcast, to assemble the new package).
+ */
+export type ReshareWire =
+	/** Announce participation so peers learn id→connection (for routing sub-shares). */
+	| { r: "hello"; session: string; from: string }
+	/** SECRET sub-share from an old member `from` to a new member `to`. Point-to-point. */
+	| { r: "sub"; session: string; from: string; to: string; share: unknown }
+	/** A new member's verifying share g^newShare (public). */
+	| { r: "vshare"; session: string; from: string; v: unknown };
