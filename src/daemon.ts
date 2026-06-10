@@ -42,7 +42,8 @@ import { committeeTopic, quorumForRound } from "./custody/committee.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "./custody/attestation.ts";
 import { isCeremonyTimeout } from "./custody/ceremony.ts";
 import { Esplora } from "./custody/esplora.ts";
-import { checkDeposit, utxosToInputs, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
+import { checkDeposit, utxosToInputs, confirmations, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
+import { pendingClaims, unsentWithdrawals, inFlightWithdrawals } from "./custody/bridge.ts";
 import { readPriceAggregate } from "./market/pricefeed.ts";
 import type { PriceSource, AggregateReading } from "./market/pricefeed.ts";
 import { Wallet } from "./wallet.ts";
@@ -222,6 +223,7 @@ export class Daemon {
 			}
 			this.driveRotation(); // advance the custody epoch loop on each finality move
 			this.maintainCommitteeTopics(); // keep this node joined to its committee's sub-swarm
+			this.maybeAuthorizePending(); // co-sign pending withdrawals / mints / settles
 		};
 	}
 
@@ -764,26 +766,22 @@ export class Daemon {
 	}
 
 	/**
-	 * Verify a real BTC deposit `txid` paid the fund (via Esplora), and attest each
-	 * fund output → mints gBTC 1:1 to `depositor`. Idempotent by txid:vout. Returns
-	 * the total credited (0 if not found / not confirmed deep enough).
+	 * Begin claiming a real BTC deposit `txid` for `depositor` (verified to have paid
+	 * THEIR per-user address). In committee mode this just posts the on-chain `bridge.claim`
+	 * TRIGGER — the committee then independently re-verifies + co-signs the mint (so no
+	 * single key mints). In seed mode the single attestor mints directly. Returns the sats
+	 * found (the gBTC appears once minted).
 	 */
 	async claimDeposit(txid: string, depositor: string): Promise<bigint> {
-		// FRONT-RUN FIX: verify the deposit paid the CLAIMER's OWN per-user address, not a
-		// shared one. An attacker claiming someone else's txid checks against their own
-		// (different) address, which the tx never paid → their claim finds nothing.
+		// FRONT-RUN FIX: verify the deposit paid the CLAIMER's OWN per-user address.
 		const deps = await checkDeposit(this.esplora(), this.depositAddressFor(depositor), txid, MIN_CONFIRMATIONS);
 		let total = 0n;
 		for (const d of deps) {
 			const depositId = `${d.txid}:${d.vout}`;
 			if (this.committeeMode() && this.view().custody.fundKey) {
-				// Committee custody: this node has VERIFIED the deposit on-chain (checkDeposit
-				// above); now the committee co-signs the mint authority. No single key mints.
-				const sig = await this.committeeAttest(depositAttestationDigest({ depositId, depositor, amount: d.amount }));
-				if (!sig) continue; // committee didn't sign (quorum offline) — retry the claim later
-				await this.custodyAccount().attestDeposit(depositId, depositor, d.amount, sig);
+				await this.custodyAccount().claim(depositId, depositor); // post the trigger; the committee mints
 			} else {
-				await this.attestor().attestDeposit(depositId, depositor, d.amount);
+				await this.attestor().attestDeposit(depositId, depositor, d.amount); // seed: direct mint
 			}
 			total += d.amount;
 		}
@@ -791,87 +789,142 @@ export class Daemon {
 	}
 
 	/**
-	 * Settle all pending withdrawals: fetch the fund's UTXOs, build ONE payout tx to
-	 * the pending recipients (+ change back to the fund, − fee), threshold-sign it,
-	 * broadcast via Esplora, then mark each withdrawal settled. Returns the broadcast
-	 * txid, or null if there's nothing pending / insufficient confirmed UTXOs.
+	 * Settle pending withdrawals. Committee mode → co-sign the unsent ones (the finality
+	 * loop also does this autonomously); seed mode → the single operator signs + broadcasts
+	 * + settles inline. Returns the broadcast txid (committee: of the unsent batch), or null.
 	 */
 	async processWithdrawals(feeSats = 1_000n): Promise<string | null> {
-		// Sign only FINALIZED withdrawals in committee mode: each member builds from its
-		// own finalized view, so a reorg can't desync "BTC sent" from "gBTC burned", and
-		// members agree on a stable pending set (finalized state is consensus).
-		const pending = (this.committeeMode() ? this.finalView() : this.view()).bridge.pending;
+		if (this.committeeMode() && this.view().custody.fundKey) return this.coSignWithdrawals();
+		return this.seedProcessWithdrawals(feeSats);
+	}
+
+	/** Seed/testnet single-operator path: sign ALL pending with the seed key, broadcast,
+	 *  settle immediately (no committee, no confirmation wait). */
+	private async seedProcessWithdrawals(feeSats: bigint): Promise<string | null> {
+		const pending = this.view().bridge.pending;
 		if (pending.length === 0) return null;
 		const esplora = this.esplora();
+		const built = await this.buildPayout(pending, feeSats);
+		if (!built) return null;
+		const fk = this.fundKey();
+		const quorum = Object.fromEntries(Object.entries(fk.shares).slice(0, fk.min));
+		const txid = await esplora.broadcast(signWithdrawalTx(built.mkUnsigned(), fk, quorum).hex);
+		for (const w of pending) await this.attestor().settleWithdrawal(w.id);
+		return txid;
+	}
+
+	/**
+	 * Gather the fund's confirmed UTXOs and build a deterministic payout tx to `targets`
+	 * (+ change back to the fund, − fee). Enforces the SIGNING POLICY (the honest-member
+	 * veto): the only non-change outputs are the requested withdrawal addresses. Returns a
+	 * rebuild thunk (finalizing a PSBT consumes it) + the txid-to-be, or null if there
+	 * isn't enough confirmed BTC yet.
+	 */
+	private async buildPayout(targets: { id: string; btcAddress: string; amount: bigint }[], feeSats: bigint): Promise<{ mkUnsigned: () => ReturnType<typeof buildWithdrawalTx> } | null> {
+		const esplora = this.esplora();
 		const tip = await esplora.tipHeight();
-		// Gather spendable UTXOs from the base + every per-user deposit address, tagging
-		// each with its owner so signWithdrawalTx applies the right key/tweak.
 		const inputs = (await Promise.all(this.fundAddresses().map(async ({ address, owner }) => utxosToInputs(await esplora.utxos(address), MIN_CONFIRMATIONS, tip).map((u) => ({ ...u, owner }))))).flat();
 		const inSum = inputs.reduce((a, u) => a + u.amount, 0n);
-		const payouts = pending.map((w) => ({ address: w.btcAddress, amount: w.amount }));
+		const payouts = targets.map((w) => ({ address: w.btcAddress, amount: w.amount }));
 		const outSum = payouts.reduce((a, p) => a + p.amount, 0n);
-		if (inputs.length === 0 || inSum < outSum + feeSats) return null; // not enough confirmed BTC yet
-		const change = inSum - outSum - feeSats;
+		if (inputs.length === 0 || inSum < outSum + feeSats) return null;
 		const fundAddr = this.fundAddress();
+		const change = inSum - outSum - feeSats;
 		if (change > 0n) payouts.push({ address: fundAddr, amount: change });
-
-		// SIGNING POLICY (the honest-member veto): the tx may pay ONLY the finalized
-		// owner-signed withdrawals — each to the address THAT OWNER put in their signed
-		// burn — plus change back to the fund. Every member enforces this from its own
-		// view before contributing a share, so redirecting or fabricating a spend needs a
-		// corrupted THRESHOLD, never one bad actor or a malicious tx-builder.
-		const requested = new Set(pending.map((w) => w.btcAddress));
-		for (const p of payouts) {
-			if (p.address === fundAddr) continue; // change back to the fund
-			if (!requested.has(p.address)) throw new Error(`withdrawal policy: refusing to pay ${p.address} — not a finalized request`);
-		}
-
-		// Deterministic tx so every committee member builds byte-identical bytes (and the
-		// ceremony converges): canonical input + output ordering. A thunk so the failover
-		// signer can rebuild it each round (finalizing a PSBT consumes it).
+		// VETO: the tx may pay ONLY the requested withdrawal addresses + change to the fund.
+		const requested = new Set(targets.map((w) => w.btcAddress));
+		for (const p of payouts) if (p.address !== fundAddr && !requested.has(p.address)) throw new Error(`withdrawal policy: refusing to pay ${p.address}`);
 		inputs.sort((a, b) => (a.txid === b.txid ? a.index - b.index : a.txid < b.txid ? -1 : 1));
 		payouts.sort((a, b) => (a.address === b.address ? Number(a.amount - b.amount) : a.address < b.address ? -1 : 1));
-		const mkUnsigned = () => buildWithdrawalTx(this.fundKey(), { inputs, outputs: payouts, network: this.btcNetwork() });
+		return { mkUnsigned: () => buildWithdrawalTx(this.fundKey(), { inputs, outputs: payouts, network: this.btcNetwork() }) };
+	}
 
-		const cs = this.committeeShare();
-		let hex: string;
-		if (cs) {
-			// Committee path: co-sign over the live transport with this node's share only,
-			// with quorum FAILOVER — every committee member runs the loop in lockstep, so an
-			// offline member just rotates the quorum instead of blocking the withdrawal. The
-			// winning quorum's members each converge on (and can broadcast) the identical tx.
-			const signed = await signWithdrawalWithFailover(mkUnsigned, {
-				node: this.node,
-				signIdBase: pending.map((w) => w.id).join(","),
-				selfId: cs.selfId,
-				committee: cs.participants,
-				min: cs.min,
-				pub: cs.pub,
-				groupPubKey: cs.groupPubKey,
-				share: cs.share,
-				timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
-				auth: this.ceremonyAuth(),
-			});
-			if (!signed) return null; // no quorum formed this round — retried on the next attempt
-			hex = signed.hex;
-		} else {
-			const fk = this.fundKey();
-			const quorum = Object.fromEntries(Object.entries(fk.shares).slice(0, fk.min));
-			hex = signWithdrawalTx(mkUnsigned(), fk, quorum).hex;
-		}
-		const txid = await esplora.broadcast(hex);
-		// Mark each withdrawal settled. In committee mode this is committee-authorized too
-		// (no single key drops reserves); the BTC payout tx just confirmed (we broadcast it).
-		for (const w of pending) {
-			if (this.committeeMode() && this.view().custody.fundKey) {
-				const sig = await this.committeeAttest(settleAttestationDigest({ withdrawalId: w.id }));
-				if (sig) await this.custodyAccount().settleWithdrawal(w.id, sig);
-				// else: settle is retried next cycle once the committee co-signs
-			} else {
-				await this.attestor().settleWithdrawal(w.id);
+	// ── autonomous committee co-signing (finality-driven; the trigger) ───────
+
+	private authorizing = false;
+	/**
+	 * On each finality advance, a committee member picks up ALL pending custody work from
+	 * FINALIZED state and co-signs it — withdrawals to sign, deposits to mint, payouts to
+	 * settle — with NO leader: every member reads the same finalized state, runs the same
+	 * deterministic ceremony per item, and idempotent effects make duplicates safe. This
+	 * is what makes the committee autonomous across many nodes. No-op unless committee mode
+	 * + this node holds a share + a fund exists. Non-reentrant.
+	 */
+	private maybeAuthorizePending(): void {
+		if (this.authorizing || !this.committeeMode() || !this.committeeShare() || !this.view().custody.fundKey) return;
+		this.authorizing = true;
+		void (async () => {
+			try {
+				await this.coSignWithdrawals();
+				await this.coMintClaims();
+				await this.coSettleConfirmed();
+			} catch (e) {
+				console.warn(`[custody] authorize: ${(e as Error).message}`);
+			} finally {
+				this.authorizing = false;
 			}
+		})();
+	}
+
+	/** Co-sign + broadcast the UNSENT finalized withdrawals (one batch), then post a
+	 *  bridge.broadcast note per withdrawal so the committee stops re-signing them. */
+	private async coSignWithdrawals(): Promise<string | null> {
+		const cs = this.committeeShare();
+		if (!cs) return null;
+		const unsent = unsentWithdrawals(this.finalView().bridge);
+		if (unsent.length === 0) return null;
+		const built = await this.buildPayout(unsent, 1_000n);
+		if (!built) return null;
+		const signed = await signWithdrawalWithFailover(built.mkUnsigned, {
+			node: this.node,
+			signIdBase: unsent.map((w) => w.id).join(","),
+			selfId: cs.selfId,
+			committee: cs.participants,
+			min: cs.min,
+			pub: cs.pub,
+			groupPubKey: cs.groupPubKey,
+			share: cs.share,
+			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
+			auth: this.ceremonyAuth(),
+		});
+		if (!signed) return null; // quorum not reached this round — retried next finality tick
+		await this.esplora().broadcast(signed.hex);
+		for (const w of unsent) await this.custodyAccount().announceBroadcast(w.id, signed.txid); // mark in flight
+		return signed.txid;
+	}
+
+	/** For each finalized deposit-claim, INDEPENDENTLY verify it on-chain, then co-sign the
+	 *  mint (committee threshold). A bogus claim fails verification and mints nothing. */
+	private async coMintClaims(): Promise<void> {
+		const claims = pendingClaims(this.finalView().bridge);
+		if (claims.length === 0) return;
+		const esplora = this.esplora();
+		for (const { depositId, depositor } of claims) {
+			const colon = depositId.lastIndexOf(":");
+			if (colon < 0) continue;
+			const txid = depositId.slice(0, colon);
+			const vout = Number(depositId.slice(colon + 1));
+			const deps = await checkDeposit(esplora, this.depositAddressFor(depositor), txid, MIN_CONFIRMATIONS);
+			const d = deps.find((x) => x.vout === vout);
+			if (!d) continue; // not verified (yet) — retried next tick
+			const sig = await this.committeeAttest(depositAttestationDigest({ depositId, depositor, amount: d.amount }));
+			if (sig) await this.custodyAccount().attestDeposit(depositId, depositor, d.amount, sig);
 		}
-		return txid;
+	}
+
+	/** For each in-flight withdrawal whose payout txid has confirmed on-chain, co-sign the
+	 *  settle (committee threshold) so reserves drop. */
+	private async coSettleConfirmed(): Promise<void> {
+		const inFlight = inFlightWithdrawals(this.finalView().bridge);
+		if (inFlight.length === 0) return;
+		const esplora = this.esplora();
+		const tip = await esplora.tipHeight();
+		for (const { withdrawal, txid } of inFlight) {
+			const tx = await esplora.getTx(txid);
+			if (!tx || confirmations(tx, tip) < MIN_CONFIRMATIONS) continue; // not confirmed yet
+			const sig = await this.committeeAttest(settleAttestationDigest({ withdrawalId: withdrawal.id }));
+			if (sig) await this.custodyAccount().settleWithdrawal(withdrawal.id, sig);
+		}
 	}
 
 	/** The channel/network this node is currently on. */
