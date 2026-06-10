@@ -29,12 +29,23 @@ import type { PublicPackage, Share } from "./threshold.ts";
 const Fn = FROST.utils.Fn;
 const Pt = secp256k1.Point;
 
-/** FROST identifier (64-hex big-endian scalar) ↔ scalar. */
-export function idToScalar(idHex: string): bigint {
-	return BigInt("0x" + idHex);
+/**
+ * Committee member id → its FROST identifier, and that identifier as a scalar.
+ *
+ * This is the ONE mapping every ceremony (DKG, signing, reshare) must share: a
+ * committee id is an arbitrary string (a node's stable producer pubkey); its FROST
+ * identifier — the Shamir x-coordinate its share lives at — is the canonical
+ * `derive(id)`. DKG/sign-coordinator both do `FROST.Identifier.derive(id)`, so
+ * reshare MUST too, or Lagrange interpolates over the wrong x's and the rotated
+ * committee can no longer sign for the group key. (An earlier version treated the id
+ * string itself as the scalar — correct only when ids happened to be raw FROST
+ * identifiers, never the case for real producer-pubkey ids.)
+ */
+export function fid(pid: string): string {
+	return FROST.Identifier.derive(pid);
 }
-export function scalarToId(x: bigint): string {
-	return x.toString(16).padStart(64, "0");
+export function fidScalar(pid: string): bigint {
+	return BigInt("0x" + fid(pid));
 }
 
 /** Deterministically select this epoch's committee from the VDF beacon (stake-weighted,
@@ -54,18 +65,20 @@ export function selectCommittee(members: Member[], vdfBeaconHex: string, size: n
  * secret's shares). `newMin` is the new signing threshold.
  */
 export function reshareToCommittee(oldShares: Record<string, Share>, groupPubKey: Uint8Array, newIds: string[], newMin: number): { shares: Record<string, Share>; pub: PublicPackage } {
-	// FROST shares → Shamir points {x = identifier scalar, y = signingShare scalar}
-	const online = Object.entries(oldShares).map(([id, s]) => ({ x: idToScalar(id), y: Fn.fromBytes(s.signingShare) }));
-	const newScalars = newIds.map(idToScalar);
-	const fresh = shamirReshare(online, { ids: newScalars, threshold: newMin });
+	// FROST shares → Shamir points {x = the member's FROST-identifier scalar, y = share}.
+	// Keys are committee ids (producer pubkeys), so x = fidScalar(id) — same as DKG/sign.
+	const online = Object.entries(oldShares).map(([pid, s]) => ({ x: fidScalar(pid), y: Fn.fromBytes(s.signingShare) }));
+	const newScalars = newIds.map(fidScalar);
+	const fresh = shamirReshare(online, { ids: newScalars, threshold: newMin }); // in newIds order
 
 	const shares: Record<string, Share> = {};
 	const verifyingShares: Record<string, Uint8Array> = {};
-	for (const f of fresh) {
-		const id = scalarToId(f.x);
-		shares[id] = { identifier: id, signingShare: Fn.toBytes(f.y) };
-		verifyingShares[id] = Pt.BASE.multiply(f.y).toBytes(true); // g^newShare
-	}
+	newIds.forEach((pid, i) => {
+		const id = fid(pid); // the FROST identifier the new share lives at
+		const y = fresh[i].y;
+		shares[id] = { identifier: id, signingShare: Fn.toBytes(y) };
+		verifyingShares[id] = Pt.BASE.multiply(y).toBytes(true); // g^newShare
+	});
 	const pub: PublicPackage = { signers: { min: newMin, max: newIds.length }, commitments: [groupPubKey], verifyingShares } as PublicPackage;
 	return { shares, pub };
 }

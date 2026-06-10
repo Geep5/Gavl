@@ -24,7 +24,7 @@
 import { schnorr_FROST as FROST, secp256k1 } from "@noble/curves/secp256k1.js";
 import { lagrangeAtZero, mod, SECP256K1_N } from "./shamir.ts";
 import { dealAtIds } from "./reshare.ts";
-import { idToScalar, scalarToId } from "./committee.ts";
+import { fid, fidScalar } from "./committee.ts";
 import { toJsonSafe as enc, fromJsonSafe as dec } from "./u8json.ts";
 import type { PublicPackage, Share } from "./threshold.ts";
 import type { GavlNode, Connection } from "../sync/node.ts";
@@ -94,20 +94,22 @@ export class ReshareCoordinator {
 		if (!targets.every((id) => this.connOf.has(id))) return;
 		this.sentSubs = true;
 
-		const quorumXs = this.o.oldQuorum.map(idToScalar);
-		const lambda = lagrangeAtZero(idToScalar(this.o.selfId), quorumXs, SECP256K1_N);
+		// Member id → FROST-identifier scalar (the Shamir x its share lives at) — the
+		// SAME mapping DKG/sign use, so Lagrange interpolates over the right points.
+		const quorumXs = this.o.oldQuorum.map(fidScalar);
+		const lambda = lagrangeAtZero(fidScalar(this.o.selfId), quorumXs, SECP256K1_N);
 		const contribution = mod(lambda * Fn.fromBytes(this.o.oldShare.signingShare), SECP256K1_N);
-		const newScalars = this.o.newCommittee.map(idToScalar);
-		const subs = dealAtIds(contribution, { ids: newScalars, threshold: this.o.newMin }); // [{x:newId, y:sub}]
-		for (const sub of subs) {
-			const recipientId = scalarToId(sub.x);
+		const subs = dealAtIds(contribution, { ids: this.o.newCommittee.map(fidScalar), threshold: this.o.newMin }); // in newCommittee order
+		// dealAtIds preserves id order, so subs[i] is the sub-share for newCommittee[i].
+		this.o.newCommittee.forEach((recipientId, i) => {
+			const y = subs[i].y;
 			if (recipientId === this.o.selfId) {
-				this.subsForMe.set(this.o.selfId, sub.y); // my own contribution to my own share
+				this.subsForMe.set(this.o.selfId, y); // my own contribution to my own share
 			} else {
 				const conn = this.connOf.get(recipientId);
-				if (conn) this.node.reshareReply(conn, { r: "sub", session: this.o.session, from: this.o.selfId, to: recipientId, share: enc(Fn.toBytes(sub.y)) });
+				if (conn) this.node.reshareReply(conn, { r: "sub", session: this.o.session, from: this.o.selfId, to: recipientId, share: enc(Fn.toBytes(y)) });
 			}
-		}
+		});
 		this.maybeCombine();
 	}
 
@@ -128,11 +130,13 @@ export class ReshareCoordinator {
 
 	private maybeFinish(): void {
 		if (this.finished || this.vshares.size < this.o.newCommittee.length) return;
-		// every new member's verifying share is in → assemble the new public package
+		// every new member's verifying share is in → assemble the new public package,
+		// keyed by FROST identifier (fid(pid)) so it drops straight into the signing
+		// ceremony, which derives the same identifiers.
 		const verifyingShares: Record<string, Uint8Array> = {};
-		for (const [id, v] of this.vshares) verifyingShares[id] = v;
+		for (const [pid, v] of this.vshares) verifyingShares[fid(pid)] = v;
 		const pub: PublicPackage = { signers: { min: this.o.newMin, max: this.o.newCommittee.length }, commitments: [this.o.groupPubKey], verifyingShares } as PublicPackage;
-		const share: Share | null = this.isNew() && this.myNewY !== null ? { identifier: this.o.selfId, signingShare: Fn.toBytes(this.myNewY) } : null;
+		const share: Share | null = this.isNew() && this.myNewY !== null ? { identifier: fid(this.o.selfId), signingShare: Fn.toBytes(this.myNewY) } : null;
 		this.finished = true;
 		this.resolve({ share, pub, groupPubKey: this.o.groupPubKey });
 	}
