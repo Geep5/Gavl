@@ -31,6 +31,7 @@ import type { StoredShare } from "./custody/share-store.ts";
 import { fundAddress as deriveFundAddress } from "./custody/bitcoin.ts";
 import { depositAddress } from "./custody/deposit.ts";
 import { buildWithdrawalTx, signWithdrawalTx } from "./custody/btctx.ts";
+import { signWithdrawalDistributed } from "./custody/withdraw-ceremony.ts";
 import { Esplora } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
 import { readPriceAggregate } from "./market/pricefeed.ts";
@@ -435,6 +436,11 @@ export class Daemon {
 	 *  this node holds only its OWN share — see runCommitteeDkg / committeeShare. */
 	private fundKeyCache?: FundKey;
 	private fundKey(): FundKey {
+		// Committee path: this node holds only its own share, so the FundKey carries the
+		// group key (for addresses) with NO gathered shares — spending goes through the
+		// distributed signing ceremony, not fundKey().shares.
+		const cs = this.committeeShare();
+		if (cs) return { groupPubKey: cs.groupPubKey, pub: cs.pub, shares: {}, min: cs.min, max: cs.participants.length };
 		if (!this.fundKeyCache) this.fundKeyCache = fundKeyFromSeed(2, 3, process.env.GAVL_FUND_SEED ?? "gavl-testnet-fund-v1");
 		return this.fundKeyCache;
 	}
@@ -461,7 +467,7 @@ export class Daemon {
 	async runCommitteeDkg(opts: { session: string; selfId: string; participants: string[]; min: number }): Promise<string> {
 		const coord = new DkgCoordinator(this.node, opts);
 		const result = await coord.start();
-		saveShare(this.sharePath(), { ...result, session: opts.session, participants: opts.participants, min: opts.min });
+		saveShare(this.sharePath(), { ...result, session: opts.session, selfId: opts.selfId, participants: opts.participants, min: opts.min });
 		return deriveFundAddress({ groupPubKey: result.groupPubKey, pub: result.pub, shares: {}, min: opts.min, max: opts.participants.length }, this.btcNetwork());
 	}
 	private esploraCache?: Esplora;
@@ -561,9 +567,27 @@ export class Daemon {
 		if (inputs.length === 0 || inSum < outSum + feeSats) return null; // not enough confirmed BTC yet
 		const change = inSum - outSum - feeSats;
 		if (change > 0n) payouts.push({ address: this.fundAddress(), amount: change });
+
+		// Deterministic tx so every committee member builds byte-identical bytes (and the
+		// ceremony converges): canonical input + output ordering.
+		inputs.sort((a, b) => (a.txid === b.txid ? a.index - b.index : a.txid < b.txid ? -1 : 1));
+		payouts.sort((a, b) => (a.address === b.address ? Number(a.amount - b.amount) : a.address < b.address ? -1 : 1));
 		const unsigned = buildWithdrawalTx(this.fundKey(), { inputs, outputs: payouts, network: this.btcNetwork() });
-		const quorum = Object.fromEntries(Object.entries(this.fundKey().shares).slice(0, this.fundKey().min));
-		const { hex } = signWithdrawalTx(unsigned, this.fundKey(), quorum);
+
+		const cs = this.committeeShare();
+		let hex: string;
+		if (cs) {
+			// Committee path: co-sign over the live transport with this node's share only.
+			// The deterministic quorum (sorted first `min`) runs the ceremony; members
+			// outside it abstain. Live multi-node convergence is the deployment validation.
+			const quorumIds = [...cs.participants].sort().slice(0, cs.min);
+			if (!quorumIds.includes(cs.selfId)) return null; // not a signer for this round
+			const signed = await signWithdrawalDistributed(unsigned, { node: this.node, signIdBase: pending.map((w) => w.id).join(","), selfId: cs.selfId, quorum: quorumIds, pub: cs.pub, groupPubKey: cs.groupPubKey, share: cs.share });
+			hex = signed.hex;
+		} else {
+			const quorum = Object.fromEntries(Object.entries(this.fundKey().shares).slice(0, this.fundKey().min));
+			hex = signWithdrawalTx(unsigned, this.fundKey(), quorum).hex;
+		}
 		const txid = await esplora.broadcast(hex);
 		for (const w of pending) await this.attestor().settleWithdrawal(w.id);
 		return txid;

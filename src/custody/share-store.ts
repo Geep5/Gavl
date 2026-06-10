@@ -21,6 +21,7 @@ import type { DkgResult } from "./dkg-coordinator.ts";
  *  the group key + the committee it belongs to (for the signing ceremony). */
 export interface StoredShare extends DkgResult {
 	session: string; // the ceremony id this share belongs to
+	selfId: string; // THIS node's committee id
 	participants: string[]; // committee member ids (who to run signing with)
 	min: number; // signing threshold
 }
