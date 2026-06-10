@@ -26,6 +26,7 @@ import { lagrangeAtZero, mod, SECP256K1_N } from "./shamir.ts";
 import { dealAtIds } from "./reshare.ts";
 import { fid, fidScalar } from "./committee.ts";
 import { toJsonSafe as enc, fromJsonSafe as dec } from "./u8json.ts";
+import { CeremonyTimeout } from "./ceremony.ts";
 import type { PublicPackage, Share } from "./threshold.ts";
 import type { GavlNode, Connection } from "../sync/node.ts";
 import type { ReshareWire } from "../sync/messages.ts";
@@ -41,16 +42,18 @@ export interface ReshareResult {
 
 export class ReshareCoordinator {
 	private readonly node: GavlNode;
-	private readonly o: { session: string; selfId: string; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupPubKey: Uint8Array; oldShare?: Share };
+	private readonly o: { session: string; selfId: string; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupPubKey: Uint8Array; oldShare?: Share; timeoutMs?: number };
 	private readonly connOf = new Map<string, Connection>(); // peer id → connection
 	private readonly subsForMe = new Map<string, bigint>(); // old sender id → sub-share scalar (new-member role)
 	private readonly vshares = new Map<string, Uint8Array>(); // new member id → verifying share
 	private sentSubs = false;
 	private myVShareSent = false;
-	private finished = false;
+	private settled = false;
+	private timer: ReturnType<typeof setTimeout> | null = null;
 	private resolve!: (r: ReshareResult) => void;
+	private reject!: (e: Error) => void;
 
-	constructor(node: GavlNode, opts: { session: string; selfId: string; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupPubKey: Uint8Array; oldShare?: Share }) {
+	constructor(node: GavlNode, opts: { session: string; selfId: string; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupPubKey: Uint8Array; oldShare?: Share; timeoutMs?: number }) {
 		this.node = node;
 		this.o = opts;
 		this.node.onReshare = (conn, m) => this.onWire(conn, m);
@@ -60,17 +63,37 @@ export class ReshareCoordinator {
 		return this.o.newCommittee.includes(this.o.selfId);
 	}
 
+	/** Run the ceremony; resolves with this node's new share (if any) + the new package,
+	 *  or rejects with a CeremonyTimeout if `timeoutMs` elapses. On timeout the caller
+	 *  retries (e.g. a different old quorum, or next epoch) — the group key is untouched. */
 	start(): Promise<ReshareResult> {
-		return new Promise<ReshareResult>((res) => {
+		return new Promise<ReshareResult>((res, rej) => {
 			this.resolve = res;
+			this.reject = rej;
+			if (this.o.timeoutMs !== undefined) this.timer = setTimeout(() => this.fail(), this.o.timeoutMs);
 			// Announce so peers learn our connection (old members route sub-shares by it).
 			this.node.reshareBroadcast({ r: "hello", session: this.o.session, from: this.o.selfId });
 			this.maybeSendSubs();
 		});
 	}
 
+	/** Who we're still waiting on: as a new member, old-quorum members whose sub-share
+	 *  hasn't arrived; for everyone, new members whose verifying share hasn't arrived. */
+	private missing(): string[] {
+		const out = new Set<string>();
+		if (this.isNew()) for (const oid of this.o.oldQuorum) if (!this.subsForMe.has(oid)) out.add(oid);
+		for (const nid of this.o.newCommittee) if (!this.vshares.has(nid)) out.add(nid);
+		return [...out];
+	}
+
+	private fail(): void {
+		if (this.settled) return;
+		this.settled = true;
+		this.reject(new CeremonyTimeout("reshare", this.missing()));
+	}
+
 	private onWire(conn: Connection, m: ReshareWire): void {
-		if (m.session !== this.o.session) return;
+		if (this.settled || m.session !== this.o.session) return;
 		if (m.r === "hello") {
 			if (m.from !== this.o.selfId) this.connOf.set(m.from, conn);
 			this.maybeSendSubs();
@@ -129,7 +152,7 @@ export class ReshareCoordinator {
 	private myNewY: bigint | null = null;
 
 	private maybeFinish(): void {
-		if (this.finished || this.vshares.size < this.o.newCommittee.length) return;
+		if (this.settled || this.vshares.size < this.o.newCommittee.length) return;
 		// every new member's verifying share is in → assemble the new public package,
 		// keyed by FROST identifier (fid(pid)) so it drops straight into the signing
 		// ceremony, which derives the same identifiers.
@@ -137,7 +160,8 @@ export class ReshareCoordinator {
 		for (const [pid, v] of this.vshares) verifyingShares[fid(pid)] = v;
 		const pub: PublicPackage = { signers: { min: this.o.newMin, max: this.o.newCommittee.length }, commitments: [this.o.groupPubKey], verifyingShares } as PublicPackage;
 		const share: Share | null = this.isNew() && this.myNewY !== null ? { identifier: fid(this.o.selfId), signingShare: Fn.toBytes(this.myNewY) } : null;
-		this.finished = true;
+		this.settled = true;
+		if (this.timer) clearTimeout(this.timer);
 		this.resolve({ share, pub, groupPubKey: this.o.groupPubKey });
 	}
 }

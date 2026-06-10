@@ -23,33 +23,44 @@ import type { PublicPackage, Share } from "./threshold.ts";
 import type { GavlNode } from "../sync/node.ts";
 import type { SignWire } from "../sync/messages.ts";
 import { toJsonSafe as enc, fromJsonSafe as dec } from "./u8json.ts";
+import { CeremonyTimeout } from "./ceremony.ts";
 
 export class SignCoordinator {
 	private readonly node: GavlNode;
-	private readonly opts: { signId: string; selfId: string; quorum: string[]; pub: PublicPackage; share: Share; message: Uint8Array };
+	private readonly opts: { signId: string; selfId: string; quorum: string[]; pub: PublicPackage; share: Share; message: Uint8Array; timeoutMs?: number };
 	private readonly selfFid: string;
 	private readonly fidOf = new Map<string, string>(); // signer id → FROST identifier
+	private readonly idOfFid = new Map<string, string>(); // FROST identifier → signer id (for `missing`)
 	private nonces: ReturnType<typeof FROST.commit>["nonces"] | null = null;
 	private readonly commits = new Map<string, unknown>(); // FROST id → nonce commitments
 	private readonly shares = new Map<string, unknown>(); // FROST id → signature share
 	private readonly quorumN: number;
 	private sentShare = false;
-	private finished = false;
+	private settled = false;
+	private timer: ReturnType<typeof setTimeout> | null = null;
 	private resolve!: (sig: Uint8Array) => void;
+	private reject!: (e: Error) => void;
 
-	constructor(node: GavlNode, opts: { signId: string; selfId: string; quorum: string[]; pub: PublicPackage; share: Share; message: Uint8Array }) {
+	constructor(node: GavlNode, opts: { signId: string; selfId: string; quorum: string[]; pub: PublicPackage; share: Share; message: Uint8Array; timeoutMs?: number }) {
 		this.node = node;
 		this.opts = opts;
 		this.quorumN = opts.quorum.length;
-		for (const id of opts.quorum) this.fidOf.set(id, FROST.Identifier.derive(id));
+		for (const id of opts.quorum) {
+			const fid = FROST.Identifier.derive(id);
+			this.fidOf.set(id, fid);
+			this.idOfFid.set(fid, id);
+		}
 		this.selfFid = this.fidOf.get(opts.selfId)!;
 		this.node.onSign = (m) => this.onWire(m);
 	}
 
-	/** Run the ceremony; resolves with the aggregated Schnorr signature. */
+	/** Run the ceremony; resolves with the aggregated Schnorr signature, or rejects
+	 *  with a CeremonyTimeout (naming whoever didn't answer) if `timeoutMs` elapses. */
 	start(): Promise<Uint8Array> {
-		return new Promise<Uint8Array>((res) => {
+		return new Promise<Uint8Array>((res, rej) => {
 			this.resolve = res;
+			this.reject = rej;
+			if (this.opts.timeoutMs !== undefined) this.timer = setTimeout(() => this.fail(), this.opts.timeoutMs);
 			// Round 1: commit nonces (kept local), broadcast the public commitment.
 			const c = FROST.commit(this.opts.share);
 			this.nonces = c.nonces;
@@ -59,8 +70,24 @@ export class SignCoordinator {
 		});
 	}
 
+	/** Quorum members we're still waiting on (no commit yet, or no sig-share yet). */
+	private missing(): string[] {
+		const out: string[] = [];
+		for (const id of this.opts.quorum) {
+			const fid = this.fidOf.get(id)!;
+			if (!this.commits.has(fid) || (this.sentShare && !this.shares.has(fid))) out.push(id);
+		}
+		return out;
+	}
+
+	private fail(): void {
+		if (this.settled) return;
+		this.settled = true;
+		this.reject(new CeremonyTimeout("sign", this.missing()));
+	}
+
 	private onWire(m: SignWire): void {
-		if (m.sign !== this.opts.signId) return;
+		if (this.settled || m.sign !== this.opts.signId) return;
 		const fid = this.fidOf.get(m.from);
 		if (!fid) return; // not a quorum member
 		if (m.s === "commit") {
@@ -88,11 +115,12 @@ export class SignCoordinator {
 	}
 
 	private maybeAggregate(): void {
-		if (this.finished || !this.sentShare || this.shares.size < this.quorumN) return; // wait for all sig shares
+		if (this.settled || !this.sentShare || this.shares.size < this.quorumN) return; // wait for all sig shares
 		const sigShares: Record<string, Uint8Array> = {};
 		for (const [fid, s] of this.shares) sigShares[fid] = s as Uint8Array;
 		const sig = FROST.aggregate(this.opts.pub, this.commitmentList() as never, this.opts.message, sigShares);
-		this.finished = true;
+		this.settled = true;
+		if (this.timer) clearTimeout(this.timer);
 		this.resolve(sig);
 	}
 }

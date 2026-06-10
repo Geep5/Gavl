@@ -27,6 +27,7 @@ import type { PublicPackage, Share } from "./threshold.ts";
 import type { GavlNode, Connection } from "../sync/node.ts";
 import type { DkgWire } from "../sync/messages.ts";
 import { toJsonSafe as enc, fromJsonSafe as dec } from "./u8json.ts";
+import { CeremonyTimeout } from "./ceremony.ts";
 
 export interface DkgResult {
 	share: Share; // THIS node's threshold share — stays local
@@ -44,12 +45,14 @@ export class DkgCoordinator {
 	private readonly sharesForMe = new Map<string, unknown>(); // sender FROST id → round-2 share
 	private readonly max: number;
 	private sentRound2 = false;
-	private finished = false;
+	private settled = false;
+	private timer: ReturnType<typeof setTimeout> | null = null;
 	private resolve!: (r: DkgResult) => void;
+	private reject!: (e: Error) => void;
 	private readonly node: GavlNode;
-	private readonly opts: { session: string; selfId: string; participants: string[]; min: number };
+	private readonly opts: { session: string; selfId: string; participants: string[]; min: number; timeoutMs?: number };
 
-	constructor(node: GavlNode, opts: { session: string; selfId: string; participants: string[]; min: number }) {
+	constructor(node: GavlNode, opts: { session: string; selfId: string; participants: string[]; min: number; timeoutMs?: number }) {
 		this.node = node;
 		this.opts = opts;
 		this.max = opts.participants.length;
@@ -64,10 +67,15 @@ export class DkgCoordinator {
 		this.node.onDkg = (conn, m) => this.onWire(conn, m);
 	}
 
-	/** Run the ceremony; resolves with this node's share + the group key. */
+	/** Run the ceremony; resolves with this node's share + the group key, or rejects
+	 *  with a CeremonyTimeout (naming who didn't answer) if `timeoutMs` elapses.
+	 *  DKG is n-of-n for key GENERATION, so any missing participant aborts the round —
+	 *  the caller retries with the responsive set (a different key/committee). */
 	start(): Promise<DkgResult> {
-		return new Promise<DkgResult>((res) => {
+		return new Promise<DkgResult>((res, rej) => {
 			this.resolve = res;
+			this.reject = rej;
+			if (this.opts.timeoutMs !== undefined) this.timer = setTimeout(() => this.fail(), this.opts.timeoutMs);
 			// Round 1: broadcast my public commitment.
 			const pkg = this.session.round1();
 			this.r1.set(this.selfFid, pkg);
@@ -76,8 +84,26 @@ export class DkgCoordinator {
 		});
 	}
 
+	/** Participants we're still waiting on (no round-1 seen, or — once we've sent
+	 *  round 2 — no secret share received). Reported as participant ids. */
+	private missing(): string[] {
+		const out: string[] = [];
+		for (const pid of this.opts.participants) {
+			if (pid === this.opts.selfId) continue;
+			const fid = this.fidOf.get(pid)!;
+			if (!this.r1.has(fid) || (this.sentRound2 && !this.sharesForMe.has(fid))) out.push(pid);
+		}
+		return out;
+	}
+
+	private fail(): void {
+		if (this.settled) return;
+		this.settled = true;
+		this.reject(new CeremonyTimeout("dkg", this.missing()));
+	}
+
 	private onWire(conn: Connection, m: DkgWire): void {
-		if (m.session !== this.opts.session) return; // not our ceremony
+		if (this.settled || m.session !== this.opts.session) return; // settled, or not our ceremony
 		if (m.d === "round1") {
 			if (m.from === this.opts.selfId) return; // own echo (shouldn't happen on broadcast)
 			const fid = this.fidOf.get(m.from);
@@ -111,9 +137,10 @@ export class DkgCoordinator {
 	}
 
 	private maybeRound3(): void {
-		if (this.finished || !this.sentRound2 || this.sharesForMe.size < this.max - 1) return; // wait for all shares
+		if (this.settled || !this.sentRound2 || this.sharesForMe.size < this.max - 1) return; // wait for all shares
 		const { groupPubKey } = this.session.round3(this.peerPackages() as never, [...this.sharesForMe.values()] as never);
-		this.finished = true;
+		this.settled = true;
+		if (this.timer) clearTimeout(this.timer);
 		this.resolve({ share: this.session.share(), pub: this.session.pub(), groupPubKey });
 	}
 }

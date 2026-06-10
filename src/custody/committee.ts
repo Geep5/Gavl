@@ -55,6 +55,22 @@ export function selectCommittee(members: Member[], vdfBeaconHex: string, size: n
 }
 
 /**
+ * The signing quorum to try on attempt `round` — a deterministic `min`-member window
+ * over the sorted committee, sliding by one each round. Round 0 is the first `min`;
+ * each subsequent round rotates a fresh member in and the oldest out, so a single
+ * unresponsive member is rotated out of the quorum within `min` rounds. Deterministic
+ * so EVERY committee node computes the identical quorum for a given round and they
+ * co-sign in lockstep — the failover for withdrawal liveness (see withdraw-ceremony).
+ */
+export function quorumForRound(committee: string[], min: number, round: number): string[] {
+	const sorted = [...committee].sort();
+	const n = sorted.length;
+	if (min >= n) return sorted; // whole committee is the only quorum
+	const start = ((round % n) + n) % n;
+	return Array.from({ length: min }, (_, i) => sorted[(start + i) % n]);
+}
+
+/**
  * Reshare the fund key from a participating quorum of OLD shares to a NEW committee
  * (identified by FROST id strings), preserving the group key. Returns the new
  * members' shares + a public package usable for signing (commitments = [group key],
