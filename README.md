@@ -166,21 +166,36 @@ web/             Svelte SPA — the BTC bull/bear trading UI
 
 ## Run
 
-Needs Node ≥ 23.6 (native TypeScript — no build step).
+Needs **Node ≥ 23.6** (native TypeScript — no build step). Works on macOS, Linux, and
+Windows. No Python needed for the local app (it uses the fast stand-in VDF).
+
+```bash
+npm install              # once
+npm run dev              # ← starts daemon + web UI together, then open http://localhost:5180
+```
+
+`npm run dev` is the zero-setup path: it boots the daemon (fast VDF, oracle publishing,
+local-only) **and** the web UI in one command, cross-platform — no env vars to type.
+
+> **Windows / browser note:** the UI binds IPv6, so open **`http://localhost:5180`**, not
+> `http://127.0.0.1:5180`.
+
+Other scripts:
 
 ```bash
 npm test                 # full suite (90 tests): consensus, perp, oracle, custody, bridge, watcher
 npm run demo             # PoST cooldown chain — watch space→cooldown
 npm run demo:consensus   # two nodes farm + gossip anchors, finalize the same state over a real mesh
-
-# the live app:
-GAVL_ORACLE_PUBLISH=1 npm run daemon   # daemon: consensus + farming + 3-feed oracle publisher + bridge
-npm run web:dev                        # web UI → http://localhost:5180
+npm run daemon           # daemon only (real chiavdf VDF — needs the .venv; see below)
+npm run web:dev          # web UI only (expects a daemon on :6440)
 ```
 
-Useful env: `GAVL_VDF=hash` (fast stand-in VDF) · `GAVL_BTC_NET=testnet|signet|mainnet` ·
-`GAVL_ORACLE_PUBLISH=1` (this node holds the oracle key) · `GAVL_PERSIST=all|mine|off` ·
-`GAVL_MESH=0` (local only) · `GAVL_NETWORK=<channel>`.
+Tuning env vars (set inline on macOS/Linux; on Windows use `set VAR=…` or `$env:VAR=…`, or
+just edit the `daemon:dev` script): `GAVL_VDF=hash|chia` · `GAVL_ORACLE_PUBLISH=1` (this node
+holds the oracle key) · `GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_PERSIST=all|mine|off` ·
+`GAVL_MESH=0` (local only) · `GAVL_NETWORK=<channel>`. The real chiavdf VDF (`GAVL_VDF=chia`,
+the daemon's default) needs a Python venv with `chiavdf`/`chiapos`; `npm run dev` sidesteps
+this by using `GAVL_VDF=hash`.
 
 **Testnet round-trip:** open the UI → send testnet BTC to the fund address shown in the
 Custody panel → paste the txid to claim → mint gBTC → trade → withdraw → process payouts

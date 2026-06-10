@@ -15,7 +15,12 @@ import path from "node:path";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..", "..");
 
-export const DEFAULT_PYTHON = process.env.GAVL_CHIA_PYTHON ?? path.join(ROOT, ".venv", "bin", "python3");
+// venv binary layout differs per OS: POSIX puts it in bin/, Windows in Scripts/.
+const VENV_PYTHON =
+	process.platform === "win32"
+		? path.join(ROOT, ".venv", "Scripts", "python.exe")
+		: path.join(ROOT, ".venv", "bin", "python3");
+export const DEFAULT_PYTHON = process.env.GAVL_CHIA_PYTHON ?? VENV_PYTHON;
 export const DEFAULT_HELPER = process.env.GAVL_CHIA_HELPER ?? path.join(ROOT, "scripts", "chia_proofs.py");
 
 export interface ChiaPaths {
