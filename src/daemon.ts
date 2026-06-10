@@ -26,6 +26,7 @@ import { oracleKeyPair, bridgeKeyPair } from "./market/oracle.ts";
 import { fundKeyFromSeed } from "./custody/threshold.ts";
 import type { FundKey } from "./custody/threshold.ts";
 import { fundAddress as deriveFundAddress } from "./custody/bitcoin.ts";
+import { depositAddress } from "./custody/deposit.ts";
 import { buildWithdrawalTx, signWithdrawalTx } from "./custody/btctx.ts";
 import { Esplora } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
@@ -443,9 +444,24 @@ export class Daemon {
 	btcNetwork(): "mainnet" | "testnet" | "signet" {
 		return this.esplora().net;
 	}
-	/** The fund's Bitcoin deposit address — send real (testnet) BTC here. */
+	/** The base fund address (change + legacy + consolidation). Per-user deposits go to
+	 *  `depositAddressFor` instead — see the front-running fix. */
 	fundAddress(): string {
 		return deriveFundAddress(this.fundKey(), this.btcNetwork());
+	}
+
+	/** A user's OWN Bitcoin deposit address — derived from (fund key, their pubkey), so a
+	 *  deposit here is cryptographically bound to them and can't be claimed by anyone else. */
+	depositAddressFor(pubHex: string): string {
+		return depositAddress(this.fundKey().groupPubKey, pubHex, this.btcNetwork());
+	}
+
+	/** Every address the fund holds BTC at: the base, plus each depositor's per-user
+	 *  address (`owner` = the depositor, telling the signer which tweak to use). */
+	private fundAddresses(): { address: string; owner?: string }[] {
+		const list: { address: string; owner?: string }[] = [{ address: this.fundAddress() }];
+		for (const d of this.view().bridge.depositors) list.push({ address: this.depositAddressFor(d), owner: d });
+		return list;
 	}
 
 	/**
@@ -458,9 +474,11 @@ export class Daemon {
 	async refreshOnChainReserves(): Promise<void> {
 		try {
 			const esplora = this.esplora();
-			const utxos = await esplora.utxos(this.fundAddress());
 			let sats = 0n;
-			for (const u of utxos) if (u.status.confirmed) sats += BigInt(u.value);
+			for (const { address } of this.fundAddresses()) {
+				const utxos = await esplora.utxos(address);
+				for (const u of utxos) if (u.status.confirmed) sats += BigInt(u.value);
+			}
 			this.onChainReserves = { sats, at: Date.now() };
 		} catch {
 			/* network hiccup — keep the last reading */
@@ -481,7 +499,10 @@ export class Daemon {
 	 * the total credited (0 if not found / not confirmed deep enough).
 	 */
 	async claimDeposit(txid: string, depositor: string): Promise<bigint> {
-		const deps = await checkDeposit(this.esplora(), this.fundAddress(), txid, MIN_CONFIRMATIONS);
+		// FRONT-RUN FIX: verify the deposit paid the CLAIMER's OWN per-user address, not a
+		// shared one. An attacker claiming someone else's txid checks against their own
+		// (different) address, which the tx never paid → their claim finds nothing.
+		const deps = await checkDeposit(this.esplora(), this.depositAddressFor(depositor), txid, MIN_CONFIRMATIONS);
 		let total = 0n;
 		for (const d of deps) {
 			await this.attestor().attestDeposit(`${d.txid}:${d.vout}`, depositor, d.amount);
@@ -501,7 +522,9 @@ export class Daemon {
 		if (pending.length === 0) return null;
 		const esplora = this.esplora();
 		const tip = await esplora.tipHeight();
-		const inputs = utxosToInputs(await esplora.utxos(this.fundAddress()), MIN_CONFIRMATIONS, tip);
+		// Gather spendable UTXOs from the base + every per-user deposit address, tagging
+		// each with its owner so signWithdrawalTx applies the right key/tweak.
+		const inputs = (await Promise.all(this.fundAddresses().map(async ({ address, owner }) => utxosToInputs(await esplora.utxos(address), MIN_CONFIRMATIONS, tip).map((u) => ({ ...u, owner }))))).flat();
 		const inSum = inputs.reduce((a, u) => a + u.amount, 0n);
 		const payouts = pending.map((w) => ({ address: w.btcAddress, amount: w.amount }));
 		const outSum = payouts.reduce((a, p) => a + p.amount, 0n);

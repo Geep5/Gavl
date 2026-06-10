@@ -60,6 +60,23 @@ test("a different quorum produces an equally valid tx", () => {
 	assert.equal(verifyWithdrawalSigs(b, fund, signWithdrawalTx(b, fund, qB).sigs), true, "quorum {3,4}");
 });
 
+test("multi-address withdrawal: spends a base UTXO AND a per-user deposit UTXO in one tx", async () => {
+	const { sha256 } = await import("@noble/hashes/sha2.js");
+	const fund = generateFundKeyDKG(2, 3);
+	const alice = Buffer.from(sha256(new TextEncoder().encode("user:alice"))).toString("hex");
+	// input 0 = base fund UTXO (owner undefined); input 1 = alice's per-user deposit UTXO
+	const unsigned = buildWithdrawalTx(fund, {
+		inputs: [
+			{ txid: "aa".repeat(32), index: 0, amount: 100_000n }, // base
+			{ txid: "bb".repeat(32), index: 1, amount: 150_000n, owner: alice }, // per-user deposit
+		],
+		outputs: [{ address: RECIPIENT, amount: 245_000n }],
+	});
+	const { sigs } = signWithdrawalTx(unsigned, fund, quorumOf(fund, 2));
+	// each input verifies against ITS OWN key (base key for input 0, alice's deposit key for input 1)
+	assert.equal(verifyWithdrawalSigs(unsigned, fund, sigs), true, "both base + per-user deposit inputs are Bitcoin-valid");
+});
+
 test("sub-threshold can't sign; can't spend more than the inputs hold", () => {
 	const fund = generateFundKeyDKG(3, 5);
 	const unsigned = buildWithdrawalTx(fund, { inputs: [{ txid: "ef".repeat(32), index: 0, amount: 100_000n }], outputs: [{ address: RECIPIENT, amount: 90_000n }] });

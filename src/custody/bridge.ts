@@ -45,12 +45,15 @@ export interface BridgeState {
 	reserves: bigint; // BTC currently in the fund (sats)
 	processed: Set<string>; // deposit ids already minted (idempotency)
 	pending: PendingWithdrawal[]; // burned gBTC awaiting a BTC payout
+	/** Every pubkey that has ever deposited — its per-user deposit address may hold
+	 *  fund BTC, so reserves + withdrawals scan these. */
+	depositors: Set<string>;
 	mintedTotal: bigint; // audit: lifetime minted
 	paidOut: bigint; // audit: lifetime BTC paid out
 }
 
 export function emptyBridge(): BridgeState {
-	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], mintedTotal: 0n, paidOut: 0n };
+	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), mintedTotal: 0n, paidOut: 0n };
 }
 
 export function gbtcOf(s: BridgeState, pubkey: string): bigint {
@@ -97,6 +100,7 @@ export function backingBps(s: BridgeState): bigint {
 export function mintFromDeposit(s: BridgeState, att: DepositAttestation): boolean {
 	if (att.amount <= 0n || s.processed.has(att.depositId)) return false;
 	s.processed.add(att.depositId);
+	s.depositors.add(att.depositor); // its per-user deposit address may hold fund BTC
 	s.reserves += att.amount; // BTC now in the fund
 	addG(s, att.depositor, att.amount); // gBTC minted to the depositor
 	s.mintedTotal += att.amount;

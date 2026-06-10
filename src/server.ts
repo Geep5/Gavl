@@ -163,8 +163,10 @@ function serializeState() {
 		gbtcOutstanding: (totalGbtc(view.bridge) + view.pool.assets).toString(),
 		pending: pendingTotal(view.bridge).toString(), // burned, awaiting BTC payout
 		pendingCount: view.bridge.pending.length,
-		// the real Bitcoin custody fund: send (testnet) BTC here to deposit
-		fundAddress: daemon.fundAddress(),
+		// YOUR OWN deposit address — derived from (fund key, your pubkey), so a deposit
+		// here is cryptographically bound to you and can't be claimed by anyone else.
+		depositAddress: daemon.depositAddressFor(me),
+		fundAddress: daemon.fundAddress(), // base fund address (change/consolidation)
 		btcNetwork: daemon.btcNetwork(),
 		// proof of reserves: real on-chain BTC vs the ledger's claimed reserves
 		onChainReserves: onChainR != null ? onChainR.toString() : null,

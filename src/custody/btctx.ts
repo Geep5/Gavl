@@ -23,15 +23,18 @@ import { schnorr } from "@noble/curves/secp256k1.js";
 import { taprootOutputKey, taprootScriptPubKey } from "./bitcoin.ts";
 import { signWithdrawal } from "./bitcoin.ts";
 import type { Network } from "./bitcoin.ts";
+import { depositOutputKey, depositScriptPubKey, signDepositSpend } from "./deposit.ts";
 import type { FundKey, Share } from "./threshold.ts";
 
 const NET: Record<Network, typeof btc.NETWORK> = { mainnet: btc.NETWORK, testnet: btc.TEST_NETWORK, regtest: btc.TEST_NETWORK };
 
-/** A fund UTXO to spend (must pay to the fund's Taproot address). */
+/** A fund UTXO to spend. `owner` = the depositor whose per-user deposit address holds
+ *  it (signed with that user's tweak); undefined = the base fund address. */
 export interface FundUtxo {
 	txid: string;
 	index: number;
 	amount: bigint; // sats — required: Taproot sighash commits to every input's amount
+	owner?: string; // depositor pubkey for a per-user deposit input
 }
 
 /** A withdrawal output. `address` may be any valid address; `amount` in sats. */
@@ -44,44 +47,53 @@ export interface UnsignedWithdrawal {
 	tx: btc.Transaction;
 	/** Per-input BIP-341 key-path sighashes — the 32-byte messages the quorum signs. */
 	sighashes: Uint8Array[];
+	/** Per-input owner (depositor pubkey, or undefined for the base fund address) —
+	 *  tells the signer which key/tweak each input needs. */
+	owners: (string | undefined)[];
 	/** in − out, in sats (the miner fee). */
 	fee: bigint;
 }
 
+/** The x-only key an input spends from: a per-user deposit key, or the base fund key. */
+function inputKey(fundKey: FundKey, owner: string | undefined): Uint8Array {
+	return owner ? depositOutputKey(fundKey.groupPubKey, owner) : taprootOutputKey(fundKey.groupPubKey);
+}
+
 /**
- * Build an unsigned withdrawal spending `inputs` (all fund UTXOs) to `outputs`.
- * Returns the tx + the per-input sighashes to threshold-sign. Throws if outputs
- * exceed inputs.
+ * Build an unsigned withdrawal spending `inputs` (base-fund and/or per-user deposit
+ * UTXOs) to `outputs`. Each input is bound to its own address's scriptPubKey; the
+ * Taproot sighash commits to all prevouts. Throws if outputs exceed inputs.
  */
 export function buildWithdrawalTx(fundKey: FundKey, opts: { inputs: FundUtxo[]; outputs: Payout[]; network?: Network }): UnsignedWithdrawal {
 	if (opts.inputs.length === 0) throw new Error("withdrawal needs at least one fund UTXO");
 	const network = NET[opts.network ?? "mainnet"];
-	const spk = taprootScriptPubKey(taprootOutputKey(fundKey.groupPubKey)); // P2TR(output key) — no re-tweak
+	const base = taprootOutputKey(fundKey.groupPubKey);
 	const inSum = opts.inputs.reduce((a, u) => a + u.amount, 0n);
 	const outSum = opts.outputs.reduce((a, o) => a + o.amount, 0n);
 	if (outSum > inSum) throw new Error(`outputs (${outSum}) exceed inputs (${inSum})`);
 
+	const scripts = opts.inputs.map((u) => (u.owner ? depositScriptPubKey(fundKey.groupPubKey, u.owner) : taprootScriptPubKey(base)));
+	const amounts = opts.inputs.map((u) => u.amount);
 	const tx = new btc.Transaction({ allowUnknownInputs: true });
-	for (const u of opts.inputs) tx.addInput({ txid: u.txid, index: u.index, witnessUtxo: { script: spk, amount: u.amount } });
+	opts.inputs.forEach((u, i) => tx.addInput({ txid: u.txid, index: u.index, witnessUtxo: { script: scripts[i], amount: u.amount } }));
 	for (const o of opts.outputs) tx.addOutputAddress(o.address, o.amount, network);
 
-	const scripts = opts.inputs.map(() => spk);
-	const amounts = opts.inputs.map((u) => u.amount);
 	const sighashes = opts.inputs.map((_, i) => tx.preimageWitnessV1(i, scripts, btc.SigHash.DEFAULT, amounts));
-	return { tx, sighashes, fee: inSum - outSum };
+	return { tx, sighashes, owners: opts.inputs.map((u) => u.owner), fee: inSum - outSum };
 }
 
 /**
- * Threshold-sign every input with `quorum`, verify each signature against the fund
- * key (Bitcoin's check) BEFORE injecting, and finalize. Returns the signed tx hex
- * + txid. Throws if a produced signature is invalid (never finalizes a bad tx).
+ * Threshold-sign every input (base inputs with the fund key, per-user deposit inputs
+ * with that user's tweak), verify each signature against the input's committed key
+ * (Bitcoin's check) BEFORE injecting, and finalize. Throws if any sig is invalid —
+ * never finalizes a bad tx.
  */
 export function signWithdrawalTx(unsigned: UnsignedWithdrawal, fundKey: FundKey, quorum: Record<string, Share>): { hex: string; txid: string; sigs: Uint8Array[] } {
-	const outKey = taprootOutputKey(fundKey.groupPubKey);
 	const sigs: Uint8Array[] = [];
 	for (let i = 0; i < unsigned.sighashes.length; i++) {
-		const sig = signWithdrawal(fundKey.pub, quorum, unsigned.sighashes[i]);
-		if (!schnorr.verify(sig, unsigned.sighashes[i], outKey)) throw new Error(`threshold signature invalid for input ${i}`);
+		const owner = unsigned.owners[i];
+		const sig = owner ? signDepositSpend(fundKey, owner, quorum, unsigned.sighashes[i]) : signWithdrawal(fundKey.pub, quorum, unsigned.sighashes[i]);
+		if (!schnorr.verify(sig, unsigned.sighashes[i], inputKey(fundKey, owner))) throw new Error(`threshold signature invalid for input ${i}`);
 		unsigned.tx.updateInput(i, { tapKeySig: sig });
 		sigs.push(sig);
 	}
@@ -89,8 +101,7 @@ export function signWithdrawalTx(unsigned: UnsignedWithdrawal, fundKey: FundKey,
 	return { hex: unsigned.tx.hex, txid: unsigned.tx.id, sigs };
 }
 
-/** Bitcoin's validity check: does each input's signature verify against the fund key? */
+/** Bitcoin's validity check: does each input's signature verify against its committed key? */
 export function verifyWithdrawalSigs(unsigned: UnsignedWithdrawal, fundKey: FundKey, sigs: Uint8Array[]): boolean {
-	const outKey = taprootOutputKey(fundKey.groupPubKey);
-	return sigs.length === unsigned.sighashes.length && sigs.every((s, i) => schnorr.verify(s, unsigned.sighashes[i], outKey));
+	return sigs.length === unsigned.sighashes.length && sigs.every((s, i) => schnorr.verify(s, unsigned.sighashes[i], inputKey(fundKey, unsigned.owners[i])));
 }

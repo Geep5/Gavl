@@ -123,9 +123,9 @@
 		</div>
 		<div class="fundrow"><span class="muted">gBTC outstanding</span><span>{fmt(m.gbtcOutstanding)}{Number(m.pending) > 0 ? ` · ${fmt(m.pending)} pending payout` : ""}</span></div>
 
-		<!-- DEPOSIT: send real (testnet) BTC to the fund address, then claim by txid -->
-		<div class="net-tag">{m.btcNetwork} · send BTC here to deposit</div>
-		<div class="addr mono" title="the fund's Bitcoin address">{m.fundAddress}</div>
+		<!-- DEPOSIT: send real (testnet) BTC to YOUR OWN address, then claim by txid -->
+		<div class="net-tag">{m.btcNetwork} · send BTC to YOUR deposit address</div>
+		<div class="addr mono" title="your personal deposit address — bound to your key; only you can claim a deposit here">{m.depositAddress}</div>
 		<div class="depline">
 			<input placeholder="deposit txid (after you send BTC)" bind:value={claimTxid} />
 			<button class="ghost" onclick={claim} disabled={!claimTxid.trim()}>Claim</button>
