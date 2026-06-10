@@ -32,12 +32,15 @@ import { fundAddress as deriveFundAddress } from "./custody/bitcoin.ts";
 import { depositAddress } from "./custody/deposit.ts";
 import { buildWithdrawalTx, signWithdrawalTx } from "./custody/btctx.ts";
 import { signWithdrawalWithFailover } from "./custody/withdraw-ceremony.ts";
+import { SignCoordinator } from "./custody/sign-coordinator.ts";
 import { CommitteeRotation } from "./custody/rotation.ts";
 import { makeCeremonyAuth } from "./custody/ceremony-auth.ts";
 import type { CeremonyAuth } from "./custody/ceremony-auth.ts";
 import { committeeEpochsFor, epochOf } from "./custody/epoch.ts";
 import type { AnchorView } from "./custody/epoch.ts";
-import { committeeTopic } from "./custody/committee.ts";
+import { committeeTopic, quorumForRound } from "./custody/committee.ts";
+import { depositAttestationDigest, settleAttestationDigest } from "./custody/attestation.ts";
+import { isCeremonyTimeout } from "./custody/ceremony.ts";
 import { Esplora } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
 import { readPriceAggregate } from "./market/pricefeed.ts";
@@ -58,7 +61,7 @@ import { KnownPeers } from "./sync/known-peers.ts";
 import { BootstrapList } from "./sync/bootstrap.ts";
 import { generateKeyPair, keyPairFromSeed } from "./det/ed25519.ts";
 import type { KeyPair } from "./det/ed25519.ts";
-import { toHex, fromHex } from "./det/canonical.ts";
+import { toHex, fromHex, sha256 } from "./det/canonical.ts";
 import { WriteStore } from "./store/store.ts";
 import { KeepAllPolicy, MinePolicy } from "./store/policy.ts";
 import type { PersistPolicy } from "./store/policy.ts";
@@ -650,6 +653,42 @@ export class Daemon {
 	}
 
 	/**
+	 * Produce a COMMITTEE threshold signature over an attestation `digest` (gate #4) —
+	 * the authority for an on-chain mint/settle, replacing the single attestor key. This
+	 * node co-signs with its share over the committee ceremony (deterministic first
+	 * quorum), so the same digest yields the same ceremony on every member and they
+	 * converge on one signature. Returns the sig hex, or null if this node isn't a
+	 * quorum signer this round / the quorum couldn't be reached (caller retries).
+	 *
+	 * As with withdrawals, every member should INDEPENDENTLY verify the underlying fact
+	 * (the deposit landed / the payout confirmed, via Esplora) before co-signing — that
+	 * check is the caller's (claimDeposit / settle). Autonomous multi-node triggering of
+	 * the ceremony is the same coordination layer withdrawals need (next).
+	 */
+	private async committeeAttest(digest: Uint8Array): Promise<string | null> {
+		const cs = this.committeeShare();
+		if (!cs) return null;
+		const quorum = quorumForRound(cs.participants, cs.min, 0);
+		if (!quorum.includes(cs.selfId)) return null; // not a signer this round
+		try {
+			const coord = new SignCoordinator(this.node, {
+				signId: `attest:${toHex(sha256(digest))}`, // same digest → same ceremony on every member
+				selfId: cs.selfId,
+				quorum,
+				pub: cs.pub,
+				share: cs.share,
+				message: digest,
+				timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
+				auth: this.ceremonyAuth(),
+			});
+			return toHex(await coord.start());
+		} catch (e) {
+			if (isCeremonyTimeout(e)) return null; // quorum not reachable — retry later
+			throw e;
+		}
+	}
+
+	/**
 	 * Run the distributed committee DKG over the LIVE node transport with the
 	 * configured committee, then persist THIS node's share (the key is generated
 	 * across the committee — no node ever holds it whole). Operator-triggered once
@@ -736,7 +775,16 @@ export class Daemon {
 		const deps = await checkDeposit(this.esplora(), this.depositAddressFor(depositor), txid, MIN_CONFIRMATIONS);
 		let total = 0n;
 		for (const d of deps) {
-			await this.attestor().attestDeposit(`${d.txid}:${d.vout}`, depositor, d.amount);
+			const depositId = `${d.txid}:${d.vout}`;
+			if (this.committeeMode() && this.view().custody.fundKey) {
+				// Committee custody: this node has VERIFIED the deposit on-chain (checkDeposit
+				// above); now the committee co-signs the mint authority. No single key mints.
+				const sig = await this.committeeAttest(depositAttestationDigest({ depositId, depositor, amount: d.amount }));
+				if (!sig) continue; // committee didn't sign (quorum offline) — retry the claim later
+				await this.custodyAccount().attestDeposit(depositId, depositor, d.amount, sig);
+			} else {
+				await this.attestor().attestDeposit(depositId, depositor, d.amount);
+			}
 			total += d.amount;
 		}
 		return total;
@@ -812,7 +860,17 @@ export class Daemon {
 			hex = signWithdrawalTx(mkUnsigned(), fk, quorum).hex;
 		}
 		const txid = await esplora.broadcast(hex);
-		for (const w of pending) await this.attestor().settleWithdrawal(w.id);
+		// Mark each withdrawal settled. In committee mode this is committee-authorized too
+		// (no single key drops reserves); the BTC payout tx just confirmed (we broadcast it).
+		for (const w of pending) {
+			if (this.committeeMode() && this.view().custody.fundKey) {
+				const sig = await this.committeeAttest(settleAttestationDigest({ withdrawalId: w.id }));
+				if (sig) await this.custodyAccount().settleWithdrawal(w.id, sig);
+				// else: settle is retried next cycle once the committee co-signs
+			} else {
+				await this.attestor().settleWithdrawal(w.id);
+			}
+		}
 		return txid;
 	}
 

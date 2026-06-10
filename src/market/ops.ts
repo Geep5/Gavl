@@ -14,16 +14,18 @@
 export type Instrument = "BTC-BULL" | "BTC-BEAR";
 
 export type Op =
-	/** Mint gBTC 1:1 from a VERIFIED BTC deposit. Only valid from the bridge attestor
-	 *  (committee) key; idempotent by `depositId` (the funding BTC outpoint). gBTC is
-	 *  the collateral — a 1:1 claim on real Bitcoin in the threshold-custody fund. */
-	| { kind: "bridge.deposit"; depositId: string; depositor: string; amount: string }
+	/** Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized by the bridge attestor key
+	 *  (seed mode) OR a committee threshold signature over the deposit digest (committee
+	 *  mode, `sig`); idempotent by `depositId` (the funding BTC outpoint). gBTC is the
+	 *  collateral — a 1:1 claim on real Bitcoin in the threshold-custody fund. */
+	| { kind: "bridge.deposit"; depositId: string; depositor: string; amount: string; sig?: string }
 	/** Send gBTC to another account. */
 	| { kind: "gbtc.transfer"; to: string; amount: string }
 	/** Burn gBTC to redeem BTC → a pending withdrawal paid to `btcAddress`. */
 	| { kind: "bridge.withdraw"; amount: string; btcAddress: string }
-	/** Attestor marks a withdrawal's BTC payout confirmed (reserves drop). */
-	| { kind: "bridge.settle"; withdrawalId: string }
+	/** Mark a withdrawal's BTC payout confirmed (reserves drop). Attestor key (seed) OR
+	 *  a committee threshold signature over the settle digest (committee mode, `sig`). */
+	| { kind: "bridge.settle"; withdrawalId: string; sig?: string }
 	/** A signed BTC price reading from the oracle. Authority = the oracle's key
 	 *  (checked in state); the webhook URL is only where it's published. Monotonic seq. */
 	| { kind: "oracle.post"; oracle: string; price: string; seq: number }

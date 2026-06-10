@@ -31,6 +31,9 @@ import type { AnchorChain } from "../consensus/chain.ts";
 import { oraclePubHex, bridgePubHex } from "./oracle.ts";
 import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
+import { verify as verifyThreshold } from "../custody/threshold.ts";
+import { depositAttestationDigest, settleAttestationDigest } from "../custody/attestation.ts";
+import { fromHex } from "../det/canonical.ts";
 
 // ── consensus constants (every node must agree) ──────────────────
 
@@ -111,6 +114,27 @@ function cmpWrite(a: Write, b: Write): number {
 	return a.seq - b.seq;
 }
 
+/**
+ * Is a bridge mint/settle authorized? Once a committee fund key is published on-chain
+ * (committee custody), authority is a BIP340 THRESHOLD signature by that group key over
+ * the attestation digest — so a quorum of the committee, each having independently
+ * verified the on-chain fact, must have agreed; no single key can mint or settle. The
+ * write's author is irrelevant then (anyone may relay a committee-signed attestation).
+ * Before any committee fund exists (seed/testnet mode), it falls back to the single
+ * legacy attestor key.
+ */
+function attestationAuthorized(view: View, w: Write, digest: Uint8Array, sig: string | undefined): boolean {
+	if (view.custody.fundKey) {
+		if (typeof sig !== "string") return false;
+		try {
+			return verifyThreshold(fromHex(sig), digest, fromHex(view.custody.fundKey));
+		} catch {
+			return false; // malformed sig/key → unauthorized
+		}
+	}
+	return w.writer === BRIDGE_ATTESTOR; // legacy single attestor (no committee fund yet)
+}
+
 export interface ViewOptions {
 	order?: (a: Write, b: Write) => number;
 	/** Anchor-clock "now" — drives funding + (later) mark finality. */
@@ -153,12 +177,12 @@ export function finalizedView(writes: Write[], anchors: AnchorChain, k: number):
 function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
-			// Mint gBTC 1:1 from a VERIFIED BTC deposit — only the attestor (committee)
-			// may assert one. Idempotent by deposit outpoint. (How a deposit is verified —
-			// committee threshold-sig or SPV — is the bridge's trust input; see attestation.)
-			if (w.writer !== BRIDGE_ATTESTOR) return;
+			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized by the committee
+			// threshold (a group-key sig over the deposit digest) once a committee fund
+			// exists, else the legacy single attestor key. Idempotent by deposit outpoint.
 			const amt = parseAmount(op.amount);
 			if (amt === null || typeof op.depositId !== "string" || typeof op.depositor !== "string") return;
+			if (!attestationAuthorized(view, w, depositAttestationDigest({ depositId: op.depositId, depositor: op.depositor, amount: amt }), op.sig)) return;
 			mintFromDeposit(view.bridge, { depositId: op.depositId, depositor: op.depositor, amount: amt });
 			return;
 		}
@@ -177,8 +201,11 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number): void {
 			return;
 		}
 		case "bridge.settle": {
-			// The attestor marks a withdrawal's BTC payout confirmed → reserves drop.
-			if (w.writer !== BRIDGE_ATTESTOR || typeof op.withdrawalId !== "string") return;
+			// Mark a withdrawal's BTC payout confirmed → reserves drop. Committee
+			// threshold (group-key sig over the settle digest) once a fund exists, else
+			// the legacy attestor key.
+			if (typeof op.withdrawalId !== "string") return;
+			if (!attestationAuthorized(view, w, settleAttestationDigest({ withdrawalId: op.withdrawalId }), op.sig)) return;
 			completeWithdrawal(view.bridge, op.withdrawalId);
 			return;
 		}

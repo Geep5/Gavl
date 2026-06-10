@@ -57,9 +57,11 @@ export class Account {
 		return this.produce(null);
 	}
 
-	/** Attest a VERIFIED BTC deposit → mints gBTC 1:1 (only valid as the bridge attestor key). */
-	attestDeposit(depositId: string, depositor: string, amount: bigint | number | string): Promise<Write> {
-		return this.produce({ kind: "bridge.deposit", depositId, depositor, amount: amountStr(amount) });
+	/** Attest a VERIFIED BTC deposit → mints gBTC 1:1. `sig` (committee threshold sig over
+	 *  the deposit digest) authorizes it in committee mode; without it, valid only as the
+	 *  legacy attestor key. The write's author is irrelevant when a committee sig is given. */
+	attestDeposit(depositId: string, depositor: string, amount: bigint | number | string, sig?: string): Promise<Write> {
+		return this.produce({ kind: "bridge.deposit", depositId, depositor, amount: amountStr(amount), sig });
 	}
 
 	/** Send gBTC to another account. */
@@ -72,9 +74,10 @@ export class Account {
 		return this.produce({ kind: "bridge.withdraw", amount: amountStr(amount), btcAddress });
 	}
 
-	/** Mark a withdrawal's BTC payout confirmed (only valid as the bridge attestor key). */
-	settleWithdrawal(withdrawalId: string): Promise<Write> {
-		return this.produce({ kind: "bridge.settle", withdrawalId });
+	/** Mark a withdrawal's BTC payout confirmed. `sig` (committee threshold sig over the
+	 *  settle digest) authorizes it in committee mode; without it, the legacy attestor key. */
+	settleWithdrawal(withdrawalId: string, sig?: string): Promise<Write> {
+		return this.produce({ kind: "bridge.settle", withdrawalId, sig });
 	}
 
 	/** Post a signed oracle price (only valid if this account IS the oracle key). */
