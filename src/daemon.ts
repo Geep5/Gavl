@@ -190,6 +190,12 @@ export class Daemon {
 	private meshOn = false;
 	private farmOn = false;
 	private publishing = false;
+	/** The oracle-publish config, remembered so it re-starts on a fresh chain after a
+	 *  channel switch (otherwise the new channel has no oracle → no price loads). */
+	private oraclePublishOpts?: { seedHex?: string; sources: PriceSource[]; everyMs: number };
+	/** Bumped each time a publisher loop (re)starts, so an old loop bound to a torn-down
+	 *  node exits cleanly on a channel switch. */
+	private oracleGen = 0;
 	private lastOracleSource: (AggregateReading & { at: number }) | null = null;
 	/** Wall-clock arrival times (ms) of recent tip heights — for a measured anchor cadence.
 	 *  Display-only (never touches the deterministic fold), so Date.now() is fine here. */
@@ -324,11 +330,15 @@ export class Daemon {
 			if (w.ts > this.clock) this.clock = w.ts;
 		});
 
-		// Persist every newly-applied write (write-through, policy-filtered).
+		// Persist every newly-applied write (write-through, policy-filtered). Guarded against
+		// a store that's being torn down mid-flight (a channel switch closes it) — a late
+		// write must NOT crash the daemon with an unhandled "Corestore is closed" rejection.
 		const prev = this.node.onApplied;
 		this.node.onApplied = (applied) => {
 			prev?.(applied);
-			for (const w of applied) void this.store!.persist(w);
+			const store = this.store;
+			if (!store) return;
+			for (const w of applied) void store.persist(w).catch(() => {});
 		};
 		return { replayed: writes };
 	}
@@ -586,7 +596,10 @@ export class Daemon {
 
 		if (opts.mesh) await this.joinMesh();
 
-		if (opts.publishOracle) this.startOraclePublisher(opts.publishOracle);
+		if (opts.publishOracle) {
+			this.oraclePublishOpts = opts.publishOracle; // remember so a channel switch re-publishes
+			this.startOraclePublisher(opts.publishOracle);
+		}
 		this.startReserveWatch(); // proof-of-reserves polling
 
 		if (opts.farm) {
@@ -667,11 +680,13 @@ export class Daemon {
 		// has none). Re-posted periodically so late-joining nodes pick it up.
 		const disclose = opts.sources.filter((s) => s.url).map((s) => ({ endpoint: s.url!, key: s.key ?? "" }));
 		this.publishing = true;
+		const myGen = ++this.oracleGen; // a channel switch bumps this → the old loop below exits
 		const loop = async () => {
-			// seq continues from whatever the chain already has (survives restarts).
+			// seq continues from whatever the chain already has (survives restarts); on a
+			// fresh channel that's -1 → 0, and `oracle` is bound to the current node.
 			let seq = (this.view().oracle.seq ?? -1) + 1;
 			let tick = 0;
-			while (this.publishing) {
+			while (this.publishing && myGen === this.oracleGen) {
 				// disclose methodology on-chain at start + every ~30 ticks (cheap, idempotent).
 				if (disclose.length > 0 && tick % 30 === 0) {
 					try {
@@ -1161,8 +1176,10 @@ export class Daemon {
 		const next = name.trim();
 		if (!next || next === this.network) return;
 
-		// 1. Tear down the current channel's consensus + storage.
+		// 1. Tear down the current channel's consensus + storage. Stop the oracle loop and
+		//    farming FIRST so neither posts a write into the store while it's closing.
 		this.farming = false;
+		this.oracleGen++; // the running oracle publisher loop exits on its next tick
 		this.producer?.stop();
 		this.producer = undefined;
 		if (this.transport) await this.transport.destroy().catch(() => {});
@@ -1183,9 +1200,11 @@ export class Daemon {
 		for (const wa of this.wallet.list()) this.bind(wa); // same identities, new node
 
 		// 3. Switch to the new channel and bring it up (init store → replay → join + farm).
+		//    Re-pass the oracle-publish config so this node re-publishes the price on the new
+		//    chain (otherwise the new channel has no oracle.post writes → "no price" loads).
 		this.network = next;
 		await this.init();
-		await this.startConsensus({ mesh: this.meshOn, farm: this.farmOn });
+		await this.startConsensus({ mesh: this.meshOn, farm: this.farmOn, publishOracle: this.oraclePublishOpts });
 	}
 
 	async stop(): Promise<void> {
