@@ -28,17 +28,12 @@
 	function setMax() {
 		amount = String(myGbtc());
 	}
-	async function goNow() {
+	// Place an order: if opposite intents are resting, take them now; otherwise broadcast
+	// your own resting intent for a peer to take. Always does something.
+	async function place() {
 		if (!amount || Number(amount) <= 0) return;
 		busy = true;
-		const ok = await act(() => api.takePosition(side, amount));
-		if (ok) amount = "";
-		busy = false;
-	}
-	async function broadcast() {
-		if (!amount || Number(amount) <= 0) return;
-		busy = true;
-		const ok = await act(() => api.broadcastIntent(side, amount, leverage));
+		const ok = await act(() => (fillable > 0 ? api.takePosition(side, amount) : api.broadcastIntent(side, amount, leverage)));
 		if (ok) amount = "";
 		busy = false;
 	}
@@ -124,12 +119,12 @@
 	</div>
 	{#if exposure}<div class="exposure">≈ {exposure} BTC · {fmt(notional)} gBTC notional</div>{/if}
 
-	<button class="cta {side === 'long' ? 'bull' : 'bear'}" onclick={goNow} disabled={busy || !amount || priceNum == null || fillable <= 0} title={fillable <= 0 ? "no opposing intents to take right now" : ""}>
-		{priceNum == null ? "waiting for price…" : busy ? "…" : `Go ${side === "long" ? "Long" : "Short"} now`}
-		{#if fillable > 0}<span class="cta-sub"> · {fmt(fillable)} {opposite} available</span>{/if}
-	</button>
-	<button class="ghost full" onclick={broadcast} disabled={busy || !amount || priceNum == null}>
-		…or broadcast a resting {side} intent ({leverage}×) for a peer to take
+	<button class="cta {side === 'long' ? 'bull' : 'bear'}" onclick={place} disabled={busy || !amount || priceNum == null}>
+		{#if priceNum == null}waiting for price…
+		{:else if busy}…
+		{:else if fillable > 0}Go {side === "long" ? "Long" : "Short"} now<span class="cta-sub"> · matches {fmt(Math.min(Number(amount) || 0, fillable))} now</span>
+		{:else}Broadcast {side === "long" ? "Long" : "Short"} intent<span class="cta-sub"> · {leverage}×, waits for a taker</span>
+		{/if}
 	</button>
 	{#if bal <= 0}<div class="hint">No gBTC yet — <button class="inline" onclick={() => (walletOpen = true)}>add funds</button> to trade.</div>{/if}
 </div>
