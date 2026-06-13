@@ -1,24 +1,26 @@
 # Gavl
 
-A decentralized **Bitcoin bull/bear perpetual exchange** on a **Proof-of-Space-Time
+A decentralized **peer-to-peer Bitcoin bull/bear market** on a **Proof-of-Space-Time
 cooldown ledger**, built on [Holepunch](https://github.com/holepunchto) (hypercore /
 hyperswarm / hyperdht).
 
-Put collateral in, go **bullish** or **bearish** on Bitcoin with bounded leverage, take
-it out worth more or less depending on how BTC moved. That's the whole product. There are
-no servers and no global chain to replay from genesis — state is computed in RAM, verified
-against your current peers, and persisted to a local append-only log. Every write pays a
-**cooldown** (a proof of space *and* a proof of time), so an attacker can't spin up cheap
-identities to flood or grind the network.
+Broadcast an intent to go **long** or **short** on Bitcoin; a real peer takes the opposite
+side; the two of you escrow against *each other* and settle at a signed oracle price.
+**There is no pool and no house** — every trade is a matched, zero-sum, fully-collateralized
+bet between two people, so the protocol is never a counterparty and reserves can never be
+drained. No counterparty → no trade. No servers and no global chain to replay from genesis —
+state is computed in RAM, verified against your current peers, and persisted to a local
+append-only log. Every write pays a **cooldown** (a proof of space *and* a proof of time),
+so an attacker can't spin up cheap identities to flood or grind the network.
 
-The price comes from a **signed, on-chain oracle** (no internal order book). Collateral is
-**gBTC** — a 1:1 claim on real Bitcoin held in a **threshold-custody fund** that only a
-quorum can spend (no single party ever holds the key).
+The price comes from a **signed, on-chain oracle**. Collateral is **gBTC** — a 1:1 claim on
+real Bitcoin held in a **threshold-custody fund** that only a quorum can spend (no single
+party ever holds the key).
 
-> **Status:** the native exchange (consensus + perp + oracle) is complete and runs live.
-> The real-BTC bridge runs end-to-end on **testnet**. Mainnet is gated on an audit and
-> four named items — see [Trust model & status](#trust-model--status). Don't put real
-> mainnet BTC in it yet.
+> **Status:** the matched market (consensus + intents + oracle) is complete and runs live,
+> including cross-node intent gossip. The real-BTC bridge runs end-to-end on **testnet**.
+> Mainnet is gated on an audit and four named items — see
+> [Trust model & status](#trust-model--status). Don't put real mainnet BTC in it yet.
 
 ---
 
@@ -55,34 +57,39 @@ in tests.
 
 ---
 
-## The product — BTC bull/bear
+## The product — peer-to-peer bull/bear
 
-1. **Deposit** real (testnet) BTC to the fund's Taproot address → mint **gBTC** 1:1.
-2. **Take a position** — Bullish (long) or Bearish (short) on Bitcoin, bounded leverage
-   (≤ 5×), collateralized in gBTC.
-3. **Withdraw** — burn gBTC → a quorum threshold-signs and broadcasts a real Bitcoin
-   transaction sending BTC back to you.
+1. **Deposit** real (testnet) BTC to *your personal* fund address → mint **gBTC** 1:1.
+2. **Broadcast an intent** — "long/short *N* gBTC at *L*× leverage" — gossiped over the mesh
+   as a signed, non-binding offer; or **take** the opposite side of a peer's resting intent.
+3. **A match** escrows both peers' gBTC and opens a bilateral contract, marked to the oracle.
+4. **Close** any time at the current mark — directional PnL, capped at the stake.
+5. **Withdraw** — burn gBTC → a quorum threshold-signs and broadcasts a real Bitcoin tx.
 
-### The perpetual engine (`src/perp`, `src/market/btc.ts`)
+### The matched engine (`src/market/intent.ts`, `src/market/btc.ts`)
 
-Oracle-priced and **pool-as-counterparty** — there is no order book. You trade against a
-shared pool; the mark is the signed oracle price.
+No pool, no order book to babysit — just signed intents and matched bilateral contracts.
 
-- **Mark = the oracle**, not an internal book. (`src/market/btc.ts`)
-- **Pool-as-counterparty.** Open/close against a shared gBTC pool; no matching needed.
-- **Insolvency-possible, but honest.** A win is paid from the pool (funded by losers + LPs).
-  If the crowd is collectively right and the pool can't cover a win, the unpaid remainder
-  is **queued pay-when-able** — the pool never goes negative, no gBTC is ever minted, and
-  the shortfall is visible (a backing ratio + a per-account "owed" amount), never hidden.
-  (`src/perp/pool.ts`)
-- **Funding as solvency defense.** No spot to peg to, so funding's job is to price the
-  pool's directional risk: the crowded side pays the other, scaled by open-interest skew —
-  pushing the book back toward balance. (`src/perp/funding.ts`)
-- **Bounded leverage + liquidation.** Leverage is capped because the clock is slow
-  (liquidation finalizes minutes deep). A position's liquidation price is shown up front;
-  a fully-collateralized 1× long has none (loss is capped at margin). (`src/perp/engine.ts`)
-- **Conservation, proven.** Collateral is never created or destroyed; PnL is zero-sum
-  between the sides. Tested as a hard invariant.
+- **Intents are non-binding signed offers.** Broadcasting locks nothing; the offer floods
+  the gossip mesh (`sync/`) and rests on every peer's *tape*. Taking one is the only thing
+  that hits the consensus ledger.
+- **A match is one ledger write** that carries the maker's signed offer. The fold verifies
+  the maker signature, checks BOTH peers can cover the stake *right now* (a maker who already
+  spent the funds just fails — we verify on-chain anyway), escrows both, and opens the
+  contract. No interactive handshake — the signed offer is the authorization.
+- **Bilateral, zero-sum, bounded.** Each side stakes the same; settlement splits the
+  `2·stake` pot by directional PnL at the oracle mark, capped at the stake. The loser can
+  never owe more than it posted, and **the protocol is never the counterparty — so reserves
+  can't be drained.** "Leverage" just scales the price move and tightens the cap (at *L*×, a
+  `1/L` move against you wipes your stake).
+- **No counterparty → no trade.** With nobody on the other side, an intent simply rests
+  until a peer takes it. That's the honest shape of a decentralized market — the easy
+  long/short button takes resting liquidity if any exists, otherwise broadcasts your own.
+- **Partial fills + cross-node.** One offer fills across many takers (tracked by nonce);
+  intents propagate epidemically, so a peer on another machine sees your tape and can take it.
+- **Conservation, proven.** `reserves == free gBTC + bonded + contract escrow + pending`.
+  Match/settle only *move* gBTC between buckets, never mint — tested as a hard invariant over
+  4,000-step random op streams. (`src/market/intent.ts`)
 
 ### The oracle (`src/market/oracle.ts`, `src/market/pricefeed.ts`)
 
@@ -116,6 +123,9 @@ threshold Schnorr (Taproot-compatible), proven against Bitcoin's own BIP340 veri
   threshold-sign, broadcast (via `@scure/btc-signer`).
 - **Bridge ledger** (`bridge.ts`) — deposit → mint gBTC; burn → pending withdrawal →
   settle once the payout confirms. Invariant: `reserves == gBTC outstanding + pending`.
+- **Per-identity deposit addresses** (`deposit.ts`) — each user deposits to its *own*
+  fund-derived address (a tweak of the fund key by the user's pubkey), so a deposit is
+  cryptographically bound to the depositor and can't be front-run/claimed by anyone else.
 - **Deposit watcher** (`watcher.ts`, `esplora.ts`) — verifies a real on-chain deposit (via
   Esplora, reorg-safe) before minting; the reverse path broadcasts withdrawals.
 - **Proof of reserves** — the daemon polls the fund's real on-chain balance and reconciles
@@ -133,7 +143,7 @@ the foundation for rotating the committee that holds the shares.
 - **Anchor chain** — PoST-proven head certificates. Heaviest-cumulative-weight fork choice
   + depth finality (a locked anchor can't be reverted by a heavier fork).
 - **Anchor-epoch canonical order** — cross-epoch order is bound to PoST weight, not
-  timestamps, neutralizing the `ts`-reorder attack while respecting funding causality.
+  timestamps, neutralizing the `ts`-reorder attack.
 - **Difficulty as pace** — deterministic retarget so the VDF cost is the cadence; weight ∝
   VDF work.
 - **App/consensus split** — `consensus/order.ts` is application-agnostic (it yields the
@@ -154,12 +164,11 @@ src/
   consensus/     anchor chain, fork choice, finality, difficulty, canonical order
   sync/          hyperswarm/hyperdht mesh, gossip, peer/bootstrap management
   store/         durable hypercore write store + selective persist policy
-  market/        the product: btc fold (gBTC + perp + oracle), ops, account, oracle, pricefeed
-  perp/          perp math: engine (PnL/liq), pool (pay-when-able), funding
-  custody/       real-BTC bridge: threshold (FROST) · DKG · Taproot · tx · ledger · watcher · esplora
-  daemon.ts      boots ledger + node + store + consensus + oracle publisher + bridge
+  market/        the matched market: intents + bilateral contracts (intent.ts), btc fold, ops, account, oracle, pricefeed
+  custody/       real-BTC bridge: threshold (FROST) · DKG · Taproot · per-identity deposits · tx · ledger · watcher · esplora
+  daemon.ts      boots ledger + node + store + consensus + oracle publisher + bridge + intent book
   server.ts      localhost JSON API for the web UI
-web/             Svelte SPA — the BTC bull/bear trading UI
+web/             Svelte SPA — the intent tape + bull/bear trading UI
 ```
 
 ---
@@ -183,7 +192,7 @@ local-only) **and** the web UI in one command, cross-platform — no env vars to
 Other scripts:
 
 ```bash
-npm test                 # full suite (90 tests): consensus, perp, oracle, custody, bridge, watcher
+npm test                 # full suite (~150 tests): consensus, matched market, intent gossip, oracle, custody, bridge
 npm run demo             # PoST cooldown chain — watch space→cooldown
 npm run demo:consensus   # two nodes farm + gossip anchors, finalize the same state over a real mesh
 npm run daemon           # daemon only (real chiavdf VDF — needs the .venv; see below)
@@ -193,20 +202,26 @@ npm run web:dev          # web UI only (expects a daemon on :6440)
 Tuning env vars (set inline on macOS/Linux; on Windows use `set VAR=…` or `$env:VAR=…`, or
 just edit the `daemon:dev` script): `GAVL_VDF=hash|chia` · `GAVL_ORACLE_PUBLISH=1` (this node
 holds the oracle key) · `GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_PERSIST=all|mine|off` ·
-`GAVL_MESH=0` (local only) · `GAVL_NETWORK=<channel>`. The real chiavdf VDF (`GAVL_VDF=chia`,
-the daemon's default) needs a Python venv with `chiavdf`/`chiapos`; `npm run dev` sidesteps
-this by using `GAVL_VDF=hash`.
+`GAVL_MESH=0` (disable the mesh — runs local-only; on by default) · `GAVL_NETWORK=<channel>`.
+The real chiavdf VDF (`GAVL_VDF=chia`, the daemon's default) needs a Python venv with
+`chiavdf`/`chiapos`; `npm run dev` sidesteps this by using `GAVL_VDF=hash`.
 
-**Testnet round-trip:** open the UI → send testnet BTC to the fund address shown in the
-Custody panel → paste the txid to claim → mint gBTC → trade → withdraw → process payouts
-(broadcasts a real testnet BTC tx).
+**Trade against yourself or a peer.** The market needs two sides, so either flip between two
+identities (the account picker, bottom-left) or run a second node on the same channel:
+broadcast an intent on one, **take** the opposite side on the other → a matched contract
+opens, both sides escrow, and it settles at the oracle mark when either side closes.
+
+**Testnet round-trip:** open the UI → **Wallet & custody** → send testnet BTC to *your*
+deposit address → paste the txid to claim → mint gBTC → broadcast/take an intent → close →
+withdraw → process payouts (broadcasts a real testnet BTC tx).
 
 ---
 
 ## Trust model & status
 
-What's **trustless**: consensus, ordering, storage (no node is trusted); the perp math
-(conservation proven); the threshold signing (no one holds the fund key).
+What's **trustless**: consensus, ordering, storage (no node is trusted); the matched market
+(zero-sum, fully-collateralized, conservation proven — no pool to go insolvent); the
+threshold signing (no one holds the fund key).
 
 What's **trusted** (and surfaced honestly in the UI):
 
@@ -228,9 +243,10 @@ What's **trusted** (and surfaced honestly in the UI):
 - **Consensus** ✅ PoST cooldown · RAM ledger + gossip · anchor chain, finality, canonical
   order, difficulty retarget, sticky finality · durable selective storage · live over a
   real hyperdht mesh
-- **Native BTC bull/bear exchange** ✅ oracle-priced pool perp · bounded leverage ·
-  funding-as-solvency-defense · pay-when-able insolvency (visible) · liquidation · gBTC
-  collateral · Svelte trading UI
+- **Peer-to-peer matched market** ✅ signed intents gossiped over the mesh · matched
+  bilateral contracts · zero-sum, fully-collateralized, **no pool** (reserves can't be
+  drained) · bounded leverage · oracle-marked · close-anytime · cross-node intent tape ·
+  Svelte tape/trade UI
 - **Oracle** ✅ signed on-chain · 3-feed average · on-chain methodology disclosure · live
   feeds. **Next:** multiple independent signers + median.
 - **Real-BTC bridge (testnet)** ✅ FROST threshold signing · DKG · Taproot address +

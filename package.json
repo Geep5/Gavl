@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Gavl — a decentralized Bitcoin bull/bear perpetual exchange on a Proof-of-Space-Time cooldown ledger (Holepunch).",
+  "description": "Gavl — a decentralized peer-to-peer Bitcoin bull/bear market (matched, no pool) on a Proof-of-Space-Time cooldown ledger (Holepunch).",
   "scripts": {
     "dev": "concurrently -k -n daemon,web -c blue,magenta \"npm:daemon:dev\" \"npm:web:dev\"",
     "daemon": "node src/server.ts",
