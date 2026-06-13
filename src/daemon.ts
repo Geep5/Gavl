@@ -795,7 +795,15 @@ export class Daemon {
 	 */
 	async claimDeposit(txid: string, depositor: string): Promise<bigint> {
 		// FRONT-RUN FIX: verify the deposit paid the CLAIMER's OWN per-user address.
-		const deps = await checkDeposit(this.esplora(), this.depositAddressFor(depositor), txid, MIN_CONFIRMATIONS);
+		let deps = await checkDeposit(this.esplora(), this.depositAddressFor(depositor), txid, MIN_CONFIRMATIONS);
+		// SEED / single-operator fallback: per-user deposit addresses are the COMMITTEE-mode
+		// front-running guard. In single-operator seed mode there's one operator (you), so a
+		// deposit that paid the shared FUND address is also yours to claim — otherwise BTC sent
+		// straight to the fund address would be stranded. Committee mode keeps the strict
+		// per-user binding (no fallback).
+		if (deps.length === 0 && !this.committeeMode()) {
+			deps = await checkDeposit(this.esplora(), this.fundAddress(), txid, MIN_CONFIRMATIONS);
+		}
 		let total = 0n;
 		for (const d of deps) {
 			const depositId = `${d.txid}:${d.vout}`;

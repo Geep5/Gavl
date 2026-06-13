@@ -10,6 +10,8 @@
  * Amounts/prices are decimal strings (BigInt-parsed, JSON/canonical-safe).
  */
 
+import type { Offer } from "./intent.ts";
+
 /** The two hardcoded instruments. side maps to the perp engine's long/short. */
 export type Instrument = "BTC-BULL" | "BTC-BEAR";
 
@@ -50,6 +52,13 @@ export type Op =
 	| { kind: "position.liquidate"; position: string }
 	/** Add native credit to the shared pool backing (drains the unpaid queue). */
 	| { kind: "pool.deposit"; amount: string }
+	/** Take the opposite side of a peer's signed intent: carries the maker's signed
+	 *  `offer` (gossiped, non-binding) and the stake the taker wants to `fill`. The fold
+	 *  verifies the maker's sig + that both peers can cover, escrows both, and opens a
+	 *  bilateral matched contract. The taker is the write's author; no pool, zero-sum. */
+	| { kind: "match.open"; offer: Offer; fill: string }
+	/** Settle a matured matched contract at the current oracle mark — permissionless. */
+	| { kind: "contract.settle"; contractId: string }
 	/** Lock gBTC as a custody-committee BOND — your committee selection WEIGHT, and
 	 *  SLASHABLE on a proven fault. Bonded gBTC is locked (unspendable) but still backed. */
 	| { kind: "custody.bond"; amount: string }
@@ -67,7 +76,7 @@ export type Op =
 	 *  alongside gate #4 non-public keys.) */
 	| { kind: "custody.fund"; groupKey: string; epoch: number };
 
-const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "oracle.post", "oracle.meta", "position.open", "position.close", "position.liquidate", "pool.deposit", "custody.fund", "custody.bond", "custody.unbond", "custody.slash"]);
+const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "oracle.post", "oracle.meta", "position.open", "position.close", "position.liquidate", "pool.deposit", "match.open", "contract.settle", "custody.fund", "custody.bond", "custody.unbond", "custody.slash"]);
 
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);

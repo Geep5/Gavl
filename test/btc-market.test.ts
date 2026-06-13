@@ -122,12 +122,12 @@ test("REALISTIC price: a small margin opens a fractional-BTC position", async ()
 	await lp.poolDeposit(1000n);
 	await oracle.postPrice(BTC_ORACLE, 50000n, 0);
 
-	const pid = await trader.open("BTC-BULL", 1000n, 1n);
+	const pid = await trader.open("BTC-BULL", 1000n, 2n);
 	const v = view(node);
-	assert.equal(v.positions.get(pid).size, (1000n * SIZE_SCALE) / 50000n, "fractional 0.02 BTC");
+	assert.equal(v.positions.get(pid).size, (2000n * SIZE_SCALE) / 50000n, "notional 2000 at 2× → fractional 0.04 BTC");
 	await oracle.postPrice(BTC_ORACLE, 55000n, 1);
 	await trader.close(pid);
-	assert.equal(gbtcOf(view(node), trader.pubHex), 1100n, "margin 1000 + 100 profit on a 10% move");
+	assert.equal(gbtcOf(view(node), trader.pubHex), 1200n, "margin 1000 + 200 profit on a 10% move at 2×");
 	assert.ok(marketConserved(view(node)));
 });
 
@@ -140,13 +140,13 @@ test("BULL profits when BTC rises: close returns margin + PnL, gBTC conserved", 
 	await lp.poolDeposit(3000n);
 	await oracle.postPrice(BTC_ORACLE, 100n, 0);
 
-	const pid = await bull.open("BTC-BULL", 1000n, 1n);
-	await oracle.postPrice(BTC_ORACLE, 150n, 1); // +50% → PnL +500
+	const pid = await bull.open("BTC-BULL", 1000n, 2n);
+	await oracle.postPrice(BTC_ORACLE, 150n, 1); // +50% at 2× → PnL +1000
 	await bull.close(pid);
 
 	const v = view(node);
 	assert.equal(v.positions.size, 0, "position closed");
-	assert.equal(gbtcOf(v, bull.pubHex), 3000n + 1500n, "margin 1000 + profit 500 (started 4000, staked 1000)");
+	assert.equal(gbtcOf(v, bull.pubHex), 3000n + 2000n, "margin 1000 + profit 1000 at 2× (started 4000, staked 1000)");
 	assert.ok(marketConserved(v), "gBTC fully backed throughout");
 });
 

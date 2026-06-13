@@ -70,10 +70,12 @@ export function equity(p: Position, mark: bigint): bigint {
  * pool from going insolvent on EVERY volatile candle rather than only rarely.
  */
 export const MAX_LEVERAGE = 5n;
+/** Floor leverage — 1× is pointless (a fully-collateralized coin flip), so the minimum is 2×. */
+export const MIN_LEVERAGE = 2n;
 
 /** True if `leverage` is a valid, in-bounds leverage. */
 export function leverageOk(leverage: bigint): boolean {
-	return leverage >= 1n && leverage <= MAX_LEVERAGE;
+	return leverage >= MIN_LEVERAGE && leverage <= MAX_LEVERAGE;
 }
 
 /**
@@ -82,7 +84,7 @@ export function leverageOk(leverage: bigint): boolean {
  * Caller must validate `leverageOk` first (this clamps defensively).
  */
 export function marginRequired(size: bigint, price: bigint, leverage: bigint = 1n): bigint {
-	const L = leverage < 1n ? 1n : leverage > MAX_LEVERAGE ? MAX_LEVERAGE : leverage;
+	const L = leverage < MIN_LEVERAGE ? MIN_LEVERAGE : leverage > MAX_LEVERAGE ? MAX_LEVERAGE : leverage;
 	return (size * price) / L;
 }
 

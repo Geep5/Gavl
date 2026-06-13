@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "concurrently -k -n daemon,web -c blue,magenta \"npm:daemon:dev\" \"npm:web:dev\"",
     "daemon": "node src/server.ts",
-    "daemon:dev": "cross-env GAVL_VDF=hash GAVL_MESH=0 GAVL_ORACLE_PUBLISH=1 node src/server.ts",
+    "daemon:dev": "cross-env GAVL_VDF=hash GAVL_ORACLE_PUBLISH=1 node src/server.ts",
     "web:dev": "vite --config web/vite.config.js web",
     "web:build": "vite --config web/vite.config.js build web",
     "test": "node --test \"test/*.test.ts\"",

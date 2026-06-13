@@ -32,6 +32,8 @@ import { oraclePubHex, bridgePubHex } from "./oracle.ts";
 import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
+import { emptyBook, escrowedInContracts, applyMatch, applySettle } from "./intent.ts";
+import type { MarketBook, Offer } from "./intent.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "../custody/attestation.ts";
 import { fromHex } from "../det/canonical.ts";
@@ -82,6 +84,9 @@ export interface View {
 	positions: Map<string, Position & { instrument: Instrument }>;
 	/** Anchor height through which funding has been charged. */
 	lastFundingHeight: number;
+	/** The peer-to-peer intent market: bilateral matched contracts + offer-fill
+	 *  tracking. The matched, zero-sum, can't-deplete-reserves replacement for the pool. */
+	book: MarketBook;
 }
 
 /** Active gBTC balance of `pubkey`. */
@@ -96,7 +101,7 @@ export function gbtcOf(view: View, pubkey: string): bigint {
  * never breaks this.
  */
 export function marketConserved(view: View): boolean {
-	return view.bridge.reserves === totalGbtc(view.bridge) + bondedTotal(view.bridge) + view.pool.assets + pendingTotal(view.bridge);
+	return view.bridge.reserves === totalGbtc(view.bridge) + bondedTotal(view.bridge) + view.pool.assets + escrowedInContracts(view.book) + pendingTotal(view.bridge);
 }
 
 export function parseAmount(s: string): bigint | null {
@@ -155,6 +160,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 		pool: emptyPool(),
 		positions: new Map(),
 		lastFundingHeight: -1,
+		book: emptyBook(),
 	};
 	const nowHeight = opts.nowHeight ?? 0;
 	for (const w of [...writes].sort(cmp)) {
@@ -313,6 +319,31 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			poolDeposit(view.pool, amt, (owner, paid) => addGbtc(view.bridge, owner, paid));
 			return;
 		}
+		case "match.open": {
+			// Take a maker's signed offer → escrow BOTH sides, open a bilateral matched
+			// contract. The taker is the write's author; the contract id is the write id.
+			// The fold re-verifies the maker's signature and that both peers can cover the
+			// stake right now — a maker who ghosted (spent the funds) simply no-ops. This is
+			// the zero-sum, protocol-is-never-counterparty path that can't deplete reserves.
+			const fill = parseAmount(op.fill);
+			const m = mark(view);
+			if (fill === null || m === null) return; // need an oracle mark for the entry price
+			// Timing uses the write's STABLE certified height (bornHeight), like unbond — so
+			// offer expiry / settle-window don't drift as the global tip advances on replay.
+			// Entry = the current oracle mark.
+			applyMatch(view.bridge, view.book, w.writer, w.id, op.offer, fill, bornHeight, m);
+			return;
+		}
+		case "contract.settle": {
+			// Permissionless once matured: split the 2·stake pot at the current oracle mark
+			// per the contract's bounded band. (v1 settles at the price when settled; both
+			// sides may settle as soon as it matures, so neither can hold out for a better
+			// mark.)
+			const m = mark(view);
+			if (m === null || typeof op.contractId !== "string") return;
+			applySettle(view.bridge, view.book, op.contractId, m, bornHeight);
+			return;
+		}
 		case "custody.bond": {
 			// Lock the writer's free gBTC as a committee bond (its selection weight, slashable).
 			const amt = parseAmount(op.amount);
@@ -340,8 +371,11 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 const MAINTENANCE_BPS = 500n;
 const LIQUIDATOR_FEE_BPS = 100n;
 export const MAX_LEVERAGE = 5n;
+/** Minimum leverage. 1× is a fully-collateralized coin flip with no upside over fees —
+ *  pointless — so the floor is 2×. */
+export const MIN_LEVERAGE = 2n;
 export function leverageOk(l: bigint): boolean {
-	return l >= 1n && l <= MAX_LEVERAGE;
+	return l >= MIN_LEVERAGE && l <= MAX_LEVERAGE;
 }
 
 /** Funding settlement (solvency defense), oracle-priced. Lazy catch-up per epoch. */

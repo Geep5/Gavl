@@ -114,15 +114,18 @@
 
 		const s1 = daemonUp ? "done" : store.error ? "pending" : "active";
 		const s2 = seq(hasId, daemonUp);
-		const s3 = seq(mesh, hasId);
-		const s4 = seq(farming, mesh);
+		// The mesh is a SIDE branch, not a gate: a node runs the full ledger locally with
+		// no peers. Mesh disabled → terminal "local" (not an endless spinner); enabled →
+		// joined the topic (done). Either way the consensus steps below proceed.
+		const s3 = mesh ? "done" : "local";
+		const s4 = seq(farming, hasId);
 		const s5 = seq(!!tip, farming);
 		const s6 = seq(finalized != null && tip != null, !!tip);
 
 		return [
 			{ key: "daemon", label: "Daemon", sub: "holds keys · runs VDF", status: s1, title: "Local engine: your wallet keys never leave it, and it computes the Proof-of-Time cooldown a browser can't." },
 			{ key: "identity", label: "Identity", sub: store.active ? "Ed25519 key" : "—", status: s2, title: "Your account is an Ed25519 keypair. Every action you take is signed by it." },
-			{ key: "mesh", label: "Peer mesh", sub: mesh ? `${peers} peer${peers === 1 ? "" : "s"}` : "joining…", status: s3, title: "Discovered peers over hyperdht/hyperswarm on a shared topic — no server, just a DHT rendezvous." },
+			{ key: "mesh", label: "Peer mesh", sub: mesh ? `${peers} peer${peers === 1 ? "" : "s"}` : "local only", status: s3, title: mesh ? "Discovered peers over hyperdht/hyperswarm on a shared topic — no server, just a DHT rendezvous." : "Running local-only (mesh off). No peers — but the node still farms anchors and runs the full ledger on its own. Enable the mesh to discover peers." },
 			{ key: "cooldown", label: "PoST cooldown", sub: c?.vdf ? c.vdf.replace(/-.*/, "") : "—", status: s4, title: "Proof-of-Space-Time: every write pays a non-parallelizable VDF cooldown. This is the anti-spam / anti-Sybil engine." },
 			{ key: "anchor", label: "Anchor chain", sub: tip ? `height ${tip.height}` : "awaiting…", status: s5, title: "Consensus heartbeat: PoST-proven anchors certify everyone's state. Heaviest chain wins — no authority, no vote." },
 			{ key: "finality", label: "Finality", sub: finalized != null ? `sealed @ ${finalized}` : "—", status: s6, title: "An anchor buried deep enough is final: reversing it would cost more proof-of-space-time than the honest chain holds." },
@@ -130,12 +133,16 @@
 	});
 
 	const n = $derived(steps.length);
-	const doneCount = $derived(steps.filter((s) => s.status === "done").length);
-	// fill the connecting track up to the last DONE step's dot center
-	const lastDone = $derived(steps.map((s) => s.status === "done").lastIndexOf(true));
+	// "local" is a terminal state (like done) — it fills the track and counts as confirmed,
+	// it just isn't the peer-to-peer outcome.
+	const isFilled = (s) => s.status === "done" || s.status === "local";
+	const doneCount = $derived(steps.filter(isFilled).length);
+	// fill the connecting track up to the last terminal step's dot center
+	const lastDone = $derived(steps.map(isFilled).lastIndexOf(true));
 	const fillPct = $derived(lastDone <= 0 ? 0 : (lastDone / (n - 1)) * 100);
 	const inset = $derived(50 / n); // % from each edge to the first/last dot center
-	const allDone = $derived(doneCount === n);
+	const allDone = $derived(steps.every(isFilled));
+	const fullyP2P = $derived(!!c?.mesh && steps.every((s) => s.status === "done"));
 
 	// The concrete identifiers a peer needs to find/dial this Gavl network — surfaced
 	// instead of vague labels, so the connection is verifiable, not just asserted.
@@ -161,7 +168,7 @@
 	<div class="head">
 		<span class="title">Decentralized connection</span>
 		<span class="head-right">
-			<span class="count" class:ok={allDone}>{doneCount}/{n} confirmed{allDone ? " · fully peer-to-peer" : ""}</span>
+			<span class="count" class:ok={allDone}>{doneCount}/{n} confirmed{fullyP2P ? " · fully peer-to-peer" : allDone ? " · local mode" : ""}</span>
 			<button class="idtoggle" onclick={() => (showIds = !showIds)}>{showIds ? "▾ connectivity" : "▸ connectivity"}</button>
 		</span>
 	</div>
@@ -173,7 +180,7 @@
 		{#each steps as s, i (s.key)}
 			<div class="step {s.status}" title={s.title}>
 				<div class="dot">
-					{#if s.status === "done"}✓{:else if s.status === "active"}<span class="spin"></span>{:else}{i + 1}{/if}
+					{#if s.status === "done"}✓{:else if s.status === "local"}⌂{:else if s.status === "active"}<span class="spin"></span>{:else}{i + 1}{/if}
 				</div>
 				<div class="lbl">{s.label}</div>
 				<div class="sub">{s.sub}</div>
@@ -384,6 +391,8 @@
 	.step.done .lbl { color: var(--text); }
 	.step.active .dot { border-color: var(--accent); color: var(--accent); background: var(--panel-2); }
 	.step.active .lbl { color: var(--accent); }
+	.step.local .dot { border-color: var(--accent-dim); color: var(--accent); background: var(--panel-2); }
+	.step.local .lbl { color: var(--text); }
 
 	.spin {
 		width: 10px; height: 10px; border-radius: 50%;

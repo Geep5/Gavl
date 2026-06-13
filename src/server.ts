@@ -312,7 +312,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			// instrument: "BTC-BULL" | "BTC-BEAR"; margin in credit; leverage ≤ MAX_LEVERAGE.
 			if (mark(daemon.view()) === null) throw new Error("no oracle price yet — wait for the oracle's first post");
 			const lev = parseAmount(String(body.leverage ?? "1"));
-			if (lev === null || !leverageOk(lev)) throw new Error(`leverage must be a whole number from 1 to ${MAX_LEVERAGE}`);
+			if (lev === null || !leverageOk(lev)) throw new Error(`leverage must be a whole number from 2 to ${MAX_LEVERAGE}`);
 			requireSpendable(String(body.margin), "margin");
 			const id = await daemon.active().open(body.instrument === "BTC-BEAR" ? "BTC-BEAR" : "BTC-BULL", String(body.margin), String(body.leverage ?? "1"));
 			return send(res, 200, { id });

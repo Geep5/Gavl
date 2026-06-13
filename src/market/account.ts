@@ -13,6 +13,8 @@ import type { GavlNode } from "../sync/node.ts";
 import { computeView, finalizedView, gbtcOf } from "./btc.ts";
 import type { View } from "./btc.ts";
 import type { Op, Instrument } from "./ops.ts";
+import { signOffer } from "./intent.ts";
+import type { Offer, OfferCore, Side } from "./intent.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 
 function amountStr(a: bigint | number | string): string {
@@ -138,6 +140,23 @@ export class Account {
 
 	poolDeposit(amount: bigint | number | string): Promise<Write> {
 		return this.produce({ kind: "pool.deposit", amount: amountStr(amount) });
+	}
+
+	/** Build + sign a non-binding intent OFFER with this identity's key (to gossip over
+	 *  the mesh). Nothing is escrowed; a taker redeems it on-chain via `matchOpen`. */
+	makeOffer(core: Omit<OfferCore, "maker">): Offer {
+		return signOffer({ ...core, maker: this.pubHex }, this.writer.keypair.privateKey);
+	}
+
+	/** Take the opposite side of a peer's signed offer, escrowing `fill` stake on both
+	 *  sides → a bilateral matched contract (id = this write's id). Returns the contract id. */
+	async matchOpen(offer: Offer, fill: bigint | number | string): Promise<string> {
+		return (await this.produce({ kind: "match.open", offer, fill: amountStr(fill) })).id;
+	}
+
+	/** Settle a matured matched contract at the current oracle mark (permissionless). */
+	settle(contractId: string): Promise<Write> {
+		return this.produce({ kind: "contract.settle", contractId });
 	}
 
 	view(): View {
