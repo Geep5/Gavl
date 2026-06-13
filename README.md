@@ -132,9 +132,23 @@ threshold Schnorr (Taproot-compatible), proven against Bitcoin's own BIP340 veri
   it against the ledger's reserves, flagging any shortfall (the solvency check a custodial
   bridge must run).
 
-The Phase-0 spikes — Shamir secret sharing, proactive resharing under churn, and
-VDF-seeded stake-weighted committee sampling (`custody/{shamir,reshare,sampling}.ts`) — are
-the foundation for rotating the committee that holds the shares.
+**Committee custody** is implemented as an **opt-in mode** (`GAVL_CUSTODY=committee`):
+VDF-seeded stake-weighted committee sampling, distributed DKG, threshold signing, and
+proactive resharing all run over the live mesh, rotating the share-holders each epoch
+*without moving the fund address*; **bonding** makes a committee seat cost stake and
+**slashing** makes ceremony equivocation cost the bond
+(`custody/{committee,epoch,rotation,*-coordinator,ceremony-auth,attestation,bridge,slashing}.ts`).
+It is unit-tested over the in-process transport but **not yet validated live across
+independent machines**, so the default stays single-operator seed custody (above).
+
+> **Deferred — auto-slashing.** The slashing *op + fraud-proof verifier* exist
+> (`custody/slashing.ts`), but nothing yet **auto-detects** an equivocation — two conflicting
+> signed ceremony messages from the same member — and **auto-submits** the proof. It's the
+> lowest-leverage custody hardening (bonding, not slashing, is what makes capturing the
+> committee expensive), so it's parked: worth adding a watcher that spots conflicting
+> messages on the wire and files the slash when committee custody goes live. Until then,
+> slashing only fires if someone submits a proof by hand. See `docs/scaling-equal-nodes.md`
+> for where custody sits in the bigger picture.
 
 ---
 
