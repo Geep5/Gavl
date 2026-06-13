@@ -19,12 +19,9 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Daemon } from "./daemon.ts";
-import { mark, gbtcOf, BTC_ORACLE, MAX_LEVERAGE, skewBps, fundingRateBps, parseAmount, leverageOk } from "./market/btc.ts";
+import { mark, gbtcOf, BTC_ORACLE, MAX_LEVERAGE, parseAmount, leverageOk } from "./market/btc.ts";
 import { escrowedInContracts } from "./market/intent.ts";
 import { totalGbtc, pendingTotal, backingBps as bridgeBackingBps } from "./custody/bridge.ts";
-import { backingBps, totalOwed } from "./perp/pool.ts";
-import { unrealizedPnl, liquidationPrice } from "./perp/engine.ts";
-import { DEFAULT_FUNDING } from "./perp/funding.ts";
 import { DEFAULT_SOURCES } from "./market/pricefeed.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
@@ -93,27 +90,6 @@ function serializeState() {
 	const gbtc: Record<string, string> = {};
 	for (const [pubkey, amt] of view.bridge.gbtc) gbtc[pubkey] = amt.toString();
 
-	// my open positions (bull/bear), with live PnL at the current mark
-	const myPositions = [...view.positions.values()]
-		.filter((p) => p.owner === me)
-		.map((p) => {
-			const liq = liquidationPrice(p); // price at which you're force-closed, or null (1× = none)
-			return {
-				id: p.id,
-				instrument: p.instrument,
-				side: p.side,
-				size: p.size.toString(),
-				entry: p.entry.toString(),
-				margin: p.margin.toString(),
-				pnl: m != null ? unrealizedPnl(p, m).toString() : null,
-				liq: liq != null ? liq.toString() : null, // null → no liquidation (fully collateralized)
-			};
-		});
-
-	// the single shared pool: backing ratio (insolvency visible) + live funding
-	const skew = m != null ? skewBps(view.positions.values(), m) : 0n;
-	const rate = fundingRateBps(skew, DEFAULT_FUNDING);
-
 	// The oracle(s) this market depends on — the price-authority, hence the v1 trust
 	// point, surfaced explicitly. A LIST (future-proof for the multi-oracle design),
 	// though v1 ships exactly one: the BTC price oracle both instruments mark against.
@@ -159,28 +135,16 @@ function serializeState() {
 
 	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)
 	const onChainR = rsv != null ? rsv.sats : null;
-	// pay-when-able winnings queued to the active account (profit recorded but unpaid
-	// until the pool has funds — i.e. a counterparty/LP). Surfaced so wins aren't invisible.
-	const myOwed = view.pool.queue.filter((c) => c.owner === me).reduce((a, c) => a + c.amount, 0n);
 	const market = {
 		oracle: view.oracle.id,
 		oracles,
 		price: m != null ? m.toString() : null,
 		oracleSeq: view.oracle.seq,
 		maxLeverage: Number(MAX_LEVERAGE),
-		poolAssets: view.pool.assets.toString(),
-		owed: totalOwed(view.pool).toString(),
-		backingBps: Number(backingBps(view.pool)), // perp-pool health (pay-when-able)
-		openPositions: view.positions.size,
-		skewBps: Number(skew), // +10000 all bull, −10000 all bear
-		fundingRateBps: Number(rate), // >0 bulls pay, <0 bears pay
-		fundingPays: rate > 0n ? "bulls" : rate < 0n ? "bears" : "none",
-		fundingEpochAnchors: DEFAULT_FUNDING.epochAnchors,
 		// collateral = gBTC, a 1:1 claim on BTC in the custody fund
 		myGbtc: gbtcOf(view, me).toString(),
-		myOwed: myOwed.toString(), // queued profit owed to you (awaiting a counterparty)
 		reserves: view.bridge.reserves.toString(), // BTC sats in the fund
-		gbtcOutstanding: (totalGbtc(view.bridge) + view.pool.assets + escrowedInContracts(view.book)).toString(),
+		gbtcOutstanding: (totalGbtc(view.bridge) + escrowedInContracts(view.book)).toString(),
 		pending: pendingTotal(view.bridge).toString(), // burned, awaiting BTC payout
 		pendingCount: view.bridge.pending.length,
 		// YOUR OWN deposit address — derived from (fund key, your pubkey), so a deposit
@@ -193,7 +157,6 @@ function serializeState() {
 		reconciled: onChainR != null ? onChainR >= view.bridge.reserves : null, // real BTC covers the ledger?
 		shortfall: onChainR != null ? (view.bridge.reserves > onChainR ? (view.bridge.reserves - onChainR).toString() : "0") : null,
 		reservesCheckedAgoMs: rsv != null ? Date.now() - rsv.at : null,
-		myPositions,
 		// ── the matched market (real counterparty, no pool) ──
 		tape: daemon.intentTape(), // live resting intents you can take the opposite of
 		myContracts: daemon.myContracts(), // your open matched positions, with live PnL
@@ -310,19 +273,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		if (path === "/api/oracle/post") {
 			// Publish a signed BTC price. Only valid if the active account IS the oracle key.
 			await daemon.active().postPrice(String(body.oracle ?? BTC_ORACLE), String(body.price), Number(body.seq));
-			return send(res, 200, { ok: true });
-		}
-		if (path === "/api/position/open") {
-			// instrument: "BTC-BULL" | "BTC-BEAR"; margin in credit; leverage ≤ MAX_LEVERAGE.
-			if (mark(daemon.view()) === null) throw new Error("no oracle price yet — wait for the oracle's first post");
-			const lev = parseAmount(String(body.leverage ?? "1"));
-			if (lev === null || !leverageOk(lev)) throw new Error(`leverage must be a whole number from 2 to ${MAX_LEVERAGE}`);
-			requireSpendable(String(body.margin), "margin");
-			const id = await daemon.active().open(body.instrument === "BTC-BEAR" ? "BTC-BEAR" : "BTC-BULL", String(body.margin), String(body.leverage ?? "1"));
-			return send(res, 200, { id });
-		}
-		if (path === "/api/position/close") {
-			await daemon.active().close(String(body.position));
 			return send(res, 200, { ok: true });
 		}
 		// ── peer-to-peer matched market (the real product: no pool, real counterparty) ──

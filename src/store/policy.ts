@@ -7,8 +7,8 @@
  * restart — making a node a light/partial node BY CHOICE. The network only stays
  * whole if some nodes archive (keep everything).
  *
- * v1 op set: credit.farm / credit.transfer / oracle.post / position.* /
- * pool.deposit.
+ * Op set: the gBTC bridge, the oracle, threshold custody, and the matched market
+ * (match.open / contract.settle).
  */
 
 import type { Write } from "../chain/writer.ts";
@@ -64,9 +64,8 @@ export class MinePolicy implements PersistPolicy {
 				return this.keys.has(op.to);
 			case "bridge.withdraw":
 				return this.keys.has(write.writer);
-			case "position.close":
-			case "position.liquidate":
-				return ctx.keptPositions.has(op.position);
+			case "contract.settle":
+				return true; // tiny; keep so a matched position's close is durable
 			default:
 				return false;
 		}
@@ -98,7 +97,6 @@ export function decode(write: Write): Op | null {
 }
 
 /** After deciding to KEEP a write, record ids it establishes for later references. */
-export function recordKept(write: Write, op: Op | null, ctx: PolicyContext): void {
-	if (!op) return;
-	if (op.kind === "position.open") ctx.keptPositions.add(write.id);
+export function recordKept(_write: Write, _op: Op | null, _ctx: PolicyContext): void {
+	// (no cross-write id references needed in the current op set)
 }

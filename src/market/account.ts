@@ -12,7 +12,7 @@ import type { KeyPair } from "../det/ed25519.ts";
 import type { GavlNode } from "../sync/node.ts";
 import { computeView, finalizedView, gbtcOf } from "./btc.ts";
 import type { View } from "./btc.ts";
-import type { Op, Instrument } from "./ops.ts";
+import type { Op } from "./ops.ts";
 import { signOffer } from "./intent.ts";
 import type { Offer, OfferCore, Side } from "./intent.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
@@ -123,23 +123,6 @@ export class Account {
 	 *  wins and is immutable — every node + client then derives the permanent address. */
 	announceFund(groupKey: string, epoch: number): Promise<Write> {
 		return this.produce({ kind: "custody.fund", groupKey, epoch });
-	}
-
-	/** Open a bull/bear position with `margin` credit at `leverage` (≤5×). Returns position id. */
-	async open(instrument: Instrument, margin: bigint | number | string, leverage: bigint | number | string = 1): Promise<string> {
-		return (await this.produce({ kind: "position.open", instrument, margin: amountStr(margin), leverage: amountStr(leverage) })).id;
-	}
-
-	close(position: string): Promise<Write> {
-		return this.produce({ kind: "position.close", position });
-	}
-
-	liquidate(position: string): Promise<Write> {
-		return this.produce({ kind: "position.liquidate", position });
-	}
-
-	poolDeposit(amount: bigint | number | string): Promise<Write> {
-		return this.produce({ kind: "pool.deposit", amount: amountStr(amount) });
 	}
 
 	/** Build + sign a non-binding intent OFFER with this identity's key (to gossip over

@@ -1,19 +1,12 @@
 /**
- * Gavl v1 op vocabulary — BTC bull/bear, oracle-priced.
- *
- * Stripped to one product: deposit native credit, go bull or bear on Bitcoin via
- * two hardcoded instruments, withdraw at the oracle price. No coins, no auctions,
- * no user-created markets in v1 — but the oracle/instrument shape is generic so
- * more can be added later (anyone deploys an instrument referencing any oracle).
+ * Gavl op vocabulary — the gBTC bridge, the oracle, threshold custody, and the
+ * peer-to-peer matched market (intents → matched bilateral contracts). No pool.
  *
  * Every op is carried by an Ed25519-signed write, so the actor IS write.writer.
  * Amounts/prices are decimal strings (BigInt-parsed, JSON/canonical-safe).
  */
 
 import type { Offer } from "./intent.ts";
-
-/** The two hardcoded instruments. side maps to the perp engine's long/short. */
-export type Instrument = "BTC-BULL" | "BTC-BEAR";
 
 export type Op =
 	/** Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized by the bridge attestor key
@@ -44,14 +37,6 @@ export type Op =
 	 *  key-path) it derives the price from — so EVERY client sees what they trust,
 	 *  not just the publishing node. Signed by the oracle key; latest-wins. */
 	| { kind: "oracle.meta"; oracle: string; sources: { endpoint: string; key: string }[] }
-	/** Open a bull or bear position: escrow `margin` credit at the current oracle mark. */
-	| { kind: "position.open"; instrument: Instrument; margin: string; leverage: string }
-	/** Close your position at the current mark; pay margin+PnL back pay-when-able. */
-	| { kind: "position.close"; position: string }
-	/** Liquidate an underwater position (anyone; earns a fee). */
-	| { kind: "position.liquidate"; position: string }
-	/** Add native credit to the shared pool backing (drains the unpaid queue). */
-	| { kind: "pool.deposit"; amount: string }
 	/** Take the opposite side of a peer's signed intent: carries the maker's signed
 	 *  `offer` (gossiped, non-binding) and the stake the taker wants to `fill`. The fold
 	 *  verifies the maker's sig + that both peers can cover, escrows both, and opens a
@@ -76,7 +61,7 @@ export type Op =
 	 *  alongside gate #4 non-public keys.) */
 	| { kind: "custody.fund"; groupKey: string; epoch: number };
 
-const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "oracle.post", "oracle.meta", "position.open", "position.close", "position.liquidate", "pool.deposit", "match.open", "contract.settle", "custody.fund", "custody.bond", "custody.unbond", "custody.slash"]);
+const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "oracle.post", "oracle.meta", "match.open", "contract.settle", "custody.fund", "custody.bond", "custody.unbond", "custody.slash"]);
 
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);

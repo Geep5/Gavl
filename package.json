@@ -11,7 +11,7 @@
     "web:dev": "vite --config web/vite.config.js web",
     "web:build": "vite --config web/vite.config.js build web",
     "test": "node --test \"test/*.test.ts\"",
-    "test:fast": "node --test test/btc-market.test.ts test/consensus.test.ts test/consensus-gossip.test.ts test/ledger.test.ts test/post-cooldown.test.ts test/sync.test.ts test/custody-threshold.test.ts test/custody-bridge.test.ts",
+    "test:fast": "node --test test/intent-match.test.ts test/intent-fold.test.ts test/intent-gossip.test.ts test/consensus.test.ts test/consensus-gossip.test.ts test/ledger.test.ts test/post-cooldown.test.ts test/sync.test.ts test/custody-threshold.test.ts test/custody-bridge.test.ts",
     "test:chia": "node --test test/chia.test.ts",
     "demo": "node src/index.ts",
     "demo:consensus": "node src/demo-consensus.ts"

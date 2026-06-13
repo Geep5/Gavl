@@ -26,7 +26,6 @@ export const api = {
 	takeIntent: (nonce, fill) => req("/intent/take", "POST", { nonce, fill }),
 	takePosition: (side, size) => req("/intent/take-position", "POST", { side, size }),
 	settleContract: (contractId) => req("/contract/settle", "POST", { contractId }),
-	closePosition: (position) => req("/position/close", "POST", { position }), // legacy pool position
 	switchChannel: (name) => req("/channel", "POST", { name }),
 	rerollIdentity: (label) => req("/identity/reroll", "POST", { label }),
 	importIdentity: (seed, label) => req("/identity/import", "POST", { seed, label }),

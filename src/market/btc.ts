@@ -1,31 +1,23 @@
 /**
- * Gavl v1 state — BTC bull/bear, oracle-priced. A pure fold of the write set.
+ * Gavl state — the BTC bull/bear MATCHED market, a pure fold of the write set.
  *
- *   computeView(writes) -> { credit, oracle, pool, positions }
+ *   computeView(writes) -> { bridge, oracle, custody, book }
  *
- * The whole product: farm native credit, open a BULL or BEAR position at the
- * BTC oracle price, withdraw at the new price. Bull = long, bear = short, both
- * against ONE shared pool (the counterparty), settled pay-when-able with funding
- * balancing the two sides. The MARK IS THE ORACLE — no order book, no internal
- * price discovery. Conservation: native credit is only minted by credit.farm;
- * the perp pool never creates or destroys it.
+ * The whole product: peers broadcast intents to long/short BTC; a taker takes the
+ * opposite side; the match escrows BOTH peers' gBTC and opens a bilateral, zero-sum,
+ * fully-collateralized contract settled against the oracle mark. There is NO pool, so
+ * the protocol is never a counterparty and reserves can't be drained. The intent
+ * match/settle logic lives in ./intent.ts; this fold wires it (match.open / contract.
+ * settle) alongside the gBTC bridge and the oracle.
  *
  * Oracle authority = a hardcoded pubkey (BTC_ORACLE). Prices enter as signed
  * `oracle.post` writes folded by every node (monotonic seq) — never per-node
  * webhook fetches, which would diverge. Deterministic across the network.
- *
- * Reuses the tested perp math: engine (PnL/equity/liquidation), pool
- * (pay-when-able + backing), funding (skew → solvency funding).
  */
 
 import type { Write } from "../chain/writer.ts";
-import type { Op, Instrument } from "./ops.ts";
+import type { Op } from "./ops.ts";
 import { isOp } from "./ops.ts";
-import { emptyPool, lockMargin, deposit as poolDeposit, closeAgainstPool } from "../perp/pool.ts";
-import type { Pool } from "../perp/pool.ts";
-import { liquidatable, unrealizedPnl, SIZE_SCALE } from "../perp/engine.ts";
-import type { Position } from "../perp/engine.ts";
-import { skewBps, fundingRateBps, fundingPayment, DEFAULT_FUNDING } from "../perp/funding.ts";
 import { finalizedOrdering } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import { oraclePubHex, bridgePubHex } from "./oracle.ts";
@@ -49,10 +41,6 @@ export const BTC_ORACLE = oraclePubHex(process.env.GAVL_ORACLE_SEED);
 /** The BTC bridge attestor (committee) key. Only it may mint gBTC from a verified
  *  deposit or settle a withdrawal. v0 single signer; production = threshold committee. */
 export const BRIDGE_ATTESTOR = bridgePubHex(process.env.GAVL_BRIDGE_SEED);
-
-/** The two instruments → perp engine side. */
-const SIDE: Record<Instrument, "buy" | "sell"> = { "BTC-BULL": "buy", "BTC-BEAR": "sell" };
-const INSTRUMENTS: Instrument[] = ["BTC-BULL", "BTC-BEAR"];
 
 export interface OracleState {
 	id: string;
@@ -78,14 +66,8 @@ export interface View {
 	oracle: OracleState;
 	/** The threshold-custody fund key, announced on-chain at genesis (committee mode). */
 	custody: CustodyState;
-	/** One shared pool backing both instruments (holds gBTC margin/liquidity). */
-	pool: Pool;
-	/** Open positions by id. Each carries its instrument (bull/bear). */
-	positions: Map<string, Position & { instrument: Instrument }>;
-	/** Anchor height through which funding has been charged. */
-	lastFundingHeight: number;
-	/** The peer-to-peer intent market: bilateral matched contracts + offer-fill
-	 *  tracking. The matched, zero-sum, can't-deplete-reserves replacement for the pool. */
+	/** The peer-to-peer intent market: bilateral matched contracts + offer-fill tracking.
+	 *  The matched, zero-sum, can't-deplete-reserves core (replaced the old pool). */
 	book: MarketBook;
 }
 
@@ -95,13 +77,12 @@ export function gbtcOf(view: View, pubkey: string): bigint {
 }
 
 /**
- * The 1:1 backing invariant for the LIVE market: every gBTC — whether in a user
- * balance, locked in the perp pool, or burned-and-pending — is backed by a satoshi
- * in reserves. The perp engine only moves gBTC between balances and the pool, so it
- * never breaks this.
+ * The 1:1 backing invariant: every gBTC — free, bonded, escrowed in an open matched
+ * contract, or burned-and-pending — is backed by a satoshi in reserves. Match/settle
+ * only MOVE gBTC between these buckets, never mint, so this always holds.
  */
 export function marketConserved(view: View): boolean {
-	return view.bridge.reserves === totalGbtc(view.bridge) + bondedTotal(view.bridge) + view.pool.assets + escrowedInContracts(view.book) + pendingTotal(view.bridge);
+	return view.bridge.reserves === totalGbtc(view.bridge) + bondedTotal(view.bridge) + escrowedInContracts(view.book) + pendingTotal(view.bridge);
 }
 
 export function parseAmount(s: string): bigint | null {
@@ -157,9 +138,6 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 		bridge: emptyBridge(),
 		oracle: { id: BTC_ORACLE, price: null, seq: -1, sources: [] },
 		custody: { fundKey: null, epoch: -1 },
-		pool: emptyPool(),
-		positions: new Map(),
-		lastFundingHeight: -1,
 		book: emptyBook(),
 	};
 	const nowHeight = opts.nowHeight ?? 0;
@@ -267,58 +245,6 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			view.custody.epoch = op.epoch;
 			return;
 		}
-		case "position.open": {
-			const m = mark(view);
-			if (m === null) return; // no price yet → can't open
-			if (!INSTRUMENTS.includes(op.instrument)) return;
-			settleFunding(view, nowHeight, m);
-			const margin = parseAmount(op.margin);
-			const leverage = parseAmount(op.leverage);
-			if (margin === null || leverage === null) return;
-			if (!leverageOk(leverage)) return;
-			// size = notional × SIZE_SCALE / mark (fixed-point, so fractional units are
-			// possible even when price ≫ margin); notional = margin × leverage.
-			const size = (margin * leverage * SIZE_SCALE) / m;
-			if (size <= 0n) return;
-			if (gbtcOf(view, w.writer) < margin) return;
-			addGbtc(view.bridge, w.writer, -margin); // escrow gBTC → pool
-			lockMargin(view.pool, margin, (owner, amt) => addGbtc(view.bridge, owner, amt));
-			view.positions.set(w.id, { id: w.id, owner: w.writer, side: SIDE[op.instrument], size, entry: m, margin, instrument: op.instrument });
-			return;
-		}
-		case "position.close":
-		case "position.liquidate": {
-			const m = mark(view);
-			if (m === null) return;
-			settleFunding(view, nowHeight, m);
-			const p = view.positions.get(op.position);
-			if (!p) return;
-			const isLiq = op.kind === "position.liquidate";
-			if (!isLiq && p.owner !== w.writer) return;
-			if (isLiq && !liquidatable(p, m, MAINTENANCE_BPS)) return;
-			const { paidNow } = closeAgainstPool(view.pool, p, m);
-			if (paidNow > 0n) {
-				let toOwner = paidNow;
-				if (isLiq) {
-					const fee = (paidNow * LIQUIDATOR_FEE_BPS) / 10_000n;
-					if (fee > 0n) {
-						addGbtc(view.bridge, w.writer, fee);
-						toOwner -= fee;
-					}
-				}
-				addGbtc(view.bridge, p.owner, toOwner);
-			}
-			view.positions.delete(op.position);
-			return;
-		}
-		case "pool.deposit": {
-			const amt = parseAmount(op.amount);
-			if (amt === null) return;
-			if (gbtcOf(view, w.writer) < amt) return;
-			addGbtc(view.bridge, w.writer, -amt);
-			poolDeposit(view.pool, amt, (owner, paid) => addGbtc(view.bridge, owner, paid));
-			return;
-		}
 		case "match.open": {
 			// Take a maker's signed offer → escrow BOTH sides, open a bilateral matched
 			// contract. The taker is the write's author; the contract id is the write id.
@@ -366,9 +292,7 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 	}
 }
 
-// ── perp tuning (consensus constants) ────────────────────────────
-const MAINTENANCE_BPS = 500n;
-const LIQUIDATOR_FEE_BPS = 100n;
+// ── leverage bounds (consensus constants) ────────────────────────
 export const MAX_LEVERAGE = 5n;
 /** Minimum leverage. 1× is a fully-collateralized coin flip with no upside over fees —
  *  pointless — so the floor is 2×. */
@@ -376,45 +300,3 @@ export const MIN_LEVERAGE = 2n;
 export function leverageOk(l: bigint): boolean {
 	return l >= MIN_LEVERAGE && l <= MAX_LEVERAGE;
 }
-
-/** Funding settlement (solvency defense), oracle-priced. Lazy catch-up per epoch. */
-function settleFunding(view: View, nowHeight: number, m: bigint): void {
-	if (view.positions.size === 0 || view.lastFundingHeight < 0) {
-		view.lastFundingHeight = nowHeight;
-		return;
-	}
-	let next = view.lastFundingHeight + DEFAULT_FUNDING.epochAnchors;
-	while (next <= nowHeight) {
-		const rate = fundingRateBps(skewBps(view.positions.values(), m), DEFAULT_FUNDING);
-		if (rate !== 0n) {
-			let debited = 0n;
-			let owed = 0n;
-			const credits: { p: Position; amt: bigint }[] = [];
-			for (const p of view.positions.values()) {
-				const pay = fundingPayment(p, m, rate);
-				if (pay > 0n) {
-					const take = pay <= p.margin ? pay : p.margin;
-					p.margin -= take;
-					debited += take;
-				} else if (pay < 0n) {
-					owed += -pay;
-					credits.push({ p, amt: -pay });
-				}
-			}
-			let dist = 0n;
-			for (const c of credits) {
-				const share = owed > 0n ? (debited * c.amt) / owed : 0n;
-				const give = share <= c.amt ? share : c.amt;
-				c.p.margin += give;
-				dist += give;
-			}
-			view.pool.assets += debited - dist; // net imbalance → pool backing
-		}
-		view.lastFundingHeight = next;
-		next += DEFAULT_FUNDING.epochAnchors;
-	}
-	view.lastFundingHeight = nowHeight;
-}
-
-// re-export for the app/finalized-view wrapper
-export { skewBps, fundingRateBps };
