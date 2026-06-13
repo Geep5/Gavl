@@ -166,6 +166,17 @@ independent machines**, so the default stays single-operator seed custody (above
 State sync is epidemic: nodes compare a `stateRoot`, diff-pull what's missing, and join a
 hyperdht topic whose name *is* the network identity.
 
+> **Deferred — anchor scaling (delta-encoded heads).** Every anchor currently embeds the
+> *full* writer-heads map (`anchor.ts`), so an anchor is O(writers) — fine now, but it caps
+> how large an all-equal-node network can grow (~150 MB/anchor at a million writers). The
+> planned fix keeps the heads **root** as the commitment but carries only the writers that
+> *changed* since the previous anchor (a **delta**), shrinking anchors to
+> O(active-per-anchor) — ~100–1000× — so a much larger set of equal commodity nodes can
+> keep up. Paired with history **pruning + snapshots** (hold active state, not all history),
+> it's the path to a big equal-node network. A *Merkle tree* over heads (for light-client
+> inclusion proofs) is deliberately **out of scope** — every node here is full and equal.
+> Full plan + the throughput trade-offs: [`docs/scaling-equal-nodes.md`](docs/scaling-equal-nodes.md).
+
 ---
 
 ## Layout
