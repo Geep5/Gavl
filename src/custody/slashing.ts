@@ -23,14 +23,22 @@ interface CeremonyMsg {
 	r?: unknown; // reshare role
 	session?: unknown; // DKG/reshare session
 	sign?: unknown; // signing session id
+	to?: unknown; // recipient (point-to-point messages only)
 }
 
-/** The ceremony "slot" two messages must share to be equivocation: role + session. */
-function slot(m: CeremonyMsg): string | null {
+/**
+ * The ceremony "slot" a member must occupy exactly once. For BROADCAST messages
+ * (round1 / commit / share / vshare) that's role + session. POINT-TO-POINT messages
+ * (DKG round-2 shares, reshare sub-shares) are legitimately one PER RECIPIENT, so their
+ * slot also includes `to` — otherwise two honest shares to different members would look
+ * like equivocation. Two DIFFERENT shares to the SAME recipient is still a fault.
+ */
+export function ceremonySlot(m: CeremonyMsg): string | null {
 	const role = m.d ?? m.s ?? m.r;
 	const session = m.session ?? m.sign;
 	if (typeof role !== "string" || typeof session !== "string") return null;
-	return `${role}:${session}`;
+	const to = typeof m.to === "string" ? `:${m.to}` : "";
+	return `${role}:${session}${to}`;
 }
 
 /**
@@ -44,8 +52,17 @@ export function equivocationCulprit(a: unknown, b: unknown): string | null {
 	const mb = b as CeremonyMsg;
 	if (!ma || !mb || typeof ma.from !== "string" || ma.from !== mb.from) return null;
 	if (typeof ma.sig !== "string" || typeof mb.sig !== "string" || ma.sig === mb.sig) return null; // identical/missing → not two distinct commitments
-	const ka = slot(ma);
-	if (ka === null || ka !== slot(mb)) return null; // different ceremony slot
+	const ka = ceremonySlot(ma);
+	if (ka === null || ka !== ceremonySlot(mb)) return null; // different ceremony slot
 	if (!verifyCeremony(ma as { from: string; sig?: string }) || !verifyCeremony(mb as { from: string; sig?: string })) return null; // not both authentically signed by `from`
 	return ma.from;
+}
+
+/** The key a watcher tracks a message under — sender + slot — so a second, conflicting
+ *  message for the same key is caught. Null for non-ceremony input. */
+export function equivocationKey(m: unknown): string | null {
+	const mm = m as CeremonyMsg;
+	if (!mm || typeof mm.from !== "string") return null;
+	const s = ceremonySlot(mm);
+	return s === null ? null : `${mm.from}|${s}`;
 }

@@ -169,14 +169,17 @@ export class GavlNode {
 				// Hand the ceremony message to the registered coordinator, WITH the
 				// connection it arrived on — so the coordinator can reply point-to-point
 				// (round-2 secret shares ride the sender's own encrypted connection).
+				this.onCeremonyMessage?.(m.m); // watch for equivocation (auto-slashing)
 				this.onDkg?.(conn, m.m);
 				return;
 			}
 			case "sign": {
+				this.onCeremonyMessage?.(m.m);
 				this.onSign?.(m.m); // signing ceremony is broadcast-only (no secrets cross)
 				return;
 			}
 			case "reshare": {
+				this.onCeremonyMessage?.(m.m);
 				this.onReshare?.(conn, m.m); // sub-shares are point-to-point → needs the conn
 				return;
 			}
@@ -188,6 +191,10 @@ export class GavlNode {
 	gossipIntent(offer: Offer): void {
 		this.broadcast({ t: "intent", offer });
 	}
+
+	/** Tap on EVERY inbound ceremony message (dkg/sign/reshare), independent of the
+	 *  coordinators — registered by the equivocation watcher for auto-slashing. */
+	onCeremonyMessage?: (m: DkgWire | SignWire | ReshareWire) => void;
 
 	// ── DKG ceremony transport (used by custody/dkg-coordinator) ─────
 	/** Registered by a DkgCoordinator to receive ceremony messages + their connection. */

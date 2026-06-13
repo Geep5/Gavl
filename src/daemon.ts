@@ -36,6 +36,7 @@ import { buildWithdrawalTx, signWithdrawalTx } from "./custody/btctx.ts";
 import { signWithdrawalWithFailover } from "./custody/withdraw-ceremony.ts";
 import { SignCoordinator } from "./custody/sign-coordinator.ts";
 import { CommitteeRotation } from "./custody/rotation.ts";
+import { EquivocationWatcher } from "./custody/equivocation-watcher.ts";
 import { makeCeremonyAuth } from "./custody/ceremony-auth.ts";
 import type { CeremonyAuth } from "./custody/ceremony-auth.ts";
 import { committeeEpochsFor, epochOf } from "./custody/epoch.ts";
@@ -45,7 +46,7 @@ import { depositAttestationDigest, settleAttestationDigest } from "./custody/att
 import { isCeremonyTimeout } from "./custody/ceremony.ts";
 import { Esplora } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, confirmations, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
-import { pendingClaims, unsentWithdrawals, inFlightWithdrawals } from "./custody/bridge.ts";
+import { pendingClaims, unsentWithdrawals, inFlightWithdrawals, slashable } from "./custody/bridge.ts";
 import { readPriceAggregate } from "./market/pricefeed.ts";
 import type { PriceSource, AggregateReading } from "./market/pricefeed.ts";
 import { Wallet } from "./wallet.ts";
@@ -183,6 +184,7 @@ export class Daemon {
 	private producerKeyCache?: KeyPair;
 	private custodyAcct?: Account;
 	private rotation?: CommitteeRotation;
+	private equivWatcher?: EquivocationWatcher;
 	/** Kept so a channel switch can rebuild ledger/anchors/store identically. */
 	private readonly verifier: SpaceVerifier;
 	private readonly schedule?: RetargetSchedule;
@@ -661,6 +663,17 @@ export class Daemon {
 			},
 			log: (m) => console.log(m),
 		});
+
+		// Auto-slashing: watch every ceremony message this node sees; when a committee
+		// member equivocates (two conflicting signed messages for one slot), file the
+		// fraud proof — but only if the culprit has stake to lose (else it's a wasted write).
+		this.equivWatcher = new EquivocationWatcher((a, b, culprit) => {
+			if (slashable(this.view().bridge, culprit) <= 0n) return;
+			console.log(`[custody] equivocation by ${culprit.slice(0, 16)}… → submitting slash`);
+			void this.custodyAccount().slash(a, b).catch(() => {});
+		});
+		this.node.onCeremonyMessage = (m) => this.equivWatcher!.observe(m);
+
 		console.log(`  custody: committee mode (epochLength ${this.custodyOpts.epochLength ?? 16}, size ${this.custodyOpts.size ?? 5}); id ${this.producerId().slice(0, 16)}…`);
 	}
 
@@ -1193,6 +1206,7 @@ export class Daemon {
 		//    the rotation against the new node when farming.
 		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, this.verifier, { schedule: this.schedule, finalityDepth: this.finalityDepth }));
 		this.rotation = undefined;
+		this.equivWatcher = undefined;
 		this.custodyAcct = undefined;
 		this.wireTipCadence();
 		this.accounts.clear();
