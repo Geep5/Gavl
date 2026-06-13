@@ -13,7 +13,7 @@
  */
 
 import type { Anchor } from "./anchor.ts";
-import { verifyAnchor } from "./anchor.ts";
+import { verifyAnchor, applyHeadsDelta } from "./anchor.ts";
 import type { SpaceVerifier } from "./space.ts";
 import { nextDifficulty } from "./difficulty.ts";
 import type { RetargetSchedule } from "./difficulty.ts";
@@ -50,6 +50,12 @@ export class AnchorChain {
 	private readonly lockDepth?: number;
 	private readonly anchors = new Map<string, Anchor>();
 	private tipId: string | null = null;
+	/** Reconstructed FULL heads for the current tip (anchors carry only deltas now). Kept
+	 *  current as the tip moves, so the producer + verifier don't re-accumulate each time. */
+	private tipHeads: Heads = {};
+	/** Cache of the finalized anchor's full heads (recomputed only when finality advances)
+	 *  so headsCovered/finalizedHeads don't re-accumulate on every poll. */
+	private finalCache: { id: string; heads: Heads } | null = null;
 	/** The deepest anchor this node has locked as final (sticky). */
 	private lockedId: string | null = null;
 
@@ -97,7 +103,10 @@ export class AnchorChain {
 		const prev = anchor.prev ? this.anchors.get(anchor.prev) ?? null : null;
 		if (anchor.prev && !prev) return { ok: false, reason: "unknown prev anchor" };
 
-		const v = await verifyAnchor(anchor, prev, this.params, this.difficultyFor(prev), this.verifier);
+		// Verify against the prev's FULL heads (delta is applied onto it); verify returns
+		// the reconstructed full heads for this anchor.
+		const prevHeads = prev ? this.headsAt(prev.id) : {};
+		const v = await verifyAnchor(anchor, prev, prevHeads, this.params, this.difficultyFor(prev), this.verifier);
 		if (!v.ok) return v;
 
 		this.anchors.set(anchor.id, anchor);
@@ -108,11 +117,24 @@ export class AnchorChain {
 		const wouldBeTip = this.tipId === null || heavier(anchor, this.anchors.get(this.tipId)!);
 		if (wouldBeTip && this.descendsFromLock(anchor)) {
 			this.tipId = anchor.id;
+			this.tipHeads = v.heads; // cache the new tip's full heads (handles reorg: v.heads is for this tip)
 			this.updateLock();
 		} else if (wouldBeTip) {
 			return { ok: false, reason: "rejected: conflicts with finalized history" };
 		}
 		return { ok: true };
+	}
+
+	/** Reconstruct the FULL writer-heads an anchor certified, accumulating deltas along its
+	 *  ancestry. The tip is cached (O(1)); any other anchor is rebuilt (O(history) — used for
+	 *  forks + finality, both infrequent). */
+	headsAt(anchorId: string): Heads {
+		if (anchorId === this.tipId) return this.tipHeads;
+		const a = this.anchors.get(anchorId);
+		if (!a) return {};
+		let heads: Heads = {};
+		for (const anc of this.chainTo(a)) heads = applyHeadsDelta(heads, anc.headsDelta);
+		return heads;
 	}
 
 	get(id: string): Anchor | undefined {
@@ -146,7 +168,12 @@ export class AnchorChain {
 	}
 
 	finalizedHeads(k: number): Heads {
-		return this.finalized(k)?.heads ?? {};
+		const f = this.finalized(k);
+		if (!f) return {};
+		if (this.finalCache?.id === f.id) return this.finalCache.heads; // unchanged since last poll
+		const heads = this.headsAt(f.id);
+		this.finalCache = { id: f.id, heads };
+		return heads;
 	}
 
 	/**

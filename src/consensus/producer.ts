@@ -45,6 +45,7 @@ export class Producer {
 		const difficulty = this.node.anchors?.difficultyFor(prev) ?? this.params.difficulty;
 		const anchor = await mineAnchor({
 			prev,
+			prevHeads: prev ? this.node.anchors?.headsAt(prev.id) : {}, // full heads the tip certified → diff for the delta
 			producer: this.keypair,
 			prover: this.prover,
 			heads: this.node.ledger.heads(),

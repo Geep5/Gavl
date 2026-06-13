@@ -35,16 +35,16 @@ const D = PARAMS.difficulty;
 test("anchors mine, chain, and verify; tampering is rejected", async () => {
 	const m = miner();
 	const g = (await mineAnchor({ prev: null, producer: m.keypair, prover: m.prover, heads: {}, params: PARAMS }))!;
-	assert.equal((await verifyAnchor(g, null, PARAMS, D, STANDIN_VERIFIER)).ok, true);
+	assert.equal((await verifyAnchor(g, null, {}, PARAMS, D, STANDIN_VERIFIER)).ok, true);
 
 	const a1 = (await mineAnchor({ prev: g, producer: m.keypair, prover: m.prover, heads: {}, params: PARAMS }))!;
-	assert.equal((await verifyAnchor(a1, g, PARAMS, D, STANDIN_VERIFIER)).ok, true);
+	assert.equal((await verifyAnchor(a1, g, {}, PARAMS, D, STANDIN_VERIFIER)).ok, true); // g certified {} → prevHeads {}
 	assert.equal(a1.height, 1);
 	assert.equal(BigInt(a1.weight), D * 2n, "cumulative weight = 2 · difficulty");
 
-	assert.equal((await verifyAnchor({ ...a1, weight: "999999" }, g, PARAMS, D, STANDIN_VERIFIER)).ok, false, "forged weight");
-	assert.equal((await verifyAnchor(a1, null, PARAMS, D, STANDIN_VERIFIER)).ok, false, "wrong predecessor");
-	assert.equal((await verifyAnchor({ ...a1, heads: { deadbeef: { id: "x", seq: 0 } } }, g, PARAMS, D, STANDIN_VERIFIER)).ok, false, "stateRoot ≠ heads");
+	assert.equal((await verifyAnchor({ ...a1, weight: "999999" }, g, {}, PARAMS, D, STANDIN_VERIFIER)).ok, false, "forged weight");
+	assert.equal((await verifyAnchor(a1, null, {}, PARAMS, D, STANDIN_VERIFIER)).ok, false, "wrong predecessor");
+	assert.equal((await verifyAnchor({ ...a1, headsDelta: { deadbeef: { id: "x", seq: 0 } } }, g, {}, PARAMS, D, STANDIN_VERIFIER)).ok, false, "stateRoot ≠ heads");
 });
 
 test("fork choice follows the heaviest cumulative-weight chain", async () => {

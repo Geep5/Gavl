@@ -37,8 +37,11 @@ export interface AnchorBody {
 	/** Grindable only at genesis (nothing to secure there); 0 for every other anchor. */
 	nonce: number;
 	difficulty: string; // committed difficulty at this height
-	heads: Heads; // the certified snapshot of writer-heads
-	stateRoot: string; // rootOfHeads(heads)
+	/** Only the writer-heads that ADVANCED since `prev` (a delta), not the full snapshot —
+	 *  so an anchor is O(active-this-round), not O(all writers). The full snapshot is
+	 *  reconstructed by accumulating deltas along the chain; `stateRoot` commits to it. */
+	headsDelta: Heads;
+	stateRoot: string; // rootOfHeads(FULL heads) — the commitment; verifies the accumulated delta
 	weight: string; // cumulative weight = prev.weight + difficulty
 	space: SpaceCommitment; // {kind, id, k}
 	proof: unknown; // backend-specific space proof payload
@@ -50,7 +53,24 @@ export interface Anchor extends AnchorBody {
 	sig: string;
 }
 
-export type AnchorResult = { ok: true } | { ok: false; reason: string };
+/** verify yields the reconstructed FULL heads (prev + delta) so the chain can chain it. */
+export type AnchorResult = { ok: true; heads: Heads } | { ok: false; reason: string };
+
+/** The writers whose head changed from `prev` to `next` (heads only ever advance, so this
+ *  is new-or-advanced writers). This is what an anchor carries instead of the full map. */
+export function diffHeads(prev: Heads, next: Heads): Heads {
+	const delta: Heads = {};
+	for (const w of Object.keys(next)) {
+		const p = prev[w];
+		if (!p || p.seq !== next[w].seq || p.id !== next[w].id) delta[w] = next[w];
+	}
+	return delta;
+}
+
+/** Apply a delta onto the previous full heads → the new full heads (delta overlays). */
+export function applyHeadsDelta(prev: Heads, delta: Heads): Heads {
+	return { ...prev, ...delta };
+}
 
 /** Next anchor's challenge. Post-genesis chains from the prev VDF output; at genesis uses `nonce`. */
 export function anchorChallenge(prev: Anchor | null, nonce: number = 0): Uint8Array {
@@ -70,7 +90,7 @@ function bodyOf(a: Anchor): AnchorBody {
 		producer: a.producer,
 		nonce: a.nonce,
 		difficulty: a.difficulty,
-		heads: a.heads,
+		headsDelta: a.headsDelta,
 		stateRoot: a.stateRoot,
 		weight: a.weight,
 		space: a.space,
@@ -87,8 +107,9 @@ function idOf(body: AnchorBody, time: TimeProof): string {
  *  constant `params.difficulty`; the AnchorChain passes a retargeted value. The
  *  committed difficulty, the cumulative weight, AND required-iters all use it, so
  *  weight stays proportional to the VDF work actually served. */
-export async function mineAnchor(opts: { prev: Anchor | null; producer: KeyPair; prover: SpaceProver; heads: Heads; params: ChainParams; difficulty?: bigint }): Promise<Anchor | null> {
+export async function mineAnchor(opts: { prev: Anchor | null; prevHeads?: Heads; producer: KeyPair; prover: SpaceProver; heads: Heads; params: ChainParams; difficulty?: bigint }): Promise<Anchor | null> {
 	const { prev, producer, prover, heads, params } = opts;
+	const prevHeads = opts.prevHeads ?? {}; // full heads the prev anchor certified ({} at genesis)
 	const difficulty = opts.difficulty ?? params.difficulty;
 	const commitment = prover.commitment();
 	const sw = spaceWeightFor(commitment);
@@ -112,8 +133,8 @@ export async function mineAnchor(opts: { prev: Anchor | null; producer: KeyPair;
 		producer: toHex(producer.publicKey),
 		nonce,
 		difficulty: difficulty.toString(),
-		heads,
-		stateRoot: rootOfHeads(heads),
+		headsDelta: diffHeads(prevHeads, heads), // only what changed since prev
+		stateRoot: rootOfHeads(heads), // commitment over the FULL heads
 		weight: weight.toString(),
 		space: commitment,
 		proof: mined.proof,
@@ -123,8 +144,10 @@ export async function mineAnchor(opts: { prev: Anchor | null; producer: KeyPair;
 	return { ...body, time, id, sig };
 }
 
-/** Verify an anchor against its predecessor + expected difficulty. Self-contained given `prev`. */
-export async function verifyAnchor(anchor: Anchor, prev: Anchor | null, params: ChainParams, expectedDifficulty: bigint, verifier: SpaceVerifier): Promise<AnchorResult> {
+/** Verify an anchor against its predecessor + expected difficulty. `prevHeads` is the FULL
+ *  heads the predecessor certified ({} at genesis) — the delta is applied onto it and the
+ *  result checked against the committed `stateRoot`. Returns the reconstructed full heads. */
+export async function verifyAnchor(anchor: Anchor, prev: Anchor | null, prevHeads: Heads, params: ChainParams, expectedDifficulty: bigint, verifier: SpaceVerifier): Promise<AnchorResult> {
 	if (anchor.difficulty !== expectedDifficulty.toString()) {
 		return { ok: false, reason: `wrong difficulty (${anchor.difficulty}, expected ${expectedDifficulty})` };
 	}
@@ -133,7 +156,9 @@ export async function verifyAnchor(anchor: Anchor, prev: Anchor | null, params: 
 
 	const expectedWeight = (prev ? BigInt(prev.weight) : 0n) + expectedDifficulty;
 	if (anchor.weight !== expectedWeight.toString()) return { ok: false, reason: "bad cumulative weight" };
-	if (anchor.stateRoot !== rootOfHeads(anchor.heads)) return { ok: false, reason: "stateRoot ≠ heads" };
+	// Reconstruct the full heads from prev + delta; the committed root must match.
+	const heads = applyHeadsDelta(prevHeads, anchor.headsDelta);
+	if (anchor.stateRoot !== rootOfHeads(heads)) return { ok: false, reason: "stateRoot ≠ heads" };
 
 	const challenge = anchorChallenge(prev, anchor.nonce);
 	const v = await verifier.verify(anchor.space, anchor.producer, challenge, anchor.proof);
@@ -148,5 +173,5 @@ export async function verifyAnchor(anchor: Anchor, prev: Anchor | null, params: 
 	if (idOf(bodyOf(anchor), anchor.time) !== anchor.id) return { ok: false, reason: "id mismatch" };
 	if (!ed.verify(fromHex(anchor.producer), fromHex(anchor.id), fromHex(anchor.sig))) return { ok: false, reason: "bad signature" };
 
-	return { ok: true };
+	return { ok: true, heads };
 }

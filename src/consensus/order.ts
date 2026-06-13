@@ -30,9 +30,11 @@ function epochOf(chain: Anchor[], writes: Write[]): Map<string, number> {
 	}
 	const covered = new Map<string, number>(); // writer → highest seq already assigned an epoch
 	for (const anchor of chain) {
-		for (const writer of Object.keys(anchor.heads)) {
+		// anchors carry only the writers that ADVANCED this round (the delta) — exactly what
+		// this loop needs (it already skips writers whose seq didn't move).
+		for (const writer of Object.keys(anchor.headsDelta)) {
 			const from = covered.get(writer) ?? -1;
-			const to = anchor.heads[writer].seq;
+			const to = anchor.headsDelta[writer].seq;
 			if (to <= from) continue;
 			for (const w of byWriter.get(writer) ?? []) {
 				if (w.seq > from && w.seq <= to && !epoch.has(w.id)) epoch.set(w.id, anchor.height);
@@ -62,7 +64,7 @@ export function finalizedOrdering(writes: Write[], anchors: AnchorChain, k: numb
 	if (!finalAnchor) return { included: [], order: () => 0, bornAt: new Map(), nowHeight: null };
 
 	const chain = anchors.chainTo(finalAnchor); // genesis → finalized, in height order
-	const heads = finalAnchor.heads;
+	const heads = anchors.headsAt(finalAnchor.id); // full heads reconstructed from deltas
 	const included = writes.filter((w) => {
 		const h = heads[w.writer];
 		return h !== undefined && w.seq <= h.seq;

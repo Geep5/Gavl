@@ -67,7 +67,7 @@ test("chiapos anchor: real plot mines + verifies an anchor; tampering + wrong id
 		assert.equal(anchor!.space.kind, "chiapos");
 		assert.equal(anchor!.space.id, plotIdFor(pub, K), "plot id bound to identity");
 
-		assert.equal((await verifyAnchor(anchor!, null, params, params.difficulty, verifier)).ok, true, "real anchor verifies");
+		assert.equal((await verifyAnchor(anchor!, null, {}, params, params.difficulty, verifier)).ok, true, "real anchor verifies");
 
 		const chain = new AnchorChain(params, verifier);
 		assert.equal((await chain.add(anchor!)).ok, true);
@@ -77,7 +77,7 @@ test("chiapos anchor: real plot mines + verifies an anchor; tampering + wrong id
 		const tamperedProof = Buffer.from(anchor!.proof as string, "hex");
 		tamperedProof[0] ^= 0xff;
 		const bad = { ...anchor!, proof: tamperedProof.toString("hex") };
-		assert.equal((await verifyAnchor(bad, null, params, params.difficulty, verifier)).ok, false, "tampered proof rejected");
+		assert.equal((await verifyAnchor(bad, null, {}, params, params.difficulty, verifier)).ok, false, "tampered proof rejected");
 
 		const stranger = toHex(generateKeyPair().publicKey);
 		const c = anchor!.space;
