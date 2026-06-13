@@ -40,7 +40,6 @@ function offer(maker: ReturnType<typeof acct>, over: Partial<OfferCore> = {}) {
 		size: "1000",
 		leverage: "2",
 		expiryHeight: 100,
-		settleHeight: 200,
 		nonce: "n" + (over.nonce ?? Math.random().toString(36).slice(2)),
 		...over,
 		maker: maker.pub, // keep maker authoritative even if `over` set it
@@ -104,7 +103,7 @@ test("match escrows both sides; settle splits the pot; conservation holds throug
 	assert.ok(conserved(bridge, book), "conserved after match");
 
 	// settle above cap → long (A) takes the whole pot
-	assert.equal(applySettle(bridge, book, "w1", 63000n, 200), true);
+	assert.equal(applySettle(bridge, book, "w1", 63000n), true);
 	assert.equal(gbtcOf(bridge, A.pub), 6000n, "A won the pot");
 	assert.equal(gbtcOf(bridge, B.pub), 4000n, "B lost its stake");
 	assert.equal(escrowedInContracts(book), 0n);
@@ -144,21 +143,20 @@ test("ghost (maker can't cover) fails cleanly; self-match rejected", () => {
 	assert.equal(applyMatch(bridge, book, M.pub, "w2", self, 1000n, 1, MARK), null, "self-match (wash) rejected");
 });
 
-// ── timing guards ────────────────────────────────────────────────
+// ── offer TTL + close-anytime ────────────────────────────────────
 
-test("expired offers and premature/late settles are rejected", () => {
+test("expired offers can't be matched; a contract closes any time", () => {
 	const bridge = emptyBridge(), book = emptyBook();
 	const M = acct(40), T = acct(41);
 	fund(bridge, M.pub, 5000n);
 	fund(bridge, T.pub, 5000n);
 	assert.equal(applyMatch(bridge, book, T.pub, "w1", offer(M, { expiryHeight: 5, nonce: "e1" }), 100n, 6, MARK), null, "past expiry → no match");
-	assert.equal(applyMatch(bridge, book, T.pub, "w2", offer(M, { settleHeight: 3, nonce: "e2" }), 100n, 5, MARK), null, "settle must be in the future");
 
-	const c = applyMatch(bridge, book, T.pub, "w3", offer(M, { settleHeight: 50, nonce: "e3" }), 100n, 1, MARK);
+	const c = applyMatch(bridge, book, T.pub, "w3", offer(M, { nonce: "e3" }), 100n, 1, MARK);
 	assert.ok(c);
-	assert.equal(applySettle(bridge, book, "w3", 61000n, 49), false, "can't settle before maturity");
-	assert.equal(applySettle(bridge, book, "nope", 61000n, 99), false, "unknown contract");
-	assert.equal(applySettle(bridge, book, "w3", 61000n, 50), true, "settles at maturity");
+	assert.equal(applySettle(bridge, book, "nope", 61000n), false, "unknown contract");
+	assert.equal(applySettle(bridge, book, "w3", 61000n), true, "closes at the current mark, no waiting");
+	assert.equal(applySettle(bridge, book, "w3", 61000n), false, "already closed");
 	assert.ok(conserved(bridge, book));
 });
 
@@ -185,7 +183,7 @@ test("random match/settle stream: conservation + no over-redemption always hold"
 			const m = pick(accts);
 			const side: Side = rnd() < 0.5 ? "long" : "short";
 			const sz = BigInt(50 + Math.floor(rnd() * 2000));
-			const o = offer(m, { makerSide: side, size: sz.toString(), leverage: (2 + Math.floor(rnd() * 99)).toString(), nonce: "r" + step, expiryHeight: now + 5 + Math.floor(rnd() * 10), settleHeight: now + 8 + Math.floor(rnd() * 20) });
+			const o = offer(m, { makerSide: side, size: sz.toString(), leverage: (2 + Math.floor(rnd() * 99)).toString(), nonce: "r" + step, expiryHeight: now + 5 + Math.floor(rnd() * 10) });
 			live.push({ o, size: sz });
 		} else if (r < 0.8 && live.length) {
 			// a random taker tries to match a random live offer with a random fill, at a random mark
@@ -196,8 +194,7 @@ test("random match/settle stream: conservation + no over-redemption always hold"
 			applyMatch(bridge, book, t.pub, "w" + wid++, e.o, fill, now, markPrice);
 		} else if (book.contracts.size) {
 			const id = pick([...book.contracts.keys()]);
-			const c = book.contracts.get(id)!;
-			if (now >= c.settleHeight) applySettle(bridge, book, id, BigInt(58000 + Math.floor(rnd() * 6000)), now);
+			applySettle(bridge, book, id, BigInt(58000 + Math.floor(rnd() * 6000)));
 		}
 		if (rnd() < 0.3) now += 1;
 
@@ -211,7 +208,7 @@ test("random match/settle stream: conservation + no over-redemption always hold"
 	}
 	// drain: settle everything left, conservation still holds
 	now = 1_000_000;
-	for (const id of [...book.contracts.keys()]) applySettle(bridge, book, id, 61000n, now);
+	for (const id of [...book.contracts.keys()]) applySettle(bridge, book, id, 61000n);
 	assert.equal(escrowedInContracts(book), 0n);
 	assert.ok(conserved(bridge, book), "conserved after draining all contracts");
 });

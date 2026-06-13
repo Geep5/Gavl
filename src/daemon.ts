@@ -20,8 +20,10 @@
 import { Ledger } from "./ledger/ledger.ts";
 import { GavlNode } from "./sync/node.ts";
 import { Account } from "./market/account.ts";
-import { computeView, finalizedView } from "./market/btc.ts";
+import { computeView, finalizedView, mark } from "./market/btc.ts";
 import type { View } from "./market/btc.ts";
+import { longPayout, verifyOffer } from "./market/intent.ts";
+import type { Offer, Side } from "./market/intent.ts";
 import { oracleKeyPair, bridgeKeyPair } from "./market/oracle.ts";
 import { fundKeyFromSeed } from "./custody/threshold.ts";
 import type { FundKey } from "./custody/threshold.ts";
@@ -67,6 +69,7 @@ import { WriteStore } from "./store/store.ts";
 import { KeepAllPolicy, MinePolicy } from "./store/policy.ts";
 import type { PersistPolicy } from "./store/policy.ts";
 import { homedir } from "node:os";
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 
@@ -228,6 +231,9 @@ export class Daemon {
 			this.maintainCommitteeTopics(); // keep this node joined to its committee's sub-swarm
 			this.maybeAuthorizePending(); // co-sign pending withdrawals / mints / settles
 		};
+		// matched-market intent gossip — (re)wire onto the fresh node.
+		this.node.onIntent = (offer) => this.receiveIntent(offer);
+		this.node.intentsToShare = () => [...this.offers.values()];
 	}
 
 	/** Feed the finalized chain to the custody rotation loop (no-op unless committee
@@ -358,6 +364,115 @@ export class Daemon {
 	/** Optimistic view over all local writes (responsive — reflects an action immediately). */
 	view(): View {
 		return computeView(this.node.ledger.allWrites());
+	}
+
+	// ── peer-to-peer intent market (in-memory offer book) ────────────
+	// Non-binding signed offers rest here locally (the gossip layer will replicate them
+	// across nodes later). Broadcasting signs an offer with the active account; taking one
+	// authors a match.open write that escrows BOTH peers and opens a matched contract.
+	private offers = new Map<string, Offer>(); // nonce → signed offer
+
+	/** Broadcast a non-binding intent from the active account → local book + the mesh. */
+	broadcastIntent(side: Side, size: string, leverage: string): Offer {
+		const me = this.active();
+		// Globally-unique nonce (crypto-random) so it never collides with a previously-matched
+		// offer's nonce in the persisted offerFills — even across restarts / store resets.
+		const nonce = `${me.pubHex.slice(0, 8)}-${randomBytes(8).toString("hex")}`;
+		// expiryHeight high → the offer doesn't expire in-fold; the book holds it until taken.
+		const offer = me.makeOffer({ makerSide: side, size, leverage, expiryHeight: 2_000_000_000, nonce });
+		this.offers.set(nonce, offer);
+		this.node.gossipIntent(offer); // flood it to peers so their tapes show it
+		return offer;
+	}
+
+	/** Ingest an intent gossiped by a peer (or a peer's whole book on connect). Verifies the
+	 *  maker signature and dedupes by nonce; returns true if it was NEW (so the node re-floods). */
+	private receiveIntent(offer: Offer): boolean {
+		if (!offer || this.offers.has(offer.nonce)) return false;
+		if (!verifyOffer(offer)) return false;
+		this.offers.set(offer.nonce, offer);
+		return true;
+	}
+
+	/** Live tape: resting offers with their remaining (unfilled) size, freshest first.
+	 *  Fully-filled offers drop off. */
+	intentTape(): { nonce: string; maker: string; side: Side; remaining: string; leverage: string; mine: boolean }[] {
+		const fills = this.view().book.offerFills;
+		const me = this.wallet.active().pubHex;
+		const out: { nonce: string; maker: string; side: Side; remaining: string; leverage: string; mine: boolean }[] = [];
+		for (const o of [...this.offers.values()].reverse()) {
+			const remaining = BigInt(o.size) - (fills.get(o.nonce) ?? 0n);
+			if (remaining <= 0n) continue;
+			out.push({ nonce: o.nonce, maker: o.maker, side: o.makerSide, remaining: remaining.toString(), leverage: o.leverage, mine: o.maker === me });
+		}
+		return out;
+	}
+
+	/** Take a specific resting intent from the active account → opens a matched contract. */
+	async takeIntent(nonce: string, fill?: string): Promise<string> {
+		const offer = this.offers.get(nonce);
+		if (!offer) throw new Error("that intent is no longer available");
+		if (offer.maker === this.wallet.active().pubHex) throw new Error("you can't take your own intent — switch to another account");
+		const remaining = BigInt(offer.size) - (this.view().book.offerFills.get(nonce) ?? 0n);
+		const want = fill ? BigInt(fill) : remaining;
+		const take = want < remaining ? want : remaining;
+		if (take <= 0n) throw new Error("that intent is fully taken");
+		if (this.active().gbtc() < take) throw new Error(`insufficient gBTC: you need ${take} to take this`);
+		const id = await this.active().matchOpen(offer, take);
+		// applyMatch no-ops (returns no contract) if the MAKER ghosted (spent its collateral).
+		if (!this.view().book.contracts.has(id)) {
+			this.offers.delete(nonce); // drop the dead offer
+			throw new Error("the maker no longer has the collateral — intent withdrawn");
+		}
+		return id;
+	}
+
+	/** Easy taker: go long/short by `size`, sweeping the best OPPOSITE resting intents
+	 *  until filled or the tape runs dry (taker-only — unfilled remainder is dropped). */
+	async takePosition(side: Side, size: string): Promise<{ filled: string; contracts: string[] }> {
+		const want = BigInt(size);
+		const opposite: Side = side === "long" ? "short" : "long";
+		const me = this.wallet.active().pubHex;
+		let left = want;
+		const contracts: string[] = [];
+		for (const t of this.intentTape()) {
+			if (left <= 0n) break;
+			if (t.side !== opposite || t.maker === me) continue; // need an opposite-side maker, not me
+			const take = left < BigInt(t.remaining) ? left : BigInt(t.remaining);
+			try {
+				contracts.push(await this.takeIntent(t.nonce, take.toString()));
+				left -= take;
+			} catch {
+				/* raced away — skip */
+			}
+		}
+		if (contracts.length === 0) throw new Error(`no ${opposite} intents on the tape to take — broadcast one or wait for a peer`);
+		return { filled: (want - left).toString(), contracts };
+	}
+
+	/** Close (settle) a matched contract at the current mark, from the active account. */
+	async settleContract(contractId: string): Promise<void> {
+		await this.active().settle(contractId);
+	}
+
+	/** The active account's open matched contracts, with live PnL at the current mark. */
+	myContracts(): { id: string; side: Side; stake: string; entry: string; leverage: string; counterparty: string; pnl: string | null }[] {
+		const v = this.view();
+		const m = mark(v);
+		const me = this.wallet.active().pubHex;
+		const out: { id: string; side: Side; stake: string; entry: string; leverage: string; counterparty: string; pnl: string | null }[] = [];
+		for (const c of v.book.contracts.values()) {
+			const iAmLong = c.long === me;
+			if (!iAmLong && c.short !== me) continue;
+			let pnl: string | null = null;
+			if (m !== null) {
+				const longGets = longPayout(c.stake, c.entry, c.leverage, m);
+				const mine = iAmLong ? longGets : c.stake * 2n - longGets;
+				pnl = (mine - c.stake).toString();
+			}
+			out.push({ id: c.id, side: iAmLong ? "long" : "short", stake: c.stake.toString(), entry: c.entry.toString(), leverage: c.leverage.toString(), counterparty: iAmLong ? c.short : c.long, pnl });
+		}
+		return out;
 	}
 
 	/** Finality-bound view: only state the anchor chain has certified `finalityDepth` deep. */
@@ -1064,6 +1179,7 @@ export class Daemon {
 		this.custodyAcct = undefined;
 		this.wireTipCadence();
 		this.accounts.clear();
+		this.offers.clear(); // each channel is its own tape — drop the old channel's intents
 		for (const wa of this.wallet.list()) this.bind(wa); // same identities, new node
 
 		// 3. Switch to the new channel and bring it up (init store → replay → join + farm).

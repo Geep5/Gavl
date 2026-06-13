@@ -9,6 +9,7 @@
 import type { Write } from "../chain/writer.ts";
 import type { Heads } from "../ledger/ledger.ts";
 import type { Anchor } from "../consensus/anchor.ts";
+import type { Offer } from "../market/intent.ts";
 
 export type SyncMessage =
 	// ── write sync ───────────────────────────────────────────────
@@ -20,6 +21,11 @@ export type SyncMessage =
 	| { t: "writes"; writes: Write[] }
 	/** Push freshly-applied writes to peers (epidemic gossip). */
 	| { t: "announce"; writes: Write[] }
+	// ── matched-market intents (non-binding, off-ledger gossip) ──
+	/** A single broadcast intent (signed offer) — propagated epidemically across the mesh. */
+	| { t: "intent"; offer: Offer }
+	/** A peer's whole resting offer book, sent once on connect so a new node sees the tape. */
+	| { t: "intents"; offers: Offer[] }
 	// ── anchor (consensus) sync ──────────────────────────────────
 	/** Advertise my heaviest anchor tip. */
 	| { t: "anchor-tip"; height: number; weight: string; id: string }

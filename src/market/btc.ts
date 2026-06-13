@@ -335,13 +335,12 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			return;
 		}
 		case "contract.settle": {
-			// Permissionless once matured: split the 2·stake pot at the current oracle mark
-			// per the contract's bounded band. (v1 settles at the price when settled; both
-			// sides may settle as soon as it matures, so neither can hold out for a better
-			// mark.)
+			// Permissionless close: split the 2·stake pot at the current oracle mark per the
+			// directional payoff. Perpetual — either side may close any time; the loser can't
+			// dodge the mark by stalling (the winner just closes it).
 			const m = mark(view);
 			if (m === null || typeof op.contractId !== "string") return;
-			applySettle(view.bridge, view.book, op.contractId, m, bornHeight);
+			applySettle(view.bridge, view.book, op.contractId, m);
 			return;
 		}
 		case "custody.bond": {

@@ -45,10 +45,8 @@ export interface OfferCore {
 	size: string;
 	/** Leverage (decimal int ≥ 1). Scales the price move; a 1/leverage move caps the bet. */
 	leverage: string;
-	/** Anchor height after which the offer can no longer be matched. */
+	/** Anchor height after which the offer can no longer be matched (a soft TTL). */
 	expiryHeight: number;
-	/** Anchor height at/after which a matched contract settles against the oracle. */
-	settleHeight: number;
 	/** Unique per offer — the redemption key (tracks cumulative fills ≤ size). */
 	nonce: string;
 }
@@ -58,7 +56,8 @@ export interface Offer extends OfferCore {
 	sig: string;
 }
 
-/** A live, escrowed bilateral bet. Pot = 2·stake; sides split it directionally at settle. */
+/** A live, escrowed bilateral bet. Pot = 2·stake; closing splits it directionally at the
+ *  current mark. Perpetual — either side may close it any time (no expiry). */
 export interface Contract {
 	id: string; // the match write's id
 	long: string; // pubkey holding the long side
@@ -66,7 +65,6 @@ export interface Contract {
 	stake: bigint; // each side staked this; pot = 2·stake
 	entry: bigint; // the oracle mark when matched
 	leverage: bigint;
-	settleHeight: number;
 	nonce: string; // the originating offer (audit)
 }
 
@@ -115,7 +113,6 @@ export function offerDigest(core: OfferCore): Uint8Array {
 		size: core.size,
 		leverage: core.leverage,
 		expiryHeight: core.expiryHeight,
-		settleHeight: core.settleHeight,
 		nonce: core.nonce,
 	});
 }
@@ -133,7 +130,7 @@ export function verifyOffer(o: Offer): boolean {
 	if (parseSats(o.size) === null) return false;
 	const lev = parseSats(o.leverage);
 	if (lev === null || lev < MIN_OFFER_LEVERAGE || lev > MAX_OFFER_LEVERAGE) return false; // 2 ≤ leverage ≤ MAX
-	if (!Number.isInteger(o.expiryHeight) || !Number.isInteger(o.settleHeight)) return false;
+	if (!Number.isInteger(o.expiryHeight)) return false;
 	if (typeof o.nonce !== "string" || o.nonce.length === 0) return false;
 	if (!isHex(o.sig, 64)) return false;
 	try {
@@ -170,8 +167,7 @@ export function longPayout(stake: bigint, entry: bigint, leverage: bigint, price
 export function applyMatch(bridge: BridgeState, book: MarketBook, taker: string, writeId: string, offer: Offer, fill: bigint, nowHeight: number, mark: bigint): Contract | null {
 	if (mark <= 0n) return null; // no oracle price yet → no entry
 	if (!verifyOffer(offer)) return null;
-	if (nowHeight > offer.expiryHeight) return null; // offer no longer takeable
-	if (offer.settleHeight <= nowHeight) return null; // must settle in the future
+	if (nowHeight > offer.expiryHeight) return null; // offer no longer takeable (soft TTL)
 	if (offer.maker === taker) return null; // self-match (wash) guard
 	if (book.contracts.has(writeId)) return null; // id reuse
 	if (fill <= 0n) return null;
@@ -190,19 +186,19 @@ export function applyMatch(bridge: BridgeState, book: MarketBook, taker: string,
 
 	const long = offer.makerSide === "long" ? offer.maker : taker;
 	const short = offer.makerSide === "long" ? taker : offer.maker;
-	const c: Contract = { id: writeId, long, short, stake: take, entry: mark, leverage: parseSats(offer.leverage)!, settleHeight: offer.settleHeight, nonce: offer.nonce };
+	const c: Contract = { id: writeId, long, short, stake: take, entry: mark, leverage: parseSats(offer.leverage)!, nonce: offer.nonce };
 	book.contracts.set(writeId, c);
 	return c;
 }
 
 /**
- * Settle a matured contract at the oracle `price`: split the 2·stake pot directionally
- * and credit each side's free gBTC. Permissionless once the settle height passes.
+ * Close (settle) a contract at the oracle `price`: split the 2·stake pot directionally
+ * and credit each side's free gBTC. Perpetual — either side (in fact anyone) may close
+ * it at any time at the current mark; the loser can't escape the mark by stalling.
  */
-export function applySettle(bridge: BridgeState, book: MarketBook, contractId: string, price: bigint, nowHeight: number): boolean {
+export function applySettle(bridge: BridgeState, book: MarketBook, contractId: string, price: bigint): boolean {
 	const c = book.contracts.get(contractId);
 	if (!c) return false;
-	if (nowHeight < c.settleHeight) return false; // not matured yet
 	const pot = c.stake * 2n;
 	const longPay = longPayout(c.stake, c.entry, c.leverage, price);
 	const shortPay = pot - longPay; // exact remainder → zero-sum

@@ -68,6 +68,8 @@ a { color: var(--accent); }
 .avatar { width: 30px; height: 30px; border-radius: 50%; background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent); border: 1px solid var(--accent-dim); display: flex; align-items: center; justify-content: center; font-weight: 700; flex: none; }
 .who { overflow: hidden; }
 .wholabel { font-size: 0.82rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acctsel { width: auto; max-width: 100%; background: transparent; border: 1px solid var(--border); color: var(--text); font-size: 0.8rem; font-weight: 600; padding: 0.1rem 0.3rem; margin: 0; cursor: pointer; border-radius: 5px; }
+.acctsel:hover { border-color: var(--accent-dim); }
 .whokey { font-size: 0.68rem; color: var(--muted); }
 
 /* CENTER — active view */

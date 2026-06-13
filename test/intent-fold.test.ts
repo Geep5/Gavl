@@ -41,7 +41,7 @@ test("a gossiped offer is taken on-chain, escrows both sides, and settles at the
 	await fund(B, 5000n);
 
 	// A signs a non-binding offer off-chain (this would be gossiped over the mesh)
-	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "100", expiryHeight: 10, settleHeight: 20, nonce: "k1" });
+	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "100", expiryHeight: 10, nonce: "k1" });
 	assert.equal(offer.maker, A.pubHex);
 
 	// B takes the opposite (short) side on-chain
@@ -81,7 +81,7 @@ test("a maker who spent the collateral (ghost) just fails to match — reserves 
 	await fund(A, 1000n);
 	await fund(B, 1000n);
 
-	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "10", expiryHeight: 10, settleHeight: 20, nonce: "g1" });
+	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "10", expiryHeight: 10, nonce: "g1" });
 	await A.transfer(C.pubHex, 1000n); // A ghosts — moves the collateral it offered
 	const matchId = await B.matchOpen(offer, 1000n);
 

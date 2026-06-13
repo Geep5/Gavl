@@ -21,10 +21,12 @@ export const api = {
 	transfer: (to, amount) => req("/transfer", "POST", { to, amount }),
 	withdraw: (amount, btcAddress) => req("/withdraw", "POST", { amount, btcAddress }),
 	processWithdrawals: () => req("/withdrawals/process", "POST", {}),
-	open: (instrument, margin, leverage) => req("/position/open", "POST", { instrument, margin, leverage }),
-	closePosition: (position) => req("/position/close", "POST", { position }),
-	liquidate: (position) => req("/position/liquidate", "POST", { position }),
-	poolDeposit: (amount) => req("/pool/deposit", "POST", { amount }),
+	// matched market (real counterparty, no pool)
+	broadcastIntent: (side, size, leverage) => req("/intent/broadcast", "POST", { side, size, leverage }),
+	takeIntent: (nonce, fill) => req("/intent/take", "POST", { nonce, fill }),
+	takePosition: (side, size) => req("/intent/take-position", "POST", { side, size }),
+	settleContract: (contractId) => req("/contract/settle", "POST", { contractId }),
+	closePosition: (position) => req("/position/close", "POST", { position }), // legacy pool position
 	switchChannel: (name) => req("/channel", "POST", { name }),
 	rerollIdentity: (label) => req("/identity/reroll", "POST", { label }),
 	importIdentity: (seed, label) => req("/identity/import", "POST", { seed, label }),

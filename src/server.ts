@@ -20,6 +20,7 @@ import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Daemon } from "./daemon.ts";
 import { mark, gbtcOf, BTC_ORACLE, MAX_LEVERAGE, skewBps, fundingRateBps, parseAmount, leverageOk } from "./market/btc.ts";
+import { escrowedInContracts } from "./market/intent.ts";
 import { totalGbtc, pendingTotal, backingBps as bridgeBackingBps } from "./custody/bridge.ts";
 import { backingBps, totalOwed } from "./perp/pool.ts";
 import { unrealizedPnl, liquidationPrice } from "./perp/engine.ts";
@@ -179,7 +180,7 @@ function serializeState() {
 		myGbtc: gbtcOf(view, me).toString(),
 		myOwed: myOwed.toString(), // queued profit owed to you (awaiting a counterparty)
 		reserves: view.bridge.reserves.toString(), // BTC sats in the fund
-		gbtcOutstanding: (totalGbtc(view.bridge) + view.pool.assets).toString(),
+		gbtcOutstanding: (totalGbtc(view.bridge) + view.pool.assets + escrowedInContracts(view.book)).toString(),
 		pending: pendingTotal(view.bridge).toString(), // burned, awaiting BTC payout
 		pendingCount: view.bridge.pending.length,
 		// YOUR OWN deposit address — derived from (fund key, your pubkey), so a deposit
@@ -193,6 +194,9 @@ function serializeState() {
 		shortfall: onChainR != null ? (view.bridge.reserves > onChainR ? (view.bridge.reserves - onChainR).toString() : "0") : null,
 		reservesCheckedAgoMs: rsv != null ? Date.now() - rsv.at : null,
 		myPositions,
+		// ── the matched market (real counterparty, no pool) ──
+		tape: daemon.intentTape(), // live resting intents you can take the opposite of
+		myContracts: daemon.myContracts(), // your open matched positions, with live PnL
 	};
 
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));
@@ -321,13 +325,34 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			await daemon.active().close(String(body.position));
 			return send(res, 200, { ok: true });
 		}
-		if (path === "/api/position/liquidate") {
-			await daemon.active().liquidate(String(body.position));
-			return send(res, 200, { ok: true });
+		// ── peer-to-peer matched market (the real product: no pool, real counterparty) ──
+		if (path === "/api/intent/broadcast") {
+			// Post a non-binding signed intent to the tape. Nothing is escrowed yet.
+			if (mark(daemon.view()) === null) throw new Error("no oracle price yet — wait for the oracle's first post");
+			const side = body.side === "short" ? "short" : "long";
+			const lev = parseAmount(String(body.leverage ?? "2"));
+			if (lev === null || !leverageOk(lev)) throw new Error(`leverage must be a whole number from 2 to ${MAX_LEVERAGE}`);
+			requireSpendable(String(body.size), "size"); // advisory: be able to back it when taken
+			const offer = daemon.broadcastIntent(side, String(body.size), String(body.leverage ?? "2"));
+			return send(res, 200, { nonce: offer.nonce });
 		}
-		if (path === "/api/pool/deposit") {
-			requireSpendable(String(body.amount), "amount");
-			await daemon.active().poolDeposit(String(body.amount));
+		if (path === "/api/intent/take") {
+			// Take a specific resting intent → opens a matched contract (you get the opposite side).
+			if (mark(daemon.view()) === null) throw new Error("no oracle price yet");
+			const id = await daemon.takeIntent(String(body.nonce), body.fill != null ? String(body.fill) : undefined);
+			return send(res, 200, { id });
+		}
+		if (path === "/api/intent/take-position") {
+			// Easy taker: go long/short by size, sweeping the best opposite intents.
+			if (mark(daemon.view()) === null) throw new Error("no oracle price yet");
+			const side = body.side === "short" ? "short" : "long";
+			requireSpendable(String(body.size), "size");
+			const r = await daemon.takePosition(side, String(body.size));
+			return send(res, 200, r);
+		}
+		if (path === "/api/contract/settle") {
+			// Close a matched contract at the current mark (perpetual — any time).
+			await daemon.settleContract(String(body.contractId));
 			return send(res, 200, { ok: true });
 		}
 		if (path === "/api/channel") {

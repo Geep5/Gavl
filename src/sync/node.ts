@@ -17,6 +17,7 @@
  */
 
 import type { SyncMessage, DkgWire, SignWire, ReshareWire } from "./messages.ts";
+import type { Offer } from "../market/intent.ts";
 import type { Write } from "../chain/writer.ts";
 import { Ledger } from "../ledger/ledger.ts";
 import type { Heads } from "../ledger/ledger.ts";
@@ -40,6 +41,10 @@ export class GavlNode {
 	onApplied?: (writes: Write[]) => void;
 	/** Notified when the heaviest anchor tip changes. */
 	onTip?: (tip: Anchor) => void;
+	/** Ingest a gossiped matched-market intent; returns true if it was NEW (→ re-gossip). */
+	onIntent?: (offer: Offer) => boolean;
+	/** This node's resting offer book, sent to a peer on connect so it sees the tape. */
+	intentsToShare?: () => Offer[];
 	/** Serializes async anchor ingestion so tip updates don't race. */
 	private anchorQueue: Promise<void> = Promise.resolve();
 
@@ -56,6 +61,8 @@ export class GavlNode {
 		conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads() });
 		const tip = this.anchorTipMsg();
 		if (tip) conn.send(tip);
+		const offers = this.intentsToShare?.();
+		if (offers && offers.length) conn.send({ t: "intents", offers }); // hand the new peer my tape
 	}
 
 	/** Apply a locally-produced write and gossip it. */
@@ -124,6 +131,17 @@ export class GavlNode {
 				if (changed) conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads() });
 				return;
 			}
+			case "intent": {
+				// Non-binding matched-market offer. Verified + deduped by the daemon; re-gossip
+				// only if it was new, so it floods the mesh once without looping.
+				if (this.onIntent?.(m.offer)) this.broadcastExcept(conn, m);
+				return;
+			}
+			case "intents": {
+				// A peer's full resting book (on connect). Ingest each; no re-broadcast storm.
+				for (const o of m.offers) this.onIntent?.(o);
+				return;
+			}
 			case "anchor-tip": {
 				if (!this.anchors || this.anchors.get(m.id)) return;
 				const myTip = this.anchors.tip();
@@ -163,6 +181,12 @@ export class GavlNode {
 				return;
 			}
 		}
+	}
+
+	// ── matched-market intent transport ─────────────────────────────
+	/** Flood a freshly-broadcast intent to all peers. */
+	gossipIntent(offer: Offer): void {
+		this.broadcast({ t: "intent", offer });
 	}
 
 	// ── DKG ceremony transport (used by custody/dkg-coordinator) ─────

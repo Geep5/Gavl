@@ -1,6 +1,12 @@
 <script>
 	import { onMount, onDestroy } from "svelte";
-	import { store, startPolling, accountLabel, short } from "./lib/store.svelte.js";
+	import { store, startPolling, accountLabel, short, act } from "./lib/store.svelte.js";
+	import { api } from "./lib/api.js";
+
+	async function switchAccount(e) {
+		const pubHex = e.target.value;
+		if (pubHex && pubHex !== store.active) await act(() => api.setActive(pubHex));
+	}
 	import BtcView from "./components/BtcView.svelte";
 	import ConsensusPanel from "./components/ConsensusPanel.svelte";
 	import ConnectProgress from "./components/ConnectProgress.svelte";
@@ -52,7 +58,13 @@
 			<div class="usercard">
 				<div class="avatar">{(accountLabel(store.active) ?? "?").slice(0, 1).toUpperCase()}</div>
 				<div class="who">
-					<div class="wholabel">{accountLabel(store.active) ?? "no account"}</div>
+					{#if store.accounts.length > 1}
+						<select class="acctsel" value={store.active} onchange={switchAccount} title="Switch identity — each is a separate trader">
+							{#each store.accounts as a}<option value={a.pubHex}>{a.label}</option>{/each}
+						</select>
+					{:else}
+						<div class="wholabel">{accountLabel(store.active) ?? "no account"}</div>
+					{/if}
 					<div class="whokey mono">{short(store.active ?? "")}</div>
 				</div>
 			</div>
