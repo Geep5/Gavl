@@ -24,7 +24,7 @@ import { computeView, finalizedView, mark } from "./market/btc.ts";
 import type { View } from "./market/btc.ts";
 import { longPayout, verifyOffer } from "./market/intent.ts";
 import type { Offer, Side } from "./market/intent.ts";
-import { oracleKeyPair, bridgeKeyPair } from "./market/oracle.ts";
+import { bridgeKeyPair } from "./market/oracle.ts";
 import { fundKeyFromSeed } from "./custody/threshold.ts";
 import type { FundKey } from "./custody/threshold.ts";
 import { DkgCoordinator } from "./custody/dkg-coordinator.ts";
@@ -194,7 +194,7 @@ export class Daemon {
 	private publishing = false;
 	/** The oracle-publish config, remembered so it re-starts on a fresh chain after a
 	 *  channel switch (otherwise the new channel has no oracle → no price loads). */
-	private oraclePublishOpts?: { seedHex?: string; sources: PriceSource[]; everyMs: number };
+	private oraclePublishOpts?: { sources: PriceSource[]; everyMs: number };
 	/** Bumped each time a publisher loop (re)starts, so an old loop bound to a torn-down
 	 *  node exits cleanly on a channel switch. */
 	private oracleGen = 0;
@@ -591,7 +591,7 @@ export class Daemon {
 	}
 
 	/** Join the live mesh and (optionally) start farming anchors. Resilient to a missing network. */
-	async startConsensus(opts: { network?: string; mesh: boolean; farm: boolean; publishOracle?: { seedHex?: string; sources: PriceSource[]; everyMs: number } }): Promise<void> {
+	async startConsensus(opts: { network?: string; mesh: boolean; farm: boolean; publishOracle?: { sources: PriceSource[]; everyMs: number } }): Promise<void> {
 		if (opts.network) this.network = opts.network;
 		this.meshOn = opts.mesh;
 		this.farmOn = opts.farm;
@@ -678,32 +678,27 @@ export class Daemon {
 	}
 
 	/**
-	 * Run the BTC oracle publisher: an Account holding the oracle key that fetches a
-	 * real price from `source` (HTTP endpoint + JSON key-path, or a fixed dev value),
-	 * then signs + submits an `oracle.post` every `everyMs` with a monotonic seq.
-	 * Only the node holding the oracle seed runs this; everyone else folds the signed
-	 * posts. Each fetch is recorded (endpoint, key, raw, value) for transparency.
+	 * Post THIS node's BTC price reading on a loop: fetch the feeds (avg the responders),
+	 * sign an `oracle.post` with the node's OWN stable key, every `everyMs`. EVERY node runs
+	 * this — there's no special publisher — and the fold takes the MEDIAN of recent posters
+	 * as the mark, so no single node is trusted for the price. Each fetch is recorded for
+	 * transparency, and the methodology is disclosed on-chain.
 	 */
-	private startOraclePublisher(opts: { seedHex?: string; sources: PriceSource[]; everyMs: number }): void {
-		const kp = oracleKeyPair(opts.seedHex);
-		const oraclePub = toHex(kp.publicKey);
-		const oracle = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: kp });
-		// The methodology disclosed on-chain so EVERY client sees the sources (not just
-		// this node). Only feeds with a real endpoint are disclosed (a fixed dev price
-		// has none). Re-posted periodically so late-joining nodes pick it up.
+	private startOraclePublisher(opts: { sources: PriceSource[]; everyMs: number }): void {
+		const kp = this.producerKey(); // this node's stable identity = its oracle-poster id
+		const myId = toHex(kp.publicKey);
+		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: kp });
 		const disclose = opts.sources.filter((s) => s.url).map((s) => ({ endpoint: s.url!, key: s.key ?? "" }));
 		this.publishing = true;
 		const myGen = ++this.oracleGen; // a channel switch bumps this → the old loop below exits
 		const loop = async () => {
-			// seq continues from whatever the chain already has (survives restarts); on a
-			// fresh channel that's -1 → 0, and `oracle` is bound to the current node.
-			let seq = (this.view().oracle.seq ?? -1) + 1;
+			// per-poster monotonic seq, continuing from this node's own latest reading.
+			let seq = (this.view().oracle.readings.get(myId)?.seq ?? -1) + 1;
 			let tick = 0;
 			while (this.publishing && myGen === this.oracleGen) {
-				// disclose methodology on-chain at start + every ~30 ticks (cheap, idempotent).
 				if (disclose.length > 0 && tick % 30 === 0) {
 					try {
-						await oracle.postMeta(oraclePub, disclose);
+						await acct.postMeta(disclose);
 					} catch {
 						/* retry next cycle */
 					}
@@ -713,7 +708,7 @@ export class Daemon {
 				this.lastOracleSource = { ...agg, at: Date.now() }; // display-only metadata
 				if (agg.value != null) {
 					try {
-						await oracle.postPrice(oraclePub, agg.value, seq);
+						await acct.postPrice(agg.value, seq);
 						seq++;
 					} catch {
 						/* a post failed (e.g. mid-restart) — retry next tick */
@@ -723,7 +718,7 @@ export class Daemon {
 			}
 		};
 		void loop();
-		console.log(`  oracle: publishing BTC price as ${oraclePub.slice(0, 16)}… (avg of ${opts.sources.length} source(s)) every ${opts.everyMs}ms`);
+		console.log(`  oracle: posting BTC price as ${myId.slice(0, 16)}… (median across all posters; avg of ${opts.sources.length} feed(s)) every ${opts.everyMs}ms`);
 	}
 
 	/** The publisher's latest aggregate reading (per-source endpoint/key/raw/value +

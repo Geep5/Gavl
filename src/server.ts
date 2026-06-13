@@ -19,7 +19,7 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Daemon } from "./daemon.ts";
-import { mark, gbtcOf, BTC_ORACLE, MAX_LEVERAGE, parseAmount, leverageOk } from "./market/btc.ts";
+import { mark, gbtcOf, MAX_LEVERAGE, parseAmount, leverageOk } from "./market/btc.ts";
 import { escrowedInContracts } from "./market/intent.ts";
 import { totalGbtc, pendingTotal, backingBps as bridgeBackingBps } from "./custody/bridge.ts";
 import { DEFAULT_SOURCES } from "./market/pricefeed.ts";
@@ -119,16 +119,15 @@ function serializeState() {
 			feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })),
 		};
 	}
+	const posters = view.oracle.readings.size; // how many nodes have posted readings
 	const oracles = [
 		{
-			id: view.oracle.id, // the signing key IS the authority
+			id: "BTC/USD", // a label — the mark is a MEDIAN across posters, not one key
 			label: "BTC / USD price",
 			feeds: ["BTC-BULL", "BTC-BEAR"], // which instruments it prices
 			price: m != null ? m.toString() : null,
-			seq: view.oracle.seq, // monotonic; update count = seq+1
-			updates: view.oracle.seq + 1,
+			posters, // independent nodes posting prices (median of these)
 			live: m != null,
-			mine: view.oracle.id === me, // is THIS node the publisher?
 			source, // { onChain, method, ageMs, feeds:[{endpoint,key,raw,value,error}] } | null
 		},
 	];
@@ -136,10 +135,10 @@ function serializeState() {
 	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)
 	const onChainR = rsv != null ? rsv.sats : null;
 	const market = {
-		oracle: view.oracle.id,
+		oracle: "median", // mechanism: median of all posters, no single authority
 		oracles,
 		price: m != null ? m.toString() : null,
-		oracleSeq: view.oracle.seq,
+		oraclePosters: posters,
 		maxLeverage: Number(MAX_LEVERAGE),
 		// collateral = gBTC, a 1:1 claim on BTC in the custody fund
 		myGbtc: gbtcOf(view, me).toString(),
@@ -271,8 +270,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			return send(res, 200, { id: await daemon.unbondCustody(amt) });
 		}
 		if (path === "/api/oracle/post") {
-			// Publish a signed BTC price. Only valid if the active account IS the oracle key.
-			await daemon.active().postPrice(String(body.oracle ?? BTC_ORACLE), String(body.price), Number(body.seq));
+			// Post this account's own signed BTC reading (any node may; the mark is the median).
+			await daemon.active().postPrice(String(body.price), Number(body.seq));
 			return send(res, 200, { ok: true });
 		}
 		// ── peer-to-peer matched market (the real product: no pool, real counterparty) ──
@@ -390,18 +389,18 @@ createServer((req, res) => {
 		console.log(`  storage: in-memory only (GAVL_PERSIST=off) — writes are lost on restart`);
 	}
 
-	// Oracle publisher: only the node holding the oracle seed should run it
-	// (GAVL_ORACLE_PUBLISH=1). Price source:
+	// Oracle: EVERY node posts its OWN reading by default (the mark is the median of all
+	// posters — no special publisher). Opt out with GAVL_ORACLE_PUBLISH=0 (e.g. a node with
+	// no internet to fetch feeds). Price source:
 	//   GAVL_BTC_PRICE       → a fixed dev price (overrides the feeds), else
 	//   GAVL_ORACLE_URL+_KEY → a single custom feed, else
 	//   default              → AVERAGE of 3 BTC feeds (Coinbase, Kraken, Bitstamp).
-	// Everyone else just folds the signed posts.
 	const sources = process.env.GAVL_BTC_PRICE
 		? [{ fixed: BigInt(process.env.GAVL_BTC_PRICE) }]
 		: process.env.GAVL_ORACLE_URL
 			? [{ url: process.env.GAVL_ORACLE_URL, key: process.env.GAVL_ORACLE_KEY }]
 			: DEFAULT_SOURCES;
-	const publishOracle = process.env.GAVL_ORACLE_PUBLISH === "1" ? { seedHex: process.env.GAVL_ORACLE_SEED, sources, everyMs: Number(process.env.GAVL_ORACLE_MS ?? "5000") } : undefined;
+	const publishOracle = process.env.GAVL_ORACLE_PUBLISH === "0" ? undefined : { sources, everyMs: Number(process.env.GAVL_ORACLE_MS ?? "5000") };
 	await daemon.startConsensus({ network: NETWORK, mesh: MESH, farm: FARM, publishOracle });
 	const c = daemon.consensus();
 	console.log(`  → mesh ${c.mesh ? "joined" : "off"}, ${c.peers} peer(s), farming ${c.farming ? "live" : "off"}`);

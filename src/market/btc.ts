@@ -10,9 +10,10 @@
  * match/settle logic lives in ./intent.ts; this fold wires it (match.open / contract.
  * settle) alongside the gBTC bridge and the oracle.
  *
- * Oracle authority = a hardcoded pubkey (BTC_ORACLE). Prices enter as signed
- * `oracle.post` writes folded by every node (monotonic seq) — never per-node
- * webhook fetches, which would diverge. Deterministic across the network.
+ * Oracle = DECENTRALIZED median, no special node. Every node posts its OWN signed
+ * `oracle.post` reading; the fold takes the MEDIAN of recent posters as the mark.
+ * Each node still folds the same on-chain posts → the same median (deterministic);
+ * what's banned is each node using its *own* live fetch as the mark (that diverges).
  */
 
 import type { Write } from "../chain/writer.ts";
@@ -32,23 +33,45 @@ import { fromHex } from "../det/canonical.ts";
 
 // ── consensus constants (every node must agree) ──────────────────
 
-/** The single hardcoded BTC price oracle for v1 (its Ed25519 pubkey hex).
- *  Derived from a fixed seed (see oracle.ts) so the constant is a REAL key the
- *  publisher can sign with; generic so more oracles/instruments register later.
- *  Override the seed (and thus this) via GAVL_ORACLE_SEED for a real deployment. */
+/** The default dev oracle pubkey. No longer an authority — the oracle is now a median of
+ *  all posters — but kept as a convenient default poster identity (and for back-compat).
+ *  Override the seed via GAVL_ORACLE_SEED. */
 export const BTC_ORACLE = oraclePubHex(process.env.GAVL_ORACLE_SEED);
 
 /** The BTC bridge attestor (committee) key. Only it may mint gBTC from a verified
  *  deposit or settle a withdrawal. v0 single signer; production = threshold committee. */
 export const BRIDGE_ATTESTOR = bridgePubHex(process.env.GAVL_BRIDGE_SEED);
 
+export interface OracleReading {
+	price: bigint;
+	seq: number; // per-poster monotonic (replay/ordering guard)
+	at: number; // global post index when folded (drives the recency window)
+}
+
 export interface OracleState {
-	id: string;
-	price: bigint | null; // latest finalized price, or null until first post
-	seq: number; // monotonic; rejects stale/replayed posts
-	/** The oracle's on-chain-disclosed methodology: the sources it derives the price
-	 *  from. Visible to EVERY client (folded into state), not just the publisher. */
+	/** The mark = MEDIAN of recent posters' latest readings; null until anyone posts. No
+	 *  single authority — every node posts its own reading and the median is the consensus. */
+	price: bigint | null;
+	/** Latest signed reading per poster (pubkey hex → reading). */
+	readings: Map<string, OracleReading>;
+	/** Count of oracle.post writes folded — a poster older than ORACLE_WINDOW posts is stale. */
+	postCount: number;
+	/** Disclosed methodology (latest from any poster) — transparency/audit, not authority. */
 	sources: { endpoint: string; key: string }[];
+}
+
+/** How many recent posts define "fresh": a poster whose latest reading is older than this
+ *  many folded posts drops out of the median, so departed/stale oracles stop counting. */
+export const ORACLE_WINDOW = 64;
+
+/** The median of the fresh posters' latest readings (even count → lower-mid average). */
+function medianMark(o: OracleState): bigint | null {
+	const fresh: bigint[] = [];
+	for (const r of o.readings.values()) if (o.postCount - r.at < ORACLE_WINDOW) fresh.push(r.price);
+	if (fresh.length === 0) return null;
+	fresh.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+	const mid = fresh.length >> 1;
+	return fresh.length % 2 === 1 ? fresh[mid] : (fresh[mid - 1] + fresh[mid]) / 2n;
 }
 
 export interface CustodyState {
@@ -136,7 +159,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	const cmp = opts.order ?? cmpWrite;
 	const view: View = {
 		bridge: emptyBridge(),
-		oracle: { id: BTC_ORACLE, price: null, seq: -1, sources: [] },
+		oracle: { price: null, readings: new Map(), postCount: 0, sources: [] },
 		custody: { fundKey: null, epoch: -1 },
 		book: emptyBook(),
 	};
@@ -218,19 +241,19 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			return;
 		}
 		case "oracle.post": {
-			// Authority is the oracle KEY (= the writer must be the oracle), monotonic seq.
-			if (op.oracle !== view.oracle.id) return;
-			if (w.writer !== view.oracle.id) return; // only the oracle key may post
-			if (typeof op.seq !== "number" || op.seq <= view.oracle.seq) return; // stale/replay
+			// ANY node posts its OWN reading (poster = the writer). Per-poster monotonic seq
+			// guards replay; the mark is the MEDIAN of recent posters — no single authority.
 			const price = parseAmount(op.price);
-			if (price === null) return;
-			view.oracle.price = price;
-			view.oracle.seq = op.seq;
+			if (price === null || typeof op.seq !== "number") return;
+			const prev = view.oracle.readings.get(w.writer);
+			if (prev && op.seq <= prev.seq) return; // stale/replayed from this poster
+			view.oracle.postCount++;
+			view.oracle.readings.set(w.writer, { price, seq: op.seq, at: view.oracle.postCount });
+			view.oracle.price = medianMark(view.oracle);
 			return;
 		}
 		case "oracle.meta": {
-			// The oracle discloses its sources on-chain (latest-wins). Only the oracle key.
-			if (op.oracle !== view.oracle.id || w.writer !== view.oracle.id) return;
+			// Any poster discloses its sources on-chain (latest-wins) — transparency, not authority.
 			if (!Array.isArray(op.sources)) return;
 			view.oracle.sources = op.sources.filter((s) => s && typeof s.endpoint === "string" && typeof s.key === "string").map((s) => ({ endpoint: s.endpoint, key: s.key }));
 			return;

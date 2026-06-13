@@ -30,13 +30,13 @@ export type Op =
 	/** Mark a withdrawal's BTC payout confirmed (reserves drop). Attestor key (seed) OR
 	 *  a committee threshold signature over the settle digest (committee mode, `sig`). */
 	| { kind: "bridge.settle"; withdrawalId: string; sig?: string }
-	/** A signed BTC price reading from the oracle. Authority = the oracle's key
-	 *  (checked in state); the webhook URL is only where it's published. Monotonic seq. */
-	| { kind: "oracle.post"; oracle: string; price: string; seq: number }
-	/** The oracle DISCLOSES its methodology on-chain — the sources (endpoint + JSON
-	 *  key-path) it derives the price from — so EVERY client sees what they trust,
-	 *  not just the publishing node. Signed by the oracle key; latest-wins. */
-	| { kind: "oracle.meta"; oracle: string; sources: { endpoint: string; key: string }[] }
+	/** A signed BTC price reading. ANY node may post its OWN reading (the poster is the
+	 *  write's signer); the mark is the MEDIAN of recent posters — no single authority.
+	 *  Per-poster monotonic seq guards replay/ordering. */
+	| { kind: "oracle.post"; price: string; seq: number }
+	/** A poster DISCLOSES the methodology it used (sources: endpoint + JSON key-path),
+	 *  on-chain, so everyone can audit what each oracle claims to source. Latest-wins. */
+	| { kind: "oracle.meta"; sources: { endpoint: string; key: string }[] }
 	/** Take the opposite side of a peer's signed intent: carries the maker's signed
 	 *  `offer` (gossiped, non-binding) and the stake the taker wants to `fill`. The fold
 	 *  verifies the maker's sig + that both peers can cover, escrows both, and opens a

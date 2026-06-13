@@ -17,7 +17,6 @@
 	let leverage = $state("2");
 	let busy = $state(false);
 	let walletOpen = $state(false);
-	let copied = $state(null);
 
 	const notional = $derived(amount && priceNum ? Number(amount) * Number(leverage) : null);
 	const exposure = $derived(notional && priceNum ? (notional / priceNum).toPrecision(3) : null);
@@ -66,13 +65,6 @@
 	async function processPayouts() {
 		await act(() => api.processWithdrawals());
 	}
-	async function copyKey(id) {
-		try {
-			await navigator.clipboard.writeText(id);
-			copied = id;
-			setTimeout(() => (copied = null), 1200);
-		} catch {}
-	}
 	function fmt(v) {
 		return v == null ? "—" : Number(v).toLocaleString();
 	}
@@ -84,9 +76,9 @@
 		<div class="pair">BTC <span class="muted">/ USD</span></div>
 		{#if priceNum != null}
 			<div class="price">${priceNum.toLocaleString()}</div>
-			<button class="src" title="copy the oracle key" onclick={() => copyKey(oracles[0]?.id)}>
-				<span class="dot live"></span> live · {copied === oracles[0]?.id ? "key copied ✓" : (oracles[0] ? short(oracles[0].id) : "oracle")}
-			</button>
+			<div class="src" title="the mark is the median of every node's posted reading — no single oracle">
+				<span class="dot live"></span> live · median of {oracles[0]?.posters ?? 1} oracle{(oracles[0]?.posters ?? 1) === 1 ? "" : "s"}
+			</div>
 		{:else}
 			<div class="price muted">—</div>
 			<div class="src"><span class="dot"></span> waiting for the oracle…</div>
@@ -229,8 +221,8 @@
 			{/each}
 			<div class="trust">
 				<p><span class="ok">✓</span> Every node verifies the ledger, the ordering, and the oracle's signature — no server, no single node trusted.</p>
-				<p><span class="ok">✓</span> The oracle's price sources are published on-chain (above), so anyone can re-fetch them and confirm the posted price.</p>
-				<p><span class="warn">⚠</span> The one thing you trust: that the oracle reports honestly. Disclosure makes a bad price <em>detectable</em>, not impossible — a later version takes an on-chain <strong>median</strong> of independent oracles.</p>
+				<p><span class="ok">✓</span> The price sources are published on-chain (above), so anyone can re-fetch them and confirm a posted reading.</p>
+				<p><span class="ok">✓</span> The mark is an on-chain <strong>median</strong> of every node's own posted reading — no single oracle to trust or bribe, and a minority posting bad prices can't move it. (Sybil-resistance — weighting posters by stake — is the next hardening.)</p>
 			</div>
 		</div>
 	</details>

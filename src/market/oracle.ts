@@ -1,30 +1,25 @@
 /**
- * The v1 BTC price oracle — identity + publisher.
+ * BTC price oracle keys.
  *
- * The oracle's AUTHORITY is its Ed25519 signing key; the webhook URL is only
- * where its signed readings are published (a convenience, never the authority).
- * Prices enter consensus as signed `oracle.post` writes folded by every node
- * (monotonic seq) — NOT per-node webhook fetches, which would diverge.
+ * The oracle is now DECENTRALIZED: every node posts its OWN signed `oracle.post`
+ * reading and the fold takes the MEDIAN of recent posters (see market/btc.ts) — no
+ * single authority key. Each node signs with its own stable identity (the daemon uses
+ * its producer key), so there's nothing special to hold here.
  *
- * v1 derives the oracle key deterministically from a fixed seed so its pubkey can
- * be the hardcoded `BTC_ORACLE` consensus constant (every node must agree which
- * key is authoritative). Whoever holds the seed runs the publisher. This is the
- * single-signer trust we accepted for v1; harden to a multi-signer median later.
- *
- * The seed is overridable via GAVL_ORACLE_SEED (hex) so a real deployment uses a
- * secret operator key instead of the public dev default — but then that key's
- * pubkey must be set as BTC_ORACLE on every node (a protocol constant change).
+ * `oracleKeyPair`/`oraclePubHex` derive a default dev oracle identity from a fixed seed —
+ * kept only as a convenient default poster identity and for back-compat (`BTC_ORACLE`);
+ * it is no longer an authority. Overridable via GAVL_ORACLE_SEED.
  */
 
 import { keyPairFromSeed } from "../det/ed25519.ts";
 import type { KeyPair } from "../det/ed25519.ts";
 import { sha256, toHex } from "../det/canonical.ts";
 
-/** Fixed dev seed for v1's BTC oracle. Public on purpose (single-signer v1).
- *  Override with GAVL_ORACLE_SEED for a real deployment (and update BTC_ORACLE). */
+/** Fixed dev seed for the default oracle identity (no longer an authority — the price is
+ *  a median of all posters). Override with GAVL_ORACLE_SEED. */
 const DEFAULT_ORACLE_SEED = "gavl-btc-oracle-v1";
 
-/** The oracle's keypair (32-byte seed → Ed25519). Holding this = able to post prices. */
+/** A default oracle keypair (32-byte seed → Ed25519). Not special anymore; any node posts. */
 export function oracleKeyPair(seedOverrideHex?: string): KeyPair {
 	const seed = seedOverrideHex && /^[0-9a-f]{64}$/i.test(seedOverrideHex) ? hexToBytes(seedOverrideHex) : sha256(DEFAULT_ORACLE_SEED); // 32 bytes
 	return keyPairFromSeed(seed);

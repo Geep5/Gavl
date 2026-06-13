@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
-import { computeView, gbtcOf, marketConserved, BTC_ORACLE } from "../src/market/btc.ts";
+import { computeView, gbtcOf, marketConserved } from "../src/market/btc.ts";
 import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
 import { PARAMS, K } from "./helpers.ts";
 
@@ -36,7 +36,7 @@ test("a gossiped offer is taken on-chain, escrows both sides, and settles at the
 	const A = mk(); // maker, will be LONG
 	const B = mk(); // taker, takes the SHORT side
 
-	await oracle.postPrice(BTC_ORACLE, 61000n, 0);
+	await oracle.postPrice(61000n, 0);
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 
@@ -60,7 +60,7 @@ test("a gossiped offer is taken on-chain, escrows both sides, and settles at the
 	assert.ok(marketConserved(v), "conserved while the contract is open");
 
 	// price settles above the cap → long (A) takes the whole pot
-	await oracle.postPrice(BTC_ORACLE, 63000n, 1);
+	await oracle.postPrice(63000n, 1);
 	const settleW = await mk().settle(matchId); // a third party settles it (permissionless)
 	born.set(settleW.id, 20);
 
@@ -77,7 +77,7 @@ test("a maker who spent the collateral (ghost) just fails to match — reserves 
 	const B = mk(); // taker
 	const C = mk(); // A sends its funds away before B can match (the "ghost")
 
-	await oracle.postPrice(BTC_ORACLE, 61000n, 0);
+	await oracle.postPrice(61000n, 0);
 	await fund(A, 1000n);
 	await fund(B, 1000n);
 

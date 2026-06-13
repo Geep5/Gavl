@@ -109,14 +109,15 @@ export class Account {
 		return this.produce({ kind: "bridge.settle", withdrawalId, sig });
 	}
 
-	/** Post a signed oracle price (only valid if this account IS the oracle key). */
-	postPrice(oracle: string, price: bigint | number | string, seq: number): Promise<Write> {
-		return this.produce({ kind: "oracle.post", oracle, price: amountStr(price), seq });
+	/** Post THIS node's signed BTC price reading. Any node may post its own; the mark is
+	 *  the median of recent posters. `seq` is per-poster monotonic. */
+	postPrice(price: bigint | number | string, seq: number): Promise<Write> {
+		return this.produce({ kind: "oracle.post", price: amountStr(price), seq });
 	}
 
-	/** Disclose the oracle's source methodology on-chain (only valid as the oracle key). */
-	postMeta(oracle: string, sources: { endpoint: string; key: string }[]): Promise<Write> {
-		return this.produce({ kind: "oracle.meta", oracle, sources });
+	/** Disclose this poster's source methodology on-chain (transparency; latest-wins). */
+	postMeta(sources: { endpoint: string; key: string }[]): Promise<Write> {
+		return this.produce({ kind: "oracle.meta", sources });
 	}
 
 	/** Announce the threshold-custody fund's group key on-chain (genesis). First write
