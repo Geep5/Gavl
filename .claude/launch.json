@@ -2,6 +2,12 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "gavl",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "port": 5180
+    },
+    {
       "name": "gavl-web",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "web:dev"],
