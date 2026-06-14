@@ -500,7 +500,28 @@ export class Daemon {
 	 *  Resumes from the checkpoint base so a pruned node folds forward, not from genesis. */
 	private appRootForParent(prev: Anchor | null): string {
 		if (!prev || !this.node.anchors) return this.emptyAppRoot();
-		return viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors, prev.id, this.checkpointBase));
+		return this.appRootFor(prev.id);
+	}
+
+	/** Memoized appRoot for the state `prevId` certified. It's a pure function of `prevId`
+	 *  (lag-by-parent → all children of prev commit the same appRoot) and the checkpoint base —
+	 *  prev's certified writes are immutable once in-chain. So cache by prevId, scoped to the
+	 *  checkpoint epoch (lastCheckpointHeight): when the base advances the whole cache is dropped
+	 *  (the old, now-pruned prevIds go with it). Folded once per (prev, checkpoint) instead of on
+	 *  every mine + every inbound anchor's verifyState. */
+	private appRootCache = new Map<string, string>();
+	private appRootCacheEpoch = Number.NaN;
+	private appRootFor(prevId: string): string {
+		if (this.appRootCacheEpoch !== this.lastCheckpointHeight) {
+			this.appRootCache.clear();
+			this.appRootCacheEpoch = this.lastCheckpointHeight;
+		}
+		let r = this.appRootCache.get(prevId);
+		if (r === undefined) {
+			r = viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, prevId, this.checkpointBase));
+			this.appRootCache.set(prevId, r);
+		}
+		return r;
 	}
 
 	/** AnchorChain.verifyState hook — enforce a peer's appRoot against our own fold. If we lack
@@ -512,7 +533,7 @@ export class Daemon {
 		if (!prev) return anchor.appRoot === this.emptyAppRoot();
 		const prevHeads = anchors.headsAt(prev.id);
 		if (!this.haveAllWrites(prevHeads)) return true; // missing data → defer, don't reject
-		return anchor.appRoot === viewRoot(viewAtAnchor(this.node.ledger.allWrites(), anchors, prev.id, this.checkpointBase));
+		return anchor.appRoot === this.appRootFor(prev.id);
 	}
 
 	/** True if our ledger holds every writer's chain up to `heads` (so we can fold that state). */

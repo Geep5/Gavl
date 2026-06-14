@@ -28,7 +28,6 @@ import { equivocationCulprit } from "../custody/slashing.ts";
 import { emptyBook, escrowedInContracts, applyMatch, applyMatchPot, applySettle, pruneExpiredOffers, settleExpired } from "./intent.ts";
 import type { Side } from "./intent.ts";
 import type { MarketBook, Offer } from "./intent.ts";
-import { serializeView, deserializeView } from "./state.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "../custody/attestation.ts";
 import { fromHex } from "../det/canonical.ts";
@@ -224,10 +223,44 @@ function accrueDemurrage(view: View, nowHeight: number): void {
 	}
 }
 
+/**
+ * Deep-copy a View so a resumed fold can mutate freely without touching the cached/snapshot base.
+ * A direct structural clone — Maps/Sets rebuilt, every nested value object the fold mutates in
+ * place (chargeFrom's `charged`, pending/unbonding/claims/readings/contracts/offerFills) copied —
+ * instead of a serialize→sort→stringify→parse round-trip. Same result, far cheaper. The
+ * checkpoint-determinism tests (full fold vs base-resumed fold) guard that this copies everything
+ * the serializer would: a dropped field would diverge the resumed viewRoot.
+ */
+export function cloneView(v: View): View {
+	const b = v.bridge;
+	const cp = <T extends object>(m: Map<string, T>): Map<string, T> => new Map([...m].map(([k, x]) => [k, { ...x }]));
+	return {
+		bridge: {
+			gbtc: new Map(b.gbtc), // bigint values are immutable → shallow Map copy is a full copy
+			reserves: b.reserves,
+			processed: new Set(b.processed),
+			pending: b.pending.map((p) => ({ ...p })),
+			depositors: new Set(b.depositors),
+			claims: cp(b.claims),
+			broadcasts: new Map(b.broadcasts),
+			bonds: new Map(b.bonds),
+			unbonding: cp(b.unbonding),
+			mintedTotal: b.mintedTotal,
+			paidOut: b.paidOut,
+			chargeFrom: cp(b.chargeFrom),
+			pot: b.pot,
+			potEscrowTaken: b.potEscrowTaken,
+		},
+		oracle: { price: v.oracle.price, readings: cp(v.oracle.readings), postCount: v.oracle.postCount, sources: v.oracle.sources.map((s) => ({ ...s })) },
+		custody: { fundKey: v.custody.fundKey, epoch: v.custody.epoch },
+		book: { contracts: cp(v.book.contracts), offerFills: cp(v.book.offerFills) },
+	};
+}
+
 export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	const cmp = opts.order ?? cmpWrite;
 	const view: View = opts.base
-		? deserializeView(serializeView(opts.base)) // deep copy so the cached/snapshot base isn't mutated
+		? cloneView(opts.base) // deep copy so the cached/snapshot base isn't mutated
 		: {
 				bridge: emptyBridge(),
 				oracle: { price: null, readings: new Map(), postCount: 0, sources: [] },
