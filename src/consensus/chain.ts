@@ -18,6 +18,7 @@ import type { SpaceVerifier } from "./space.ts";
 import { nextDifficulty } from "./difficulty.ts";
 import type { RetargetSchedule } from "./difficulty.ts";
 import type { ChainParams } from "../chain/writer.ts";
+import { rootOfHeads } from "../ledger/ledger.ts";
 import type { Heads } from "../ledger/ledger.ts";
 
 export type AddResult = { ok: true } | { ok: false; reason: string };
@@ -233,6 +234,37 @@ export class AnchorChain {
 		for (const [id, a] of this.anchors) if (a.height < floorHeight) this.anchors.delete(id); // dead forks included
 		this.floorId = floor.id;
 		this.floorHeads = fh;
+	}
+
+	/**
+	 * Bootstrap a FRESH chain at a trusted floor — the genesis-free counterpart to prune(). A node
+	 * that loaded a finalized checkpoint installs that checkpoint's anchor as the root: it is taken
+	 * on TRUST (weak subjectivity — its PoST is NOT re-verified back to genesis, which is grindable
+	 * and unprovable by design), and everything ABOVE it is verified normally, inheriting the
+	 * floor's committed cumulative weight. `floorHeads` are the FULL heads the floor certified
+	 * (carried by the snapshot), so head reconstruction works without the pruned-away ancestry. The
+	 * floor is locked as final. The CALLER authenticates the matching state separately (the
+	 * checkpoint's child anchor commits its appRoot); adopt() only seeds the anchor chain.
+	 *
+	 * Must be called on an empty chain. With a retarget schedule the floor must sit on an epoch
+	 * boundary and window ≤ epoch, so every difficulty recompute above the floor draws a window
+	 * that lies entirely above it (between boundaries difficulty just inherits) — otherwise a
+	 * recompute would dip into the missing ancestry and diverge from a full node. Throws if either
+	 * the integrity check or that safety condition fails, rather than adopt into a fork.
+	 */
+	adopt(floor: Anchor, floorHeads: Heads): void {
+		if (this.tipId !== null || this.anchors.size > 0) throw new Error("adopt: chain is not empty");
+		if (rootOfHeads(floorHeads) !== floor.stateRoot) throw new Error("adopt: floorHeads do not match floor.stateRoot");
+		if (this.schedule) {
+			if (this.schedule.window > this.schedule.epoch) throw new Error("adopt: retarget window exceeds epoch — cannot bound the difficulty window above the floor");
+			if (floor.height % this.schedule.epoch !== 0) throw new Error("adopt: floor must sit on an epoch boundary for deterministic retarget");
+		}
+		this.anchors.set(floor.id, floor);
+		this.floorId = floor.id;
+		this.floorHeads = { ...floorHeads };
+		this.tipId = floor.id;
+		this.tipHeads = { ...floorHeads };
+		this.lockedId = floor.id; // the adopted checkpoint is final by assumption
 	}
 
 	/** Anchors currently held (for tests / diagnostics). */
