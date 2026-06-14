@@ -22,9 +22,12 @@ class SwarmConnection implements Connection {
 	private readonly closeHandlers: (() => void)[] = [];
 	private inbuf: Buffer = Buffer.alloc(0);
 	private closed = false;
+	/** Remote Noise/DHT public key (hex) — the peer's stable wire identity, for adoption quorum. */
+	readonly peerKey?: string;
 
-	constructor(socket: Duplex) {
+	constructor(socket: Duplex & { remotePublicKey?: Buffer }) {
 		this.socket = socket;
+		this.peerKey = socket.remotePublicKey ? socket.remotePublicKey.toString("hex") : undefined;
 		socket.on("data", (d: Buffer) => this.onData(d));
 		socket.on("close", () => this.fireClose());
 		socket.on("error", () => this.fireClose());

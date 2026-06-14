@@ -31,6 +31,9 @@ export interface Connection {
 	onMessage(handler: (msg: SyncMessage) => void): void;
 	onClose(handler: () => void): void;
 	close(): void;
+	/** The remote peer's stable identity (hex pubkey), if the transport exposes one. Used to count
+	 *  DISTINCT peers for adoption quorum — so one peer can't fake agreement over many connections. */
+	readonly peerKey?: string;
 }
 
 export class GavlNode {
@@ -59,6 +62,12 @@ export class GavlNode {
 	 *  adopt a TRUSTED finalized floor if one matches a pulled checkpoint. Returns true if it did
 	 *  (then the suffix links above it). The app decides what to trust. */
 	adoptFloor?: (candidates: Anchor[]) => boolean;
+	/** How many DISTINCT peers must offer the same checkpoint before we'll pull + adopt it. 1 =
+	 *  trust the first peer (weak); ≥2 = require quorum so a lone (or sybil) peer can't feed a fake
+	 *  floor. See docs/weak-subjectivity.md. */
+	snapshotQuorum = 1;
+	/** Latest checkpoint a peer has offered, per connection — the votes counted toward quorum. */
+	private readonly snapshotOffers = new Map<Connection, { anchorId: string; height: number }>();
 	/** Suffix anchors a fresh node received that couldn't link to (its absent) genesis — held until
 	 *  a checkpoint lets us adopt a floor beneath them. Cleared once adopted. */
 	private orphanAnchors = new Map<string, Anchor>();
@@ -73,7 +82,10 @@ export class GavlNode {
 	/** Wire up a peer connection and greet it (write hello + anchor tip). */
 	addPeer(conn: Connection): void {
 		this.conns.add(conn);
-		conn.onClose(() => this.conns.delete(conn));
+		conn.onClose(() => {
+			this.conns.delete(conn);
+			this.snapshotOffers.delete(conn); // its checkpoint vote no longer counts toward quorum
+		});
 		conn.onMessage((m) => this.handle(conn, m));
 		conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads() });
 		const tip = this.anchorTipMsg();
@@ -160,9 +172,11 @@ export class GavlNode {
 				return;
 			}
 			case "snapshot-offer": {
-				// A peer advertises a checkpoint. Pull it only if I'm missing the history it
-				// covers (a fresh joiner) — otherwise normal write sync handles me.
-				if (this.wantSnapshot?.(m)) conn.send({ t: "snapshot-want" });
+				// A peer advertises a checkpoint. Record its vote, then pull it only if I'm missing
+				// the history it covers (a fresh joiner) AND enough DISTINCT peers vouch for the same
+				// checkpoint (quorum) — so a lone or sybil peer can't feed me a fabricated floor.
+				this.snapshotOffers.set(conn, { anchorId: m.anchorId, height: m.height });
+				if (this.wantSnapshot?.(m) && this.snapshotQuorumMet(m.anchorId)) conn.send({ t: "snapshot-want" });
 				return;
 			}
 			case "snapshot-want": {
@@ -309,6 +323,15 @@ export class GavlNode {
 			this.onTip?.(after);
 			this.broadcastExcept(conn, this.anchorTipMsg()!); // propagate the heavier tip onward
 		}
+	}
+
+	/** True if at least `snapshotQuorum` DISTINCT peers have offered the checkpoint `anchorId`.
+	 *  Peers are deduped by their stable wire identity (peerKey) so one peer opening many
+	 *  connections can't manufacture agreement; absent a peerKey, the connection itself counts. */
+	snapshotQuorumMet(anchorId: string): boolean {
+		const vouchers = new Set<string | Connection>();
+		for (const [conn, offer] of this.snapshotOffers) if (offer.anchorId === anchorId) vouchers.add(conn.peerKey ?? conn);
+		return vouchers.size >= this.snapshotQuorum;
 	}
 
 	/** Genesis-free bootstrap: on a fresh (tipless) chain, ask the app to adopt a trusted floor from

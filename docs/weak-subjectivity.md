@@ -51,13 +51,24 @@ doesn't match the floor it presents, but it can present an entirely fabricated f
 
 The mechanism is sound; the *trust in the floor* is what must be hardened operationally:
 
-- **Multi-peer agreement** — require the same `(floorId, height, weight)` from N independent peers
-  before adopting. A lone peer then can't feed a fork. *(planned)*
-- **Shipped checkpoints** — bake a recent `(height, anchorId)` into releases (or a signed
+- **Multi-peer agreement (implemented).** A fresh node adopts a checkpoint only after
+  `adoptQuorum` **distinct peers** offer the *same* checkpoint anchor. Peers are deduped by their
+  stable wire identity (`peerKey`), so one peer opening many connections can't manufacture
+  agreement. Default is `1` (trust the first peer — fine for dev / a single trusted bootstrap);
+  set `adoptQuorum: 2+` in production so a lone or sybil peer can't feed a fabricated floor.
+  Implemented in `GavlNode.snapshotQuorumMet` + the daemon's `adoptFloor` gate.
+- **Deterministic checkpoint cadence (implemented).** Nodes checkpoint at a fixed height — the
+  largest `CHECKPOINT_EVERY` boundary the finalized anchor has crossed — not at each node's current
+  finalized tip. So every honest node checkpoints the *same* anchor, which is what makes a quorum of
+  identical offers actually achievable (`maybeCheckpoint`).
+- **Shipped checkpoints (planned).** Bake a recent `(height, anchorId)` into releases (or a signed
   well-known list), so the trust anchor is the software you installed, not whoever answers first.
-  *(planned)*
-- **Online assumption** — a node offline longer than the checkpoint horizon should re-verify its
+- **Online assumption.** A node offline longer than the checkpoint horizon should re-verify its
   checkpoint out-of-band before trusting peers, exactly as Ethereum PoS weak-subjectivity advises.
+
+> Quorum raises the bar from "trust one peer" to "trust that N independent peers aren't all
+> colluding," but it is not a cryptographic guarantee — N sybil identities (distinct pubkeys) still
+> defeat it. Shipped checkpoints are the stronger anchor; quorum is the cheap, always-on default.
 
 ## Determinism constraint (retarget)
 

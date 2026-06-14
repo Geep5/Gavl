@@ -87,6 +87,10 @@ export interface DaemonOptions {
 	k?: number;
 	/** Anchor-depth at which state is considered final. */
 	finalityDepth?: number;
+	/** Distinct peers that must offer the same checkpoint before a fresh node adopts it as a trusted
+	 *  floor (genesis-free bootstrap). Default 1 (trust the first peer); set ≥2 for quorum so a lone
+	 *  or sybil peer can't feed a fabricated history. See docs/weak-subjectivity.md. */
+	adoptQuorum?: number;
 	/** Anchor space backend: light stand-in (default) or real chiapos (real disk cost). */
 	space?: SpaceMode;
 	/** Initial channel/network name (the DHT topic is sha256 of it). Default "gavl". */
@@ -199,6 +203,7 @@ export class Daemon {
 	readonly knownPeers = new KnownPeers();
 	readonly bootstrap: BootstrapList;
 	readonly finalityDepth: number;
+	private readonly adoptQuorum: number;
 	private readonly params: ChainParams;
 	private readonly k: number;
 	private readonly spaceMode: SpaceMode;
@@ -244,6 +249,7 @@ export class Daemon {
 		this.params = opts.params ?? defaultParams();
 		this.k = opts.k ?? 11;
 		this.finalityDepth = opts.finalityDepth ?? 1;
+		this.adoptQuorum = opts.adoptQuorum ?? 1;
 		this.heartbeatMs = opts.heartbeatMs ?? 120_000;
 		this.targetSecPerAnchor = opts.targetSecPerAnchor ?? 60;
 		this.spaceMode = opts.space ?? "standin";
@@ -287,6 +293,7 @@ export class Daemon {
 		this.node.wantSnapshot = (offer) => this.node.ledger.summary().writers === 0 && offer.height > this.lastCheckpointHeight; // only a truly fresh node bootstraps from state
 		this.node.onSnapshot = (snap) => this.ingestSnapshot(snap);
 		this.node.adoptFloor = (candidates) => this.adoptFloor(candidates);
+		this.node.snapshotQuorum = this.adoptQuorum; // distinct peers required to adopt a checkpoint
 	}
 
 	/** Verify a peer-supplied checkpoint against our synced anchor chain, then seed from it.
@@ -331,6 +338,7 @@ export class Daemon {
 		if (!anchors || !snap || anchors.tip() !== null) return false; // only on a fresh chain, with a pulled checkpoint
 		const floor = candidates.find((a) => a.id === snap.anchorId);
 		if (!floor) return false; // the checkpoint's anchor isn't in this suffix (yet)
+		if (!this.node.snapshotQuorumMet(snap.anchorId)) return false; // not enough distinct peers vouch for this floor
 		if (rootOfHeads(snap.heads) !== floor.stateRoot) return false; // snapshot heads must be the ones the floor PoST-committed
 		try {
 			anchors.adopt(floor, snap.heads); // install the trusted root (throws if unsafe — e.g. off an epoch boundary)
@@ -576,14 +584,22 @@ export class Daemon {
 		const anchors = this.node.anchors;
 		if (!anchors) return;
 		const fin = anchors.finalized(this.finalityDepth);
-		if (!fin || fin.height <= this.lastCheckpointHeight) return;
-		if (this.lastCheckpointHeight >= 0 && fin.height - this.lastCheckpointHeight < CHECKPOINT_EVERY) return;
-		const heads = anchors.finalizedHeads(this.finalityDepth);
+		if (!fin) return;
+		// Checkpoint at a DETERMINISTIC height — the largest CHECKPOINT_EVERY boundary the finalized
+		// anchor has crossed — not at each node's current finalized tip. So every honest node
+		// checkpoints the SAME anchor, and a bootstrapping node can collect a quorum of identical
+		// offers (see docs/weak-subjectivity.md). Local-only; checkpoints aren't committed in any root.
+		const target = Math.floor(fin.height / CHECKPOINT_EVERY) * CHECKPOINT_EVERY;
+		if (target <= 0 || target <= this.lastCheckpointHeight) return;
+		let ckpt: Anchor | undefined = fin;
+		while (ckpt && ckpt.height > target) ckpt = ckpt.prev ? anchors.get(ckpt.prev) : undefined;
+		if (!ckpt || ckpt.height !== target) return; // the boundary anchor isn't reachable yet → wait
+		const heads = anchors.headsAt(ckpt.id);
 		if (Object.keys(heads).length === 0) return; // nothing certified yet
-		const view = this.finalView(); // full finalized state (resumes from the current base)
-		this.lastCheckpointHeight = fin.height;
+		const view = viewAtAnchor(this.node.ledger.allWrites(), anchors, ckpt.id, this.checkpointBase); // state at the boundary
+		this.lastCheckpointHeight = ckpt.height;
 		this.checkpointBase = view;
-		const snap: StoredSnapshot = { anchorId: fin.id, height: fin.height, heads, state: serializeView(view) };
+		const snap: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(view) };
 		this.lastSnapshot = snap; // kept in RAM to serve fresh peers (key-only nodes included)
 		const before = this.node.ledger.summary().writes;
 		this.node.ledger.pruneBelow(heads); // drop RAM history below the checkpoint — bounds memory
@@ -592,14 +608,14 @@ export class Daemon {
 		// every backward walk (difficulty, finality, committee selection, heads) stays intact.
 		const anchorsBefore = anchors.size;
 		const margin = Math.max(ANCHOR_KEEP_MARGIN, this.schedule?.window ?? 0, this.custodyOpts.windowAnchors ?? 0);
-		anchors.prune(fin.height - margin);
+		anchors.prune(ckpt.height - margin); // keep a margin below the CHECKPOINT (not the tip) so it stays serveable
 		this.viewCache = undefined;
 		this.finalCache = undefined;
 		// Durable store, if any: persist the snapshot + reclaim the pruned blocks (best-effort).
 		const store = this.store;
 		const persisted = store ? " (persisting)" : " (RAM-only)";
 		if (store) void store.persistSnapshot(snap).then(() => store.pruneBelow(heads)).catch(() => {});
-		console.log(`  checkpoint: height ${fin.height}, ${Object.keys(heads).length} writer(s); pruned ${before - this.node.ledger.summary().writes} write(s) + ${anchorsBefore - anchors.size} anchor(s) from RAM${persisted}`);
+		console.log(`  checkpoint: height ${ckpt.height} (boundary), ${Object.keys(heads).length} writer(s); pruned ${before - this.node.ledger.summary().writes} write(s) + ${anchorsBefore - anchors.size} anchor(s) from RAM${persisted}`);
 	}
 
 	// ── peer-to-peer intent market (in-memory offer book) ────────────

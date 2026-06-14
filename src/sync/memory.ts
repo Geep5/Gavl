@@ -16,9 +16,12 @@ class MemoryConnection implements Connection {
 	private readonly messageHandlers: ((m: SyncMessage) => void)[] = [];
 	private readonly closeHandlers: (() => void)[] = [];
 	private closed = false;
+	/** The remote node's stable id (so quorum counts distinct peers, mirroring the wire's pubkey). */
+	readonly peerKey: string;
 
-	constructor(net: MemoryNetwork) {
+	constructor(net: MemoryNetwork, peerKey: string) {
 		this.net = net;
+		this.peerKey = peerKey;
 	}
 
 	send(msg: SyncMessage): void {
@@ -48,11 +51,21 @@ class MemoryConnection implements Connection {
 
 export class MemoryNetwork {
 	private outstanding = 0;
+	private readonly nodeIds = new WeakMap<GavlNode, string>();
+	private nodeCounter = 0;
+	private idOf(n: GavlNode): string {
+		let id = this.nodeIds.get(n);
+		if (!id) {
+			id = "node" + this.nodeCounter++;
+			this.nodeIds.set(n, id);
+		}
+		return id;
+	}
 
 	/** Connect two nodes with a bidirectional in-memory link. */
 	link(a: GavlNode, b: GavlNode): void {
-		const ca = new MemoryConnection(this);
-		const cb = new MemoryConnection(this);
+		const ca = new MemoryConnection(this, this.idOf(b)); // a's view of b → peerKey = b's id
+		const cb = new MemoryConnection(this, this.idOf(a));
 		ca.peer = cb;
 		cb.peer = ca;
 		a.addPeer(ca);
