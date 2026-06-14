@@ -7,8 +7,9 @@ hyperswarm / hyperdht).
 Broadcast an intent to go **long** or **short** on Bitcoin; a real peer takes the opposite
 side; the two of you escrow against *each other* and settle at a signed oracle price.
 **There is no pool and no house** — every trade is a matched, zero-sum, fully-collateralized
-bet between two people, so the protocol is never a counterparty and reserves can never be
-drained. No counterparty → no trade. No servers and no chain to replay from genesis — state lives in
+bet between two people, so reserves can never be drained. When no peer is on the other side, a
+**liquidity backstop funded by idle-balance decay** can take it — so the reclaimed gBTC of
+squatters becomes the capital that lets someone trade. No servers and no chain to replay from genesis — state lives in
 RAM, is **checkpointed into the consensus chain** so a node boots from committed state (a
 key-only node can hold nothing but its key and bootstrap from peers), and is bounded by
 **cost + decay** rather than hard caps, so it stays small enough for commodity hardware. Every
@@ -69,7 +70,7 @@ in tests.
    position you never close **auto-settles at its time-lock** (a hard ~1-month cap), so nothing
    sits open forever.
 5. **Withdraw** — burn gBTC → a quorum threshold-signs and broadcasts a real Bitcoin tx. (Leave
-   gBTC idle too long and it **decays** to active traders — this is a service, not a vault.)
+   gBTC idle too long and it **decays** into the liquidity pot — this is a service, not a vault.)
 
 ### The matched engine (`src/market/intent.ts`, `src/market/btc.ts`)
 
@@ -84,24 +85,29 @@ No pool, no order book to babysit — just signed intents and matched bilateral 
   contract. No interactive handshake — the signed offer is the authorization.
 - **Bilateral, zero-sum, bounded.** Each side stakes the same; settlement splits the
   `2·stake` pot by directional PnL at the oracle mark, capped at the stake. The loser can
-  never owe more than it posted, and **the protocol is never the counterparty — so reserves
-  can't be drained.** "Leverage" just scales the price move and tightens the cap (at *L*×, a
-  `1/L` move against you wipes your stake).
-- **No counterparty → no trade.** With nobody on the other side, an intent simply rests
-  until a peer takes it. That's the honest shape of a decentralized market — the easy
-  long/short button takes resting liquidity if any exists, otherwise broadcasts your own.
+  never owe more than it posted. "Leverage" just scales the price move and tightens the cap (at
+  *L*×, a `1/L` move against you wipes your stake).
+- **A liquidity backstop, funded by idle decay.** With no peer on the other side, the **pot**
+  (the idle-decay bucket, see below) can take it — staking matching gBTC as the counterparty
+  (`match.pot`). The easy long/short button sweeps resting peer intents first, then falls back to
+  the pot for any remainder, so a trade can land even on an empty tape. The pot has PnL like any
+  side — winning trades drain idle capital out to traders, losing trades refill it. It can never
+  be drawn insolvent: a trade may only stake against pot capital that has *finalized* (a
+  network-agreed, deterministic budget), which provably keeps the free pot ≥ 0. It funds only
+  what it holds and never mints, so reserves still can't be drained.
 - **Partial fills + cross-node.** One offer fills across many takers (tracked by nonce);
   intents propagate epidemically, so a peer on another machine sees your tape and can take it.
 - **Time-locked.** Either side may close early at the mark, but every contract has a hard
   lifetime cap and **auto-settles at expiry** against the oracle — so the open-contract set is
   bounded by throughput, never accumulating positions nobody closes.
-- **Idle gBTC decays (a service, not a vault).** Free balances left idle past a ~1-week grace
-  bleed (−20%/day, with a hard 1-month cutoff) to capital working in open contracts — pushing
-  money to trade or withdraw rather than squat. It only *moves* gBTC (conservation holds) and is
-  self-limiting (no open contracts → no charge).
-- **Conservation, proven.** `reserves == free gBTC + bonded + contract escrow + pending`.
-  Match/settle/decay only *move* gBTC between buckets, never mint — tested as a hard invariant
-  over random op streams. (`src/market/intent.ts`)
+- **Idle gBTC decays into the pot (a service, not a vault).** Free balances left idle past a
+  ~1-week grace bleed (−20%/day, with a hard 1-month cutoff) into the liquidity **pot** — pushing
+  money to trade or withdraw rather than squat, and giving the backstop its capital. Decay is
+  per-balance and base-independent (the cutoff measures from a fixed idle-start, not a drifting
+  pointer), and only *moves* gBTC; the pot is just a counter, so every node agrees on it.
+- **Conservation, proven.** `reserves == free gBTC + bonded + contract escrow + pending + pot`.
+  Match/settle/decay/backstop only *move* gBTC between buckets, never mint — tested as a hard
+  invariant over random op streams. (`src/market/intent.ts`)
 
 ### The oracle (`src/market/oracle.ts`, `src/market/btc.ts`)
 
@@ -206,7 +212,7 @@ hyperdht topic whose name *is* the network identity.
 > **Bounded by design — no hard caps.** Every structure that lives in RAM is held in check by
 > the same shape: it **costs** something to create (a PoST cooldown, or real gBTC backing) **and
 > it decays or expires**. History prunes behind checkpoints; the anchor chain keeps only a recent
-> suffix; perps time-lock; idle balances decay (demurrage); stale deposit-claim requests expire
+> suffix; perps time-lock; idle balances decay (demurrage) into the liquidity pot; stale deposit-claim requests expire
 > after a reclaim grace; the gossip offer tape is cover-checked (only offers a maker can back are
 > kept) + TTL'd; and the out-of-order write buffer is PoST-gated + decays. So a small node's
 > memory is bounded by the **real economy**, not by an attacker's willingness to spam — with no
@@ -253,7 +259,7 @@ local-only) **and** the web UI in one command, cross-platform — no env vars to
 Other scripts:
 
 ```bash
-npm test                 # full suite (~200 tests): consensus, checkpoints, matched market, demurrage, intent gossip, oracle, custody, bridge
+npm test                 # full suite (~210 tests): consensus, checkpoints, matched market, demurrage, liquidity backstop, intent gossip, oracle, custody, bridge
 npm run demo             # PoST cooldown chain — watch space→cooldown
 npm run demo:consensus   # two nodes farm + gossip anchors, finalize the same state over a real mesh
 npm run daemon           # daemon only (real chiavdf VDF — needs the .venv; see below)
@@ -311,7 +317,8 @@ What's **trusted** (and surfaced honestly in the UI):
 - **Peer-to-peer matched market** ✅ signed intents gossiped over the mesh · matched
   bilateral contracts · zero-sum, fully-collateralized, **no pool** (reserves can't be
   drained) · bounded leverage · oracle-marked · close-early **+ time-locked auto-settle** ·
-  idle-balance **demurrage** · cross-node intent tape · Svelte tape/trade UI
+  idle-balance **demurrage** → **liquidity backstop** (pot as counterparty of last resort) ·
+  cross-node intent tape · Svelte tape/trade UI
 - **Oracle** ✅ decentralized **median of all posters** (no special publisher) · per-poster
   multi-feed average · move/heartbeat-gated posts · on-chain methodology disclosure · live feeds
 - **Real-BTC bridge (testnet)** ✅ FROST threshold signing · DKG · Taproot address +
