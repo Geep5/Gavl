@@ -42,6 +42,13 @@ export interface AnchorBody {
 	 *  reconstructed by accumulating deltas along the chain; `stateRoot` commits to it. */
 	headsDelta: Heads;
 	stateRoot: string; // rootOfHeads(FULL heads) — the commitment; verifies the accumulated delta
+	/** Application-state commitment: viewRoot of the folded state as of this anchor's PARENT's
+	 *  certified heads (the state this anchor builds upon; genesis commits the empty-state root).
+	 *  Committed lagged-by-one so both producer and verifier compute it from an anchor already in
+	 *  the chain (no chicken-and-egg with the id). Enforced by AnchorChain.verifyState — honest
+	 *  full nodes reject a wrong appRoot, which is what makes a finalized anchor a trustless
+	 *  checkpoint a pruned/new node can load instead of replaying history. */
+	appRoot: string;
 	weight: string; // cumulative weight = prev.weight + difficulty
 	space: SpaceCommitment; // {kind, id, k}
 	proof: unknown; // backend-specific space proof payload
@@ -92,6 +99,7 @@ function bodyOf(a: Anchor): AnchorBody {
 		difficulty: a.difficulty,
 		headsDelta: a.headsDelta,
 		stateRoot: a.stateRoot,
+		appRoot: a.appRoot,
 		weight: a.weight,
 		space: a.space,
 		proof: a.proof,
@@ -107,7 +115,7 @@ function idOf(body: AnchorBody, time: TimeProof): string {
  *  constant `params.difficulty`; the AnchorChain passes a retargeted value. The
  *  committed difficulty, the cumulative weight, AND required-iters all use it, so
  *  weight stays proportional to the VDF work actually served. */
-export async function mineAnchor(opts: { prev: Anchor | null; prevHeads?: Heads; producer: KeyPair; prover: SpaceProver; heads: Heads; params: ChainParams; difficulty?: bigint }): Promise<Anchor | null> {
+export async function mineAnchor(opts: { prev: Anchor | null; prevHeads?: Heads; producer: KeyPair; prover: SpaceProver; heads: Heads; params: ChainParams; difficulty?: bigint; appRoot?: string }): Promise<Anchor | null> {
 	const { prev, producer, prover, heads, params } = opts;
 	const prevHeads = opts.prevHeads ?? {}; // full heads the prev anchor certified ({} at genesis)
 	const difficulty = opts.difficulty ?? params.difficulty;
@@ -135,6 +143,7 @@ export async function mineAnchor(opts: { prev: Anchor | null; prevHeads?: Heads;
 		difficulty: difficulty.toString(),
 		headsDelta: diffHeads(prevHeads, heads), // only what changed since prev
 		stateRoot: rootOfHeads(heads), // commitment over the FULL heads
+		appRoot: opts.appRoot ?? "", // app-state commitment (see AnchorBody); "" when no app fold supplied
 		weight: weight.toString(),
 		space: commitment,
 		proof: mined.proof,

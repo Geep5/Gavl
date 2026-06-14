@@ -122,7 +122,7 @@ test("an offer fills partially across takers and never over-redeems", () => {
 	const cY = applyMatch(bridge, book, Y.pub, "w2", o, 50n, 1, MARK); // only 40 remain
 	assert.ok(cY && cY.stake === 40n, "Y is clamped to the remaining 40");
 	assert.equal(applyMatch(bridge, book, Z.pub, "w3", o, 10n, 1, MARK), null, "offer exhausted → no fill");
-	assert.equal(book.offerFills.get("p1"), 100n, "total filled == size, never more");
+	assert.equal(book.offerFills.get("p1")?.filled, 100n, "total filled == size, never more");
 	assert.ok(conserved(bridge, book));
 });
 
@@ -201,7 +201,7 @@ test("random match/settle stream: conservation + no over-redemption always hold"
 		// invariants after EVERY step
 		assert.ok(conserved(bridge, book), `conservation broke at step ${step}`);
 		for (const { o, size } of live) {
-			const filled = book.offerFills.get(o.nonce) ?? 0n;
+			const filled = book.offerFills.get(o.nonce)?.filled ?? 0n;
 			assert.ok(filled <= size, `offer ${o.nonce} over-redeemed: ${filled} > ${size}`);
 		}
 		assert.ok(bridge.reserves >= 0n && totalGbtc(bridge) >= 0n, "no negative balances");

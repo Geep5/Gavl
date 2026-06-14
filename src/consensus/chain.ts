@@ -34,6 +34,16 @@ export interface AnchorChainOptions {
 	 * a deep reorg would do). Omit → no locking (pure heaviest-chain).
 	 */
 	finalityDepth?: number;
+	/**
+	 * Application-state validator for an anchor's `appRoot`. The consensus layer can't fold
+	 * app state itself ("consensus never imports app state"), so the app supplies a closure:
+	 * given a cryptographically-valid anchor and its reconstructed full heads, return false to
+	 * REJECT it (the committed appRoot doesn't match the folded state). Honest full nodes
+	 * rejecting wrong-appRoot anchors is what secures the checkpoint a pruned/new node loads.
+	 * A node that can't yet fully fold (missing certified writes) should return true (defer) —
+	 * it isn't in a position to judge and must not reject a valid anchor. Omit → no app check.
+	 */
+	verifyState?: (anchor: Anchor, fullHeads: Heads) => boolean | Promise<boolean>;
 }
 
 function heavier(a: Anchor, b: Anchor): boolean {
@@ -48,6 +58,7 @@ export class AnchorChain {
 	private readonly verifier: SpaceVerifier;
 	private readonly schedule?: RetargetSchedule;
 	private readonly lockDepth?: number;
+	private readonly verifyState?: (anchor: Anchor, fullHeads: Heads) => boolean | Promise<boolean>;
 	private readonly anchors = new Map<string, Anchor>();
 	private tipId: string | null = null;
 	/** Reconstructed FULL heads for the current tip (anchors carry only deltas now). Kept
@@ -64,6 +75,7 @@ export class AnchorChain {
 		this.verifier = verifier;
 		this.schedule = opts.schedule;
 		this.lockDepth = opts.finalityDepth;
+		this.verifyState = opts.verifyState;
 	}
 
 	/** True if `anchor` descends from (or is) the locked final anchor. */
@@ -110,6 +122,14 @@ export class AnchorChain {
 		if (!v.ok) return v;
 
 		this.anchors.set(anchor.id, anchor);
+
+		// Application-state check: the anchor's appRoot must match the folded state (the app
+		// supplies the fold). Store first so the closure can walk this anchor's ancestry, then
+		// drop it on failure — a wrong appRoot makes the anchor invalid, like a bad signature.
+		if (this.verifyState && !(await this.verifyState(anchor, v.heads))) {
+			this.anchors.delete(anchor.id);
+			return { ok: false, reason: "appRoot ≠ folded state" };
+		}
 
 		// Sticky finality: reject any tip that would abandon the locked final anchor,
 		// even if it's heavier. Store the anchor (it may be a valid sibling branch) but

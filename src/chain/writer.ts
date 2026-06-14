@@ -182,22 +182,51 @@ export type AppendResult =
 
 export class WriterChain {
 	readonly writer: string;
-	readonly plotRoot: string;
+	/** The writer's fixed plot commitment root. Null only on a checkpoint-resumed chain
+	 *  with no writes yet — adopted from the first write (which self-verifies its plot). */
+	private plotRoot: string | null;
 	readonly params: ChainParams;
 	readonly writes: Write[] = [];
-	/** Cumulative weight (sum of difficulty) — input to heaviest-chain fork choice in P2. */
+	/** Cumulative weight (sum of difficulty) — input to heaviest-chain fork choice in P2.
+	 *  A resumed chain seeds this from its pruned prefix so totalWeight stays consistent. */
 	weight = 0n;
+	/** Floor seq: this chain holds writes from `baseSeq` upward (0 = full history). Writes
+	 *  below it were pruned behind a finalized checkpoint. */
+	readonly baseSeq: number;
+	/** Id of the write at `baseSeq - 1` (the pruned tip) so the first post-base write links
+	 *  its `prev`. Null at genesis (baseSeq 0). */
+	readonly baseHeadId: string | null;
 	private readonly bySeq = new Map<number, Write>();
 
-	constructor(opts: { writer: string; plot: PlotCommitment; params: ChainParams }) {
+	constructor(opts: { writer: string; plot?: PlotCommitment; params: ChainParams; baseSeq?: number; baseHeadId?: string | null }) {
 		this.writer = opts.writer;
-		this.plotRoot = opts.plot.root;
+		this.plotRoot = opts.plot?.root ?? null;
 		this.params = opts.params;
+		this.baseSeq = opts.baseSeq ?? 0;
+		this.baseHeadId = opts.baseHeadId ?? null;
+		// Account for the pruned prefix's weight (each write contributed writeWeight).
+		this.weight = BigInt(this.baseSeq) * writeWeight(this.params);
+	}
+
+	/** Resume a chain above a finalized checkpoint: no history below `baseSeq`, but the next
+	 *  write links to `baseHeadId`. The plot root is learned from the first post-base write. */
+	static resumeAt(opts: { writer: string; params: ChainParams; baseSeq: number; baseHeadId: string }): WriterChain {
+		return new WriterChain({ writer: opts.writer, params: opts.params, baseSeq: opts.baseSeq, baseHeadId: opts.baseHeadId });
+	}
+
+	/** Next seq this chain expects (floor + writes held). */
+	get nextSeq(): number {
+		return this.baseSeq + this.writes.length;
+	}
+
+	/** Current tip id: last write, else the pruned base head, else null (empty genesis chain). */
+	get headId(): string | null {
+		return this.writes.length > 0 ? this.writes[this.writes.length - 1].id : this.baseHeadId;
 	}
 
 	append(w: Write): AppendResult {
 		if (w.writer !== this.writer) return { ok: false, reason: "wrong writer" };
-		if (w.plot.root !== this.plotRoot) return { ok: false, reason: "wrong plot commitment" };
+		if (this.plotRoot !== null && w.plot.root !== this.plotRoot) return { ok: false, reason: "wrong plot commitment" };
 
 		const v = verifyWrite(w, this.params);
 		if (!v.ok) return { ok: false, reason: `invalid write: ${v.reason}` };
@@ -209,16 +238,23 @@ export class WriterChain {
 			return { ok: false, reason: "equivocation", equivocation: [existing, w] };
 		}
 
-		// Linear append: seq and prev must extend the tip exactly.
-		if (w.seq !== this.writes.length) {
-			return { ok: false, reason: `non-sequential seq (${w.seq}, expected ${this.writes.length})` };
+		// Linear append: seq and prev must extend the tip exactly (tip = last write, or the
+		// pruned base head for the first write above a checkpoint).
+		if (w.seq !== this.nextSeq) {
+			return { ok: false, reason: `non-sequential seq (${w.seq}, expected ${this.nextSeq})` };
 		}
-		const expectedPrev = this.writes.length > 0 ? this.writes[this.writes.length - 1].id : null;
-		if (w.prev !== expectedPrev) return { ok: false, reason: "bad prev link" };
+		if (w.prev !== this.headId) return { ok: false, reason: "bad prev link" };
 
+		if (this.plotRoot === null) this.plotRoot = w.plot.root; // adopt the plot on the first resumed write
 		this.writes.push(w);
 		this.bySeq.set(w.seq, w);
 		this.weight += writeWeight(this.params);
 		return { ok: true };
+	}
+
+	/** Applied write at absolute `seq`, or undefined (pruned/not yet held). */
+	at(seq: number): Write | undefined {
+		if (seq < this.baseSeq) return undefined;
+		return this.writes[seq - this.baseSeq];
 	}
 }

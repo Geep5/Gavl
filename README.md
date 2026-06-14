@@ -166,16 +166,25 @@ independent machines**, so the default stays single-operator seed custody (above
 State sync is epidemic: nodes compare a `stateRoot`, diff-pull what's missing, and join a
 hyperdht topic whose name *is* the network identity.
 
-> **Deferred — anchor scaling (delta-encoded heads).** Every anchor currently embeds the
-> *full* writer-heads map (`anchor.ts`), so an anchor is O(writers) — fine now, but it caps
-> how large an all-equal-node network can grow (~150 MB/anchor at a million writers). The
-> planned fix keeps the heads **root** as the commitment but carries only the writers that
-> *changed* since the previous anchor (a **delta**), shrinking anchors to
-> O(active-per-anchor) — ~100–1000× — so a much larger set of equal commodity nodes can
-> keep up. Paired with history **pruning + snapshots** (hold active state, not all history),
-> it's the path to a big equal-node network. A *Merkle tree* over heads (for light-client
-> inclusion proofs) is deliberately **out of scope** — every node here is full and equal.
-> Full plan + the throughput trade-offs: [`docs/scaling-equal-nodes.md`](docs/scaling-equal-nodes.md).
+> **State-committed checkpoints — the ledger never replays from 0.** Each anchor commits an
+> `appRoot` (`anchor.ts`): a `viewRoot` of the folded application state its parent certified.
+> A `k`-deep finalized anchor is therefore a **trustless checkpoint** — honest full nodes
+> reject any anchor whose `appRoot` doesn't match the state they fold (`AnchorChain.verifyState`),
+> so a checkpoint is as secure as the heaviest chain. On that basis a node:
+> - **boots** by loading the last checkpoint and folding only the post-checkpoint writes
+>   (`Ledger.seedCheckpoint`), never replaying from genesis;
+> - **prunes** history below a checkpoint from RAM and disk (`Ledger.pruneBelow`,
+>   `WriteStore.pruneBelow`), so neither grows without bound; and
+> - **bootstraps a fresh peer** by serving the committed *state* (a `snapshot` gossip message),
+>   which the peer authenticates against the anchor `appRoot` and folds forward — it never
+>   receives the pre-checkpoint history.
+>
+> Writer chains are prunable (a `baseSeq` floor + `baseHeadId` so the next write still links;
+> `writer.ts`), and the fold is resumable (`computeView({ base })`). Paired with the
+> already-shipped **delta-encoded anchor heads** (an anchor carries only the writers that
+> *changed*, keeping it O(active-per-anchor)), this is the path to a large equal-node network.
+> A *Merkle tree* over heads (light-client inclusion proofs) stays **out of scope** — every
+> node here is full and equal. Background: [`docs/scaling-equal-nodes.md`](docs/scaling-equal-nodes.md).
 
 ---
 

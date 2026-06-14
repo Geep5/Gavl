@@ -20,8 +20,19 @@
 
 import Corestore from "corestore";
 import type { Write } from "../chain/writer.ts";
+import type { Heads } from "../ledger/ledger.ts";
+import type { CanonState } from "../market/state.ts";
 import type { PersistPolicy, PolicyContext } from "./policy.ts";
 import { decode, recordKept } from "./policy.ts";
+
+/** A durable state checkpoint: the appRoot-certified view at a finalized anchor, plus the
+ *  heads it covers. Loaded on boot so the node resumes from state instead of replaying. */
+export interface StoredSnapshot {
+	anchorId: string;
+	height: number;
+	heads: Heads;
+	state: CanonState;
+}
 
 export interface StoreOptions {
 	/** Directory for the corestore (e.g. ~/.gavl/store). */
@@ -94,7 +105,8 @@ export class WriteStore {
 			const c = this.core(writerHex);
 			await c.ready();
 			for (let i = 0; i < c.length; i++) {
-				const block = await c.get(i);
+				const block = await c.get(i, { wait: false }); // null = pruned below a checkpoint → skip
+				if (!block) continue;
 				const w = JSON.parse(block.toString("utf8")) as Write;
 				onWrite(w);
 				writes++;
@@ -125,6 +137,57 @@ export class WriteStore {
 			set.add(block.toString("utf8"));
 		}
 		return [...set];
+	}
+
+	// ── state checkpoints (so boot resumes from state, not history) ──
+
+	private snapCore(): any {
+		return this.store.get({ name: "gavl/snapshot" });
+	}
+
+	/** Append a state checkpoint; the latest block is the current snapshot. */
+	async persistSnapshot(snap: StoredSnapshot): Promise<void> {
+		const c = this.snapCore();
+		await c.ready();
+		await c.append(Buffer.from(JSON.stringify(snap), "utf8"));
+	}
+
+	/** The most recent durable snapshot, or null if none taken yet. */
+	async loadSnapshot(): Promise<StoredSnapshot | null> {
+		const c = this.snapCore();
+		await c.ready();
+		if (c.length === 0) return null;
+		const block = await c.get(c.length - 1);
+		return JSON.parse(block.toString("utf8")) as StoredSnapshot;
+	}
+
+	/**
+	 * Reclaim disk behind a finalized checkpoint: clear persisted blocks for writes at/below
+	 * the checkpoint heads. The log keeps its length (positions stay valid) but the block data
+	 * is freed; replay() skips cleared blocks. Best-effort — never throws into the caller.
+	 */
+	async pruneBelow(heads: Heads): Promise<number> {
+		let cleared = 0;
+		for (const writerHex of await this.writerIndex()) {
+			const h = heads[writerHex];
+			if (!h) continue;
+			const c = this.core(writerHex);
+			await c.ready();
+			for (let i = 0; i < c.length; i++) {
+				try {
+					const block = await c.get(i, { wait: false });
+					if (!block) continue; // already cleared
+					const w = JSON.parse(block.toString("utf8")) as Write;
+					if (w.seq <= h.seq) {
+						await c.clear(i, i + 1);
+						cleared++;
+					}
+				} catch {
+					/* leave the block; pruning is opportunistic */
+				}
+			}
+		}
+		return cleared;
 	}
 
 	stats(): { kept: number; seen: number; policy: string } {

@@ -19,14 +19,15 @@
 import type { Write } from "../chain/writer.ts";
 import type { Op } from "./ops.ts";
 import { isOp } from "./ops.ts";
-import { finalizedOrdering } from "../consensus/order.ts";
+import { finalizedOrdering, orderingFor } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import { oraclePubHex, bridgePubHex } from "./oracle.ts";
 import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
-import { emptyBook, escrowedInContracts, applyMatch, applySettle } from "./intent.ts";
+import { emptyBook, escrowedInContracts, applyMatch, applySettle, pruneExpiredOffers } from "./intent.ts";
 import type { MarketBook, Offer } from "./intent.ts";
+import { serializeView, deserializeView } from "./state.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "../custody/attestation.ts";
 import { fromHex } from "../det/canonical.ts";
@@ -63,6 +64,13 @@ export interface OracleState {
 /** How many recent posts define "fresh": a poster whose latest reading is older than this
  *  many folded posts drops out of the median, so departed/stale oracles stop counting. */
 export const ORACLE_WINDOW = 64;
+
+/** Drop readings that have fallen out of the freshness window — they no longer count toward
+ *  the median, so this is behaviorally neutral, but it stops `readings` growing with every
+ *  poster ever seen (a departed/rotated oracle's last reading lingered forever otherwise). */
+function evictStaleReadings(o: OracleState): void {
+	for (const [poster, r] of o.readings) if (o.postCount - r.at >= ORACLE_WINDOW) o.readings.delete(poster);
+}
 
 /** The median of the fresh posters' latest readings (even count → lower-mid average). */
 function medianMark(o: OracleState): bigint | null {
@@ -153,16 +161,23 @@ export interface ViewOptions {
 	 *  write happened at, used for height-timed effects (unbond maturity) that must not
 	 *  drift as the fold's global `nowHeight` advances. */
 	bornAt?: Map<string, number>;
+	/** Resume from this state (a checkpoint): the fold starts from a DEEP COPY of `base`
+	 *  and applies only `writes` on top. Folding [post-checkpoint writes] onto the
+	 *  checkpoint view equals folding the full history — the basis for never replaying
+	 *  from 0. Height-timed effects act on state carried in `base` (bonds live there). */
+	base?: View;
 }
 
 export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	const cmp = opts.order ?? cmpWrite;
-	const view: View = {
-		bridge: emptyBridge(),
-		oracle: { price: null, readings: new Map(), postCount: 0, sources: [] },
-		custody: { fundKey: null, epoch: -1 },
-		book: emptyBook(),
-	};
+	const view: View = opts.base
+		? deserializeView(serializeView(opts.base)) // deep copy so the cached/snapshot base isn't mutated
+		: {
+				bridge: emptyBridge(),
+				oracle: { price: null, readings: new Map(), postCount: 0, sources: [] },
+				custody: { fundKey: null, epoch: -1 },
+				book: emptyBook(),
+			};
 	const nowHeight = opts.nowHeight ?? 0;
 	for (const w of [...writes].sort(cmp)) {
 		const op = w.payload as Op | null;
@@ -172,6 +187,8 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
+	evictStaleReadings(view.oracle); // drop posters that fell out of the freshness window
+	pruneExpiredOffers(view.book, nowHeight); // drop fill-tracking for offers that can no longer be matched
 	return view;
 }
 
@@ -185,10 +202,24 @@ export function mark(view: View): bigint | null {
  * PoST-bound order. Composes the pure consensus ordering with this app fold —
  * consensus never imports app state; the app calls consensus.
  */
-export function finalizedView(writes: Write[], anchors: AnchorChain, k: number): View {
+export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, base?: View): View {
 	const { included, order, bornAt, nowHeight } = finalizedOrdering(writes, anchors, k);
-	if (nowHeight === null) return computeView([]);
-	return computeView(included, { order, nowHeight, bornAt });
+	if (nowHeight === null) return base ? computeView([], { base }) : computeView([]);
+	return computeView(included, { order, nowHeight, bornAt, base });
+}
+
+/**
+ * The application state a SPECIFIC anchor commits to — the deterministic view of
+ * exactly the writes its heads certify, in the chain-induced order. This is what an
+ * anchor's `appRoot` is `viewRoot()` of; the producer computes it when mining and a
+ * verifier recomputes it to accept the anchor. Optionally resumes from a checkpoint
+ * `base` (a pruned node folds forward from its snapshot instead of from genesis).
+ */
+export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: string, base?: View): View {
+	const anchor = anchors.get(anchorId);
+	const { included, order, bornAt, nowHeight } = orderingFor(writes, anchors, anchor ?? null);
+	if (nowHeight === null) return base ? computeView([], { base }) : computeView([]);
+	return computeView(included, { order, nowHeight, bornAt, base });
 }
 
 function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number): void {

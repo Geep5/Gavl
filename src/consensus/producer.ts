@@ -21,6 +21,9 @@ export interface ProducerOptions {
 	keypair: KeyPair;
 	prover: SpaceProver;
 	params: ChainParams;
+	/** App-state commitment for an anchor extending `prev` (the appRoot it carries). Supplied
+	 *  by the app (the consensus layer can't fold app state). Omit → anchors carry "". */
+	appRootFor?: (prev: Anchor | null) => string;
 }
 
 export class Producer {
@@ -28,6 +31,7 @@ export class Producer {
 	private readonly keypair: KeyPair;
 	private readonly prover: SpaceProver;
 	private readonly params: ChainParams;
+	private readonly appRootFor?: (prev: Anchor | null) => string;
 	private active = false;
 
 	constructor(opts: ProducerOptions) {
@@ -35,6 +39,7 @@ export class Producer {
 		this.keypair = opts.keypair;
 		this.prover = opts.prover;
 		this.params = opts.params;
+		this.appRootFor = opts.appRootFor;
 	}
 
 	/** Mine + submit one anchor over the current tip + heads. Null if no proof this round.
@@ -51,6 +56,7 @@ export class Producer {
 			heads: this.node.ledger.heads(),
 			params: this.params,
 			difficulty,
+			appRoot: this.appRootFor?.(prev), // commit the state prev certified (lag-by-parent)
 		});
 		if (anchor) await this.node.submitAnchor(anchor);
 		return anchor;

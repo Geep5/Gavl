@@ -60,11 +60,19 @@ export interface FinalOrdering {
 }
 
 export function finalizedOrdering(writes: Write[], anchors: AnchorChain, k: number): FinalOrdering {
-	const finalAnchor = anchors.finalized(k);
-	if (!finalAnchor) return { included: [], order: () => 0, bornAt: new Map(), nowHeight: null };
+	return orderingFor(writes, anchors, anchors.finalized(k));
+}
 
-	const chain = anchors.chainTo(finalAnchor); // genesis → finalized, in height order
-	const heads = anchors.headsAt(finalAnchor.id); // full heads reconstructed from deltas
+/**
+ * The same PoST-bound ordering, but relative to an EXPLICIT anchor (genesis→anchor)
+ * rather than `finalized(k)`. Used to compute the state an anchor commits to (`appRoot`):
+ * the view of exactly the writes that anchor's heads certify, in its chain-induced order.
+ */
+export function orderingFor(writes: Write[], anchors: AnchorChain, anchor: Anchor | null): FinalOrdering {
+	if (!anchor) return { included: [], order: () => 0, bornAt: new Map(), nowHeight: null };
+
+	const chain = anchors.chainTo(anchor); // genesis → anchor, in height order
+	const heads = anchors.headsAt(anchor.id); // full heads reconstructed from deltas
 	const included = writes.filter((w) => {
 		const h = heads[w.writer];
 		return h !== undefined && w.seq <= h.seq;
@@ -79,5 +87,5 @@ export function finalizedOrdering(writes: Write[], anchors: AnchorChain, k: numb
 		if (a.writer !== b.writer) return a.writer < b.writer ? -1 : 1;
 		return a.seq - b.seq;
 	};
-	return { included, order, bornAt: epoch, nowHeight: finalAnchor.height };
+	return { included, order, bornAt: epoch, nowHeight: anchor.height };
 }

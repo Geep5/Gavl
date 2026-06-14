@@ -17,11 +17,14 @@
  * either way; chiapos is opt-in via GAVL_SPACE=chiapos.
  */
 
-import { Ledger } from "./ledger/ledger.ts";
+import { Ledger, rootOfHeads } from "./ledger/ledger.ts";
 import { GavlNode } from "./sync/node.ts";
 import { Account } from "./market/account.ts";
-import { computeView, finalizedView, mark } from "./market/btc.ts";
+import { computeView, finalizedView, viewAtAnchor, mark } from "./market/btc.ts";
 import type { View } from "./market/btc.ts";
+import { serializeView, deserializeView, viewRoot } from "./market/state.ts";
+import type { Anchor } from "./consensus/anchor.ts";
+import type { Heads } from "./ledger/ledger.ts";
 import { longPayout, verifyOffer } from "./market/intent.ts";
 import type { Offer, Side } from "./market/intent.ts";
 import { bridgeKeyPair } from "./market/oracle.ts";
@@ -67,6 +70,7 @@ import { generateKeyPair, keyPairFromSeed } from "./det/ed25519.ts";
 import type { KeyPair } from "./det/ed25519.ts";
 import { toHex, fromHex, sha256 } from "./det/canonical.ts";
 import { WriteStore } from "./store/store.ts";
+import type { StoredSnapshot } from "./store/store.ts";
 import { KeepAllPolicy, MinePolicy } from "./store/policy.ts";
 import type { PersistPolicy } from "./store/policy.ts";
 import { homedir } from "node:os";
@@ -156,6 +160,34 @@ export interface ConsensusStatus {
 	bootstrap: { node: string; default: boolean }[];
 }
 
+/**
+ * Source-side oracle pruning: should this node mint a new on-chain price post?
+ *
+ * Posting an identical price every poll is dead-weight — it grows every node's
+ * write-chain and durable store forever, and (deleting it after the fact is a
+ * consensus-level change to the hash-chained ledger, so we avoid creating it).
+ * We post only when the price actually MOVED ≥ `minMoveBps` from the last post,
+ * or it's gone STALE (≥ `heartbeatMs` since the last post) so the mark never
+ * drifts too old. `lastPrice == null` (never posted) always posts.
+ *
+ * Pure + exported so the gating is unit-testable without the network/clock.
+ */
+export function oracleShouldPost(a: { v: bigint; lastPrice: bigint | null; lastPostAt: number; now: number; minMoveBps: number; heartbeatMs: number }): boolean {
+	if (a.lastPrice == null || a.lastPrice === 0n) return true; // first post for this writer
+	const diff = a.v > a.lastPrice ? a.v - a.lastPrice : a.lastPrice - a.v;
+	const movedBps = Number((diff * 10_000n) / a.lastPrice);
+	if (movedBps >= a.minMoveBps) return true; // moved enough to be worth a write
+	return a.now - a.lastPostAt >= a.heartbeatMs; // else only on the staleness heartbeat
+}
+
+/** How many finalized anchors between durable checkpoints. Small enough to bound growth,
+ *  large enough that snapshotting/pruning isn't a per-anchor cost. Override for tests/tuning. */
+const CHECKPOINT_EVERY = Number(process.env.GAVL_CHECKPOINT_EVERY ?? "16");
+
+/** Default offer lifetime in anchors. Long enough to rest and get filled on a quiet market,
+ *  finite so its consensus fill-tracking (offerFills) retires after expiry instead of forever. */
+const OFFER_TTL_ANCHORS = Number(process.env.GAVL_OFFER_TTL ?? "2880");
+
 export class Daemon {
 	readonly node: GavlNode;
 	readonly wallet: Wallet;
@@ -219,7 +251,7 @@ export class Daemon {
 		this.bootstrap = new BootstrapList(undefined, opts.bootstrapEnv);
 		// Verifier must match the space backend producers use, or anchors are rejected.
 		this.verifier = this.spaceMode === "chiapos" ? new ChiaSpaceVerifier() : new StandinSpaceVerifier();
-		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, this.verifier, { schedule: opts.schedule, finalityDepth: this.finalityDepth }));
+		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, this.verifier, { schedule: opts.schedule, finalityDepth: this.finalityDepth, verifyState: (a, h) => this.checkAppRoot(a, h) }));
 		this.wallet = new Wallet(opts.walletDir);
 		this.wallet.ensureSeeded();
 		for (const wa of this.wallet.list()) this.bind(wa);
@@ -238,10 +270,53 @@ export class Daemon {
 			this.driveRotation(); // advance the custody epoch loop on each finality move
 			this.maintainCommitteeTopics(); // keep this node joined to its committee's sub-swarm
 			this.maybeAuthorizePending(); // co-sign pending withdrawals / mints / settles
+			this.maybeCheckpoint(); // snapshot + prune behind finality so history never grows unbounded
+			this.tryPendingSnapshot(); // a stashed peer checkpoint may now be verifiable
 		};
 		// matched-market intent gossip — (re)wire onto the fresh node.
 		this.node.onIntent = (offer) => this.receiveIntent(offer);
 		this.node.intentsToShare = () => [...this.offers.values()];
+		// checkpoint bootstrap — let a fresh peer load our latest state instead of all history.
+		this.node.snapshotHeader = () => (this.lastSnapshot ? { anchorId: this.lastSnapshot.anchorId, height: this.lastSnapshot.height } : null);
+		this.node.fullSnapshot = () => this.lastSnapshot ?? null;
+		this.node.wantSnapshot = (offer) => this.node.ledger.summary().writers === 0 && offer.height > this.lastCheckpointHeight; // only a truly fresh node bootstraps from state
+		this.node.onSnapshot = (snap) => this.ingestSnapshot(snap);
+	}
+
+	/** Verify a peer-supplied checkpoint against our synced anchor chain, then seed from it.
+	 *  Trust comes from the anchor chain: the checkpoint's heads must match the finalized
+	 *  anchor's stateRoot, and its committed state must match that anchor's CHILD appRoot
+	 *  (appRoot is lag-by-parent). If the anchors aren't synced yet, stash + retry on next tip. */
+	private ingestSnapshot(snap: StoredSnapshot): boolean {
+		const anchors = this.node.anchors;
+		if (!anchors) return false;
+		const anchor = anchors.get(snap.anchorId);
+		if (!anchor) {
+			this.pendingSnapshot = snap; // anchors not here yet → retry once they sync
+			return false;
+		}
+		if (rootOfHeads(snap.heads) !== anchor.stateRoot) return false; // heads not the ones this anchor PoST-committed
+		const child = anchors.chainTo().find((a) => a.prev === snap.anchorId); // the anchor that commits snap's state (lag-by-parent)
+		if (!child) {
+			this.pendingSnapshot = snap; // need the child anchor to authenticate the state
+			return false;
+		}
+		if (viewRoot(deserializeView(snap.state)) !== child.appRoot) return false; // state doesn't match the committed appRoot → reject
+		// Authentic. Seed the ledger at the checkpoint + rebase folds onto its state.
+		this.node.ledger.seedCheckpoint(snap.heads);
+		this.checkpointBase = deserializeView(snap.state);
+		this.lastCheckpointHeight = snap.height;
+		this.lastSnapshot = snap;
+		this.pendingSnapshot = undefined;
+		this.viewCache = undefined;
+		this.finalCache = undefined;
+		return true;
+	}
+
+	/** Retry a stashed snapshot once the anchor chain has caught up (called on each tip move).
+	 *  On success, re-advertise so peers serve the post-checkpoint write tail. */
+	private tryPendingSnapshot(): void {
+		if (this.pendingSnapshot && this.ingestSnapshot(this.pendingSnapshot)) this.node.advertise();
 	}
 
 	/** Feed the finalized chain to the custody rotation loop (no-op unless committee
@@ -323,6 +398,20 @@ export class Daemon {
 		this.store = new WriteStore({ dir, policy });
 		await this.store.ready();
 
+		// Boot from the last durable checkpoint instead of replaying from 0: load the committed
+		// state, seed the ledger at the checkpoint heads, and rebase future folds onto it. Writes
+		// at/below the floor then no-op in apply() (a cheap seq compare — no fold), so replay only
+		// re-applies the post-checkpoint tail. Self-trusted (we computed it); a peer-supplied
+		// snapshot is appRoot-verified on the sync path.
+		const snap = await this.store.loadSnapshot();
+		if (snap) {
+			this.checkpointBase = deserializeView(snap.state);
+			this.node.ledger.seedCheckpoint(snap.heads);
+			this.lastCheckpointHeight = snap.height;
+			this.lastSnapshot = snap; // serve it to fresh peers too
+			console.log(`  storage: loaded checkpoint at height ${snap.height} (${Object.keys(snap.heads).length} writer head(s)) — skipping replay below it`);
+		}
+
 		// Replay persisted writes into the ledger BEFORE going live. Seed the logical
 		// clock past the highest replayed ts so new writes are GLOBALLY monotonic —
 		// otherwise a restart resets ts to 0, colliding with persisted writes and
@@ -373,9 +462,90 @@ export class Daemon {
 		return this.bind(this.wallet.create(label));
 	}
 
-	/** Optimistic view over all local writes (responsive — reflects an action immediately). */
+	/** Optimistic view over all local writes (responsive — reflects an action immediately).
+	 *  Folds the writes the ledger still holds onto the checkpoint base (so it never re-folds
+	 *  pruned history), and memoizes on the heads root so polls don't re-fold unchanged state. */
 	view(): View {
-		return computeView(this.node.ledger.allWrites());
+		const root = this.node.ledger.stateRoot();
+		if (this.viewCache && this.viewCache.root === root) return this.viewCache.view;
+		const view = computeView(this.node.ledger.allWrites(), { base: this.checkpointBase });
+		this.viewCache = { root, view };
+		return view;
+	}
+
+	// ── state-committed checkpoints — the ledger never replays from 0 ──────
+	/** View at the ledger's prune floor (the last checkpoint). The ledger holds only writes
+	 *  ABOVE it; every fold resumes from here. Undefined ⇒ full history (never checkpointed). */
+	private checkpointBase?: View;
+	private lastCheckpointHeight = -1;
+	/** The latest durable checkpoint (kept in memory so it can be served to fresh peers). */
+	private lastSnapshot?: StoredSnapshot;
+	/** A peer's checkpoint awaiting anchor-chain sync before it can be authenticated. */
+	private pendingSnapshot?: StoredSnapshot;
+	private viewCache?: { root: string; view: View };
+	private finalCache?: { id: string | null; view: View };
+	private emptyAppRootCache?: string;
+
+	private emptyAppRoot(): string {
+		return (this.emptyAppRootCache ??= viewRoot(computeView([])));
+	}
+
+	/** The appRoot an anchor extending `prev` must commit: viewRoot of the state `prev`
+	 *  certified (empty at genesis). Lag-by-parent → always computable from an in-chain anchor.
+	 *  Resumes from the checkpoint base so a pruned node folds forward, not from genesis. */
+	private appRootForParent(prev: Anchor | null): string {
+		if (!prev || !this.node.anchors) return this.emptyAppRoot();
+		return viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors, prev.id, this.checkpointBase));
+	}
+
+	/** AnchorChain.verifyState hook — enforce a peer's appRoot against our own fold. If we lack
+	 *  the parent's certified writes we DEFER (can't judge yet; re-checked when they arrive). */
+	private checkAppRoot(anchor: Anchor, _heads: Heads): boolean {
+		const anchors = this.node.anchors;
+		if (!anchors) return true;
+		const prev = anchor.prev ? anchors.get(anchor.prev) ?? null : null;
+		if (!prev) return anchor.appRoot === this.emptyAppRoot();
+		const prevHeads = anchors.headsAt(prev.id);
+		if (!this.haveAllWrites(prevHeads)) return true; // missing data → defer, don't reject
+		return anchor.appRoot === viewRoot(viewAtAnchor(this.node.ledger.allWrites(), anchors, prev.id, this.checkpointBase));
+	}
+
+	/** True if our ledger holds every writer's chain up to `heads` (so we can fold that state). */
+	private haveAllWrites(heads: Heads): boolean {
+		for (const writer of Object.keys(heads)) {
+			if (this.node.ledger.idAt(writer, heads[writer].seq) !== heads[writer].id) return false;
+		}
+		return true;
+	}
+
+	/** Once finality advances past the cadence, checkpoint the committed state and prune history
+	 *  behind it so RAM never grows without bound — for EVERY node, with or without a durable
+	 *  store. The checkpoint is a RAM-first thing: a key-only client (no store, just its key on
+	 *  disk) bounds its own memory and can serve the checkpoint to fresh peers exactly like an
+	 *  archiver. A durable store, if present, additionally persists the snapshot + reclaims disk
+	 *  so the node can also resume from its own disk after a crash. Idempotent + cheap per tip. */
+	private maybeCheckpoint(): void {
+		const anchors = this.node.anchors;
+		if (!anchors) return;
+		const fin = anchors.finalized(this.finalityDepth);
+		if (!fin || fin.height <= this.lastCheckpointHeight) return;
+		if (this.lastCheckpointHeight >= 0 && fin.height - this.lastCheckpointHeight < CHECKPOINT_EVERY) return;
+		const heads = anchors.finalizedHeads(this.finalityDepth);
+		if (Object.keys(heads).length === 0) return; // nothing certified yet
+		const view = this.finalView(); // full finalized state (resumes from the current base)
+		this.lastCheckpointHeight = fin.height;
+		this.checkpointBase = view;
+		const snap: StoredSnapshot = { anchorId: fin.id, height: fin.height, heads, state: serializeView(view) };
+		this.lastSnapshot = snap; // kept in RAM to serve fresh peers (key-only nodes included)
+		const before = this.node.ledger.summary().writes;
+		this.node.ledger.pruneBelow(heads); // drop RAM history below the checkpoint — bounds memory
+		this.viewCache = undefined;
+		this.finalCache = undefined;
+		// Durable store, if any: persist the snapshot + reclaim the pruned blocks (best-effort).
+		const store = this.store;
+		const persisted = store ? " (persisting)" : " (RAM-only)";
+		if (store) void store.persistSnapshot(snap).then(() => store.pruneBelow(heads)).catch(() => {});
+		console.log(`  checkpoint: height ${fin.height}, ${Object.keys(heads).length} writer(s); pruned ${before - this.node.ledger.summary().writes} write(s) from RAM${persisted}`);
 	}
 
 	// ── peer-to-peer intent market (in-memory offer book) ────────────
@@ -390,8 +560,10 @@ export class Daemon {
 		// Globally-unique nonce (crypto-random) so it never collides with a previously-matched
 		// offer's nonce in the persisted offerFills — even across restarts / store resets.
 		const nonce = `${me.pubHex.slice(0, 8)}-${randomBytes(8).toString("hex")}`;
-		// expiryHeight high → the offer doesn't expire in-fold; the book holds it until taken.
-		const offer = me.makeOffer({ makerSide: side, size, leverage, expiryHeight: 2_000_000_000, nonce });
+		// Finite TTL (anchors) so the offer's fill-tracking can be retired after it expires —
+		// otherwise offerFills (consensus state) grows with every offer ever broadcast.
+		const expiryHeight = (this.node.anchorTip()?.height ?? 0) + OFFER_TTL_ANCHORS;
+		const offer = me.makeOffer({ makerSide: side, size, leverage, expiryHeight, nonce });
 		this.offers.set(nonce, offer);
 		this.node.gossipIntent(offer); // flood it to peers so their tapes show it
 		return offer;
@@ -406,15 +578,20 @@ export class Daemon {
 		return true;
 	}
 
-	/** Live tape: resting offers with their remaining (unfilled) size, freshest first.
-	 *  Fully-filled offers drop off. */
+	/** Live tape: resting offers with their remaining (unfilled) size, freshest first. Doubles
+	 *  as the gossip-tape GC — fully-filled or expired offers are evicted from the local book
+	 *  (it's RAM-only, non-consensus, but should still not grow with every offer ever seen). */
 	intentTape(): { nonce: string; maker: string; side: Side; remaining: string; leverage: string; mine: boolean }[] {
 		const fills = this.view().book.offerFills;
 		const me = this.wallet.active().pubHex;
+		const height = this.node.anchorTip()?.height ?? 0;
 		const out: { nonce: string; maker: string; side: Side; remaining: string; leverage: string; mine: boolean }[] = [];
 		for (const o of [...this.offers.values()].reverse()) {
-			const remaining = BigInt(o.size) - (fills.get(o.nonce) ?? 0n);
-			if (remaining <= 0n) continue;
+			const remaining = BigInt(o.size) - (fills.get(o.nonce)?.filled ?? 0n);
+			if (remaining <= 0n || height > o.expiryHeight) {
+				this.offers.delete(o.nonce); // retire filled/expired offers from the local tape
+				continue;
+			}
 			out.push({ nonce: o.nonce, maker: o.maker, side: o.makerSide, remaining: remaining.toString(), leverage: o.leverage, mine: o.maker === me });
 		}
 		return out;
@@ -425,7 +602,7 @@ export class Daemon {
 		const offer = this.offers.get(nonce);
 		if (!offer) throw new Error("that intent is no longer available");
 		if (offer.maker === this.wallet.active().pubHex) throw new Error("you can't take your own intent — switch to another account");
-		const remaining = BigInt(offer.size) - (this.view().book.offerFills.get(nonce) ?? 0n);
+		const remaining = BigInt(offer.size) - (this.view().book.offerFills.get(nonce)?.filled ?? 0n);
 		const want = fill ? BigInt(fill) : remaining;
 		const take = want < remaining ? want : remaining;
 		if (take <= 0n) throw new Error("that intent is fully taken");
@@ -487,10 +664,15 @@ export class Daemon {
 		return out;
 	}
 
-	/** Finality-bound view: only state the anchor chain has certified `finalityDepth` deep. */
+	/** Finality-bound view: only state the anchor chain has certified `finalityDepth` deep.
+	 *  Resumes from the checkpoint base; memoized on the finalized anchor id. */
 	finalView(): View {
-		if (!this.node.anchors) return computeView([]);
-		return finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth);
+		if (!this.node.anchors) return this.checkpointBase ? computeView([], { base: this.checkpointBase }) : computeView([]);
+		const finId = this.node.anchors.finalized(this.finalityDepth)?.id ?? null;
+		if (this.finalCache && this.finalCache.id === finId) return this.finalCache.view;
+		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase);
+		this.finalCache = { id: finId, view };
+		return view;
 	}
 
 	/** Current "now" on the anchor clock — the finalized anchor's height, or null pre-consensus. */
@@ -617,7 +799,7 @@ export class Daemon {
 			} else {
 				prover = new StandinSpaceProver(new Plot(farmer.publicKey, this.k));
 			}
-			this.producer = new Producer({ node: this.node, keypair: farmer, prover, params: this.params });
+			this.producer = new Producer({ node: this.node, keypair: farmer, prover, params: this.params, appRootFor: (prev) => this.appRootForParent(prev) });
 			this.farming = true;
 			if (this.committeeMode()) this.startCommitteeCustody();
 			// Adaptive: farm hard while there are unfinalized writes to bury, then drop
@@ -691,9 +873,15 @@ export class Daemon {
 		const disclose = opts.sources.filter((s) => s.url).map((s) => ({ endpoint: s.url!, key: s.key ?? "" }));
 		this.publishing = true;
 		const myGen = ++this.oracleGen; // a channel switch bumps this → the old loop below exits
+		// Prune at the source: gate posts on move-or-heartbeat (see oracleShouldPost). Poll
+		// stays frequent (cheap); writes only happen when they carry new information.
+		const minMoveBps = Number(process.env.GAVL_ORACLE_MIN_BPS ?? "5"); // 0.05% default
+		const oracleHeartbeatMs = Number(process.env.GAVL_ORACLE_HEARTBEAT_MS ?? "300000"); // ≤5min stale
 		const loop = async () => {
 			// per-poster monotonic seq, continuing from this node's own latest reading.
 			let seq = (this.view().oracle.readings.get(myId)?.seq ?? -1) + 1;
+			let lastPrice: bigint | null = this.view().oracle.readings.get(myId)?.price ?? null;
+			let lastPostAt = 0;
 			let tick = 0;
 			while (this.publishing && myGen === this.oracleGen) {
 				if (disclose.length > 0 && tick % 30 === 0) {
@@ -706,10 +894,13 @@ export class Daemon {
 				tick++;
 				const agg = await readPriceAggregate(opts.sources); // fetch all, average the responders
 				this.lastOracleSource = { ...agg, at: Date.now() }; // display-only metadata
-				if (agg.value != null) {
+				const v = agg.value;
+				if (v != null && oracleShouldPost({ v, lastPrice, lastPostAt, now: Date.now(), minMoveBps, heartbeatMs: oracleHeartbeatMs })) {
 					try {
-						await acct.postPrice(agg.value, seq);
+						await acct.postPrice(v, seq);
 						seq++;
+						lastPrice = v;
+						lastPostAt = Date.now();
 					} catch {
 						/* a post failed (e.g. mid-restart) — retry next tick */
 					}
@@ -1199,10 +1390,15 @@ export class Daemon {
 		// 2. Fresh ledger + anchor chain — a clean economy for the new channel. The custody
 		//    loop + accounts referenced the OLD node, so drop them; startConsensus rebuilds
 		//    the rotation against the new node when farming.
-		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, this.verifier, { schedule: this.schedule, finalityDepth: this.finalityDepth }));
+		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, this.verifier, { schedule: this.schedule, finalityDepth: this.finalityDepth, verifyState: (a, h) => this.checkAppRoot(a, h) }));
 		this.rotation = undefined;
 		this.equivWatcher = undefined;
 		this.custodyAcct = undefined;
+		// Reset checkpoint state — the new channel is a fresh economy with its own history.
+		this.checkpointBase = undefined;
+		this.lastCheckpointHeight = -1;
+		this.viewCache = undefined;
+		this.finalCache = undefined;
 		this.wireTipCadence();
 		this.accounts.clear();
 		this.offers.clear(); // each channel is its own tape — drop the old channel's intents
