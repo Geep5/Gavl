@@ -212,14 +212,14 @@ export function applyMatch(bridge: BridgeState, book: MarketBook, taker: string,
  * current mark; the loser can't escape the mark by stalling. A position that's never closed
  * early auto-settles at its time-lock (see settleExpired).
  */
-export function applySettle(bridge: BridgeState, book: MarketBook, contractId: string, price: bigint): boolean {
+export function applySettle(bridge: BridgeState, book: MarketBook, contractId: string, price: bigint, height?: number): boolean {
 	const c = book.contracts.get(contractId);
 	if (!c) return false;
 	const pot = c.stake * 2n;
 	const longPay = longPayout(c.stake, c.entry, c.leverage, price);
 	const shortPay = pot - longPay; // exact remainder → zero-sum
-	addGbtc(bridge, c.long, longPay);
-	addGbtc(bridge, c.short, shortPay);
+	addGbtc(bridge, c.long, longPay, height); // payout = a fresh credit → restarts the idle clock
+	addGbtc(bridge, c.short, shortPay, height);
 	book.contracts.delete(contractId);
 	return true;
 }
@@ -235,5 +235,5 @@ export function settleExpired(bridge: BridgeState, book: MarketBook, nowHeight: 
 	if (mark === null || mark <= 0n) return;
 	const due: string[] = [];
 	for (const [id, c] of book.contracts) if (nowHeight >= c.expiryHeight) due.push(id);
-	for (const id of due) applySettle(bridge, book, id, mark);
+	for (const id of due) applySettle(bridge, book, id, mark, nowHeight);
 }

@@ -22,7 +22,7 @@ import { isOp } from "./ops.ts";
 import { finalizedOrdering, orderingFor } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import { oraclePubHex, bridgePubHex } from "./oracle.ts";
-import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims } from "../custody/bridge.ts";
+import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
 import { emptyBook, escrowedInContracts, applyMatch, applySettle, pruneExpiredOffers, settleExpired } from "./intent.ts";
@@ -65,15 +65,6 @@ export interface OracleState {
  *  many folded posts drops out of the median, so departed/stale oracles stop counting. */
 export const ORACLE_WINDOW = 64;
 
-/** Demurrage — a disclosed holding fee on IDLE (free) gBTC, redistributed to capital that's
- *  working (escrowed in open contracts). This makes the system a service, not a vault: idle
- *  money is gently pushed to either trade or withdraw, and liquidity providers earn the drag.
- *  It only MOVES gBTC (idle → active), never mints/burns, so 1:1 backing holds throughout, and
- *  it's self-limiting (no charge when there's no active capital to reward). Both values are
- *  CONSENSUS-CRITICAL (every node must agree). Default ≈ 3.6%/yr at a 60s/anchor target —
- *  tune DEMURRAGE_BPS to set the annual drag. */
-export const DEMURRAGE_WINDOW = 1440; // anchors per charge (~1 day)
-export const DEMURRAGE_BPS = 1n; // charged per window on the idle balance (1 bps/day ≈ 3.6%/yr)
 
 /** Drop readings that have fallen out of the freshness window — they no longer count toward
  *  the median, so this is behaviorally neutral, but it stops `readings` growing with every
@@ -179,18 +170,19 @@ export interface ViewOptions {
 }
 
 /**
- * Charge demurrage on idle (free) gBTC for each elapsed window and redistribute it pro-rata to
- * capital escrowed in open contracts. Pure integer math + sorted iteration → deterministic;
- * conserves total gBTC (idle loses exactly what active gains). Self-limiting: with no open
- * contracts there's nothing to reward, so it skips (only advancing the marker). Charges fee =
- * floor(balance · DEMURRAGE_BPS / 10000) per window, so balances below the rounding floor don't
- * decay — fine, those are bounded by PoST write cost, not a target.
+ * Demurrage — a disclosed holding fee on IDLE (free) gBTC, redistributed to capital working in
+ * open contracts. Per balance, from its idle clock `chargeFrom` (= last-credit + grace):
+ *   - before chargeFrom: untouched (the ~1-week grace),
+ *   - after: −20%/day,
+ *   - at the 1-month cutoff (or once it dips below the dust floor): take whatever's left.
+ * So the whole lifecycle is ≤ 1 month for ANY balance — the % decay is the gentle warning, the
+ * cutoff is the hard guarantee. Only MOVES gBTC (idle → active), never mints/burns, so 1:1
+ * backing holds; deterministic (integer math, sorted iteration); self-limiting — with no open
+ * contracts there's no one to reward, so it skips entirely.
  */
 function accrueDemurrage(view: View, nowHeight: number): void {
 	const b = view.bridge;
-	const windows = Math.floor((nowHeight - b.lastDemurrageHeight) / DEMURRAGE_WINDOW);
-	if (windows <= 0) return;
-	// Active stake per holder (both sides of every open contract) + the total.
+	// Active stake per holder (both sides of every open contract) + the total to split across.
 	const stake = new Map<string, bigint>();
 	let total = 0n;
 	for (const c of view.book.contracts.values()) {
@@ -198,33 +190,52 @@ function accrueDemurrage(view: View, nowHeight: number): void {
 		stake.set(c.short, (stake.get(c.short) ?? 0n) + c.stake);
 		total += c.stake * 2n;
 	}
-	if (total === 0n) {
-		b.lastDemurrageHeight += windows * DEMURRAGE_WINDOW; // no liquidity to reward → skip, just advance
-		return;
+	if (total === 0n) return; // nothing active to reward → don't charge (self-limiting, conserves)
+
+	const decayWindow = (DEMURRAGE_CUTOFF_DAYS - DEMURRAGE_GRACE_DAYS) * DEMURRAGE_DAY; // age past chargeFrom at which we take it all
+	let pool = 0n;
+	for (const [k, bal] of [...b.gbtc]) {
+		let cf = b.chargeFrom.get(k);
+		if (cf === undefined) {
+			b.chargeFrom.set(k, nowHeight + DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY); // unstamped → grace from now
+			continue;
+		}
+		if (nowHeight <= cf) continue; // still in grace
+		if (nowHeight - cf >= decayWindow) {
+			pool += bal; // past the 1-month cutoff → take the whole balance
+			addGbtc(b, k, -bal); // (deletes the entry + its clock)
+			continue;
+		}
+		const days = Math.floor((nowHeight - cf) / DEMURRAGE_DAY);
+		if (days <= 0) continue;
+		let kept = bal;
+		for (let i = 0; i < days; i++) kept = (kept * DEMURRAGE_KEEP_NUM) / DEMURRAGE_KEEP_DEN; // −20%/day, per-day floor
+		const charge = bal - kept;
+		if (charge > 0n) {
+			addGbtc(b, k, -charge);
+			pool += charge;
+		}
+		b.chargeFrom.set(k, cf + days * DEMURRAGE_DAY); // advance the charged-through boundary
+		const left = b.gbtc.get(k) ?? 0n;
+		if (left > 0n && left < DEMURRAGE_DUST) {
+			pool += left; // the % tail isn't worth a slot → take it
+			addGbtc(b, k, -left);
+		}
 	}
+	if (pool === 0n) return;
+	// Redistribute the drag pro-rata to capital working in open contracts (no clock reset here —
+	// passive income shouldn't shield other idle funds).
 	const holders = [...stake.keys()].sort();
-	for (let w = 0; w < windows; w++) {
-		let pool = 0n;
-		for (const [k, bal] of [...b.gbtc]) {
-			const fee = (bal * DEMURRAGE_BPS) / 10000n;
-			if (fee > 0n) {
-				addGbtc(b, k, -fee);
-				pool += fee;
-			}
+	let distributed = 0n;
+	for (const h of holders) {
+		const share = (pool * stake.get(h)!) / total;
+		if (share > 0n) {
+			addGbtc(b, h, share);
+			distributed += share;
 		}
-		if (pool === 0n) continue;
-		let distributed = 0n;
-		for (const h of holders) {
-			const share = (pool * stake.get(h)!) / total;
-			if (share > 0n) {
-				addGbtc(b, h, share);
-				distributed += share;
-			}
-		}
-		const remainder = pool - distributed; // rounding dust → lowest-key holder, deterministically
-		if (remainder > 0n) addGbtc(b, holders[0], remainder);
 	}
-	b.lastDemurrageHeight += windows * DEMURRAGE_WINDOW;
+	const remainder = pool - distributed; // rounding dust → lowest-key holder, deterministically
+	if (remainder > 0n) addGbtc(b, holders[0], remainder);
 }
 
 export function computeView(writes: Write[], opts: ViewOptions = {}): View {
@@ -293,13 +304,13 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			const amt = parseAmount(op.amount);
 			if (amt === null || typeof op.depositId !== "string" || typeof op.depositor !== "string") return;
 			if (!attestationAuthorized(view, w, depositAttestationDigest({ depositId: op.depositId, depositor: op.depositor, amount: amt }), op.sig)) return;
-			mintFromDeposit(view.bridge, { depositId: op.depositId, depositor: op.depositor, amount: amt });
+			mintFromDeposit(view.bridge, { depositId: op.depositId, depositor: op.depositor, amount: amt }, bornHeight);
 			return;
 		}
 		case "gbtc.transfer": {
 			const amt = parseAmount(op.amount);
 			if (amt === null || typeof op.to !== "string") return;
-			transferGbtc(view.bridge, w.writer, op.to, amt);
+			transferGbtc(view.bridge, w.writer, op.to, amt, bornHeight);
 			return;
 		}
 		case "bridge.withdraw": {
@@ -382,7 +393,7 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			// dodge the mark by stalling (the winner just closes it).
 			const m = mark(view);
 			if (m === null || typeof op.contractId !== "string") return;
-			applySettle(view.bridge, view.book, op.contractId, m);
+			applySettle(view.bridge, view.book, op.contractId, m, bornHeight);
 			return;
 		}
 		case "custody.bond": {

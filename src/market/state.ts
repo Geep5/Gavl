@@ -40,7 +40,7 @@ export interface CanonBridge {
 	unbonding: Entry<{ amount: string; releaseHeight: number }>[]; // pubkey → ..., sorted
 	mintedTotal: string;
 	paidOut: string;
-	lastDemurrageHeight: number;
+	chargeFrom: Entry<number>[]; // pubkey → demurrage idle-clock height, sorted
 }
 
 export interface CanonOracle {
@@ -92,7 +92,7 @@ function serializeBridge(b: BridgeState): CanonBridge {
 		unbonding: mapEntries(b.unbonding, (u) => ({ amount: u.amount.toString(), releaseHeight: u.releaseHeight })),
 		mintedTotal: b.mintedTotal.toString(),
 		paidOut: b.paidOut.toString(),
-		lastDemurrageHeight: b.lastDemurrageHeight,
+		chargeFrom: mapEntries(b.chargeFrom, (v) => v),
 	};
 }
 
@@ -141,7 +141,7 @@ function deserializeBridge(b: CanonBridge): BridgeState {
 	for (const [k, u] of b.unbonding) s.unbonding.set(k, { amount: BigInt(u.amount), releaseHeight: u.releaseHeight });
 	s.mintedTotal = BigInt(b.mintedTotal);
 	s.paidOut = BigInt(b.paidOut);
-	s.lastDemurrageHeight = b.lastDemurrageHeight;
+	for (const [k, v] of b.chargeFrom) s.chargeFrom.set(k, v);
 	return s;
 }
 

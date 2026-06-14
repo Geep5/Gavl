@@ -1,9 +1,13 @@
 /**
- * Demurrage — a disclosed holding fee on idle (free) gBTC, redistributed to capital working in
- * open contracts. Makes the system a service, not a vault: idle money is pushed to trade or
- * withdraw, and liquidity providers earn the drag. It only MOVES gBTC, never mints/burns, so
- * total supply + 1:1 backing are preserved; and it's self-limiting (no charge when nothing's
- * active to reward).
+ * Demurrage — idle (free) gBTC decays to capital working in open contracts, on a clock that
+ * GUARANTEES the whole process is ≤ 1 month for any balance:
+ *   - ~1-week grace (untouched),
+ *   - then −20%/day,
+ *   - hard cutoff at 30 days idle → take whatever remains.
+ * Only MOVES gBTC (idle → active), never mints/burns (supply + 1:1 backing preserved); it's
+ * self-limiting (no open contracts → nothing to reward → no charge); and the per-balance clock
+ * resets on any credit. Heights are driven via bornAt so credits land early and the fold height
+ * is the demurrage clock.
  *
  *   node --test test/demurrage.test.ts
  */
@@ -14,83 +18,89 @@ import assert from "node:assert/strict";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
-import { computeView, gbtcOf, marketConserved, DEMURRAGE_WINDOW } from "../src/market/btc.ts";
-import { totalGbtc } from "../src/custody/bridge.ts";
+import { computeView, gbtcOf, marketConserved } from "../src/market/btc.ts";
+import { totalGbtc, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS } from "../src/custody/bridge.ts";
 import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
 import { PARAMS, K } from "./helpers.ts";
 
+const GRACE = DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY; // first chargeable height for a balance credited at 0
+const CUTOFF = DEMURRAGE_CUTOFF_DAYS * DEMURRAGE_DAY; // idle age at which the balance is taken whole
+
 let depN = 0;
-function setup() {
+function harness() {
 	const node = new GavlNode(new Ledger(PARAMS));
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
-	const oracle = new Account({ node, params: PARAMS, k: K, now, keypair: oracleKeyPair() });
-	const attestor = new Account({ node, params: PARAMS, k: K, now, keypair: bridgeKeyPair() });
-	const fund = (a: Account, amt: bigint) => attestor.attestDeposit("dep" + depN++ + ":0", a.pubHex, amt);
-	return { node, mk, oracle, fund };
+	const oracle = mk(oracleKeyPair());
+	const attestor = mk(bridgeKeyPair());
+	const fund = (a: Account, amt: bigint, id?: string) => attestor.attestDeposit((id ?? "dep" + depN++) + ":0", a.pubHex, amt);
+	return { node, mk, fund, oracle };
 }
-
-test("idle gBTC bleeds to capital working in open contracts; supply is conserved", async () => {
-	const { node, mk, oracle, fund } = setup();
-	const A = mk(); // idle whale — never trades
-	const B = mk(); // maker (goes long)
-	const C = mk(); // taker (short) — both lock capital in the contract
+/** A market where only A is idle: B/C stake their ENTIRE balance into one open contract. */
+async function market() {
+	const { node, mk, fund, oracle } = harness();
+	const A = mk();
+	const B = mk();
+	const C = mk();
 	await oracle.postPrice(61000n, 0);
 	await fund(A, 1_000_000n);
-	await fund(B, 100_000n);
-	await fund(C, 100_000n);
-	const offer = B.makeOffer({ makerSide: "long", size: "50000", leverage: "2", expiryHeight: 1_000_000, nonce: "d1" });
-	await C.matchOpen(offer, 50_000n); // B & C each escrow 50000 → both are "active"
+	await fund(B, 50_000n);
+	await fund(C, 50_000n);
+	const offer = B.makeOffer({ makerSide: "long", size: "50000", leverage: "2", expiryHeight: 9_999_999, nonce: "z1" });
+	const matchId = await C.matchOpen(offer, 50_000n);
+	return { node, mk, fund, A, B, C, matchId };
+}
+/** All writes born at height 0 (credits are "old"); override specific ids via `extra`. */
+const bornAll = (node: GavlNode, extra: [string, number][] = []) => {
+	const m = new Map(node.ledger.allWrites().map((w) => [w.id, 0] as [string, number]));
+	for (const [id, h] of extra) m.set(id, h);
+	return m;
+};
+const viewAt = (node: GavlNode, born: Map<string, number>, nowHeight: number) => computeView(node.ledger.allWrites(), { bornAt: born, nowHeight });
 
-	const writes = node.ledger.allWrites();
-	const before = computeView(writes, { nowHeight: 0 }); // no windows elapsed yet
-	const after = computeView(writes, { nowHeight: 2 * DEMURRAGE_WINDOW }); // two charge windows
+test("grace, then 20%/day decay to working capital; supply conserved", async () => {
+	const { node, A, B, C } = await market();
+	const born = bornAll(node);
 
-	assert.ok(gbtcOf(after, A.pubHex) < gbtcOf(before, A.pubHex), "idle holder A was charged");
-	assert.ok(gbtcOf(after, B.pubHex) > gbtcOf(before, B.pubHex), "active holder B earned the drag");
-	assert.ok(gbtcOf(after, C.pubHex) > gbtcOf(before, C.pubHex), "active holder C earned the drag");
-	assert.equal(totalGbtc(after.bridge), totalGbtc(before.bridge), "pure redistribution — total gBTC unchanged");
-	assert.equal(after.bridge.reserves, before.bridge.reserves, "reserves untouched");
-	assert.ok(marketConserved(after), "1:1 backing holds after demurrage");
+	const inGrace = viewAt(node, born, GRACE - 1);
+	assert.equal(gbtcOf(inGrace, A.pubHex), 1_000_000n, "untouched during the ~1-week grace");
+
+	const after = viewAt(node, born, GRACE + 3 * DEMURRAGE_DAY);
+	assert.equal(gbtcOf(after, A.pubHex), 512_000n, "3 days of −20%: 1,000,000 → 512,000");
+	assert.equal(gbtcOf(after, B.pubHex) + gbtcOf(after, C.pubHex), 488_000n, "the 488,000 drag went to the active pair");
+	assert.equal(totalGbtc(after.bridge), totalGbtc(inGrace.bridge), "pure redistribution — total gBTC unchanged");
+	assert.ok(marketConserved(after), "1:1 backing holds");
 });
 
-test("demurrage is self-limiting — no charge when there's no active capital to reward", async () => {
-	const { node, mk, oracle, fund } = setup();
+test("hard cutoff — any idle balance is fully taken by 1 month", async () => {
+	const { node, A, B, C, matchId } = await market();
+	const born = bornAll(node, [[matchId, 1000]]); // contract outlives A's cutoff (else it'd auto-settle first)
+
+	const v = viewAt(node, born, CUTOFF); // A credited at 0 → idle exactly one month
+	assert.equal(gbtcOf(v, A.pubHex), 0n, "fully taken at the 30-day cutoff — the process never exceeds a month");
+	assert.equal(gbtcOf(v, B.pubHex) + gbtcOf(v, C.pubHex), 1_000_000n, "all of it went to the active pair");
+	assert.ok(marketConserved(v));
+});
+
+test("self-limiting — no open contracts means no charge", async () => {
+	const { node, mk, fund } = harness();
 	const A = mk();
-	await oracle.postPrice(61000n, 0);
-	await fund(A, 1_000_000n); // idle, and NO open contracts anywhere
-
-	const writes = node.ledger.allWrites();
-	const after = computeView(writes, { nowHeight: 5 * DEMURRAGE_WINDOW });
-	assert.equal(gbtcOf(after, A.pubHex), 1_000_000n, "nothing to reward → idle is left untouched");
-	assert.ok(marketConserved(after));
+	await fund(A, 1_000_000n);
+	const born = bornAll(node);
+	const v = viewAt(node, born, CUTOFF * 3); // long past any cutoff
+	assert.equal(gbtcOf(v, A.pubHex), 1_000_000n, "nothing active to reward → idle is left untouched");
+	assert.ok(marketConserved(v));
 });
 
-test("the drag splits pro-rata by stake between active holders", async () => {
-	const { node, mk, oracle, fund } = setup();
-	const A = mk(); // idle source of the drag
-	const B = mk(); // will hold 3x the stake of D
-	const C = mk();
-	const D = mk();
-	const E = mk();
-	await oracle.postPrice(61000n, 0);
-	await fund(A, 10_000_000n);
-	for (const x of [B, C, D, E]) await fund(x, 200_000n);
-	// B/C contract: B long 150k, C short 150k.  D/E contract: D long 50k, E short 50k.
-	const o1 = B.makeOffer({ makerSide: "long", size: "150000", leverage: "2", expiryHeight: 1_000_000, nonce: "p1" });
-	await C.matchOpen(o1, 150_000n);
-	const o2 = D.makeOffer({ makerSide: "long", size: "50000", leverage: "2", expiryHeight: 1_000_000, nonce: "p2" });
-	await E.matchOpen(o2, 50_000n);
+test("activity resets the clock — a fresh credit refreshes the grace", async () => {
+	const { node, fund, A } = await market();
+	const refresh = await fund(A, 1n, "refresh"); // a second credit to A
+	const born = bornAll(node, [[refresh.id, 5000]]); // the fresh credit lands at height 5000
 
-	const writes = node.ledger.allWrites();
-	const before = computeView(writes, { nowHeight: 0 });
-	const after = computeView(writes, { nowHeight: DEMURRAGE_WINDOW });
-	const gainB = gbtcOf(after, B.pubHex) - gbtcOf(before, B.pubHex);
-	const gainD = gbtcOf(after, D.pubHex) - gbtcOf(before, D.pubHex);
-	// B staked 150k vs D's 50k (3:1); each also pays a tiny fee on equal 50k free balances, so
-	// B's NET gain is well above D's. Just assert B clearly out-earns D (pro-rata by stake).
-	assert.ok(gainB > gainD, `B (3x stake) should earn more than D — got ${gainB} vs ${gainD}`);
-	assert.ok(gainD > 0n, "D still earns a share");
-	assert.ok(marketConserved(after));
+	// At a height where the ORIGINAL clock (chargeFrom = GRACE) would have decayed, the refreshed
+	// clock (chargeFrom = 5000 + GRACE) is still in grace → untouched.
+	const v = viewAt(node, born, GRACE + 3 * DEMURRAGE_DAY);
+	assert.equal(gbtcOf(v, A.pubHex), 1_000_001n, "the later credit reset A's idle clock → still in grace");
+	assert.ok(marketConserved(v));
 });

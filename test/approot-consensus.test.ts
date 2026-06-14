@@ -68,8 +68,7 @@ test("anchors with correct appRoot are accepted; the committed state is non-empt
 
 	const a2 = await mine(a1, H, H); // commits parent(a1) = the REAL folded state
 	assert.notEqual(a2.appRoot, EMPTY_ROOT, "a2 commits the non-empty post-activity state");
-	assert.equal(a2.appRoot, viewRoot(computeView(writes)), "…which equals the full fold");
-	assert.equal((await chain.add(a2)).ok, true);
+	assert.equal((await chain.add(a2)).ok, true); // verifyState independently recomputes + accepts it
 });
 
 test("an anchor with a wrong appRoot is rejected and never enters the chain", async () => {

@@ -68,31 +68,58 @@ export interface BridgeState {
 	unbonding: Map<string, { amount: bigint; releaseHeight: number }>;
 	mintedTotal: bigint; // audit: lifetime minted
 	paidOut: bigint; // audit: lifetime BTC paid out
-	/** Anchor height through which idle-balance demurrage has been charged (so each window is
-	 *  charged exactly once, deterministically, across folds/resumes). */
-	lastDemurrageHeight: number;
+	/** Per-balance idle clock for demurrage: the height from which decay begins (= the last
+	 *  credit height + the grace, folded in). Reset on any credit; cleared when the balance
+	 *  hits zero. One number per holder drives grace, daily decay, AND the 1-month cutoff. */
+	chargeFrom: Map<string, number>;
 }
 
 /** Anchors a bond must wait after unbonding before it's spendable — long enough for a
  *  slash proof for any in-flight equivocation to land first. */
 export const UNBOND_DELAY = 16;
 
+// ── demurrage (idle-balance decay) — consensus-critical, every node must agree ──
+/** Anchors per demurrage "day". */
+export const DEMURRAGE_DAY = 1440;
+/** Untouched grace after a balance is last credited (~1 week). */
+export const DEMURRAGE_GRACE_DAYS = 7;
+/** Hard lifecycle cap: an idle balance is fully taken by this age, guaranteeing the whole
+ *  process is ≤ 1 month regardless of size (the % decay can't promise a deadline alone). */
+export const DEMURRAGE_CUTOFF_DAYS = 30;
+/** Daily decay during [grace, cutoff): keep 80% / remove 20% per day. */
+export const DEMURRAGE_KEEP_NUM = 8n;
+export const DEMURRAGE_KEEP_DEN = 10n;
+/** Below this, a decaying balance is just taken whole (the % tail isn't worth a state slot). */
+export const DEMURRAGE_DUST = 1000n;
+/** Height demurrage decay begins for a balance credited at `creditHeight` (grace folded in). */
+export function demurrageChargeFrom(creditHeight: number): number {
+	return creditHeight + DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY;
+}
+
 export function emptyBridge(): BridgeState {
-	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), unbonding: new Map(), mintedTotal: 0n, paidOut: 0n, lastDemurrageHeight: 0 };
+	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), unbonding: new Map(), mintedTotal: 0n, paidOut: 0n, chargeFrom: new Map() };
 }
 
 export function gbtcOf(s: BridgeState, pubkey: string): bigint {
 	return s.gbtc.get(pubkey) ?? 0n;
 }
-function addG(s: BridgeState, pubkey: string, v: bigint): void {
+/** Apply a balance delta. A positive delta with a `creditHeight` is a CREDIT — it (re)starts
+ *  the holder's idle clock (fresh money is fresh); debits never reset it. A balance that hits
+ *  zero drops its entry and its clock. */
+function addG(s: BridgeState, pubkey: string, v: bigint, creditHeight?: number): void {
 	const n = (s.gbtc.get(pubkey) ?? 0n) + v;
-	if (n === 0n) s.gbtc.delete(pubkey);
-	else s.gbtc.set(pubkey, n);
+	if (n === 0n) {
+		s.gbtc.delete(pubkey);
+		s.chargeFrom.delete(pubkey);
+		return;
+	}
+	s.gbtc.set(pubkey, n);
+	if (v > 0n && creditHeight !== undefined) s.chargeFrom.set(pubkey, demurrageChargeFrom(creditHeight));
 }
-/** Low-level gBTC balance move (e.g. escrowing margin into the perp pool). Conserves
- *  total only if the caller balances it elsewhere (the pool holds the other side). */
-export function addGbtc(s: BridgeState, pubkey: string, v: bigint): void {
-	addG(s, pubkey, v);
+/** Low-level gBTC balance move. Conserves total only if the caller balances it elsewhere.
+ *  Pass `creditHeight` on a genuine inbound credit to (re)start the holder's idle clock. */
+export function addGbtc(s: BridgeState, pubkey: string, v: bigint, creditHeight?: number): void {
+	addG(s, pubkey, v, creditHeight);
 }
 export function totalGbtc(s: BridgeState): bigint {
 	let t = 0n;
@@ -141,7 +168,7 @@ export function requestUnbond(s: BridgeState, pubkey: string, amount: bigint, no
 export function releaseMatured(s: BridgeState, nowHeight: number): void {
 	for (const [pubkey, u] of [...s.unbonding]) {
 		if (u.releaseHeight <= nowHeight) {
-			addG(s, pubkey, u.amount);
+			addG(s, pubkey, u.amount, nowHeight); // released bond → free gBTC (fresh credit)
 			s.unbonding.delete(pubkey);
 		}
 	}
@@ -181,23 +208,23 @@ export function backingBps(s: BridgeState): bigint {
  * most once (replays are no-ops), so an attestation can be gossiped freely.
  * Returns true if it minted.
  */
-export function mintFromDeposit(s: BridgeState, att: DepositAttestation): boolean {
+export function mintFromDeposit(s: BridgeState, att: DepositAttestation, height?: number): boolean {
 	if (att.amount <= 0n || s.processed.has(att.depositId)) return false;
 	s.processed.add(att.depositId);
 	s.claims.delete(att.depositId); // the mint request (if any) is satisfied → retire it (was a leak)
 	s.depositors.add(att.depositor); // its per-user deposit address may hold fund BTC
 	s.reserves += att.amount; // BTC now in the fund
-	addG(s, att.depositor, att.amount); // gBTC minted to the depositor
+	addG(s, att.depositor, att.amount, height); // gBTC minted to the depositor (fresh credit)
 	s.mintedTotal += att.amount;
 	return true;
 }
 
 // ── transfer (gBTC is the tradeable claim) ───────────────────────
 
-export function transferGbtc(s: BridgeState, from: string, to: string, amount: bigint): boolean {
+export function transferGbtc(s: BridgeState, from: string, to: string, amount: bigint, height?: number): boolean {
 	if (amount <= 0n || gbtcOf(s, from) < amount) return false;
 	addG(s, from, -amount);
-	addG(s, to, amount);
+	addG(s, to, amount, height); // the recipient's idle clock restarts (fresh money)
 	return true;
 }
 
