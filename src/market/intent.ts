@@ -225,15 +225,23 @@ export function applySettle(bridge: BridgeState, book: MarketBook, contractId: s
 }
 
 /**
- * Auto-settle every contract whose time-lock has elapsed (expiryHeight ≤ nowHeight) at the
- * current mark. A perp can't outlive its cap, so the open-contract set is bounded by
- * throughput × CONTRACT_MAX_LIFE instead of accumulating stuck positions. Deterministic —
- * every node settles when its fold first crosses the expiry height (same clock as releaseMatured).
- * No-op while there's no mark; the contracts settle once a price returns.
+ * Auto-unwind every contract whose time-lock has elapsed (expiryHeight ≤ nowHeight): settle at
+ * its OWN ENTRY price, i.e. return each side its stake (no PnL). A perp can't outlive its cap,
+ * so the open-contract set is bounded by throughput × CONTRACT_MAX_LIFE.
+ *
+ * Why entry and not the mark: this sweep runs at the fold's `nowHeight`, which a checkpoint-
+ * resumed node reaches from a different base than a full node — and the oracle mark is
+ * time-varying, so settling at the mark would settle the SAME contract at DIFFERENT prices
+ * depending on where the node last checkpointed → divergent appRoot → fork. Entry is stored in
+ * the contract, so it's base-independent and every node agrees. To realize PnL you close EARLY
+ * via `contract.settle` (settle-at-mark, deterministic via the write's fold position); a
+ * position nobody closes by the cap just unwinds.
  */
-export function settleExpired(bridge: BridgeState, book: MarketBook, nowHeight: number, mark: bigint | null): void {
-	if (mark === null || mark <= 0n) return;
+export function settleExpired(bridge: BridgeState, book: MarketBook, nowHeight: number): void {
 	const due: string[] = [];
 	for (const [id, c] of book.contracts) if (nowHeight >= c.expiryHeight) due.push(id);
-	for (const id of due) applySettle(bridge, book, id, mark, nowHeight);
+	for (const id of due) {
+		const c = book.contracts.get(id)!;
+		applySettle(bridge, book, id, c.entry); // unwind at entry → each gets its stake back (base-independent)
+	}
 }

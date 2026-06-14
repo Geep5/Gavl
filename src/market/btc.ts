@@ -257,7 +257,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
-	settleExpired(view.bridge, view.book, nowHeight, view.oracle.price); // time-locked perps auto-settle at the mark
+	settleExpired(view.bridge, view.book, nowHeight); // time-locked perps unwind at entry (base-independent)
 	accrueDemurrage(view, nowHeight); // idle gBTC bleeds to capital working in open contracts
 	evictStaleReadings(view.oracle); // drop posters that fell out of the freshness window
 	pruneExpiredOffers(view.book, nowHeight); // drop fill-tracking for offers that can no longer be matched

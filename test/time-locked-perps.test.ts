@@ -31,7 +31,7 @@ function setup() {
 }
 const viewAt = (node: GavlNode, bornAt: Map<string, number>, nowHeight: number) => computeView(node.ledger.allWrites(), { bornAt, nowHeight });
 
-test("a position auto-settles at the mark once its time-lock elapses", async () => {
+test("a position auto-unwinds at entry once its time-lock elapses (no PnL — base-independent)", async () => {
 	const { node, mk, oracle, fund } = setup();
 	const A = mk(); // LONG (maker)
 	const B = mk(); // SHORT (taker)
@@ -49,14 +49,15 @@ test("a position auto-settles at the mark once its time-lock elapses", async () 
 	assert.equal(v.book.contracts.get(matchId)!.expiryHeight, 5 + CONTRACT_MAX_LIFE, "expiry = born + max life");
 	assert.ok(marketConserved(v));
 
-	// Price moves up past the 10× cap (>61000 + 6100), then the clock passes the time-lock.
-	await oracle.postPrice(70000n, 1); // long takes the whole pot (move caps the payoff)
+	// Price moves far past the cap, but expiry IGNORES the mark — it unwinds at entry so the
+	// settle price can't depend on a node's checkpoint position (the consensus-safe choice).
+	await oracle.postPrice(70000n, 1);
 	const expiry = 5 + CONTRACT_MAX_LIFE;
 	v = viewAt(node, born, expiry); // fold AT the expiry height
-	assert.equal(v.book.contracts.size, 0, "auto-settled at the time-lock — no settle tx needed");
-	assert.equal(gbtcOf(v, A.pubHex), 6000n, "long (A) won the 2000 pot: 4000 free + 2000");
-	assert.equal(gbtcOf(v, B.pubHex), 4000n, "short (B) lost its 1000 stake");
-	assert.ok(marketConserved(v), "conserved across the auto-settle");
+	assert.equal(v.book.contracts.size, 0, "auto-unwound at the time-lock — no settle tx needed");
+	assert.equal(gbtcOf(v, A.pubHex), 5000n, "long (A) gets its stake back — no PnL at expiry");
+	assert.equal(gbtcOf(v, B.pubHex), 5000n, "short (B) gets its stake back — close EARLY to realize PnL");
+	assert.ok(marketConserved(v), "conserved across the auto-unwind");
 });
 
 test("early close still works and pre-empts the time-lock", async () => {
