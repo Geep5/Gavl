@@ -230,7 +230,7 @@ export function applySettle(bridge: BridgeState, book: MarketBook, contractId: s
 }
 
 /** Pay a contract side. The backstop POT is paid into `bridge.pot` (no holder balance, no idle
- *  clock — the pool isn't an idle squatter); everyone else gets a normal gBTC credit. */
+ *  clock — the pot isn't an idle squatter); everyone else gets a normal gBTC credit. */
 function creditParty(bridge: BridgeState, who: string, amount: bigint, height?: number): void {
 	if (who === POT) bridge.pot += amount;
 	else addGbtc(bridge, who, amount, height);

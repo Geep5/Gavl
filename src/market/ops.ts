@@ -44,7 +44,7 @@ export type Op =
 	| { kind: "match.open"; offer: Offer; fill: string }
 	/** Open a position directly against the liquidity BACKSTOP — no peer maker. The pot (idle-decay
 	 *  pool) stakes matching gBTC and takes the OPPOSITE side at the mark, capped by a deterministic
-	 *  finalized budget so the pool can never be drawn insolvent. The taker is the write's author. */
+	 *  finalized budget so the pot can never be drawn insolvent. The taker is the write's author. */
 	| { kind: "match.pot"; side: "long" | "short"; fill: string; leverage: string }
 	/** Settle a matured matched contract at the current oracle mark — permissionless. */
 	| { kind: "contract.settle"; contractId: string }

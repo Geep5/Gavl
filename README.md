@@ -69,8 +69,9 @@ in tests.
 4. **Close** early any time at the current mark — directional PnL, capped at the stake. A
    position you never close **auto-settles at its time-lock** (a hard ~1-month cap), so nothing
    sits open forever.
-5. **Withdraw** — burn gBTC → a quorum threshold-signs and broadcasts a real Bitcoin tx. (Leave
-   gBTC idle too long and it **decays** into the liquidity pot — this is a service, not a vault.)
+5. **Withdraw** — burn gBTC → a quorum threshold-signs and broadcasts a real Bitcoin tx. (Because
+   the whole ledger lives in RAM, balances can't sit untouched forever; gBTC left idle too long
+   **decays into the liquidity pot**, where it's put to work backing trades instead of squatting.)
 
 ### The matched engine (`src/market/intent.ts`, `src/market/btc.ts`)
 
@@ -100,11 +101,14 @@ No pool, no order book to babysit — just signed intents and matched bilateral 
 - **Time-locked.** Either side may close early at the mark, but every contract has a hard
   lifetime cap and **auto-settles at expiry** against the oracle — so the open-contract set is
   bounded by throughput, never accumulating positions nobody closes.
-- **Idle gBTC decays into the pot (a service, not a vault).** Free balances left idle past a
-  ~1-week grace bleed (−20%/day, with a hard 1-month cutoff) into the liquidity **pot** — pushing
-  money to trade or withdraw rather than squat, and giving the backstop its capital. Decay is
-  per-balance and base-independent (the cutoff measures from a fixed idle-start, not a drifting
-  pointer), and only *moves* gBTC; the pot is just a counter, so every node agrees on it.
+- **Idle decay → liquidity (the RAM ledger's bound, turned into a feature).** State lives in RAM,
+  so nothing can grow or sit unbounded — including user balances. Rather than cap them, gBTC left
+  idle past a ~1-week grace **decays** (−20%/day, hard 1-month cutoff) and is **reappropriated into
+  the liquidity pot** — the very capital the backstop above stakes as a counterparty. So the
+  constraint *is* the solution: the funds of people who park and forget become the liquidity that
+  lets others trade. Decay is per-balance and base-independent (the cutoff measures from a fixed
+  idle-start, not a drifting pointer) and only *moves* gBTC; the pot is just a counter, so every
+  node agrees on it.
 - **Conservation, proven.** `reserves == free gBTC + bonded + contract escrow + pending + pot`.
   Match/settle/decay/backstop only *move* gBTC between buckets, never mint — tested as a hard
   invariant over random op streams. (`src/market/intent.ts`)
@@ -259,7 +263,7 @@ local-only) **and** the web UI in one command, cross-platform — no env vars to
 Other scripts:
 
 ```bash
-npm test                 # full suite (~210 tests): consensus, checkpoints, matched market, demurrage, liquidity backstop, intent gossip, oracle, custody, bridge
+npm test                 # full suite (~220 tests): consensus, checkpoints, genesis-free adoption, matched market, demurrage, liquidity backstop, intent gossip, oracle, custody, bridge
 npm run demo             # PoST cooldown chain — watch space→cooldown
 npm run demo:consensus   # two nodes farm + gossip anchors, finalize the same state over a real mesh
 npm run daemon           # daemon only (real chiavdf VDF — needs the .venv; see below)
@@ -313,6 +317,8 @@ What's **trusted** (and surfaced honestly in the UI):
   real hyperdht mesh
 - **Bounded RAM / scaling** ✅ state-committed checkpoints (boot from state, never replay from
   0) · history + anchor-chain pruning · key-only peers bootstrap from a committed snapshot ·
+  **genesis-free adoption** (a fresh node trusts a recent checkpoint, not the grindable origin) with
+  a **multi-peer quorum** so no lone peer can feed a fake floor ([weak-subjectivity](docs/weak-subjectivity.md)) ·
   delta-encoded anchor heads · every structure bounded by cost + decay (no hard caps)
 - **Peer-to-peer matched market** ✅ signed intents gossiped over the mesh · matched
   bilateral contracts · zero-sum, fully-collateralized, **no pool** (reserves can't be

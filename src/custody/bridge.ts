@@ -74,10 +74,11 @@ export interface BridgeState {
 	 *               regardless of how it checkpointed (a drifting reference would fork).
 	 *  - `charged` — the advancing "charged-through" boundary for the incremental −20%/day decay. */
 	chargeFrom: Map<string, { since: number; charged: number }>;
-	/** The liquidity pot: idle-decay flows here (a conservation bucket holding real gBTC, never
-	 *  minted — so it can never owe more than it holds). This is the FREE (unescrowed) pot capital;
-	 *  capital staked as a backstop counterparty lives in the contract escrow until it settles.
-	 *  Just a counter, so it's base-independent (= cumulative decay − escrow drawn + payouts back). */
+	/** The liquidity pot: reclaimed idle-balance decay flows here (a conservation bucket holding real
+	 *  gBTC, never minted — so it can never owe more than it holds) and becomes the backstop's trading
+	 *  capital. This is the FREE (unescrowed) pot; capital staked as a backstop counterparty lives in
+	 *  the contract escrow until it settles. Just a counter, base-independent (= cumulative decay −
+	 *  escrow drawn + payouts back). */
 	pot: bigint;
 	/** Lifetime gBTC the pot has staked as a backstop counterparty (monotonic; += at each pot match).
 	 *  The backstop budget is `finalizedPot − (potEscrowTaken − finalizedPotEscrowTaken)`: a trade may

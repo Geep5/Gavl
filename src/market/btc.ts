@@ -177,8 +177,10 @@ export interface ViewOptions {
 }
 
 /**
- * Demurrage — a disclosed holding fee on IDLE (free) gBTC, swept into the liquidity POT. Per
- * balance, from its idle clock `chargeFrom` (= last-credit + grace):
+ * Demurrage — the RAM ledger's "balances can't sit forever" rule, turned into liquidity. State
+ * lives in RAM, so an idle balance that never moves is just an unbounded entry; rather than cap it,
+ * we let IDLE (free) gBTC decay and reappropriate it into the liquidity POT (which backstops
+ * trades). Per balance, from its idle clock `chargeFrom` (= last-credit + grace):
  *   - before chargeFrom: untouched (the ~1-week grace),
  *   - after: −20%/day,
  *   - at the 1-month cutoff (or once it dips below the dust floor): take whatever's left.
@@ -187,8 +189,8 @@ export interface ViewOptions {
  * redistributed per-fold: redistribution to the active-contract set is path-dependent (which
  * contracts are open at a fold differs by checkpoint base → divergent appRoot → fork). The pot
  * is just a counter, so it's base-independent (= cumulative idle decay). It only MOVES gBTC
- * (idle → pot), never mints/burns, so 1:1 backing holds. The pot funds maker rebates / a
- * liquidity backstop at deterministic write events (a separate step).
+ * (idle → pot), never mints/burns, so 1:1 backing holds. The pot is the backstop's capital
+ * (`applyMatchPot`): reclaimed idle balances become the counterparty that lets someone trade.
  */
 function accrueDemurrage(view: View, nowHeight: number): void {
 	const b = view.bridge;
