@@ -69,6 +69,10 @@ export class AnchorChain {
 	private finalCache: { id: string; heads: Heads } | null = null;
 	/** The deepest anchor this node has locked as final (sticky). */
 	private lockedId: string | null = null;
+	/** Oldest anchor still held (the prune floor) + its materialized FULL heads, so head
+	 *  reconstruction still works after the ancestry below it is dropped. null = unpruned. */
+	private floorId: string | null = null;
+	private floorHeads: Heads = {};
 
 	constructor(params: ChainParams, verifier: SpaceVerifier, opts: AnchorChainOptions = {}) {
 		this.params = params;
@@ -150,10 +154,15 @@ export class AnchorChain {
 	 *  forks + finality, both infrequent). */
 	headsAt(anchorId: string): Heads {
 		if (anchorId === this.tipId) return this.tipHeads;
+		if (anchorId === this.floorId) return { ...this.floorHeads };
 		const a = this.anchors.get(anchorId);
 		if (!a) return {};
-		let heads: Heads = {};
-		for (const anc of this.chainTo(a)) heads = applyHeadsDelta(heads, anc.headsDelta);
+		const chain = this.chainTo(a); // [bottom … a]; bottom is genesis OR the prune floor
+		// If the walk bottoms at the floor, seed from its materialized full heads (which already
+		// include the floor's own delta) and apply only the deltas above it.
+		const atFloor = this.floorId !== null && chain.length > 0 && chain[0].id === this.floorId;
+		let heads: Heads = atFloor ? { ...this.floorHeads } : {};
+		for (let i = atFloor ? 1 : 0; i < chain.length; i++) heads = applyHeadsDelta(heads, chain[i].headsDelta);
 		return heads;
 	}
 
@@ -194,6 +203,41 @@ export class AnchorChain {
 		const heads = this.headsAt(f.id);
 		this.finalCache = { id: f.id, heads };
 		return heads;
+	}
+
+	/**
+	 * Drop anchors below `floorHeight` to bound memory. This is a LOCAL optimization, NOT a
+	 * consensus change: the anchor chain isn't committed in any state root, and a node only
+	 * needs a deep-enough SUFFIX to keep operating — verify new anchors (prev link), retarget
+	 * (window from the tip), apply finality (k from the tip), and reconstruct heads. The last
+	 * is preserved by materializing the floor's full heads before its ancestry is dropped.
+	 *
+	 * Never prunes at/above the sticky lock (clamped), so finalized history is always intact.
+	 * The caller keeps `floorHeight` below the app checkpoint + a margin covering the retarget /
+	 * committee windows, so every reachable walk still has the anchors it needs.
+	 */
+	prune(floorHeight: number): void {
+		const tip = this.tip();
+		if (!tip) return;
+		const lock = this.lockedId ? this.anchors.get(this.lockedId) : undefined;
+		if (lock && floorHeight > lock.height) floorHeight = lock.height; // never drop the locked region
+		if (floorHeight <= 0) return; // always keep genesis as the base case
+		const haveFloor = this.floorId ? this.anchors.get(this.floorId) : undefined;
+		if (haveFloor && floorHeight <= haveFloor.height) return; // already pruned at least this deep
+		// Locate the floor = the tip's ancestor at exactly floorHeight (the canonical chain is
+		// contiguous in height), then materialize its full heads BEFORE dropping anything.
+		let floor: Anchor | undefined = tip;
+		while (floor && floor.height > floorHeight) floor = floor.prev ? this.anchors.get(floor.prev) : undefined;
+		if (!floor || floor.height !== floorHeight) return; // floor not cleanly reachable → skip
+		const fh = this.headsAt(floor.id);
+		for (const [id, a] of this.anchors) if (a.height < floorHeight) this.anchors.delete(id); // dead forks included
+		this.floorId = floor.id;
+		this.floorHeads = fh;
+	}
+
+	/** Anchors currently held (for tests / diagnostics). */
+	get size(): number {
+		return this.anchors.size;
 	}
 
 	/**

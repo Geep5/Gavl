@@ -188,6 +188,11 @@ const CHECKPOINT_EVERY = Number(process.env.GAVL_CHECKPOINT_EVERY ?? "16");
  *  finite so its consensus fill-tracking (offerFills) retires after expiry instead of forever. */
 const OFFER_TTL_ANCHORS = Number(process.env.GAVL_OFFER_TTL ?? "2880");
 
+/** Anchors retained below a checkpoint. Generous enough to cover the retarget + committee
+ *  windows (the only backward walks that reach below the checkpoint); the daemon takes the
+ *  max with those windows. Bounds the anchor chain to a constant suffix instead of forever. */
+const ANCHOR_KEEP_MARGIN = Number(process.env.GAVL_ANCHOR_MARGIN ?? "256");
+
 export class Daemon {
 	readonly node: GavlNode;
 	readonly wallet: Wallet;
@@ -539,13 +544,19 @@ export class Daemon {
 		this.lastSnapshot = snap; // kept in RAM to serve fresh peers (key-only nodes included)
 		const before = this.node.ledger.summary().writes;
 		this.node.ledger.pruneBelow(heads); // drop RAM history below the checkpoint — bounds memory
+		// Bound the anchor chain too (local memory only — not committed in any root). Keep a
+		// suffix below the checkpoint that still covers the retarget + committee windows, so
+		// every backward walk (difficulty, finality, committee selection, heads) stays intact.
+		const anchorsBefore = anchors.size;
+		const margin = Math.max(ANCHOR_KEEP_MARGIN, this.schedule?.window ?? 0, this.custodyOpts.windowAnchors ?? 0);
+		anchors.prune(fin.height - margin);
 		this.viewCache = undefined;
 		this.finalCache = undefined;
 		// Durable store, if any: persist the snapshot + reclaim the pruned blocks (best-effort).
 		const store = this.store;
 		const persisted = store ? " (persisting)" : " (RAM-only)";
 		if (store) void store.persistSnapshot(snap).then(() => store.pruneBelow(heads)).catch(() => {});
-		console.log(`  checkpoint: height ${fin.height}, ${Object.keys(heads).length} writer(s); pruned ${before - this.node.ledger.summary().writes} write(s) from RAM${persisted}`);
+		console.log(`  checkpoint: height ${fin.height}, ${Object.keys(heads).length} writer(s); pruned ${before - this.node.ledger.summary().writes} write(s) + ${anchorsBefore - anchors.size} anchor(s) from RAM${persisted}`);
 	}
 
 	// ── peer-to-peer intent market (in-memory offer book) ────────────
