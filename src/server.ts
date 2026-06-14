@@ -159,6 +159,9 @@ function serializeState() {
 		// ── the matched market (real counterparty, no pool) ──
 		tape: daemon.intentTape(), // live resting intents you can take the opposite of
 		myContracts: daemon.myContracts(), // your open matched positions, with live PnL
+		// ── the liquidity backstop (idle-decay pot as counterparty of last resort) ──
+		pot: view.bridge.pot.toString(), // free idle-decay capital backing the pot
+		backstopAvailable: daemon.backstopAvailable(view).toString(), // gBTC the pot can stake right now
 	};
 
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));

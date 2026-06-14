@@ -25,7 +25,8 @@ import { oraclePubHex, bridgePubHex } from "./oracle.ts";
 import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
-import { emptyBook, escrowedInContracts, applyMatch, applySettle, pruneExpiredOffers, settleExpired } from "./intent.ts";
+import { emptyBook, escrowedInContracts, applyMatch, applyMatchPot, applySettle, pruneExpiredOffers, settleExpired } from "./intent.ts";
+import type { Side } from "./intent.ts";
 import type { MarketBook, Offer } from "./intent.ts";
 import { serializeView, deserializeView } from "./state.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
@@ -168,6 +169,12 @@ export interface ViewOptions {
 	 *  checkpoint view equals folding the full history — the basis for never replaying
 	 *  from 0. Height-timed effects act on state carried in `base` (bonds live there). */
 	base?: View;
+	/** The liquidity-backstop budget, taken from the FINALIZED view (`pot` = its free pot,
+	 *  `taken` = its lifetime `potEscrowTaken`). A `match.pot` may draw against
+	 *  `(pot + taken) − currentPotEscrowTaken` — i.e. only finalized pot capital, which every node
+	 *  agrees on, so the budget is deterministic and the free pot can't go negative. Absent (pure
+	 *  folds / no finalized state yet) → budget 0 → the backstop is simply unavailable. */
+	backstop?: { pot: bigint; taken: bigint };
 }
 
 /**
@@ -228,12 +235,19 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 				book: emptyBook(),
 			};
 	const nowHeight = opts.nowHeight ?? 0;
+	// Total finalized pot capital the backstop may commit (free + lifetime-drawn); a match.pot
+	// draws against this minus the live draw counter. Source, in order: an explicit budget
+	// (tests), else the CHECKPOINT BASE's pot — the finalized, network-agreed snapshot every node
+	// resumes from, so the budget is identical for full and pruned nodes and across tip/final/
+	// appRoot folds (which all share that base). No base yet (pre-first-checkpoint) → 0.
+	const backstop = opts.backstop ?? (opts.base ? { pot: opts.base.bridge.pot, taken: opts.base.bridge.potEscrowTaken } : null);
+	const backstopBudget = backstop ? backstop.pot + backstop.taken : 0n;
 	for (const w of [...writes].sort(cmp)) {
 		const op = w.payload as Op | null;
 		// Effects timed by height (unbond maturity) use the write's STABLE certifying
 		// height (bornAt) so they don't drift as the global nowHeight advances; others
 		// use nowHeight (the current anchor clock).
-		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight);
+		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
 	settleExpired(view.bridge, view.book, nowHeight); // time-locked perps unwind at entry (base-independent)
@@ -274,7 +288,7 @@ export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: st
 	return computeView(included, { order, nowHeight, bornAt, base });
 }
 
-function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number): void {
+function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized by the committee
@@ -364,6 +378,19 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			// offer expiry / settle-window don't drift as the global tip advances on replay.
 			// Entry = the current oracle mark.
 			applyMatch(view.bridge, view.book, w.writer, w.id, op.offer, fill, bornHeight, m);
+			return;
+		}
+		case "match.pot": {
+			// Open against the liquidity backstop: the pot takes the opposite side at the mark,
+			// staking from finalized pot capital. available = the finalized budget minus what the
+			// pot has already drawn (deterministic; keeps the free pot ≥ 0). Entry = the mark.
+			const fill = parseAmount(op.fill);
+			const lev = parseAmount(op.leverage);
+			const m = mark(view);
+			if (fill === null || lev === null || m === null) return;
+			if (op.side !== "long" && op.side !== "short") return;
+			const available = backstopBudget - view.bridge.potEscrowTaken;
+			applyMatchPot(view.bridge, view.book, w.writer, w.id, op.side as Side, fill, lev, bornHeight, m, available);
 			return;
 		}
 		case "contract.settle": {

@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 import { computeView, gbtcOf, marketConserved } from "../src/market/btc.ts";
 import type { View } from "../src/market/btc.ts";
 import { emptyBridge, addGbtc, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS } from "../src/custody/bridge.ts";
-import { emptyBook, settleExpired } from "../src/market/intent.ts";
+import { emptyBook, settleExpired, POT } from "../src/market/intent.ts";
 import { viewRoot } from "../src/market/state.ts";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
@@ -95,4 +95,39 @@ test("folding to the same target from two different checkpoint heights agrees (d
 	assert.equal(viewRoot(resumeEarly), viewRoot(full), "early-checkpoint resume diverged from the full fold");
 	assert.equal(viewRoot(resumeLate), viewRoot(full), "late-checkpoint resume diverged from the full fold");
 	assert.ok(marketConserved(full) && marketConserved(resumeEarly) && marketConserved(resumeLate));
+});
+
+// ── a backstop (match.pot) position folds identically across checkpoint bases ──
+// A match.pot draws against the FINALIZED pot, so it's only ever folded ON TOP of a checkpoint
+// base that already holds the decayed pot — never from genesis. The budget auto-derives from that
+// base (base.pot + base.potEscrowTaken), so every node folding onto the same agreed base agrees.
+test("a backstop position folds identically from two checkpoint heights (deterministic budget)", async () => {
+	const node = new GavlNode(new Ledger(PARAMS));
+	let t = 0;
+	const D = new Account({ node, params: PARAMS, k: K, now: () => ++t });
+	await D.takePot("long", 40_000n, 3n); // D's only write: open long against the pot
+	const writes = node.ledger.allWrites();
+	const born = new Map(writes.map((w) => [w.id, 0] as [string, number]));
+
+	// The agreed checkpoint base: D pre-funded, a pot grown from prior idle decay, an oracle mark.
+	const base = (): View => {
+		const bridge = emptyBridge();
+		addGbtc(bridge, D.pubHex, 100_000n);
+		bridge.pot = 200_000n; // accumulated idle decay → the backstop's finalized capital
+		bridge.reserves = 300_000n; // 100k free + 200k pot
+		return { bridge, oracle: { price: 61_000n, readings: new Map(), postCount: 0, sources: [] }, custody: { fundKey: null, epoch: -1 }, book: emptyBook() };
+	};
+	const T = 43_300; // past the backstop contract's time-lock (born 0 → expiry 43200)
+
+	const full = computeView(writes, { base: base(), bornAt: born, nowHeight: T }); // budget from base.pot
+	const mid = computeView(writes, { base: base(), bornAt: born, nowHeight: 20_000 }); // checkpoint while open
+	const resume = computeView([], { base: mid, nowHeight: T });
+
+	// the pot took the short side and never went negative (drew from its 200k finalized budget)
+	const open = computeView(writes, { base: base(), bornAt: born, nowHeight: 20_000 });
+	assert.equal([...open.book.contracts.values()][0].short, POT, "the pot is the counterparty");
+	assert.ok(open.bridge.pot >= 0n, "free pot stayed solvent through the draw");
+
+	assert.equal(viewRoot(resume), viewRoot(full), "backstop fold must agree across checkpoint bases");
+	assert.ok(marketConserved(full) && marketConserved(resume));
 });

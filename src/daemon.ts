@@ -649,9 +649,22 @@ export class Daemon {
 		return id;
 	}
 
-	/** Easy taker: go long/short by `size`, sweeping the best OPPOSITE resting intents
-	 *  until filled or the tape runs dry (taker-only — unfilled remainder is dropped). */
-	async takePosition(side: Side, size: string): Promise<{ filled: string; contracts: string[] }> {
+	/** gBTC the liquidity backstop can stake right now: its FINALIZED capital (the checkpoint
+	 *  base's free pot + lifetime draws — the deterministic budget) minus what it has already
+	 *  drawn in the live view. 0 before the first checkpoint. */
+	backstopAvailable(view = this.view()): bigint {
+		const base = this.checkpointBase;
+		if (!base) return 0n;
+		const budget = base.bridge.pot + base.bridge.potEscrowTaken;
+		const avail = budget - view.bridge.potEscrowTaken;
+		return avail > 0n ? avail : 0n;
+	}
+
+	/** Easy taker: go long/short by `size`, sweeping the best OPPOSITE resting intents first,
+	 *  then falling back to the liquidity BACKSTOP (the idle-decay pot) for any remainder — so a
+	 *  trade can be placed even with no peer on the other side. `leverage` applies to the backstop
+	 *  leg (default 2×); peer fills keep the maker's offered leverage. */
+	async takePosition(side: Side, size: string, leverage = "2"): Promise<{ filled: string; contracts: string[]; viaBackstop: string }> {
 		const want = BigInt(size);
 		const opposite: Side = side === "long" ? "short" : "long";
 		const me = this.wallet.active().pubHex;
@@ -668,8 +681,27 @@ export class Daemon {
 				/* raced away — skip */
 			}
 		}
-		if (contracts.length === 0) throw new Error(`no ${opposite} intents on the tape to take — broadcast one or wait for a peer`);
-		return { filled: (want - left).toString(), contracts };
+		// No peer (or not enough) → let the pot take the other side, capped by its finalized budget.
+		let viaBackstop = 0n;
+		if (left > 0n) {
+			const avail = this.backstopAvailable();
+			let take = left < avail ? left : avail;
+			if (take > this.active().gbtc()) take = this.active().gbtc();
+			if (take > 0n) {
+				try {
+					const id = await this.active().takePot(side, take, leverage);
+					if (this.view().book.contracts.has(id)) {
+						contracts.push(id);
+						left -= take;
+						viaBackstop = take;
+					}
+				} catch {
+					/* budget/coverage raced — skip */
+				}
+			}
+		}
+		if (contracts.length === 0) throw new Error(`no ${opposite} intents on the tape and the backstop pot is dry — broadcast an intent or wait for a peer`);
+		return { filled: (want - left).toString(), contracts, viaBackstop: viaBackstop.toString() };
 	}
 
 	/** Close (settle) a matched contract at the current mark, from the active account. */
