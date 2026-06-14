@@ -181,6 +181,7 @@ export function backingBps(s: BridgeState): bigint {
 export function mintFromDeposit(s: BridgeState, att: DepositAttestation): boolean {
 	if (att.amount <= 0n || s.processed.has(att.depositId)) return false;
 	s.processed.add(att.depositId);
+	s.claims.delete(att.depositId); // the mint request (if any) is satisfied → retire it (was a leak)
 	s.depositors.add(att.depositor); // its per-user deposit address may hold fund BTC
 	s.reserves += att.amount; // BTC now in the fund
 	addG(s, att.depositor, att.amount); // gBTC minted to the depositor
@@ -220,9 +221,11 @@ export function withdrawalPayouts(s: BridgeState): { address: string; amount: bi
 
 // ── autonomous co-signing triggers (the work the committee picks up off-chain) ──
 
-/** Record a deposit-mint request (the on-chain trigger). Idempotent by depositId. */
+/** Record a deposit-mint request (the on-chain trigger). Idempotent by depositId, and a
+ *  no-op once the deposit is already minted — so `claims` only ever holds OUTSTANDING
+ *  requests (bounded), never a permanent record of every claim ever. */
 export function recordClaim(s: BridgeState, depositId: string, depositor: string): void {
-	if (!s.claims.has(depositId)) s.claims.set(depositId, depositor);
+	if (!s.claims.has(depositId) && !s.processed.has(depositId)) s.claims.set(depositId, depositor);
 }
 
 /** Record a withdrawal's payout txid → marks it in flight (stop re-signing). */
@@ -265,5 +268,6 @@ export function completeWithdrawal(s: BridgeState, id: string): boolean {
 	s.reserves -= w.amount; // BTC has left the fund
 	s.paidOut += w.amount;
 	s.pending.splice(i, 1);
+	s.broadcasts.delete(id); // withdrawal settled → retire the in-flight marker (was a leak)
 	return true;
 }

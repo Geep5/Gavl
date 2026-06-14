@@ -72,8 +72,9 @@ export interface Contract {
 export interface MarketBook {
 	/** Open contracts by id. */
 	contracts: Map<string, Contract>;
-	/** Cumulative stake matched against each offer nonce — enforces Σ fills ≤ size. */
-	offerFills: Map<string, bigint>;
+	/** Per offer nonce: cumulative stake matched (enforces Σ fills ≤ size) + the offer's expiry
+	 *  height, so the entry can be RETIRED once the offer can no longer be matched (bounds the map). */
+	offerFills: Map<string, { filled: bigint; expiryHeight: number }>;
 }
 
 export function emptyBook(): MarketBook {
@@ -85,6 +86,13 @@ export function escrowedInContracts(book: MarketBook): bigint {
 	let t = 0n;
 	for (const c of book.contracts.values()) t += c.stake * 2n;
 	return t;
+}
+
+/** Retire fill-tracking for offers past their expiry. applyMatch already rejects any match on
+ *  an expired offer, so a passed-expiry entry can never change again — dropping it bounds
+ *  offerFills to live offers instead of every nonce ever matched. */
+export function pruneExpiredOffers(book: MarketBook, nowHeight: number): void {
+	for (const [nonce, f] of book.offerFills) if (nowHeight > f.expiryHeight) book.offerFills.delete(nonce);
 }
 
 // ── parsing / validation ─────────────────────────────────────────
@@ -173,7 +181,7 @@ export function applyMatch(bridge: BridgeState, book: MarketBook, taker: string,
 	if (fill <= 0n) return null;
 
 	const size = parseSats(offer.size)!;
-	const already = book.offerFills.get(offer.nonce) ?? 0n;
+	const already = book.offerFills.get(offer.nonce)?.filled ?? 0n;
 	const remaining = size - already;
 	if (remaining <= 0n) return null; // offer fully consumed
 	const take = fill <= remaining ? fill : remaining; // partial fill
@@ -182,7 +190,7 @@ export function applyMatch(bridge: BridgeState, book: MarketBook, taker: string,
 
 	addGbtc(bridge, offer.maker, -take); // escrow both stakes → the contract
 	addGbtc(bridge, taker, -take);
-	book.offerFills.set(offer.nonce, already + take);
+	book.offerFills.set(offer.nonce, { filled: already + take, expiryHeight: offer.expiryHeight });
 
 	const long = offer.makerSide === "long" ? offer.maker : taker;
 	const short = offer.makerSide === "long" ? taker : offer.maker;
