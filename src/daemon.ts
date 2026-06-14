@@ -286,6 +286,7 @@ export class Daemon {
 		this.node.fullSnapshot = () => this.lastSnapshot ?? null;
 		this.node.wantSnapshot = (offer) => this.node.ledger.summary().writers === 0 && offer.height > this.lastCheckpointHeight; // only a truly fresh node bootstraps from state
 		this.node.onSnapshot = (snap) => this.ingestSnapshot(snap);
+		this.node.adoptFloor = (candidates) => this.adoptFloor(candidates);
 	}
 
 	/** Verify a peer-supplied checkpoint against our synced anchor chain, then seed from it.
@@ -316,6 +317,27 @@ export class Daemon {
 		this.viewCache = undefined;
 		this.finalCache = undefined;
 		return true;
+	}
+
+	/** Genesis-free bootstrap (node.adoptFloor hook): a truly fresh node can't link a pruned anchor
+	 *  suffix back to genesis. If we've pulled a checkpoint, adopt ITS anchor (found among the suffix)
+	 *  as a TRUSTED floor — weak subjectivity: we trust the checkpoint we chose to bootstrap from; its
+	 *  PoST isn't re-verified to genesis (grindable/unprovable), but everything above it is, and the
+	 *  STATE is authenticated separately (ingestSnapshot checks the child anchor's appRoot). Returns
+	 *  true if a floor was installed (then the suffix links above it and onTip seeds the state). */
+	private adoptFloor(candidates: Anchor[]): boolean {
+		const anchors = this.node.anchors;
+		const snap = this.pendingSnapshot;
+		if (!anchors || !snap || anchors.tip() !== null) return false; // only on a fresh chain, with a pulled checkpoint
+		const floor = candidates.find((a) => a.id === snap.anchorId);
+		if (!floor) return false; // the checkpoint's anchor isn't in this suffix (yet)
+		if (rootOfHeads(snap.heads) !== floor.stateRoot) return false; // snapshot heads must be the ones the floor PoST-committed
+		try {
+			anchors.adopt(floor, snap.heads); // install the trusted root (throws if unsafe — e.g. off an epoch boundary)
+		} catch {
+			return false;
+		}
+		return true; // ingestSnapshot (on the next tip) authenticates + seeds the state above this floor
 	}
 
 	/** Retry a stashed snapshot once the anchor chain has caught up (called on each tip move).

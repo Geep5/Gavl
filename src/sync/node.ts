@@ -55,6 +55,13 @@ export class GavlNode {
 	wantSnapshot?: (offer: { anchorId: string; height: number }) => boolean;
 	/** Ingest a pulled checkpoint: verify against my anchor chain + seed. Returns true if seeded. */
 	onSnapshot?: (snap: StoredSnapshot) => boolean;
+	/** Genesis-free bootstrap: from these orphan anchors (a pruned suffix that can't reach genesis),
+	 *  adopt a TRUSTED finalized floor if one matches a pulled checkpoint. Returns true if it did
+	 *  (then the suffix links above it). The app decides what to trust. */
+	adoptFloor?: (candidates: Anchor[]) => boolean;
+	/** Suffix anchors a fresh node received that couldn't link to (its absent) genesis — held until
+	 *  a checkpoint lets us adopt a floor beneath them. Cleared once adopted. */
+	private orphanAnchors = new Map<string, Anchor>();
 	/** Serializes async anchor ingestion so tip updates don't race. */
 	private anchorQueue: Promise<void> = Promise.resolve();
 
@@ -166,7 +173,17 @@ export class GavlNode {
 			case "snapshot": {
 				// Verify (appRoot against my synced anchor chain) + seed. On success, re-advertise
 				// my new heads so the peer serves me only the POST-checkpoint writes.
-				if (this.onSnapshot?.(m.snap)) this.advertise();
+				if (this.onSnapshot?.(m.snap)) {
+					this.advertise();
+					return;
+				}
+				// Couldn't seed directly — a truly fresh node has no chain to authenticate against yet.
+				// The checkpoint may now let us adopt a trusted floor beneath the buffered suffix.
+				this.anchorQueue = this.anchorQueue
+					.then(async () => {
+						await this.resolveBootstrap();
+					})
+					.catch(() => {});
 				return;
 			}
 			case "intent": {
@@ -266,6 +283,9 @@ export class GavlNode {
 		conn.send({ t: "reshare", m });
 	}
 
+	/** Cap on buffered orphan anchors (transient bootstrap state) — far above any real suffix. */
+	private static readonly ORPHAN_CAP = 50_000;
+
 	private async ingestAnchors(conn: Connection, anchors: Anchor[]): Promise<void> {
 		if (!this.anchors) return;
 		const before = this.anchors.tip()?.id ?? null;
@@ -274,12 +294,37 @@ export class GavlNode {
 			const r = await this.anchors.add(a);
 			if (!r.ok && r.reason === "unknown prev anchor") gap = true;
 		}
+		if (gap && this.anchors.tip() === null) {
+			// Fresh node: this suffix can't reach (grindable, unkept) genesis. Buffer it and try to
+			// adopt a trusted floor from a pulled checkpoint. If none is available yet we simply WAIT —
+			// the checkpoint is already being pulled (snapshot-want), and re-requesting anchors would
+			// just spin. Adoption fires once the checkpoint lands (see the snapshot handler).
+			if (this.orphanAnchors.size < GavlNode.ORPHAN_CAP) for (const a of anchors) this.orphanAnchors.set(a.id, a);
+			await this.resolveBootstrap();
+			return; // resolveBootstrap notifies onTip on success
+		}
 		if (gap) conn.send({ t: "anchor-want", fromHeight: 0 }); // missing lower anchors → full pull
 		const after = this.anchors.tip();
 		if (after && after.id !== before) {
 			this.onTip?.(after);
 			this.broadcastExcept(conn, this.anchorTipMsg()!); // propagate the heavier tip onward
 		}
+	}
+
+	/** Genesis-free bootstrap: on a fresh (tipless) chain, ask the app to adopt a trusted floor from
+	 *  the buffered orphan suffix. If it does, the suffix links above the floor and we advance to a
+	 *  tip; the app's onTip then authenticates + seeds the matching checkpoint state. */
+	private async resolveBootstrap(): Promise<boolean> {
+		if (!this.anchors || this.anchors.tip() !== null || !this.adoptFloor || this.orphanAnchors.size === 0) return false;
+		if (!this.adoptFloor([...this.orphanAnchors.values()])) return false; // nothing trusted to adopt yet
+		for (const a of [...this.orphanAnchors.values()].sort((x, y) => x.height - y.height)) await this.anchors.add(a);
+		this.orphanAnchors.clear();
+		const after = this.anchors.tip();
+		if (after) {
+			this.onTip?.(after);
+			this.broadcast(this.anchorTipMsg()!);
+		}
+		return true;
 	}
 
 	private anchorTipMsg(): SyncMessage | null {
