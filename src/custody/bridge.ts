@@ -51,7 +51,7 @@ export interface BridgeState {
 	/** Deposit-mint REQUESTS (depositId → depositor) — the on-chain trigger that tells
 	 *  every committee member to verify this deposit on-chain and co-sign the mint. A
 	 *  request whose depositId is already `processed` is satisfied. */
-	claims: Map<string, string>;
+	claims: Map<string, { depositor: string; height: number }>;
 	/** Withdrawal payout txids (withdrawalId → btc txid) — posted once the committee has
 	 *  signed + broadcast the payout. Marks a withdrawal IN FLIGHT so members stop
 	 *  re-signing it and instead watch that txid for confirmation, then co-sign settle. */
@@ -227,8 +227,19 @@ export function withdrawalPayouts(s: BridgeState): { address: string; amount: bi
 /** Record a deposit-mint request (the on-chain trigger). Idempotent by depositId, and a
  *  no-op once the deposit is already minted — so `claims` only ever holds OUTSTANDING
  *  requests (bounded), never a permanent record of every claim ever. */
-export function recordClaim(s: BridgeState, depositId: string, depositor: string): void {
-	if (!s.claims.has(depositId) && !s.processed.has(depositId)) s.claims.set(depositId, depositor);
+export function recordClaim(s: BridgeState, depositId: string, depositor: string, height = 0): void {
+	if (!s.claims.has(depositId) && !s.processed.has(depositId)) s.claims.set(depositId, { depositor, height });
+}
+
+/** Anchors a deposit-mint request rests before a never-completed (e.g. bogus) one is retired.
+ *  ~1 week at a 60s/anchor target — ample time for the committee to co-sign a real deposit;
+ *  a genuine deposit can always be re-claimed afterward, so nothing is permanently stranded. */
+export const CLAIM_RECLAIM_GRACE = 10_080;
+
+/** Drop deposit-mint requests that have gone unminted past the reclaim grace (stale or bogus).
+ *  Bounds `claims` to recent requests; a real deposit is simply re-claimed if it lapsed. */
+export function pruneStaleClaims(s: BridgeState, nowHeight: number): void {
+	for (const [depositId, c] of s.claims) if (nowHeight - c.height > CLAIM_RECLAIM_GRACE) s.claims.delete(depositId);
 }
 
 /** Record a withdrawal's payout txid → marks it in flight (stop re-signing). */
@@ -240,7 +251,7 @@ export function recordBroadcast(s: BridgeState, withdrawalId: string, txid: stri
  *  Every committee member scans these, verifies the deposit on-chain, and co-signs. */
 export function pendingClaims(s: BridgeState): { depositId: string; depositor: string }[] {
 	const out: { depositId: string; depositor: string }[] = [];
-	for (const [depositId, depositor] of s.claims) if (!s.processed.has(depositId)) out.push({ depositId, depositor });
+	for (const [depositId, c] of s.claims) if (!s.processed.has(depositId)) out.push({ depositId, depositor: c.depositor });
 	return out;
 }
 

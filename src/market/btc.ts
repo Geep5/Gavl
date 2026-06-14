@@ -22,7 +22,7 @@ import { isOp } from "./ops.ts";
 import { finalizedOrdering, orderingFor } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import { oraclePubHex, bridgePubHex } from "./oracle.ts";
-import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash } from "../custody/bridge.ts";
+import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
 import { emptyBook, escrowedInContracts, applyMatch, applySettle, pruneExpiredOffers, settleExpired } from "./intent.ts";
@@ -250,6 +250,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	accrueDemurrage(view, nowHeight); // idle gBTC bleeds to capital working in open contracts
 	evictStaleReadings(view.oracle); // drop posters that fell out of the freshness window
 	pruneExpiredOffers(view.book, nowHeight); // drop fill-tracking for offers that can no longer be matched
+	pruneStaleClaims(view.bridge, nowHeight); // retire deposit-mint requests unminted past the reclaim grace
 	return view;
 }
 
@@ -314,7 +315,7 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			// it only ever credits the per-user-address owner, and the committee verifies
 			// the deposit on-chain before minting, so a bogus claim mints nothing.
 			if (typeof op.depositId !== "string" || typeof op.depositor !== "string") return;
-			recordClaim(view.bridge, op.depositId, op.depositor);
+			recordClaim(view.bridge, op.depositId, op.depositor, bornHeight);
 			return;
 		}
 		case "bridge.broadcast": {

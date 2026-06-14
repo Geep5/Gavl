@@ -10,7 +10,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { emptyBridge, mintFromDeposit, recordClaim, recordBroadcast, completeWithdrawal, requestWithdrawal, addGbtc } from "../src/custody/bridge.ts";
+import { emptyBridge, mintFromDeposit, recordClaim, recordBroadcast, completeWithdrawal, requestWithdrawal, addGbtc, pruneStaleClaims, CLAIM_RECLAIM_GRACE } from "../src/custody/bridge.ts";
 import { emptyBook, signOffer, applyMatch, pruneExpiredOffers } from "../src/market/intent.ts";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
@@ -29,6 +29,17 @@ test("a deposit-claim marker is retired once the deposit mints, and not re-added
 	assert.equal(s.claims.size, 0, "claim retired on mint");
 	recordClaim(s, "dep1:0", "alice"); // already processed
 	assert.equal(s.claims.size, 0, "a satisfied claim is never re-recorded");
+});
+
+test("an unminted deposit claim is retired only after the reclaim grace, and can be re-claimed", () => {
+	const s = emptyBridge();
+	recordClaim(s, "depX:0", "alice", 100);
+	pruneStaleClaims(s, 100 + CLAIM_RECLAIM_GRACE); // exactly at the grace → still held
+	assert.equal(s.claims.size, 1, "kept within the reclaim grace (≥ a week to complete the mint)");
+	pruneStaleClaims(s, 100 + CLAIM_RECLAIM_GRACE + 1); // past the grace → retired
+	assert.equal(s.claims.size, 0, "retired once the grace lapses");
+	recordClaim(s, "depX:0", "alice", 99_999); // a real deposit can always be re-claimed
+	assert.equal(s.claims.size, 1, "nothing is permanently stranded — re-claim works");
 });
 
 test("a withdrawal's in-flight marker is retired once it settles", () => {

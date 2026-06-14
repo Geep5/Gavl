@@ -23,7 +23,7 @@ function makeView(rev = false): View {
 	const bridge = emptyBridge();
 	const gbtc: [string, bigint][] = [["aa", 100n], ["bb", 250n], ["cc", 7n]];
 	const bonds: [string, bigint][] = [["bb", 50n], ["dd", 9n]];
-	const claims: [string, string][] = [["dep1:0", "aa"], ["dep2:1", "cc"]];
+	const claims: [string, { depositor: string; height: number }][] = [["dep1:0", { depositor: "aa", height: 3 }], ["dep2:1", { depositor: "cc", height: 7 }]];
 	const broadcasts: [string, string][] = [["w1", "txa"], ["w2", "txb"]];
 	const unb: [string, { amount: bigint; releaseHeight: number }][] = [["ee", { amount: 4n, releaseHeight: 20 }], ["ff", { amount: 8n, releaseHeight: 33 }]];
 	const order = <T>(xs: T[]) => (rev ? [...xs].reverse() : xs);

@@ -34,7 +34,7 @@ export interface CanonBridge {
 	processed: string[]; // sorted
 	pending: { id: string; owner: string; amount: string; btcAddress: string }[]; // fold order (FIFO)
 	depositors: string[]; // sorted
-	claims: Entry<string>[]; // depositId → depositor, sorted
+	claims: Entry<{ depositor: string; height: number }>[]; // depositId → {depositor, request height}, sorted
 	broadcasts: Entry<string>[]; // withdrawalId → txid, sorted
 	bonds: Entry<string>[]; // pubkey → sats, sorted
 	unbonding: Entry<{ amount: string; releaseHeight: number }>[]; // pubkey → ..., sorted
@@ -86,7 +86,7 @@ function serializeBridge(b: BridgeState): CanonBridge {
 		processed: sortedSet(b.processed),
 		pending: b.pending.map((p) => ({ id: p.id, owner: p.owner, amount: p.amount.toString(), btcAddress: p.btcAddress })),
 		depositors: sortedSet(b.depositors),
-		claims: mapEntries(b.claims, (v) => v),
+		claims: mapEntries(b.claims, (c) => ({ depositor: c.depositor, height: c.height })),
 		broadcasts: mapEntries(b.broadcasts, (v) => v),
 		bonds: mapEntries(b.bonds, (v) => v.toString()),
 		unbonding: mapEntries(b.unbonding, (u) => ({ amount: u.amount.toString(), releaseHeight: u.releaseHeight })),
@@ -135,7 +135,7 @@ function deserializeBridge(b: CanonBridge): BridgeState {
 	for (const id of b.processed) s.processed.add(id);
 	s.pending = b.pending.map((p): PendingWithdrawal => ({ id: p.id, owner: p.owner, amount: BigInt(p.amount), btcAddress: p.btcAddress }));
 	for (const d of b.depositors) s.depositors.add(d);
-	for (const [k, v] of b.claims) s.claims.set(k, v);
+	for (const [k, c] of b.claims) s.claims.set(k, { depositor: c.depositor, height: c.height });
 	for (const [k, v] of b.broadcasts) s.broadcasts.set(k, v);
 	for (const [k, v] of b.bonds) s.bonds.set(k, BigInt(v));
 	for (const [k, u] of b.unbonding) s.unbonding.set(k, { amount: BigInt(u.amount), releaseHeight: u.releaseHeight });
