@@ -10,6 +10,7 @@ import type { Write } from "../chain/writer.ts";
 import type { Heads } from "../ledger/ledger.ts";
 import type { Anchor } from "../consensus/anchor.ts";
 import type { Offer } from "../market/intent.ts";
+import type { StoredSnapshot } from "../store/store.ts";
 
 export type SyncMessage =
 	// ── write sync ───────────────────────────────────────────────
@@ -33,6 +34,13 @@ export type SyncMessage =
 	| { t: "anchor-want"; fromHeight: number }
 	/** Serve anchors along the tip chain. */
 	| { t: "anchor-chain"; anchors: Anchor[] }
+	// ── checkpoint bootstrap (a fresh peer loads state, not history) ──
+	/** Advertise my latest durable checkpoint on connect (so a fresh peer can skip history). */
+	| { t: "snapshot-offer"; anchorId: string; height: number }
+	/** Ask a peer to send its full checkpoint. */
+	| { t: "snapshot-want" }
+	/** Serve the full checkpoint (committed state + heads at a finalized anchor). */
+	| { t: "snapshot"; snap: StoredSnapshot }
 	// ── distributed key generation (custody committee ceremony) ──
 	/** A DKG ceremony message, routed to the node's registered DKG coordinator. */
 	| { t: "dkg"; m: DkgWire }

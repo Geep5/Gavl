@@ -18,6 +18,7 @@
 
 import type { SyncMessage, DkgWire, SignWire, ReshareWire } from "./messages.ts";
 import type { Offer } from "../market/intent.ts";
+import type { StoredSnapshot } from "../store/store.ts";
 import type { Write } from "../chain/writer.ts";
 import { Ledger } from "../ledger/ledger.ts";
 import type { Heads } from "../ledger/ledger.ts";
@@ -45,6 +46,15 @@ export class GavlNode {
 	onIntent?: (offer: Offer) => boolean;
 	/** This node's resting offer book, sent to a peer on connect so it sees the tape. */
 	intentsToShare?: () => Offer[];
+	// ── checkpoint bootstrap (a fresh peer loads state instead of replaying history) ──
+	/** Header of my latest durable checkpoint, advertised on connect (null = full/none). */
+	snapshotHeader?: () => { anchorId: string; height: number } | null;
+	/** The full checkpoint, served on request. */
+	fullSnapshot?: () => StoredSnapshot | null;
+	/** Should I pull this offered checkpoint? (true → I lack the history it would let me skip.) */
+	wantSnapshot?: (offer: { anchorId: string; height: number }) => boolean;
+	/** Ingest a pulled checkpoint: verify against my anchor chain + seed. Returns true if seeded. */
+	onSnapshot?: (snap: StoredSnapshot) => boolean;
 	/** Serializes async anchor ingestion so tip updates don't race. */
 	private anchorQueue: Promise<void> = Promise.resolve();
 
@@ -63,6 +73,14 @@ export class GavlNode {
 		if (tip) conn.send(tip);
 		const offers = this.intentsToShare?.();
 		if (offers && offers.length) conn.send({ t: "intents", offers }); // hand the new peer my tape
+		const snap = this.snapshotHeader?.();
+		if (snap) conn.send({ t: "snapshot-offer", anchorId: snap.anchorId, height: snap.height }); // offer a fast-bootstrap checkpoint
+	}
+
+	/** Re-broadcast my write-head fingerprint so peers serve me whatever I now lack (used after
+	 *  seeding a checkpoint: my heads jumped, and I want only the post-checkpoint writes). */
+	advertise(): void {
+		this.broadcast({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads() });
 	}
 
 	/** Apply a locally-produced write and gossip it. */
@@ -100,6 +118,9 @@ export class GavlNode {
 			case "hello": {
 				const want = this.diffWant(m.heads);
 				if (Object.keys(want).length > 0) conn.send({ t: "want", from: want });
+				// If the sender is BEHIND me (I hold writes it lacks), reply with my hello so it
+				// can pull — e.g. after it seeds a checkpoint and re-advertises its new heads.
+				else if (this.aheadOf(m.heads)) conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads() });
 				return;
 			}
 			case "want": {
@@ -129,6 +150,23 @@ export class GavlNode {
 					this.broadcastExcept(conn, { t: "announce", writes: learned });
 				}
 				if (changed) conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads() });
+				return;
+			}
+			case "snapshot-offer": {
+				// A peer advertises a checkpoint. Pull it only if I'm missing the history it
+				// covers (a fresh joiner) — otherwise normal write sync handles me.
+				if (this.wantSnapshot?.(m)) conn.send({ t: "snapshot-want" });
+				return;
+			}
+			case "snapshot-want": {
+				const snap = this.fullSnapshot?.();
+				if (snap) conn.send({ t: "snapshot", snap });
+				return;
+			}
+			case "snapshot": {
+				// Verify (appRoot against my synced anchor chain) + seed. On success, re-advertise
+				// my new heads so the peer serves me only the POST-checkpoint writes.
+				if (this.onSnapshot?.(m.snap)) this.advertise();
 				return;
 			}
 			case "intent": {
@@ -271,6 +309,17 @@ export class GavlNode {
 			}
 		}
 		return want;
+	}
+
+	/** Do I hold writes the peer (with heads `theirHeads`) lacks? — a writer they don't have,
+	 *  or one I'm further ahead on. Used to nudge a behind peer to pull (reply with my hello). */
+	private aheadOf(theirHeads: Heads): boolean {
+		const mine = this.ledger.heads();
+		for (const writer of Object.keys(mine)) {
+			const their = theirHeads[writer];
+			if (!their || mine[writer].seq > their.seq) return true;
+		}
+		return false;
 	}
 
 	private broadcast(m: SyncMessage): void {
