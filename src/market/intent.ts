@@ -33,6 +33,12 @@ export type Side = "long" | "short";
 export const MIN_OFFER_LEVERAGE = 2n;
 export const MAX_OFFER_LEVERAGE = 100n;
 
+/** Maximum contract lifetime in anchors (the time-lock). A matched position auto-settles at the
+ *  mark once it's this old — either side may still close EARLY, but nothing outlives the cap, so
+ *  the open-contract set can't accumulate stuck positions. Consensus-critical: every node must
+ *  use the same value. ~30 days at a 60s/anchor target. */
+export const CONTRACT_MAX_LIFE = 43_200;
+
 /** The signed part of an offer (everything except the signature). Canonical-JSON
  *  encoded and signed by the maker — a self-authenticating signal a taker can redeem
  *  on-chain without the maker being online. */
@@ -66,6 +72,7 @@ export interface Contract {
 	entry: bigint; // the oracle mark when matched
 	leverage: bigint;
 	nonce: string; // the originating offer (audit)
+	expiryHeight: number; // auto-settles at the mark once the anchor clock reaches this (time-lock)
 }
 
 /** The matched-market state that lives alongside the bridge in the View. */
@@ -194,15 +201,16 @@ export function applyMatch(bridge: BridgeState, book: MarketBook, taker: string,
 
 	const long = offer.makerSide === "long" ? offer.maker : taker;
 	const short = offer.makerSide === "long" ? taker : offer.maker;
-	const c: Contract = { id: writeId, long, short, stake: take, entry: mark, leverage: parseSats(offer.leverage)!, nonce: offer.nonce };
+	const c: Contract = { id: writeId, long, short, stake: take, entry: mark, leverage: parseSats(offer.leverage)!, nonce: offer.nonce, expiryHeight: nowHeight + CONTRACT_MAX_LIFE };
 	book.contracts.set(writeId, c);
 	return c;
 }
 
 /**
  * Close (settle) a contract at the oracle `price`: split the 2·stake pot directionally
- * and credit each side's free gBTC. Perpetual — either side (in fact anyone) may close
- * it at any time at the current mark; the loser can't escape the mark by stalling.
+ * and credit each side's free gBTC. Either side (in fact anyone) may close it EARLY at the
+ * current mark; the loser can't escape the mark by stalling. A position that's never closed
+ * early auto-settles at its time-lock (see settleExpired).
  */
 export function applySettle(bridge: BridgeState, book: MarketBook, contractId: string, price: bigint): boolean {
 	const c = book.contracts.get(contractId);
@@ -214,4 +222,18 @@ export function applySettle(bridge: BridgeState, book: MarketBook, contractId: s
 	addGbtc(bridge, c.short, shortPay);
 	book.contracts.delete(contractId);
 	return true;
+}
+
+/**
+ * Auto-settle every contract whose time-lock has elapsed (expiryHeight ≤ nowHeight) at the
+ * current mark. A perp can't outlive its cap, so the open-contract set is bounded by
+ * throughput × CONTRACT_MAX_LIFE instead of accumulating stuck positions. Deterministic —
+ * every node settles when its fold first crosses the expiry height (same clock as releaseMatured).
+ * No-op while there's no mark; the contracts settle once a price returns.
+ */
+export function settleExpired(bridge: BridgeState, book: MarketBook, nowHeight: number, mark: bigint | null): void {
+	if (mark === null || mark <= 0n) return;
+	const due: string[] = [];
+	for (const [id, c] of book.contracts) if (nowHeight >= c.expiryHeight) due.push(id);
+	for (const id of due) applySettle(bridge, book, id, mark);
 }

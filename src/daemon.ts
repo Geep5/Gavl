@@ -656,11 +656,12 @@ export class Daemon {
 	}
 
 	/** The active account's open matched contracts, with live PnL at the current mark. */
-	myContracts(): { id: string; side: Side; stake: string; entry: string; leverage: string; counterparty: string; pnl: string | null }[] {
+	myContracts(): { id: string; side: Side; stake: string; entry: string; leverage: string; counterparty: string; pnl: string | null; expiryHeight: number; expiresIn: number | null }[] {
 		const v = this.view();
 		const m = mark(v);
 		const me = this.wallet.active().pubHex;
-		const out: { id: string; side: Side; stake: string; entry: string; leverage: string; counterparty: string; pnl: string | null }[] = [];
+		const height = this.node.anchorTip()?.height ?? 0;
+		const out: { id: string; side: Side; stake: string; entry: string; leverage: string; counterparty: string; pnl: string | null; expiryHeight: number; expiresIn: number | null }[] = [];
 		for (const c of v.book.contracts.values()) {
 			const iAmLong = c.long === me;
 			if (!iAmLong && c.short !== me) continue;
@@ -670,7 +671,7 @@ export class Daemon {
 				const mine = iAmLong ? longGets : c.stake * 2n - longGets;
 				pnl = (mine - c.stake).toString();
 			}
-			out.push({ id: c.id, side: iAmLong ? "long" : "short", stake: c.stake.toString(), entry: c.entry.toString(), leverage: c.leverage.toString(), counterparty: iAmLong ? c.short : c.long, pnl });
+			out.push({ id: c.id, side: iAmLong ? "long" : "short", stake: c.stake.toString(), entry: c.entry.toString(), leverage: c.leverage.toString(), counterparty: iAmLong ? c.short : c.long, pnl, expiryHeight: c.expiryHeight, expiresIn: height > 0 ? Math.max(0, c.expiryHeight - height) : null });
 		}
 		return out;
 	}

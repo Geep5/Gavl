@@ -25,7 +25,7 @@ import { oraclePubHex, bridgePubHex } from "./oracle.ts";
 import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
-import { emptyBook, escrowedInContracts, applyMatch, applySettle, pruneExpiredOffers } from "./intent.ts";
+import { emptyBook, escrowedInContracts, applyMatch, applySettle, pruneExpiredOffers, settleExpired } from "./intent.ts";
 import type { MarketBook, Offer } from "./intent.ts";
 import { serializeView, deserializeView } from "./state.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
@@ -187,6 +187,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
+	settleExpired(view.bridge, view.book, nowHeight, view.oracle.price); // time-locked perps auto-settle at the mark
 	evictStaleReadings(view.oracle); // drop posters that fell out of the freshness window
 	pruneExpiredOffers(view.book, nowHeight); // drop fill-tracking for offers that can no longer be matched
 	return view;

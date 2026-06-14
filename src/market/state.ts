@@ -50,7 +50,7 @@ export interface CanonOracle {
 }
 
 export interface CanonBook {
-	contracts: Entry<{ id: string; long: string; short: string; stake: string; entry: string; leverage: string; nonce: string }>[]; // sorted by id
+	contracts: Entry<{ id: string; long: string; short: string; stake: string; entry: string; leverage: string; nonce: string; expiryHeight: number }>[]; // sorted by id
 	offerFills: Entry<{ filled: string; expiryHeight: number }>[]; // nonce → {filled sats, expiry}, sorted
 }
 
@@ -105,7 +105,7 @@ function serializeOracle(o: OracleState): CanonOracle {
 
 function serializeBook(book: MarketBook): CanonBook {
 	return {
-		contracts: mapEntries(book.contracts, (c) => ({ id: c.id, long: c.long, short: c.short, stake: c.stake.toString(), entry: c.entry.toString(), leverage: c.leverage.toString(), nonce: c.nonce })),
+		contracts: mapEntries(book.contracts, (c) => ({ id: c.id, long: c.long, short: c.short, stake: c.stake.toString(), entry: c.entry.toString(), leverage: c.leverage.toString(), nonce: c.nonce, expiryHeight: c.expiryHeight })),
 		offerFills: mapEntries(book.offerFills, (f) => ({ filled: f.filled.toString(), expiryHeight: f.expiryHeight })),
 	};
 }
@@ -150,7 +150,7 @@ function deserializeOracle(o: CanonOracle): OracleState {
 
 function deserializeBook(b: CanonBook): MarketBook {
 	const book = emptyBook();
-	for (const [id, c] of b.contracts) book.contracts.set(id, { id: c.id, long: c.long, short: c.short, stake: BigInt(c.stake), entry: BigInt(c.entry), leverage: BigInt(c.leverage), nonce: c.nonce } as Contract);
+	for (const [id, c] of b.contracts) book.contracts.set(id, { id: c.id, long: c.long, short: c.short, stake: BigInt(c.stake), entry: BigInt(c.entry), leverage: BigInt(c.leverage), nonce: c.nonce, expiryHeight: c.expiryHeight } as Contract);
 	for (const [k, f] of b.offerFills) book.offerFills.set(k, { filled: BigInt(f.filled), expiryHeight: f.expiryHeight });
 	return book;
 }
