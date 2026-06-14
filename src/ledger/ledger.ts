@@ -40,10 +40,18 @@ export type ApplyResult =
 	| { ok: true; applied: Write[]; buffered?: boolean }
 	| { ok: false; reason: string; equivocation?: [Write, Write] };
 
+/** A buffered (ahead-of-tip) write whose gap hasn't filled within this many apply-ticks is
+ *  dropped. Buffering each one already costs a PoST cooldown (so inflow is PoST-rate-limited);
+ *  this decay just stops a never-filling gap from lingering. The sender re-gossips if it ever
+ *  becomes relevant — sync pulls gaps in order anyway. */
+export const PENDING_MAX_AGE = 1024;
+
 export class Ledger {
 	readonly params: ChainParams;
 	private readonly chains = new Map<string, WriterChain>();
-	private readonly pending = new Map<string, Map<number, Write>>();
+	private readonly pending = new Map<string, Map<number, { w: Write; tick: number }>>();
+	/** Monotonic apply counter — the clock the pending buffer decays against. */
+	private tick = 0;
 
 	constructor(params: ChainParams) {
 		this.params = params;
@@ -51,6 +59,7 @@ export class Ledger {
 
 	/** Apply a write: append in order, buffer if ahead, detect equivocation. */
 	apply(w: Write): ApplyResult {
+		this.tick++;
 		let chain = this.chains.get(w.writer);
 		if (!chain) {
 			chain = new WriterChain({ writer: w.writer, plot: w.plot, params: this.params });
@@ -58,6 +67,8 @@ export class Ledger {
 			this.pending.set(w.writer, new Map());
 		}
 		const pend = this.pending.get(w.writer)!;
+		// Decay: drop buffered writes whose gap has gone unfilled too long (junk that never drains).
+		for (const [seq, e] of pend) if (this.tick - e.tick > PENDING_MAX_AGE) pend.delete(seq);
 		const nextSeq = chain.nextSeq;
 
 		// Below the checkpoint floor → already finalized and pruned; accept as a no-op
@@ -65,17 +76,17 @@ export class Ledger {
 		if (w.seq < chain.baseSeq) return { ok: true, applied: [] };
 
 		// Already have this slot? Idempotent if same id, equivocation if different.
-		const existing = w.seq < nextSeq ? chain.at(w.seq) : pend.get(w.seq);
+		const existing = w.seq < nextSeq ? chain.at(w.seq) : pend.get(w.seq)?.w;
 		if (existing) {
 			if (existing.id === w.id) return { ok: true, applied: [] };
 			return { ok: false, reason: "equivocation", equivocation: [existing, w] };
 		}
 
-		// Ahead of the tip: verify now (so junk can't accumulate) and buffer.
+		// Ahead of the tip: verify now (so junk can't accumulate) and buffer (with its tick).
 		if (w.seq > nextSeq) {
 			const v = verifyWrite(w, this.params);
 			if (!v.ok) return { ok: false, reason: v.reason };
-			pend.set(w.seq, w);
+			pend.set(w.seq, { w, tick: this.tick });
 			return { ok: true, applied: [], buffered: true };
 		}
 
@@ -87,7 +98,7 @@ export class Ledger {
 		// Drain any contiguous buffered writes now unblocked.
 		let s = chain.nextSeq;
 		while (pend.has(s)) {
-			const next = pend.get(s)!;
+			const next = pend.get(s)!.w;
 			pend.delete(s);
 			const rr = chain.append(next);
 			if (!rr.ok) return { ok: false, reason: rr.reason, equivocation: rr.equivocation };

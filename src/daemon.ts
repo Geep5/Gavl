@@ -20,7 +20,7 @@
 import { Ledger, rootOfHeads } from "./ledger/ledger.ts";
 import { GavlNode } from "./sync/node.ts";
 import { Account } from "./market/account.ts";
-import { computeView, finalizedView, viewAtAnchor, mark } from "./market/btc.ts";
+import { computeView, finalizedView, viewAtAnchor, mark, gbtcOf } from "./market/btc.ts";
 import type { View } from "./market/btc.ts";
 import { serializeView, deserializeView, viewRoot } from "./market/state.ts";
 import type { Anchor } from "./consensus/anchor.ts";
@@ -575,16 +575,38 @@ export class Daemon {
 		// otherwise offerFills (consensus state) grows with every offer ever broadcast.
 		const expiryHeight = (this.node.anchorTip()?.height ?? 0) + OFFER_TTL_ANCHORS;
 		const offer = me.makeOffer({ makerSide: side, size, leverage, expiryHeight, nonce });
+		if (!this.canBack(offer)) throw new Error("insufficient gBTC to back this offer"); // peers would drop it anyway
 		this.offers.set(nonce, offer);
 		this.node.gossipIntent(offer); // flood it to peers so their tapes show it
 		return offer;
 	}
 
+	/** Can `offer`'s maker actually back it? — total resting offer notional from that maker must
+	 *  be covered by their current free gBTC. This is the match-time ghost-check (we verify it at
+	 *  match anyway), applied at gossip time: unfunded spam is dropped on arrival for free, and
+	 *  every offer the tape keeps is tied to real gBTC (PoST/BTC-bounded capital) — so the tape
+	 *  self-bounds to the funded economy, no cap needed. */
+	private canBack(offer: Offer, view = this.view()): boolean {
+		const free = gbtcOf(view, offer.maker);
+		if (free <= 0n) return false; // unfunded → can't cover any stake; the match would ghost-fail
+		const fills = view.book.offerFills;
+		let resting = BigInt(offer.size) - (fills.get(offer.nonce)?.filled ?? 0n);
+		if (resting <= 0n) return false; // nothing left to rest
+		for (const o of this.offers.values()) {
+			if (o.maker !== offer.maker || o.nonce === offer.nonce) continue;
+			const rem = BigInt(o.size) - (fills.get(o.nonce)?.filled ?? 0n);
+			if (rem > 0n) resting += rem;
+		}
+		return resting <= free;
+	}
+
 	/** Ingest an intent gossiped by a peer (or a peer's whole book on connect). Verifies the
-	 *  maker signature and dedupes by nonce; returns true if it was NEW (so the node re-floods). */
+	 *  maker signature, drops offers the maker can't back (the early ghost-check), and dedupes by
+	 *  nonce; returns true if it was NEW (so the node re-floods). */
 	private receiveIntent(offer: Offer): boolean {
 		if (!offer || this.offers.has(offer.nonce)) return false;
 		if (!verifyOffer(offer)) return false;
+		if (!this.canBack(offer)) return false; // drop unbacked/over-committed offers — they'd fail to match
 		this.offers.set(offer.nonce, offer);
 		return true;
 	}
