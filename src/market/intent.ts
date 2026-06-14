@@ -28,6 +28,11 @@ import { gbtcOf, addGbtc } from "../custody/bridge.ts";
 
 export type Side = "long" | "short";
 
+/** The liquidity backstop's identity as a contract counterparty. Not a real pubkey (those are
+ *  64 hex chars), so it can never collide with a holder. A contract side equal to POT is funded
+ *  from / settled to `bridge.pot` (the idle-decay pool), never a `gbtc` balance. */
+export const POT = "POT";
+
 /** Leverage bounds an offer may specify. Higher = tighter cap (wiped by a smaller move).
  *  1× is a pointless fully-collateralized coin flip, so the floor is 2×. */
 export const MIN_OFFER_LEVERAGE = 2n;
@@ -218,10 +223,50 @@ export function applySettle(bridge: BridgeState, book: MarketBook, contractId: s
 	const pot = c.stake * 2n;
 	const longPay = longPayout(c.stake, c.entry, c.leverage, price);
 	const shortPay = pot - longPay; // exact remainder → zero-sum
-	addGbtc(bridge, c.long, longPay, height); // payout = a fresh credit → restarts the idle clock
-	addGbtc(bridge, c.short, shortPay, height);
+	creditParty(bridge, c.long, longPay, height); // payout = a fresh credit → restarts the idle clock
+	creditParty(bridge, c.short, shortPay, height);
 	book.contracts.delete(contractId);
 	return true;
+}
+
+/** Pay a contract side. The backstop POT is paid into `bridge.pot` (no holder balance, no idle
+ *  clock — the pool isn't an idle squatter); everyone else gets a normal gBTC credit. */
+function creditParty(bridge: BridgeState, who: string, amount: bigint, height?: number): void {
+	if (who === POT) bridge.pot += amount;
+	else addGbtc(bridge, who, amount, height);
+}
+
+/**
+ * A taker opens a position directly against the liquidity BACKSTOP — no peer maker needed. The pot
+ * takes the OPPOSITE side at the current oracle `mark`, staking matching gBTC from `bridge.pot`.
+ * `available` is the deterministic backstop budget (see BridgeState.potEscrowTaken): the stake is
+ * clamped to it, so the free pot provably never goes negative even under a loss storm. `fill` is
+ * also clamped to what the taker can cover. Returns the opened contract, or null if rejected (no
+ * mark, bad leverage, id reuse, or no budget/coverage). The pot's PnL flows back into `bridge.pot`
+ * at settle — winning trades drain idle capital out to traders; losing trades refill it.
+ */
+export function applyMatchPot(bridge: BridgeState, book: MarketBook, taker: string, writeId: string, takerSide: Side, fill: bigint, leverage: bigint, nowHeight: number, mark: bigint, available: bigint): Contract | null {
+	if (mark <= 0n) return null; // no oracle price yet → no entry
+	if (taker === POT) return null; // the pot can't take its own side
+	if (book.contracts.has(writeId)) return null; // id reuse
+	if (fill <= 0n) return null;
+	if (leverage < MIN_OFFER_LEVERAGE || leverage > MAX_OFFER_LEVERAGE) return null;
+
+	const budget = available > 0n ? available : 0n;
+	let take = fill;
+	const takerFree = gbtcOf(bridge, taker);
+	if (take > takerFree) take = takerFree; // taker can't cover → partial
+	if (take > budget) take = budget; // pot's finalized budget → partial
+	if (take <= 0n) return null; // taker broke or pot exhausted → no-op
+
+	addGbtc(bridge, taker, -take); // taker escrows its stake
+	bridge.pot -= take; // pot escrows the matching counter-stake (≥ 0 by the budget invariant)
+	bridge.potEscrowTaken += take; // committed counter the budget is measured against
+	const long = takerSide === "long" ? taker : POT;
+	const short = takerSide === "long" ? POT : taker;
+	const c: Contract = { id: writeId, long, short, stake: take, entry: mark, leverage, nonce: writeId, expiryHeight: nowHeight + CONTRACT_MAX_LIFE };
+	book.contracts.set(writeId, c);
+	return c;
 }
 
 /**

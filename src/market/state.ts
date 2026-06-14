@@ -41,7 +41,8 @@ export interface CanonBridge {
 	mintedTotal: string;
 	paidOut: string;
 	chargeFrom: Entry<{ since: number; charged: number }>[]; // pubkey → demurrage idle clock, sorted
-	pot: string; // the liquidity pot (idle-decay bucket)
+	pot: string; // the liquidity pot (idle-decay bucket), free/unescrowed
+	potEscrowTaken: string; // lifetime pot capital staked as backstop (budget counter)
 }
 
 export interface CanonOracle {
@@ -95,6 +96,7 @@ function serializeBridge(b: BridgeState): CanonBridge {
 		paidOut: b.paidOut.toString(),
 		chargeFrom: mapEntries(b.chargeFrom, (e) => ({ since: e.since, charged: e.charged })),
 		pot: b.pot.toString(),
+		potEscrowTaken: b.potEscrowTaken.toString(),
 	};
 }
 
@@ -145,6 +147,7 @@ function deserializeBridge(b: CanonBridge): BridgeState {
 	s.paidOut = BigInt(b.paidOut);
 	for (const [k, e] of b.chargeFrom) s.chargeFrom.set(k, { since: e.since, charged: e.charged });
 	s.pot = BigInt(b.pot);
+	s.potEscrowTaken = BigInt(b.potEscrowTaken);
 	return s;
 }
 

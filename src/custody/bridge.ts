@@ -75,9 +75,16 @@ export interface BridgeState {
 	 *  - `charged` — the advancing "charged-through" boundary for the incremental −20%/day decay. */
 	chargeFrom: Map<string, { since: number; charged: number }>;
 	/** The liquidity pot: idle-decay flows here (a conservation bucket holding real gBTC, never
-	 *  minted — so it can never owe more than it holds). Funds maker rebates / a liquidity
-	 *  backstop. Just a counter, so it's base-independent (= cumulative decay − rebates paid). */
+	 *  minted — so it can never owe more than it holds). This is the FREE (unescrowed) pot capital;
+	 *  capital staked as a backstop counterparty lives in the contract escrow until it settles.
+	 *  Just a counter, so it's base-independent (= cumulative decay − escrow drawn + payouts back). */
 	pot: bigint;
+	/** Lifetime gBTC the pot has staked as a backstop counterparty (monotonic; += at each pot match).
+	 *  The backstop budget is `finalizedPot − (potEscrowTaken − finalizedPotEscrowTaken)`: a trade may
+	 *  only draw against pot capital that has FINALIZED, and settle-returns re-enter the budget only
+	 *  once they finalize too. Both finalized figures are agreed by every node, and this counter is
+	 *  write-driven, so the budget is deterministic — and it provably keeps the free pot ≥ 0. */
+	potEscrowTaken: bigint;
 }
 
 /** Anchors a bond must wait after unbonding before it's spendable — long enough for a
@@ -103,7 +110,7 @@ export function demurrageChargeFrom(creditHeight: number): number {
 }
 
 export function emptyBridge(): BridgeState {
-	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), unbonding: new Map(), mintedTotal: 0n, paidOut: 0n, chargeFrom: new Map(), pot: 0n };
+	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), unbonding: new Map(), mintedTotal: 0n, paidOut: 0n, chargeFrom: new Map(), pot: 0n, potEscrowTaken: 0n };
 }
 
 export function gbtcOf(s: BridgeState, pubkey: string): bigint {
