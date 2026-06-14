@@ -68,6 +68,9 @@ export interface BridgeState {
 	unbonding: Map<string, { amount: bigint; releaseHeight: number }>;
 	mintedTotal: bigint; // audit: lifetime minted
 	paidOut: bigint; // audit: lifetime BTC paid out
+	/** Anchor height through which idle-balance demurrage has been charged (so each window is
+	 *  charged exactly once, deterministically, across folds/resumes). */
+	lastDemurrageHeight: number;
 }
 
 /** Anchors a bond must wait after unbonding before it's spendable — long enough for a
@@ -75,7 +78,7 @@ export interface BridgeState {
 export const UNBOND_DELAY = 16;
 
 export function emptyBridge(): BridgeState {
-	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), unbonding: new Map(), mintedTotal: 0n, paidOut: 0n };
+	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), unbonding: new Map(), mintedTotal: 0n, paidOut: 0n, lastDemurrageHeight: 0 };
 }
 
 export function gbtcOf(s: BridgeState, pubkey: string): bigint {

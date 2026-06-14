@@ -65,6 +65,16 @@ export interface OracleState {
  *  many folded posts drops out of the median, so departed/stale oracles stop counting. */
 export const ORACLE_WINDOW = 64;
 
+/** Demurrage — a disclosed holding fee on IDLE (free) gBTC, redistributed to capital that's
+ *  working (escrowed in open contracts). This makes the system a service, not a vault: idle
+ *  money is gently pushed to either trade or withdraw, and liquidity providers earn the drag.
+ *  It only MOVES gBTC (idle → active), never mints/burns, so 1:1 backing holds throughout, and
+ *  it's self-limiting (no charge when there's no active capital to reward). Both values are
+ *  CONSENSUS-CRITICAL (every node must agree). Default ≈ 3.6%/yr at a 60s/anchor target —
+ *  tune DEMURRAGE_BPS to set the annual drag. */
+export const DEMURRAGE_WINDOW = 1440; // anchors per charge (~1 day)
+export const DEMURRAGE_BPS = 1n; // charged per window on the idle balance (1 bps/day ≈ 3.6%/yr)
+
 /** Drop readings that have fallen out of the freshness window — they no longer count toward
  *  the median, so this is behaviorally neutral, but it stops `readings` growing with every
  *  poster ever seen (a departed/rotated oracle's last reading lingered forever otherwise). */
@@ -168,6 +178,55 @@ export interface ViewOptions {
 	base?: View;
 }
 
+/**
+ * Charge demurrage on idle (free) gBTC for each elapsed window and redistribute it pro-rata to
+ * capital escrowed in open contracts. Pure integer math + sorted iteration → deterministic;
+ * conserves total gBTC (idle loses exactly what active gains). Self-limiting: with no open
+ * contracts there's nothing to reward, so it skips (only advancing the marker). Charges fee =
+ * floor(balance · DEMURRAGE_BPS / 10000) per window, so balances below the rounding floor don't
+ * decay — fine, those are bounded by PoST write cost, not a target.
+ */
+function accrueDemurrage(view: View, nowHeight: number): void {
+	const b = view.bridge;
+	const windows = Math.floor((nowHeight - b.lastDemurrageHeight) / DEMURRAGE_WINDOW);
+	if (windows <= 0) return;
+	// Active stake per holder (both sides of every open contract) + the total.
+	const stake = new Map<string, bigint>();
+	let total = 0n;
+	for (const c of view.book.contracts.values()) {
+		stake.set(c.long, (stake.get(c.long) ?? 0n) + c.stake);
+		stake.set(c.short, (stake.get(c.short) ?? 0n) + c.stake);
+		total += c.stake * 2n;
+	}
+	if (total === 0n) {
+		b.lastDemurrageHeight += windows * DEMURRAGE_WINDOW; // no liquidity to reward → skip, just advance
+		return;
+	}
+	const holders = [...stake.keys()].sort();
+	for (let w = 0; w < windows; w++) {
+		let pool = 0n;
+		for (const [k, bal] of [...b.gbtc]) {
+			const fee = (bal * DEMURRAGE_BPS) / 10000n;
+			if (fee > 0n) {
+				addGbtc(b, k, -fee);
+				pool += fee;
+			}
+		}
+		if (pool === 0n) continue;
+		let distributed = 0n;
+		for (const h of holders) {
+			const share = (pool * stake.get(h)!) / total;
+			if (share > 0n) {
+				addGbtc(b, h, share);
+				distributed += share;
+			}
+		}
+		const remainder = pool - distributed; // rounding dust → lowest-key holder, deterministically
+		if (remainder > 0n) addGbtc(b, holders[0], remainder);
+	}
+	b.lastDemurrageHeight += windows * DEMURRAGE_WINDOW;
+}
+
 export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	const cmp = opts.order ?? cmpWrite;
 	const view: View = opts.base
@@ -188,6 +247,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
 	settleExpired(view.bridge, view.book, nowHeight, view.oracle.price); // time-locked perps auto-settle at the mark
+	accrueDemurrage(view, nowHeight); // idle gBTC bleeds to capital working in open contracts
 	evictStaleReadings(view.oracle); // drop posters that fell out of the freshness window
 	pruneExpiredOffers(view.book, nowHeight); // drop fill-tracking for offers that can no longer be matched
 	return view;
