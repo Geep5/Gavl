@@ -242,6 +242,9 @@ export function settleExpired(bridge: BridgeState, book: MarketBook, nowHeight: 
 	for (const [id, c] of book.contracts) if (nowHeight >= c.expiryHeight) due.push(id);
 	for (const id of due) {
 		const c = book.contracts.get(id)!;
-		applySettle(bridge, book, id, c.entry); // unwind at entry → each gets its stake back (base-independent)
+		// Unwind at entry → each gets its stake back. Credit at the contract's EXPIRY height (not
+		// the fold's nowHeight) so the returned stake's idle clock resets to the same height on
+		// every node, regardless of when each node's fold first crossed the expiry (else fork).
+		applySettle(bridge, book, id, c.entry, c.expiryHeight);
 	}
 }

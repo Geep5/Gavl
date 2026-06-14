@@ -110,11 +110,12 @@ export function gbtcOf(view: View, pubkey: string): bigint {
 
 /**
  * The 1:1 backing invariant: every gBTC — free, bonded, escrowed in an open matched
- * contract, or burned-and-pending — is backed by a satoshi in reserves. Match/settle
- * only MOVE gBTC between these buckets, never mint, so this always holds.
+ * contract, held in the liquidity pot, or burned-and-pending — is backed by a satoshi in
+ * reserves. Match/settle/demurrage only MOVE gBTC between these buckets, never mint, so this
+ * always holds.
  */
 export function marketConserved(view: View): boolean {
-	return view.bridge.reserves === totalGbtc(view.bridge) + bondedTotal(view.bridge) + escrowedInContracts(view.book) + pendingTotal(view.bridge);
+	return view.bridge.reserves === totalGbtc(view.bridge) + bondedTotal(view.bridge) + escrowedInContracts(view.book) + pendingTotal(view.bridge) + view.bridge.pot;
 }
 
 export function parseAmount(s: string): bigint | null {
@@ -170,72 +171,50 @@ export interface ViewOptions {
 }
 
 /**
- * Demurrage — a disclosed holding fee on IDLE (free) gBTC, redistributed to capital working in
- * open contracts. Per balance, from its idle clock `chargeFrom` (= last-credit + grace):
+ * Demurrage — a disclosed holding fee on IDLE (free) gBTC, swept into the liquidity POT. Per
+ * balance, from its idle clock `chargeFrom` (= last-credit + grace):
  *   - before chargeFrom: untouched (the ~1-week grace),
  *   - after: −20%/day,
  *   - at the 1-month cutoff (or once it dips below the dust floor): take whatever's left.
- * So the whole lifecycle is ≤ 1 month for ANY balance — the % decay is the gentle warning, the
- * cutoff is the hard guarantee. Only MOVES gBTC (idle → active), never mints/burns, so 1:1
- * backing holds; deterministic (integer math, sorted iteration); self-limiting — with no open
- * contracts there's no one to reward, so it skips entirely.
+ * The whole lifecycle is ≤ 1 month for ANY balance — the % decay is the gentle warning, the
+ * cutoff the hard guarantee. The drag goes to `bridge.pot` (a conservation bucket), NOT
+ * redistributed per-fold: redistribution to the active-contract set is path-dependent (which
+ * contracts are open at a fold differs by checkpoint base → divergent appRoot → fork). The pot
+ * is just a counter, so it's base-independent (= cumulative idle decay). It only MOVES gBTC
+ * (idle → pot), never mints/burns, so 1:1 backing holds. The pot funds maker rebates / a
+ * liquidity backstop at deterministic write events (a separate step).
  */
 function accrueDemurrage(view: View, nowHeight: number): void {
 	const b = view.bridge;
-	// Active stake per holder (both sides of every open contract) + the total to split across.
-	const stake = new Map<string, bigint>();
-	let total = 0n;
-	for (const c of view.book.contracts.values()) {
-		stake.set(c.long, (stake.get(c.long) ?? 0n) + c.stake);
-		stake.set(c.short, (stake.get(c.short) ?? 0n) + c.stake);
-		total += c.stake * 2n;
-	}
-	if (total === 0n) return; // nothing active to reward → don't charge (self-limiting, conserves)
-
-	const decayWindow = (DEMURRAGE_CUTOFF_DAYS - DEMURRAGE_GRACE_DAYS) * DEMURRAGE_DAY; // age past chargeFrom at which we take it all
-	let pool = 0n;
+	const cutoffAge = DEMURRAGE_CUTOFF_DAYS * DEMURRAGE_DAY; // age past `since` at which we take it all
 	for (const [k, bal] of [...b.gbtc]) {
-		let cf = b.chargeFrom.get(k);
-		if (cf === undefined) {
-			b.chargeFrom.set(k, nowHeight + DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY); // unstamped → grace from now
+		const e = b.chargeFrom.get(k);
+		if (e === undefined) {
+			b.chargeFrom.set(k, { since: nowHeight, charged: nowHeight + DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY }); // unstamped → grace from now
 			continue;
 		}
-		if (nowHeight <= cf) continue; // still in grace
-		if (nowHeight - cf >= decayWindow) {
-			pool += bal; // past the 1-month cutoff → take the whole balance
+		if (nowHeight - e.since >= cutoffAge) {
+			b.pot += bal; // past the 1-month cutoff (measured from the FIXED idle-start) → take it all
 			addGbtc(b, k, -bal); // (deletes the entry + its clock)
 			continue;
 		}
-		const days = Math.floor((nowHeight - cf) / DEMURRAGE_DAY);
+		if (nowHeight <= e.charged) continue; // still in grace / nothing new to charge
+		const days = Math.floor((nowHeight - e.charged) / DEMURRAGE_DAY);
 		if (days <= 0) continue;
 		let kept = bal;
 		for (let i = 0; i < days; i++) kept = (kept * DEMURRAGE_KEEP_NUM) / DEMURRAGE_KEEP_DEN; // −20%/day, per-day floor
 		const charge = bal - kept;
 		if (charge > 0n) {
 			addGbtc(b, k, -charge);
-			pool += charge;
+			b.pot += charge;
 		}
-		b.chargeFrom.set(k, cf + days * DEMURRAGE_DAY); // advance the charged-through boundary
+		e.charged += days * DEMURRAGE_DAY; // advance the charged-through boundary (since stays fixed)
 		const left = b.gbtc.get(k) ?? 0n;
 		if (left > 0n && left < DEMURRAGE_DUST) {
-			pool += left; // the % tail isn't worth a slot → take it
+			b.pot += left; // the % tail isn't worth a slot → take it into the pot
 			addGbtc(b, k, -left);
 		}
 	}
-	if (pool === 0n) return;
-	// Redistribute the drag pro-rata to capital working in open contracts (no clock reset here —
-	// passive income shouldn't shield other idle funds).
-	const holders = [...stake.keys()].sort();
-	let distributed = 0n;
-	for (const h of holders) {
-		const share = (pool * stake.get(h)!) / total;
-		if (share > 0n) {
-			addGbtc(b, h, share);
-			distributed += share;
-		}
-	}
-	const remainder = pool - distributed; // rounding dust → lowest-key holder, deterministically
-	if (remainder > 0n) addGbtc(b, holders[0], remainder);
 }
 
 export function computeView(writes: Write[], opts: ViewOptions = {}): View {

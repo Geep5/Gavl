@@ -68,10 +68,16 @@ export interface BridgeState {
 	unbonding: Map<string, { amount: bigint; releaseHeight: number }>;
 	mintedTotal: bigint; // audit: lifetime minted
 	paidOut: bigint; // audit: lifetime BTC paid out
-	/** Per-balance idle clock for demurrage: the height from which decay begins (= the last
-	 *  credit height + the grace, folded in). Reset on any credit; cleared when the balance
-	 *  hits zero. One number per holder drives grace, daily decay, AND the 1-month cutoff. */
-	chargeFrom: Map<string, number>;
+	/** Per-balance idle clock for demurrage, reset on any credit, cleared at zero:
+	 *  - `since`   — FIXED idle-start (the credit height). Grace + the 1-month cutoff measure
+	 *               from here, so the cutoff fires at the same absolute height on every node
+	 *               regardless of how it checkpointed (a drifting reference would fork).
+	 *  - `charged` — the advancing "charged-through" boundary for the incremental −20%/day decay. */
+	chargeFrom: Map<string, { since: number; charged: number }>;
+	/** The liquidity pot: idle-decay flows here (a conservation bucket holding real gBTC, never
+	 *  minted — so it can never owe more than it holds). Funds maker rebates / a liquidity
+	 *  backstop. Just a counter, so it's base-independent (= cumulative decay − rebates paid). */
+	pot: bigint;
 }
 
 /** Anchors a bond must wait after unbonding before it's spendable — long enough for a
@@ -97,7 +103,7 @@ export function demurrageChargeFrom(creditHeight: number): number {
 }
 
 export function emptyBridge(): BridgeState {
-	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), unbonding: new Map(), mintedTotal: 0n, paidOut: 0n, chargeFrom: new Map() };
+	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), unbonding: new Map(), mintedTotal: 0n, paidOut: 0n, chargeFrom: new Map(), pot: 0n };
 }
 
 export function gbtcOf(s: BridgeState, pubkey: string): bigint {
@@ -114,7 +120,7 @@ function addG(s: BridgeState, pubkey: string, v: bigint, creditHeight?: number):
 		return;
 	}
 	s.gbtc.set(pubkey, n);
-	if (v > 0n && creditHeight !== undefined) s.chargeFrom.set(pubkey, demurrageChargeFrom(creditHeight));
+	if (v > 0n && creditHeight !== undefined) s.chargeFrom.set(pubkey, { since: creditHeight, charged: demurrageChargeFrom(creditHeight) });
 }
 /** Low-level gBTC balance move. Conserves total only if the caller balances it elsewhere.
  *  Pass `creditHeight` on a genuine inbound credit to (re)start the holder's idle clock. */

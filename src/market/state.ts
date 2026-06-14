@@ -40,7 +40,8 @@ export interface CanonBridge {
 	unbonding: Entry<{ amount: string; releaseHeight: number }>[]; // pubkey → ..., sorted
 	mintedTotal: string;
 	paidOut: string;
-	chargeFrom: Entry<number>[]; // pubkey → demurrage idle-clock height, sorted
+	chargeFrom: Entry<{ since: number; charged: number }>[]; // pubkey → demurrage idle clock, sorted
+	pot: string; // the liquidity pot (idle-decay bucket)
 }
 
 export interface CanonOracle {
@@ -92,7 +93,8 @@ function serializeBridge(b: BridgeState): CanonBridge {
 		unbonding: mapEntries(b.unbonding, (u) => ({ amount: u.amount.toString(), releaseHeight: u.releaseHeight })),
 		mintedTotal: b.mintedTotal.toString(),
 		paidOut: b.paidOut.toString(),
-		chargeFrom: mapEntries(b.chargeFrom, (v) => v),
+		chargeFrom: mapEntries(b.chargeFrom, (e) => ({ since: e.since, charged: e.charged })),
+		pot: b.pot.toString(),
 	};
 }
 
@@ -141,7 +143,8 @@ function deserializeBridge(b: CanonBridge): BridgeState {
 	for (const [k, u] of b.unbonding) s.unbonding.set(k, { amount: BigInt(u.amount), releaseHeight: u.releaseHeight });
 	s.mintedTotal = BigInt(b.mintedTotal);
 	s.paidOut = BigInt(b.paidOut);
-	for (const [k, v] of b.chargeFrom) s.chargeFrom.set(k, v);
+	for (const [k, e] of b.chargeFrom) s.chargeFrom.set(k, { since: e.since, charged: e.charged });
+	s.pot = BigInt(b.pot);
 	return s;
 }
 

@@ -12,11 +12,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { gbtcOf, marketConserved } from "../src/market/btc.ts";
+import { computeView, gbtcOf, marketConserved } from "../src/market/btc.ts";
 import type { View } from "../src/market/btc.ts";
-import { emptyBridge, addGbtc } from "../src/custody/bridge.ts";
+import { emptyBridge, addGbtc, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS } from "../src/custody/bridge.ts";
 import { emptyBook, settleExpired } from "../src/market/intent.ts";
 import { viewRoot } from "../src/market/state.ts";
+import { Ledger } from "../src/ledger/ledger.ts";
+import { GavlNode } from "../src/sync/node.ts";
+import { Account } from "../src/market/account.ts";
+import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
+import { PARAMS, K } from "./helpers.ts";
 
 function stateWithOpenContract(mark: bigint): View {
 	const bridge = emptyBridge();
@@ -50,4 +55,44 @@ test("an expired contract's settle ignores the oracle mark entirely (the fork-sa
 	assert.equal(gbtcOf(hi, "bb"), gbtcOf(lo, "bb"), "short's payout must not depend on the mark");
 	assert.equal(gbtcOf(hi, "aa"), 5000n);
 	assert.equal(hi.book.contracts.size, 0);
+});
+
+// ── cross-boundary fold equivalence: demurrage (→ pot) + an expiring contract ──
+let depN = 0;
+async function market() {
+	const node = new GavlNode(new Ledger(PARAMS));
+	let t = 0;
+	const now = () => ++t;
+	const mk = (kp?: any) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
+	const oracle = mk(oracleKeyPair());
+	const attestor = mk(bridgeKeyPair());
+	const fund = (a: Account, amt: bigint) => attestor.attestDeposit("dep" + depN++ + ":0", a.pubHex, amt);
+	const A = mk(); // idle whale → its decay flows to the pot
+	const B = mk();
+	const C = mk();
+	await oracle.postPrice(61_000n, 0);
+	await fund(A, 1_000_000n);
+	await fund(B, 50_000n);
+	await fund(C, 50_000n);
+	const offer = B.makeOffer({ makerSide: "long", size: "50000", leverage: "2", expiryHeight: 9_999_999, nonce: "z" });
+	await C.matchOpen(offer, 50_000n);
+	return { node };
+}
+
+test("folding to the same target from two different checkpoint heights agrees (demurrage + expiry)", async () => {
+	const { node } = await market();
+	const writes = node.ledger.allWrites();
+	const born = new Map(writes.map((w) => [w.id, 0] as [string, number])); // all credits at height 0
+	const grace = DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY;
+	const T = 43_300; // past the demurrage grace AND the contract's time-lock (born 0 → expiry 43200)
+
+	const full = computeView(writes, { bornAt: born, nowHeight: T });
+	// checkpoint BEFORE the contract expires (still open in the base)
+	const resumeEarly = computeView([], { base: computeView(writes, { bornAt: born, nowHeight: grace + 5 * DEMURRAGE_DAY }), nowHeight: T });
+	// checkpoint AFTER it expires (already unwound in the base)
+	const resumeLate = computeView([], { base: computeView(writes, { bornAt: born, nowHeight: 43_250 }), nowHeight: T });
+
+	assert.equal(viewRoot(resumeEarly), viewRoot(full), "early-checkpoint resume diverged from the full fold");
+	assert.equal(viewRoot(resumeLate), viewRoot(full), "late-checkpoint resume diverged from the full fold");
+	assert.ok(marketConserved(full) && marketConserved(resumeEarly) && marketConserved(resumeLate));
 });
