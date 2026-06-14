@@ -8,10 +8,12 @@ Broadcast an intent to go **long** or **short** on Bitcoin; a real peer takes th
 side; the two of you escrow against *each other* and settle at a signed oracle price.
 **There is no pool and no house** — every trade is a matched, zero-sum, fully-collateralized
 bet between two people, so the protocol is never a counterparty and reserves can never be
-drained. No counterparty → no trade. No servers and no global chain to replay from genesis —
-state is computed in RAM, verified against your current peers, and persisted to a local
-append-only log. Every write pays a **cooldown** (a proof of space *and* a proof of time),
-so an attacker can't spin up cheap identities to flood or grind the network.
+drained. No counterparty → no trade. No servers and no chain to replay from genesis — state lives in
+RAM, is **checkpointed into the consensus chain** so a node boots from committed state (a
+key-only node can hold nothing but its key and bootstrap from peers), and is bounded by
+**cost + decay** rather than hard caps, so it stays small enough for commodity hardware. Every
+write pays a **cooldown** (a proof of space *and* a proof of time), so an attacker can't spin
+up cheap identities to flood or grind the network.
 
 The price comes from a **signed, on-chain oracle**. Collateral is **gBTC** — a 1:1 claim on
 real Bitcoin held in a **threshold-custody fund** that only a quorum can spend (no single
@@ -63,8 +65,11 @@ in tests.
 2. **Broadcast an intent** — "long/short *N* gBTC at *L*× leverage" — gossiped over the mesh
    as a signed, non-binding offer; or **take** the opposite side of a peer's resting intent.
 3. **A match** escrows both peers' gBTC and opens a bilateral contract, marked to the oracle.
-4. **Close** any time at the current mark — directional PnL, capped at the stake.
-5. **Withdraw** — burn gBTC → a quorum threshold-signs and broadcasts a real Bitcoin tx.
+4. **Close** early any time at the current mark — directional PnL, capped at the stake. A
+   position you never close **auto-settles at its time-lock** (a hard ~1-month cap), so nothing
+   sits open forever.
+5. **Withdraw** — burn gBTC → a quorum threshold-signs and broadcasts a real Bitcoin tx. (Leave
+   gBTC idle too long and it **decays** to active traders — this is a service, not a vault.)
 
 ### The matched engine (`src/market/intent.ts`, `src/market/btc.ts`)
 
@@ -87,24 +92,35 @@ No pool, no order book to babysit — just signed intents and matched bilateral 
   long/short button takes resting liquidity if any exists, otherwise broadcasts your own.
 - **Partial fills + cross-node.** One offer fills across many takers (tracked by nonce);
   intents propagate epidemically, so a peer on another machine sees your tape and can take it.
+- **Time-locked.** Either side may close early at the mark, but every contract has a hard
+  lifetime cap and **auto-settles at expiry** against the oracle — so the open-contract set is
+  bounded by throughput, never accumulating positions nobody closes.
+- **Idle gBTC decays (a service, not a vault).** Free balances left idle past a ~1-week grace
+  bleed (−20%/day, with a hard 1-month cutoff) to capital working in open contracts — pushing
+  money to trade or withdraw rather than squat. It only *moves* gBTC (conservation holds) and is
+  self-limiting (no open contracts → no charge).
 - **Conservation, proven.** `reserves == free gBTC + bonded + contract escrow + pending`.
-  Match/settle only *move* gBTC between buckets, never mint — tested as a hard invariant over
-  4,000-step random op streams. (`src/market/intent.ts`)
+  Match/settle/decay only *move* gBTC between buckets, never mint — tested as a hard invariant
+  over random op streams. (`src/market/intent.ts`)
 
-### The oracle (`src/market/oracle.ts`, `src/market/pricefeed.ts`)
+### The oracle (`src/market/oracle.ts`, `src/market/btc.ts`)
 
-The price is the one *trusted* part — and it's made transparent:
+The price is the thinnest *trusted* part — decentralized and transparent:
 
-- Prices enter as **signed `oracle.post` writes folded by every node** (monotonic seq),
-  not per-node web fetches (which would diverge).
-- The publisher averages **three independent feeds** (Coinbase, Kraken, Bitstamp), so one
-  bad/offline source can't set the mark.
-- The oracle **discloses its methodology on-chain** (`oracle.meta`) — every client sees the
-  exact endpoints + keys it derives the price from, and can audit the posted price against
-  them.
-- **The honest caveat:** verifying the signature proves *who* posted, not that the price is
-  *true*. v1 is a single signer (the one trusted party). Multiple independent signers with
-  an on-chain median is the trust-removing upgrade.
+- **Every node posts its own reading** — no special publisher. Prices enter as signed
+  `oracle.post` writes folded by every peer (per-poster monotonic seq); the mark is the
+  **median of recent posters** within a freshness window, so no single key sets the price and a
+  departed or stale poster drops out of the median automatically.
+- **Each poster averages independent feeds** (Coinbase, Kraken, Bitstamp), so one bad/offline
+  source can't move that poster's reading.
+- **Posts are gated, not constant** — a node only writes a new reading when the price moves past
+  a threshold or a staleness heartbeat elapses (`oracleShouldPost`), so the oracle never floods
+  the ledger with identical prices.
+- **Methodology is disclosed on-chain** (`oracle.meta`) — every client sees the exact endpoints
+  + keys each poster derives from, and can audit the posted price against them.
+- **The honest caveat:** a median of independent posters is far stronger than one signer, but
+  it's still trust in the *set* of posters and their feeds. The trust shrinks as posters
+  diversify; it doesn't vanish.
 
 ---
 
@@ -180,11 +196,22 @@ hyperdht topic whose name *is* the network identity.
 >   receives the pre-checkpoint history.
 >
 > Writer chains are prunable (a `baseSeq` floor + `baseHeadId` so the next write still links;
-> `writer.ts`), and the fold is resumable (`computeView({ base })`). Paired with the
-> already-shipped **delta-encoded anchor heads** (an anchor carries only the writers that
-> *changed*, keeping it O(active-per-anchor)), this is the path to a large equal-node network.
-> A *Merkle tree* over heads (light-client inclusion proofs) stays **out of scope** — every
-> node here is full and equal. Background: [`docs/scaling-equal-nodes.md`](docs/scaling-equal-nodes.md).
+> `writer.ts`), the fold is resumable (`computeView({ base })`), and the **anchor chain itself
+> is pruned** to a recent suffix below the checkpoint (it's committed in no root, so a node only
+> needs enough to verify new anchors). Paired with the **delta-encoded anchor heads** (an anchor
+> carries only the writers that *changed*), this is the path to a large equal-node network. A
+> *Merkle tree* over heads (light-client inclusion proofs) stays **out of scope** — every node
+> here is full and equal. Background: [`docs/scaling-equal-nodes.md`](docs/scaling-equal-nodes.md).
+
+> **Bounded by design — no hard caps.** Every structure that lives in RAM is held in check by
+> the same shape: it **costs** something to create (a PoST cooldown, or real gBTC backing) **and
+> it decays or expires**. History prunes behind checkpoints; the anchor chain keeps only a recent
+> suffix; perps time-lock; idle balances decay (demurrage); stale deposit-claim requests expire
+> after a reclaim grace; the gossip offer tape is cover-checked (only offers a maker can back are
+> kept) + TTL'd; and the out-of-order write buffer is PoST-gated + decays. So a small node's
+> memory is bounded by the **real economy**, not by an attacker's willingness to spam — with no
+> arbitrary size limit anywhere. At ~10k active traders that's a phone-class footprint (tens of
+> MB); it stays commodity-hardware-friendly into the millions.
 
 ---
 
@@ -197,7 +224,7 @@ src/
   ledger/        multi-writer RAM ledger + stateRoot
   consensus/     anchor chain, fork choice, finality, difficulty, canonical order
   sync/          hyperswarm/hyperdht mesh, gossip, peer/bootstrap management
-  store/         durable hypercore write store + selective persist policy
+  store/         durable hypercore write store + state snapshots/checkpoints + selective persist policy
   market/        the matched market: intents + bilateral contracts (intent.ts), btc fold, ops, account, oracle, pricefeed
   custody/       real-BTC bridge: threshold (FROST) · DKG · Taproot · per-identity deposits · tx · ledger · watcher · esplora
   daemon.ts      boots ledger + node + store + consensus + oracle publisher + bridge + intent book
@@ -226,7 +253,7 @@ local-only) **and** the web UI in one command, cross-platform — no env vars to
 Other scripts:
 
 ```bash
-npm test                 # full suite (~150 tests): consensus, matched market, intent gossip, oracle, custody, bridge
+npm test                 # full suite (~200 tests): consensus, checkpoints, matched market, demurrage, intent gossip, oracle, custody, bridge
 npm run demo             # PoST cooldown chain — watch space→cooldown
 npm run demo:consensus   # two nodes farm + gossip anchors, finalize the same state over a real mesh
 npm run daemon           # daemon only (real chiavdf VDF — needs the .venv; see below)
@@ -259,7 +286,8 @@ threshold signing (no one holds the fund key).
 
 What's **trusted** (and surfaced honestly in the UI):
 
-- **The oracle price** — a single signer in v1 (mitigable with a multi-signer median).
+- **The oracle price** — now a **median of independent posters** (no single signer); the trust
+  shrinks to the diversity of the poster set and their feeds.
 - **The bridge, on testnet** — currently **single-operator**: the daemon holds all the
   fund's key shares (deterministic dev seed) and is the deposit attestor. Real BTC custody
   is never zero-trust; this pushes trust as thin as it goes, but it isn't there yet.
@@ -277,12 +305,15 @@ What's **trusted** (and surfaced honestly in the UI):
 - **Consensus** ✅ PoST cooldown · RAM ledger + gossip · anchor chain, finality, canonical
   order, difficulty retarget, sticky finality · durable selective storage · live over a
   real hyperdht mesh
+- **Bounded RAM / scaling** ✅ state-committed checkpoints (boot from state, never replay from
+  0) · history + anchor-chain pruning · key-only peers bootstrap from a committed snapshot ·
+  delta-encoded anchor heads · every structure bounded by cost + decay (no hard caps)
 - **Peer-to-peer matched market** ✅ signed intents gossiped over the mesh · matched
   bilateral contracts · zero-sum, fully-collateralized, **no pool** (reserves can't be
-  drained) · bounded leverage · oracle-marked · close-anytime · cross-node intent tape ·
-  Svelte tape/trade UI
-- **Oracle** ✅ signed on-chain · 3-feed average · on-chain methodology disclosure · live
-  feeds. **Next:** multiple independent signers + median.
+  drained) · bounded leverage · oracle-marked · close-early **+ time-locked auto-settle** ·
+  idle-balance **demurrage** · cross-node intent tape · Svelte tape/trade UI
+- **Oracle** ✅ decentralized **median of all posters** (no special publisher) · per-poster
+  multi-feed average · move/heartbeat-gated posts · on-chain methodology disclosure · live feeds
 - **Real-BTC bridge (testnet)** ✅ FROST threshold signing · DKG · Taproot address +
   BIP340-valid spends · withdrawal tx build/sign/broadcast · deposit watcher · bridge
   ledger · proof of reserves
