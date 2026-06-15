@@ -28,10 +28,28 @@
 
 	// create-market form
 	let cLabel = $state("");
+	let cCollateral = $state("gBTC"); // only BTC/gBTC supported for now
 	let cEndpoint = $state("https://api.coinbase.com/v2/prices/ETH-USD/spot");
 	let cKey = $state("data.amount");
+	let testing = $state(false);
+	let tested = $state(null); // { value, raw, error } | null — must pass before create
+	// editing the source invalidates a prior test
+	$effect(() => {
+		cEndpoint;
+		cKey;
+		tested = null;
+	});
 	// join-by-name
 	let joinName = $state("");
+
+	async function testSource() {
+		const endpoint = cEndpoint.trim();
+		const key = cKey.trim();
+		if (!endpoint || !key) return;
+		testing = true;
+		tested = await api.testMarket(endpoint, key).catch((e) => ({ value: null, error: String(e?.message ?? e) }));
+		testing = false;
+	}
 
 	function load() {
 		try {
@@ -78,11 +96,13 @@
 		const label = cLabel.trim();
 		const endpoint = cEndpoint.trim();
 		const key = cKey.trim();
-		if (!label || !endpoint || !key || !myReporter) return;
-		if ([label, endpoint, key].some((x) => x.includes("::"))) return; // `::` is the field delimiter
+		if (!createOk) return;
 		join(`${label}::${endpoint}::${key}::${myReporter}`);
 	}
-	const createOk = $derived(!!cLabel.trim() && !!cEndpoint.trim() && !!cKey.trim() && !!myReporter && ![cLabel, cEndpoint, cKey].some((x) => x.includes("::")));
+	// require a PASSING source test before create, and no `::` (the field delimiter) in any field
+	const createOk = $derived(
+		!!cLabel.trim() && !!cEndpoint.trim() && !!cKey.trim() && !!myReporter && tested?.value != null && ![cLabel, cEndpoint, cKey].some((x) => x.includes("::")),
+	);
 </script>
 
 <div class="cs">
@@ -107,6 +127,13 @@
 				<input class="cin" placeholder="ETH-USD" bind:value={cLabel} disabled={switching} />
 			</label>
 			<label class="fl">
+				<span>Collateral</span>
+				<select class="cin" bind:value={cCollateral} disabled={switching}>
+					<option value="gBTC">BTC — gBTC (1:1 claim on Bitcoin)</option>
+					<option value="" disabled>more coming soon…</option>
+				</select>
+			</label>
+			<label class="fl">
 				<span>Price endpoint</span>
 				<input class="cin" placeholder="https://…" bind:value={cEndpoint} disabled={switching} />
 			</label>
@@ -114,12 +141,22 @@
 				<span>JSON key path</span>
 				<input class="cin" placeholder="data.amount" bind:value={cKey} disabled={switching} />
 			</label>
+			<div class="trow">
+				<button class="test" onclick={testSource} disabled={switching || testing || !cEndpoint.trim() || !cKey.trim()}>{testing ? "testing…" : "Test source"}</button>
+				{#if tested}
+					{#if tested.value != null}
+						<span class="tok">✓ resolves to {Number(tested.value).toLocaleString()}</span>
+					{:else}
+						<span class="tbad">✗ {tested.error || "no value at that key"}</span>
+					{/if}
+				{/if}
+			</div>
 			<div class="hint">
 				Your node reports this market from that endpoint, signed as <span class="mono">{myReporter ? myReporter.slice(0, 10) + "…" : "—"}</span>.
-				Collateral is gBTC (BTC signing) for now — only the price source changes.
+				BTC signing only for now, so collateral stays gBTC — you just pick the price source.
 			</div>
 			<div class="prow">
-				<button class="go" onclick={createMarket} disabled={switching || !createOk}>{switching ? "…" : "Create & join"}</button>
+				<button class="go" onclick={createMarket} disabled={switching || !createOk} title={tested?.value == null ? "test the source first" : ""}>{switching ? "…" : "Create & join"}</button>
 				<button class="cancel" onclick={() => (mode = null)} disabled={switching}>cancel</button>
 			</div>
 		</div>
@@ -182,6 +219,11 @@
 		width: 100%; box-sizing: border-box; margin: 0; background: var(--panel-2); border: 1px solid var(--accent-dim);
 		color: var(--text); font-size: 0.8rem; padding: 0.3rem 0.45rem; border-radius: 5px; font-family: ui-monospace, monospace;
 	}
+	.trow { display: flex; align-items: center; gap: 0.5rem; margin: 0.45rem 0 0.1rem; flex-wrap: wrap; }
+	.test { background: var(--panel-2); border: 1px solid var(--accent-dim); color: var(--text); cursor: pointer; padding: 0.28rem 0.55rem; border-radius: 5px; font-size: 0.78rem; }
+	.test:disabled { opacity: 0.5; cursor: not-allowed; }
+	.tok { color: var(--green); font-size: 0.76rem; font-family: ui-monospace, monospace; }
+	.tbad { color: var(--red, #e06c6c); font-size: 0.72rem; }
 	.hint { font-size: 0.68rem; color: var(--muted); line-height: 1.35; margin: 0.35rem 0; }
 	.mono { font-family: ui-monospace, monospace; color: var(--text); }
 	.prow { display: flex; gap: 0.4rem; align-items: center; margin-top: 0.35rem; }

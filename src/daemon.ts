@@ -50,7 +50,7 @@ import { isCeremonyTimeout } from "./custody/ceremony.ts";
 import { Esplora } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, confirmations, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
 import { pendingClaims, unsentWithdrawals, inFlightWithdrawals, slashable } from "./custody/bridge.ts";
-import { readPriceAggregate, DEFAULT_SOURCE } from "./market/pricefeed.ts";
+import { readPriceAggregate, readPrice, DEFAULT_SOURCE } from "./market/pricefeed.ts";
 import type { PriceSource, AggregateReading } from "./market/pricefeed.ts";
 import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
@@ -519,6 +519,12 @@ export class Daemon {
 	 *  own node will report it. Surfaced to the UI's "create a market" form. */
 	reporterPubkey(): string {
 		return oraclePubHex(process.env.GAVL_ORACLE_SEED);
+	}
+
+	/** Fetch-test a candidate market source before creating it: pull `endpoint` and extract `key`,
+	 *  returning the resolved value (or the error) so a typo'd source is caught up front. */
+	testSource(endpoint: string, key: string): Promise<{ value: string | null; raw: string | null; error?: string }> {
+		return readPrice({ url: endpoint, key }).then((r) => ({ value: r.value != null ? r.value.toString() : null, raw: r.raw, error: r.error }));
 	}
 
 	// ── state-committed checkpoints — the ledger never replays from 0 ──────

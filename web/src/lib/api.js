@@ -27,6 +27,7 @@ export const api = {
 	takePosition: (side, size) => req("/intent/take-position", "POST", { side, size }),
 	settleContract: (contractId) => req("/contract/settle", "POST", { contractId }),
 	switchChannel: (name) => req("/channel", "POST", { name }),
+	testMarket: (endpoint, key) => req("/market/test", "POST", { endpoint, key }),
 	rerollIdentity: (label) => req("/identity/reroll", "POST", { label }),
 	importIdentity: (seed, label) => req("/identity/import", "POST", { seed, label }),
 	exportSeed: () => req("/identity/export", "POST", {}),

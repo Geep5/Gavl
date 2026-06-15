@@ -252,6 +252,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			if (amt === null) throw new Error("amount must be a positive integer");
 			return send(res, 200, { id: await daemon.unbondCustody(amt) });
 		}
+		if (path === "/api/market/test") {
+			// Fetch-test a candidate source before creating the market — catch a typo'd endpoint/key.
+			const r = await daemon.testSource(String(body.endpoint ?? ""), String(body.key ?? ""));
+			return send(res, 200, r);
+		}
 		if (path === "/api/market/report") {
 			// Post THIS channel's price (accepted only if this account is the channel's reporter).
 			await daemon.active().report(String(body.price), Number(body.seq));
