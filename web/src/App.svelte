@@ -11,6 +11,7 @@
 	import ConsensusPanel from "./components/ConsensusPanel.svelte";
 	import ConnectProgress from "./components/ConnectProgress.svelte";
 	import ChannelSwitcher from "./components/ChannelSwitcher.svelte";
+	import CreateMarket from "./components/CreateMarket.svelte";
 	import MembersPane from "./components/MembersPane.svelte";
 
 	let timer;
@@ -19,8 +20,9 @@
 	});
 	onDestroy(() => clearInterval(timer));
 
-	let view = $state("trade"); // trade | network
+	let view = $state("trade"); // trade | network | create
 	let mobileNav = $state(false); // left pane drawer on narrow screens
+	const viewTitle = $derived(view === "create" ? "new market" : view);
 
 	const NAV = [
 		{ id: "trade", label: "trade", icon: "₿", hint: "Go bullish or bearish on Bitcoin" },
@@ -42,7 +44,7 @@
 		<aside class="left" class:open={mobileNav}>
 			<div class="brand"><span class="brass">⚖</span> Gavl</div>
 
-			<ChannelSwitcher />
+			<ChannelSwitcher goto={go} />
 
 			<div class="nav-label">views</div>
 			<nav class="nav">
@@ -77,8 +79,8 @@
 			<header class="chead">
 				<button class="hamburger" onclick={() => (mobileNav = true)} aria-label="Open navigation">☰</button>
 				<span class="chead-hash">#</span>
-				<span class="chead-title">{view}</span>
-				<span class="chead-chan">on <strong>{channel}</strong></span>
+				<span class="chead-title">{viewTitle}</span>
+				{#if view !== "create"}<span class="chead-chan">on <strong>{channel}</strong></span>{/if}
 			</header>
 
 			{#if store.error}<div class="err">{store.error}</div>{/if}
@@ -86,6 +88,8 @@
 			<div class="scroll">
 				{#if view === "trade"}
 					<BtcView />
+				{:else if view === "create"}
+					<CreateMarket goto={go} />
 				{:else if view === "network"}
 					<ConnectProgress />
 					<ConsensusPanel />
