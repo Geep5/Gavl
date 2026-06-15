@@ -27,7 +27,7 @@ import type { Anchor } from "./consensus/anchor.ts";
 import type { Heads } from "./ledger/ledger.ts";
 import { longPayout, verifyOffer } from "./market/intent.ts";
 import type { Offer, Side } from "./market/intent.ts";
-import { bridgeKeyPair } from "./market/oracle.ts";
+import { bridgeKeyPair, oracleKeyPair, oraclePubHex } from "./market/oracle.ts";
 import { fundKeyFromSeed } from "./custody/threshold.ts";
 import type { FundKey } from "./custody/threshold.ts";
 import { DkgCoordinator } from "./custody/dkg-coordinator.ts";
@@ -50,7 +50,7 @@ import { isCeremonyTimeout } from "./custody/ceremony.ts";
 import { Esplora } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, confirmations, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
 import { pendingClaims, unsentWithdrawals, inFlightWithdrawals, slashable } from "./custody/bridge.ts";
-import { readPriceAggregate } from "./market/pricefeed.ts";
+import { readPriceAggregate, DEFAULT_SOURCE } from "./market/pricefeed.ts";
 import type { PriceSource, AggregateReading } from "./market/pricefeed.ts";
 import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
@@ -998,14 +998,20 @@ export class Daemon {
 	 * transparency, and the methodology is disclosed on-chain.
 	 */
 	private startOraclePublisher(opts: { sources: PriceSource[]; everyMs: number }): void {
-		const kp = this.producerKey(); // this node's stable identity = its oracle-poster id
+		// Report AS the channel's reporter identity (the dev oracle key; override via GAVL_ORACLE_SEED).
+		// A CHANNEL IS A MARKET: only the reporter named in the channel name may post, so this node
+		// posts only if it holds that key AND the channel names it — otherwise it just consumes.
+		const kp = oracleKeyPair(process.env.GAVL_ORACLE_SEED);
 		const myId = toHex(kp.publicKey);
 		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: kp });
-		// A CHANNEL IS A MARKET: only the channel's named reporter (encoded in the channel name) may
-		// post its price. If this node isn't that reporter, it just consumes the on-chain price.
 		const amReporter = this.channelReporter() === myId;
 		this.publishing = true;
 		const myGen = ++this.oracleGen; // a channel switch bumps this → the old loop below exits
+		// Only the channel's reporter fetches + posts; a consumer node has nothing to publish.
+		if (!amReporter) {
+			console.log(`  channel ${this.network}: consuming on-chain price (this node isn't its reporter)`);
+			return;
+		}
 		// Prune at the source: gate posts on move-or-heartbeat (see oracleShouldPost). Poll
 		// stays frequent (cheap); writes only happen when they carry new information.
 		const minMoveBps = Number(process.env.GAVL_ORACLE_MIN_BPS ?? "5"); // 0.05% default
@@ -1019,7 +1025,7 @@ export class Daemon {
 				const agg = await readPriceAggregate(opts.sources); // fetch all, average the responders
 				this.lastOracleSource = { ...agg, at: Date.now() }; // display-only metadata
 				const v = agg.value;
-				if (v != null && amReporter && oracleShouldPost({ v, lastPrice, lastPostAt, now: Date.now(), minMoveBps, heartbeatMs: oracleHeartbeatMs })) {
+				if (v != null && oracleShouldPost({ v, lastPrice, lastPostAt, now: Date.now(), minMoveBps, heartbeatMs: oracleHeartbeatMs })) {
 					try {
 						await acct.report(v, seq);
 						seq++;
@@ -1033,7 +1039,7 @@ export class Daemon {
 			}
 		};
 		void loop();
-		console.log(`  channel ${this.network}: ${amReporter ? `REPORTING as ${myId.slice(0, 16)}…` : "consuming on-chain price (not this channel's reporter)"} (avg of ${opts.sources.length} feed(s)) every ${opts.everyMs}ms`);
+		console.log(`  channel ${this.network}: REPORTING as ${myId.slice(0, 16)}… (avg of ${opts.sources.length} feed(s)) every ${opts.everyMs}ms`);
 	}
 
 	/** The publisher's latest aggregate reading (per-source endpoint/key/raw/value +
@@ -1567,4 +1573,11 @@ export function parseChannel(name: string): ChannelMarket | null {
 	const [label, endpoint, key, reporter] = parts;
 	if (!/^[0-9a-f]{64}$/i.test(reporter)) return null;
 	return { label, endpoint, key, reporter };
+}
+
+/** The default channel — the BTC-USD market we ship with: the public Coinbase spot feed, reported
+ *  by the dev oracle key (override the seed with GAVL_ORACLE_SEED; a production deployment names its
+ *  own reporter). This is the channel `npm run dev` joins, so the app prices + trades out of the box. */
+export function defaultMarketChannel(): string {
+	return `BTC-USD::${DEFAULT_SOURCE.url}::${DEFAULT_SOURCE.key}::${oraclePubHex(process.env.GAVL_ORACLE_SEED)}`;
 }

@@ -18,7 +18,7 @@
 
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { Daemon, parseChannel } from "./daemon.ts";
+import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
 import { mark, gbtcOf, MAX_LEVERAGE, parseAmount, leverageOk } from "./market/btc.ts";
 import { escrowedInContracts } from "./market/intent.ts";
 import { totalGbtc, pendingTotal, backingBps as bridgeBackingBps } from "./custody/bridge.ts";
@@ -46,8 +46,10 @@ const HEARTBEAT_MS = Number(process.env.GAVL_HEARTBEAT_MS ?? "60000");
 const PERSIST = process.env.GAVL_PERSIST ?? "all";
 
 // Channel/network: the name IS the address (its DHT topic is sha256 of it). GAVL_NETWORK
-// sets the initial channel; the UI can switch at runtime. MESH/FARM gate consensus.
-const NETWORK = process.env.GAVL_NETWORK ?? "gavl";
+// sets the initial channel; the UI can switch at runtime. MESH/FARM gate consensus. Default is
+// the shipped BTC-USD market channel (name encodes the public source + reporter), so the app
+// prices + trades out of the box; a plain GAVL_NETWORK name = a transfers-only channel.
+const NETWORK = process.env.GAVL_NETWORK ?? defaultMarketChannel();
 const MESH = process.env.GAVL_MESH !== "0";
 const FARM = process.env.GAVL_FARM !== "0";
 
@@ -94,7 +96,9 @@ function serializeState() {
 	// Not a vote — only that reporter posts, the public endpoint keeps it auditable, and each
 	// channel is its own economy (a malicious market can't touch funds in another channel).
 	const def = parseChannel(daemon.currentChannel()); // {label, endpoint, key, reporter} | null
-	const live = daemon.oracleSource(); // this node's own live feed readings (raw), if it's the reporter
+	// This node's live feed (raw values), present only if it's the channel's reporter — it signs
+	// reports with the reporter key, which is separate from the active wallet identity.
+	const live = def ? daemon.oracleSource() : null;
 	const marketInfo = def
 		? {
 				channel: daemon.currentChannel(),
@@ -103,8 +107,8 @@ function serializeState() {
 				key: def.key,
 				reporter: def.reporter,
 				price: m != null ? m.toString() : null,
-				iAmReporter: def.reporter === me,
-				source: def.reporter === me && live ? { method: live.method, ageMs: Date.now() - live.at, feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })) } : null,
+				iAmReporter: !!live, // this node holds the channel's reporter key and is posting
+				source: live ? { method: live.method, ageMs: Date.now() - live.at, feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })) } : null,
 			}
 		: null;
 

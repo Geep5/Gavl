@@ -7,7 +7,7 @@
 
 	const m = $derived(store.market);
 	const priceNum = $derived(m?.price != null ? Number(m.price) : null);
-	const oracles = $derived(m?.oracles ?? []);
+	const mkt = $derived(m?.marketInfo ?? null); // {label, endpoint, key, reporter, price, iAmReporter, source} | null
 	const bal = $derived(Number(myGbtc()));
 	const tape = $derived(m?.tape ?? []);
 	const contracts = $derived(m?.myContracts ?? []);
@@ -73,15 +73,15 @@
 <!-- ── price + balance ──────────────────────────────────────────────── -->
 <div class="market">
 	<div class="price-block">
-		<div class="pair">BTC <span class="muted">/ USD</span></div>
+		<div class="pair">{mkt?.label ?? "BTC"} <span class="muted">/ USD</span></div>
 		{#if priceNum != null}
 			<div class="price">${priceNum.toLocaleString()}</div>
-			<div class="src" title="the mark is the median of every node's posted reading — no single oracle">
-				<span class="dot live"></span> live · median of {oracles[0]?.posters ?? 1} oracle{(oracles[0]?.posters ?? 1) === 1 ? "" : "s"}
+			<div class="src" title={mkt ? `reported by ${mkt.reporter} from ${mkt.endpoint}` : ""}>
+				<span class="dot live"></span> live · reported by {mkt ? short(mkt.reporter) : "—"}{mkt?.iAmReporter ? " (you)" : ""}
 			</div>
 		{:else}
 			<div class="price muted">—</div>
-			<div class="src"><span class="dot"></span> waiting for the oracle…</div>
+			<div class="src"><span class="dot"></span> {mkt ? "waiting for the reporter…" : "not a market channel — no price"}</div>
 		{/if}
 	</div>
 	<div class="bal-block">
@@ -154,7 +154,7 @@
 					<span class="pnl" class:up={Number(c.pnl) > 0} class:down={Number(c.pnl) < 0}>{Number(c.pnl) > 0 ? "+" : ""}{fmt(c.pnl)}</span>
 					<button class="mini" onclick={() => closeContract(c.id)}>close</button>
 				</div>
-				<div class="liq muted">vs {short(c.counterparty)} · settles at the oracle mark when either side closes</div>
+				<div class="liq muted">vs {short(c.counterparty)} · settles at the channel's mark when either side closes</div>
 			</div>
 		{/each}
 	</div>
@@ -197,32 +197,33 @@
 	<details class="more">
 		<summary>
 			<span class="s-title">Price &amp; trust</span>
-			<span class="s-meta">{oracles[0]?.source ? `${oracles[0].source.feeds?.length ?? 0} disclosed sources` : "1 oracle"}</span>
+			<span class="s-meta">{mkt ? "channel reporter" : "no market"}</span>
 			<span class="chev">▾</span>
 		</summary>
 		<div class="more-body">
-			{#each oracles as o}
+			{#if mkt}
 				<div class="orow">
-					<span class="dot" class:live={o.live}></span>
-					<span class="oname">{o.label}{#if o.mine}<span class="tag">this node</span>{/if}</span>
-					<span class="oprice mono">{o.price != null ? Number(o.price).toLocaleString() : "—"}</span>
+					<span class="dot" class:live={priceNum != null}></span>
+					<span class="oname">{mkt.label}{#if mkt.iAmReporter}<span class="tag">this node reports</span>{/if}</span>
+					<span class="oprice mono">{priceNum != null ? priceNum.toLocaleString() : "—"}</span>
 				</div>
-				{#if o.source}
-					<div class="sources">
-						<div class="smeta">{o.source.method}{#if o.source.onChain}<span class="tag green">⛓ on-chain</span>{/if}{#if o.source.ageMs != null}<span class="muted"> · {(o.source.ageMs / 1000).toFixed(0)}s ago</span>{/if}</div>
-						{#each o.source.feeds as f}
+				<div class="sources">
+					<div class="smeta">reporter <span class="mono">{short(mkt.reporter)}</span> · source <a class="fhost mono" href={mkt.endpoint} target="_blank" rel="noopener">{(mkt.endpoint || "").split("/")[2] || "?"}</a> <span class="muted">→ {mkt.key}</span></div>
+					{#if mkt.source}
+						<div class="smeta">{mkt.source.method}{#if mkt.source.ageMs != null}<span class="muted"> · {(mkt.source.ageMs / 1000).toFixed(0)}s ago</span>{/if}</div>
+						{#each mkt.source.feeds as f}
 							<div class="feed">
 								<a class="fhost mono" href={f.endpoint} target="_blank" rel="noopener">{(f.endpoint || "").split("/")[2] || "?"}</a>
 								{#if f.error}<span class="bad">⚠ {f.error}</span>{:else if f.value != null}<span class="fval mono">{Number(f.value).toLocaleString()}</span>{:else}<span class="muted tiny">fetch to verify</span>{/if}
 							</div>
 						{/each}
-					</div>
-				{/if}
-			{/each}
+					{/if}
+				</div>
+			{/if}
 			<div class="trust">
-				<p><span class="ok">✓</span> Every node verifies the ledger, the ordering, and the oracle's signature — no server, no single node trusted.</p>
-				<p><span class="ok">✓</span> The price sources are published on-chain (above), so anyone can re-fetch them and confirm a posted reading.</p>
-				<p><span class="ok">✓</span> The mark is an on-chain <strong>median</strong> of every node's own posted reading — no single oracle to trust or bribe, and a minority posting bad prices can't move it. (Sybil-resistance — weighting posters by stake — is the next hardening.)</p>
+				<p><span class="ok">✓</span> Every node verifies the ledger, the ordering, and each write's signature — no server, no single node trusted.</p>
+				<p><span class="ok">✓</span> <strong>A channel is a market.</strong> Its name fixes the public source + the one reporter, so anyone can re-fetch the endpoint and audit the posted price — before even joining.</p>
+				<p><span class="ok">✓</span> Each channel is its own economy: a bad market can only ever touch its own pot/collateral. The recourse to a bad reporter is a rival channel on the same source.</p>
 			</div>
 		</div>
 	</details>
