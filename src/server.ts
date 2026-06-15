@@ -92,24 +92,34 @@ function serializeState() {
 	const gbtc: Record<string, string> = {};
 	for (const [pubkey, amt] of view.bridge.gbtc) gbtc[pubkey] = amt.toString();
 
-	// A CHANNEL IS A MARKET: the channel name encodes the instrument's public source + reporter.
-	// Not a vote — only that reporter posts, the public endpoint keeps it auditable, and each
-	// channel is its own economy (a malicious market can't touch funds in another channel).
-	const def = parseChannel(daemon.currentChannel()); // {label, endpoint, key, reporter} | null
-	// This node's live feed (raw values), present only if it's the channel's reporter — it signs
-	// reports with the reporter key, which is separate from the active wallet identity.
+	// A CHANNEL IS A MARKET. Two kinds: a reporter market (one named reporter + public endpoint) or a
+	// Pyth market (anyone relays a guardian-attested Pyth feed — no reporter). Each channel is its own
+	// sandboxed economy: a malicious market can't touch funds in another channel.
+	const def = parseChannel(daemon.currentChannel());
 	const live = def ? daemon.oracleSource() : null;
 	const marketInfo = def
-		? {
-				channel: daemon.currentChannel(),
-				label: def.label,
-				endpoint: def.endpoint,
-				key: def.key,
-				reporter: def.reporter,
-				price: m != null ? m.toString() : null,
-				iAmReporter: !!live, // this node holds the channel's reporter key and is posting
-				source: live ? { method: live.method, ageMs: Date.now() - live.at, feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })) } : null,
-			}
+		? def.kind === "pyth"
+			? {
+					channel: daemon.currentChannel(),
+					kind: "pyth" as const,
+					label: def.label,
+					feedId: def.feedId,
+					reporter: null, // none — verified via the Wormhole guardian quorum
+					price: m != null ? m.toString() : null,
+					iAmReporter: !!live, // this node is relaying the Pyth feed
+					source: live ? { method: live.method, ageMs: Date.now() - live.at, feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })) } : null,
+				}
+			: {
+					channel: daemon.currentChannel(),
+					kind: "reporter" as const,
+					label: def.label,
+					endpoint: def.endpoint,
+					key: def.key,
+					reporter: def.reporter,
+					price: m != null ? m.toString() : null,
+					iAmReporter: !!live, // this node holds the channel's reporter key and is posting
+					source: live ? { method: live.method, ageMs: Date.now() - live.at, feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })) } : null,
+				}
 		: null;
 
 	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)

@@ -78,6 +78,22 @@ function toInt(raw: unknown): bigint | null {
  * extracts the key-path, parses. Always returns a PriceReading (with `error` set
  * on failure) so the caller can surface the source state instead of throwing.
  */
+/** Hermes endpoint serving the latest Wormhole-attested Pyth price updates. */
+export const HERMES_URL = process.env.GAVL_HERMES_URL ?? "https://hermes.pyth.network";
+
+/** Fetch the latest signed Pyth update blob (hex) for `feedId` from Hermes. The blob is
+ *  guardian-attested, so it's verified on-chain — Hermes (or any relay) is untrusted transport. */
+export async function fetchPythUpdate(feedId: string): Promise<string | null> {
+	try {
+		const res = await fetch(`${HERMES_URL}/v2/updates/price/latest?ids[]=${feedId}&encoding=hex`, { headers: { accept: "application/json" } });
+		if (!res.ok) return null;
+		const json = (await res.json()) as { binary?: { data?: string[] } };
+		return json.binary?.data?.[0] ?? null;
+	} catch {
+		return null;
+	}
+}
+
 export async function readPrice(src: PriceSource): Promise<PriceReading> {
 	if (src.fixed != null) {
 		return { value: src.fixed, raw: src.fixed.toString(), endpoint: null, key: null };

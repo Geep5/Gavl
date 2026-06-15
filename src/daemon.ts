@@ -50,7 +50,8 @@ import { isCeremonyTimeout } from "./custody/ceremony.ts";
 import { Esplora } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, confirmations, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
 import { pendingClaims, unsentWithdrawals, inFlightWithdrawals, slashable } from "./custody/bridge.ts";
-import { readPriceAggregate, readPrice, DEFAULT_SOURCE } from "./market/pricefeed.ts";
+import { readPriceAggregate, readPrice, DEFAULT_SOURCE, fetchPythUpdate, HERMES_URL } from "./market/pricefeed.ts";
+import { verifyPythUpdate } from "./market/pyth.ts";
 import type { PriceSource, AggregateReading } from "./market/pricefeed.ts";
 import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
@@ -503,7 +504,7 @@ export class Daemon {
 	view(): View {
 		const root = this.node.ledger.stateRoot();
 		if (this.viewCache && this.viewCache.root === root) return this.viewCache.view;
-		const view = computeView(this.node.ledger.allWrites(), { base: this.checkpointBase, reporter: this.channelReporter() });
+		const view = computeView(this.node.ledger.allWrites(), { base: this.checkpointBase, reporter: this.channelReporter(), pythFeedId: this.channelPyth() });
 		this.viewCache = { root, view };
 		return view;
 	}
@@ -511,7 +512,15 @@ export class Daemon {
 	/** This channel's authorized price reporter (parsed from the channel name), or undefined for a
 	 *  plain (non-market) channel. A per-channel constant every node agrees on → deterministic fold. */
 	channelReporter(): string | undefined {
-		return parseChannel(this.network)?.reporter;
+		const c = parseChannel(this.network);
+		return c?.kind === "reporter" ? c.reporter : undefined;
+	}
+
+	/** This channel's Pyth feed id, if it's a Pyth market (`label::pyth::feedId`) — else undefined.
+	 *  When set, the fold accepts a verified Pyth update from anyone (no reporter). */
+	channelPyth(): string | undefined {
+		const c = parseChannel(this.network);
+		return c?.kind === "pyth" ? c.feedId : undefined;
 	}
 
 	/** This node's price-reporter identity — the key it signs `market.report` with (the dev oracle
@@ -567,7 +576,7 @@ export class Daemon {
 		}
 		let r = this.appRootCache.get(prevId);
 		if (r === undefined) {
-			r = viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, prevId, this.checkpointBase, this.channelReporter()));
+			r = viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, prevId, this.checkpointBase, this.channelReporter(), this.channelPyth()));
 			this.appRootCache.set(prevId, r);
 		}
 		return r;
@@ -615,7 +624,7 @@ export class Daemon {
 		if (!ckpt || ckpt.height !== target) return; // the boundary anchor isn't reachable yet → wait
 		const heads = anchors.headsAt(ckpt.id);
 		if (Object.keys(heads).length === 0) return; // nothing certified yet
-		const view = viewAtAnchor(this.node.ledger.allWrites(), anchors, ckpt.id, this.checkpointBase, this.channelReporter()); // state at the boundary
+		const view = viewAtAnchor(this.node.ledger.allWrites(), anchors, ckpt.id, this.checkpointBase, this.channelReporter(), this.channelPyth()); // state at the boundary
 		this.lastCheckpointHeight = ckpt.height;
 		this.checkpointBase = view;
 		const snap: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(view) };
@@ -814,7 +823,7 @@ export class Daemon {
 		if (!this.node.anchors) return this.checkpointBase ? computeView([], { base: this.checkpointBase }) : computeView([]);
 		const finId = this.node.anchors.finalized(this.finalityDepth)?.id ?? null;
 		if (this.finalCache && this.finalCache.id === finId) return this.finalCache.view;
-		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase, this.channelReporter());
+		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase, this.channelReporter(), this.channelPyth());
 		this.finalCache = { id: finId, view };
 		return view;
 	}
@@ -1018,11 +1027,38 @@ export class Daemon {
 		const myId = toHex(kp.publicKey);
 		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: kp });
 		const def = parseChannel(this.network);
-		const amReporter = def?.reporter === myId;
 		this.publishing = true;
 		const myGen = ++this.oracleGen; // a channel switch bumps this → the old loop below exits
-		// Only the channel's reporter fetches + posts; a consumer node has nothing to publish.
-		if (!amReporter || !def) {
+
+		// Pyth market: relay the latest Wormhole-attested update from Hermes. No reporter — anyone
+		// may relay; the fold verifies the guardian quorum. This node relays as a public service.
+		if (def?.kind === "pyth") {
+			const feedId = def.feedId;
+			void (async () => {
+				let lastPub = this.view().market.seq; // last on-chain publish time
+				while (this.publishing && myGen === this.oracleGen) {
+					const blob = await fetchPythUpdate(feedId);
+					const p = blob ? verifyPythUpdate(blob).find((x) => x.feedId === feedId) : null;
+					if (p && p.price > 0n) {
+						this.lastOracleSource = { value: p.price, method: `Pyth ${feedId.slice(0, 10)}…`, used: 1, readings: [{ value: p.price, raw: `${p.price}e${p.expo}`, endpoint: HERMES_URL, key: feedId }], at: Date.now() };
+						if (p.publishTime > lastPub) {
+							try {
+								await acct.reportPythUpdate(blob!); // newer attested update → relay it
+								lastPub = p.publishTime;
+							} catch {
+								/* retry next tick */
+							}
+						}
+					}
+					await new Promise((r) => setTimeout(r, opts.everyMs));
+				}
+			})();
+			console.log(`  market ${def.label}: relaying Pyth feed ${feedId.slice(0, 10)}… from Hermes (verified on-chain; no reporter)`);
+			return;
+		}
+
+		// Only the channel's reporter fetches + posts; a consumer / non-market channel has nothing to publish.
+		if (def?.kind !== "reporter" || def.reporter !== myId) {
 			console.log(`  channel ${this.network}: consuming on-chain price (this node isn't its reporter)`);
 			return;
 		}
@@ -1573,23 +1609,20 @@ function channelSlug(name: string): string {
 	return safe || "default";
 }
 
-/** A market channel's name encodes its instrument: `label::endpoint::jsonKey::reporterHex`.
- *  This IS the market definition — public + auditable from the name, immutable (the name hashes to
- *  the DHT topic). The fold only needs `reporter` (to authorize price posts); endpoint/key are
- *  human-auditable metadata. A name without the 4 `::`-parts (or a bad reporter key) is a plain
- *  channel: no market, no price, transfers only. */
-export interface ChannelMarket {
-	label: string;
-	endpoint: string;
-	key: string;
-	reporter: string;
-}
+/** A market channel's name IS its definition (and hashes to the DHT topic). Two kinds:
+ *   - reporter: `label::endpoint::jsonKey::reporterHex` — one named reporter posts the price.
+ *   - pyth:     `label::pyth::feedIdHex` — anyone relays a Wormhole-attested Pyth update; no reporter.
+ *  A name that matches neither is a plain channel: no market, transfers only. */
+export type ChannelMarket = { kind: "reporter"; label: string; endpoint: string; key: string; reporter: string } | { kind: "pyth"; label: string; feedId: string };
 export function parseChannel(name: string): ChannelMarket | null {
 	const parts = name.split("::");
-	if (parts.length !== 4) return null;
-	const [label, endpoint, key, reporter] = parts;
-	if (!/^[0-9a-f]{64}$/i.test(reporter)) return null;
-	return { label, endpoint, key, reporter };
+	if (parts.length === 3 && parts[1].toLowerCase() === "pyth" && /^[0-9a-f]{64}$/i.test(parts[2])) {
+		return { kind: "pyth", label: parts[0], feedId: parts[2].toLowerCase() };
+	}
+	if (parts.length === 4 && /^[0-9a-f]{64}$/i.test(parts[3])) {
+		return { kind: "reporter", label: parts[0], endpoint: parts[1], key: parts[2], reporter: parts[3] };
+	}
+	return null;
 }
 
 /** The default channel — the BTC-USD market we ship with: the public Coinbase spot feed, reported
