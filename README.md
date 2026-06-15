@@ -5,7 +5,7 @@ cooldown ledger**, built on [Holepunch](https://github.com/holepunchto) (hyperco
 hyperswarm / hyperdht).
 
 Broadcast an intent to go **long** or **short** on Bitcoin; a real peer takes the opposite
-side; the two of you escrow against *each other* and settle at a signed oracle price.
+side; the two of you escrow against *each other* and settle at the channel's market price.
 **There is no pool and no house** — every trade is a matched, zero-sum, fully-collateralized
 bet between two people, so reserves can never be drained. When no peer is on the other side, a
 **liquidity backstop funded by idle-balance decay** can take it — so the reclaimed gBTC of
@@ -16,11 +16,12 @@ key-only node can hold nothing but its key and bootstrap from peers), and is bou
 write pays a **cooldown** (a proof of space *and* a proof of time), so an attacker can't spin
 up cheap identities to flood or grind the network.
 
-The price comes from a **signed, on-chain oracle**. Collateral is **gBTC** — a 1:1 claim on
-real Bitcoin held in a **threshold-custody fund** that only a quorum can spend (no single
-party ever holds the key).
+The price is **named, not voted**: a market is a channel whose name encodes its public source +
+the one reporter allowed to post it (`label::endpoint::jsonKey::reporter`), and each channel is
+its own sandboxed economy. Collateral is **gBTC** — a 1:1 claim on real Bitcoin held in a
+**threshold-custody fund** that only a quorum can spend (no single party ever holds the key).
 
-> **Status:** the matched market (consensus + intents + oracle) is complete and runs live,
+> **Status:** the matched market (consensus + intents + per-channel pricing) is complete and runs live,
 > including cross-node intent gossip. The real-BTC bridge runs end-to-end on **testnet**.
 > Mainnet is gated on an audit and four named items — see
 > [Trust model & status](#trust-model--status). Don't put real mainnet BTC in it yet.
@@ -65,7 +66,7 @@ in tests.
 1. **Deposit** real (testnet) BTC to *your personal* fund address → mint **gBTC** 1:1.
 2. **Broadcast an intent** — "long/short *N* gBTC at *L*× leverage" — gossiped over the mesh
    as a signed, non-binding offer; or **take** the opposite side of a peer's resting intent.
-3. **A match** escrows both peers' gBTC and opens a bilateral contract, marked to the oracle.
+3. **A match** escrows both peers' gBTC and opens a bilateral contract, marked to the channel's market.
 4. **Close** early any time at the current mark — directional PnL, capped at the stake. A
    position you never close **auto-settles at its time-lock** (a hard ~1-month cap), so nothing
    sits open forever.
@@ -85,7 +86,7 @@ No pool, no order book to babysit — just signed intents and matched bilateral 
   spent the funds just fails — we verify on-chain anyway), escrows both, and opens the
   contract. No interactive handshake — the signed offer is the authorization.
 - **Bilateral, zero-sum, bounded.** Each side stakes the same; settlement splits the
-  `2·stake` pot by directional PnL at the oracle mark, capped at the stake. The loser can
+  `2·stake` pot by directional PnL at the channel's mark, capped at the stake. The loser can
   never owe more than it posted. "Leverage" just scales the price move and tightens the cap (at
   *L*×, a `1/L` move against you wipes your stake).
 - **A liquidity backstop, funded by idle decay.** With no peer on the other side, the **pot**
@@ -99,7 +100,7 @@ No pool, no order book to babysit — just signed intents and matched bilateral 
 - **Partial fills + cross-node.** One offer fills across many takers (tracked by nonce);
   intents propagate epidemically, so a peer on another machine sees your tape and can take it.
 - **Time-locked.** Either side may close early at the mark, but every contract has a hard
-  lifetime cap and **auto-settles at expiry** against the oracle — so the open-contract set is
+  lifetime cap and **auto-settles at expiry** against the market — so the open-contract set is
   bounded by throughput, never accumulating positions nobody closes.
 - **Idle decay → liquidity (the RAM ledger's bound, turned into a feature).** State lives in RAM,
   so nothing can grow or sit unbounded — including user balances. Rather than cap them, gBTC left
@@ -113,24 +114,27 @@ No pool, no order book to babysit — just signed intents and matched bilateral 
   Match/settle/decay/backstop only *move* gBTC between buckets, never mint — tested as a hard
   invariant over random op streams. (`src/market/intent.ts`)
 
-### The oracle (`src/market/oracle.ts`, `src/market/btc.ts`)
+### Pricing — a channel *is* a market (`src/market/btc.ts`, `src/daemon.ts`)
 
-The price is the thinnest *trusted* part — decentralized and transparent:
+The price isn't voted on — it's **named**. A market channel's name encodes the instrument:
+`label::endpoint::jsonKey::reporter`. That string IS the market's public, immutable definition
+(it hashes to the DHT topic), and each channel is its own economy (own ledger, bridge, pot, book).
 
-- **Every node posts its own reading** — no special publisher. Prices enter as signed
-  `oracle.post` writes folded by every peer (per-poster monotonic seq); the mark is the
-  **median of recent posters** within a freshness window, so no single key sets the price and a
-  departed or stale poster drops out of the median automatically.
-- **Each poster averages independent feeds** (Coinbase, Kraken, Bitstamp), so one bad/offline
-  source can't move that poster's reading.
-- **Posts are gated, not constant** — a node only writes a new reading when the price moves past
-  a threshold or a staleness heartbeat elapses (`oracleShouldPost`), so the oracle never floods
-  the ledger with identical prices.
-- **Methodology is disclosed on-chain** (`oracle.meta`) — every client sees the exact endpoints
-  + keys each poster derives from, and can audit the posted price against them.
-- **The honest caveat:** a median of independent posters is far stronger than one signer, but
-  it's still trust in the *set* of posters and their feeds. The trust shrinks as posters
-  diversify; it doesn't vanish.
+- **One reporter per channel, fixed by the name.** Only the `reporter` pubkey encoded in the
+  channel name may post the price (`market.report {price, seq}`, per-reporter monotonic seq). The
+  fold learns that reporter from the channel name (a per-channel constant → deterministic) and
+  rejects everyone else. No median, no per-price voting → **nothing to sybil.**
+- **The public endpoint keeps it honest.** `endpoint::jsonKey` is in the name, so anyone can fetch
+  the source and audit the reporter *before even joining*. A bad reporter just doesn't attract
+  traders — and anyone can launch a rival market (a different channel) on the same source with a
+  better reporter. Trust is competed for at the market level, not aggregated per price.
+- **Each reporter averages independent feeds** (Coinbase, Kraken, Bitstamp) and posts gated on
+  move-or-heartbeat (`oracleShouldPost`), so it never floods the ledger with identical prices.
+- **Stale-source safe.** A price the reporter stops refreshing past `MARKET_STALE_AFTER` is
+  treated as no-price — matching/settling pauses rather than trade on a dead number.
+- **Sandboxed by construction.** Because the market is the channel, a malicious market can only
+  ever touch *its own* channel's pot/collateral — funds in another channel are unreachable. The
+  trust is "this channel's named reporter," which you opt into by joining (and can audit first).
 
 ---
 
@@ -235,9 +239,9 @@ src/
   consensus/     anchor chain, fork choice, finality, difficulty, canonical order
   sync/          hyperswarm/hyperdht mesh, gossip, peer/bootstrap management
   store/         durable hypercore write store + state snapshots/checkpoints + selective persist policy
-  market/        the matched market: intents + bilateral contracts (intent.ts), btc fold, ops, account, oracle, pricefeed
+  market/        the matched market: intents + bilateral contracts (intent.ts), btc fold, ops, account, price feeds
   custody/       real-BTC bridge: threshold (FROST) · DKG · Taproot · per-identity deposits · tx · ledger · watcher · esplora
-  daemon.ts      boots ledger + node + store + consensus + oracle publisher + bridge + intent book
+  daemon.ts      boots ledger + node + store + consensus + price reporter + bridge + intent book
   server.ts      localhost JSON API for the web UI
 web/             Svelte SPA — the intent tape + bull/bear trading UI
 ```
@@ -254,7 +258,7 @@ npm install              # once
 npm run dev              # ← starts daemon + web UI together, then open http://localhost:5180
 ```
 
-`npm run dev` is the zero-setup path: it boots the daemon (fast VDF, oracle publishing,
+`npm run dev` is the zero-setup path: it boots the daemon (fast VDF, price reporting,
 local-only) **and** the web UI in one command, cross-platform — no env vars to type.
 
 > **Windows / browser note:** the UI binds IPv6, so open **`http://localhost:5180`**, not
@@ -263,7 +267,7 @@ local-only) **and** the web UI in one command, cross-platform — no env vars to
 Other scripts:
 
 ```bash
-npm test                 # full suite (~220 tests): consensus, checkpoints, genesis-free adoption, matched market, demurrage, liquidity backstop, intent gossip, oracle, custody, bridge
+npm test                 # full suite (~220 tests): consensus, checkpoints, genesis-free adoption, matched market, demurrage, liquidity backstop, intent gossip, per-channel pricing, custody, bridge
 npm run demo             # PoST cooldown chain — watch space→cooldown
 npm run demo:consensus   # two nodes farm + gossip anchors, finalize the same state over a real mesh
 npm run daemon           # daemon only (real chiavdf VDF — needs the .venv; see below)
@@ -271,16 +275,18 @@ npm run web:dev          # web UI only (expects a daemon on :6440)
 ```
 
 Tuning env vars (set inline on macOS/Linux; on Windows use `set VAR=…` or `$env:VAR=…`, or
-just edit the `daemon:dev` script): `GAVL_VDF=hash|chia` · `GAVL_ORACLE_PUBLISH=1` (this node
-holds the oracle key) · `GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_PERSIST=all|mine|off` ·
-`GAVL_MESH=0` (disable the mesh — runs local-only; on by default) · `GAVL_NETWORK=<channel>`.
+just edit the `daemon:dev` script): `GAVL_VDF=hash|chia` · `GAVL_ORACLE_PUBLISH=1` (this node is
+the channel's price reporter) · `GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_PERSIST=all|mine|off` ·
+`GAVL_MESH=0` (disable the mesh — runs local-only; on by default) · `GAVL_NETWORK=<channel>`. A
+**market** channel is named `label::endpoint::jsonKey::reporterPubkey` (that name is the market's
+public definition); a plain name is a transfers-only channel with no price.
 The real chiavdf VDF (`GAVL_VDF=chia`, the daemon's default) needs a Python venv with
 `chiavdf`/`chiapos`; `npm run dev` sidesteps this by using `GAVL_VDF=hash`.
 
 **Trade against yourself or a peer.** The market needs two sides, so either flip between two
 identities (the account picker, bottom-left) or run a second node on the same channel:
 broadcast an intent on one, **take** the opposite side on the other → a matched contract
-opens, both sides escrow, and it settles at the oracle mark when either side closes.
+opens, both sides escrow, and it settles at the channel's mark when either side closes.
 
 **Testnet round-trip:** open the UI → **Wallet & custody** → send testnet BTC to *your*
 deposit address → paste the txid to claim → mint gBTC → broadcast/take an intent → close →
@@ -296,8 +302,10 @@ threshold signing (no one holds the fund key).
 
 What's **trusted** (and surfaced honestly in the UI):
 
-- **The oracle price** — now a **median of independent posters** (no single signer); the trust
-  shrinks to the diversity of the poster set and their feeds.
+- **The market price** — each market channel names one **reporter** + a **public source** in its
+  name. You trust that reporter for that channel only (auditable against the public endpoint before
+  you join), and a malicious market is sandboxed to its own channel. A rival channel on the same
+  source with a better reporter is the recourse.
 - **The bridge, on testnet** — currently **single-operator**: the daemon holds all the
   fund's key shares (deterministic dev seed) and is the deposit attestor. Real BTC custody
   is never zero-trust; this pushes trust as thin as it goes, but it isn't there yet.
@@ -307,7 +315,7 @@ What's **trusted** (and surfaced honestly in the UI):
 1. **Independent audit.**
 2. **Real distributed DKG** across independent nodes (not in-process).
 3. **Bonding + slashing** so the honest-majority assumption is economically enforced.
-4. **Non-public keys** — the oracle / attestor / fund keys currently derive from public dev
+4. **Non-public keys** — the reporter / attestor / fund keys currently derive from public dev
    seeds (fine for testnet, instant theft on mainnet).
 
 ## Roadmap
@@ -322,11 +330,12 @@ What's **trusted** (and surfaced honestly in the UI):
   delta-encoded anchor heads · every structure bounded by cost + decay (no hard caps)
 - **Peer-to-peer matched market** ✅ signed intents gossiped over the mesh · matched
   bilateral contracts · zero-sum, fully-collateralized, **no pool** (reserves can't be
-  drained) · bounded leverage · oracle-marked · close-early **+ time-locked auto-settle** ·
-  idle-balance **demurrage** → **liquidity backstop** (pot as counterparty of last resort) ·
-  cross-node intent tape · Svelte tape/trade UI
-- **Oracle** ✅ decentralized **median of all posters** (no special publisher) · per-poster
-  multi-feed average · move/heartbeat-gated posts · on-chain methodology disclosure · live feeds
+  drained) · bounded leverage · marked to the channel's market · close-early **+ time-locked
+  auto-settle** · idle-balance **demurrage** → **liquidity backstop** (pot as counterparty of last
+  resort) · cross-node intent tape · Svelte tape/trade UI
+- **Pricing** ✅ **a channel is a market** — the channel name encodes the public source + the one
+  reporter; sandboxed per channel (no shared pot, no registry) · reporter averages multiple feeds ·
+  move/heartbeat-gated posts · stale-source pause
 - **Real-BTC bridge (testnet)** ✅ FROST threshold signing · DKG · Taproot address +
   BIP340-valid spends · withdrawal tx build/sign/broadcast · deposit watcher · bridge
   ledger · proof of reserves
