@@ -30,7 +30,7 @@ function stateWithOpenContract(mark: bigint): View {
 	bridge.reserves = 10_000n; // 8000 free + 2000 escrow
 	const book = emptyBook();
 	book.contracts.set("c1", { id: "c1", long: "aa", short: "bb", stake: 1000n, entry: 61_000n, leverage: 10n, nonce: "n", expiryHeight: 50 });
-	return { bridge, market: { price: mark, seq: 0, at: 0 }, custody: { fundKey: null, epoch: -1 }, book };
+	return { bridge, market: { price: mark, expo: 0, seq: 0, at: 0 }, custody: { fundKey: null, epoch: -1 }, book };
 }
 
 test("an expired contract unwinds at entry — independent of the height it's processed at", () => {
@@ -115,7 +115,7 @@ test("a backstop position folds identically from two checkpoint heights (determi
 		addGbtc(bridge, D.pubHex, 100_000n);
 		bridge.pot = 200_000n; // accumulated idle decay → the backstop's finalized capital
 		bridge.reserves = 300_000n; // 100k free + 200k pot
-		return { bridge, market: { price: 61_000n, seq: 0, at: 0 }, custody: { fundKey: null, epoch: -1 }, book: emptyBook() };
+		return { bridge, market: { price: 61_000n, expo: 0, seq: 0, at: 0 }, custody: { fundKey: null, epoch: -1 }, book: emptyBook() };
 	};
 	const T = 43_300; // past the backstop contract's time-lock (born 0 → expiry 43200)
 

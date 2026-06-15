@@ -6,8 +6,9 @@
 	import { api } from "../lib/api.js";
 
 	const m = $derived(store.market);
-	const priceNum = $derived(m?.price != null ? Number(m.price) : null);
-	const mkt = $derived(m?.marketInfo ?? null); // {label, endpoint, key, reporter, price, iAmReporter, source} | null
+	// display value = integer price · 10^expo (Pyth feeds carry an expo; reporter prices use 0)
+	const priceNum = $derived(m?.price != null ? Number(m.price) * 10 ** (m.priceExpo ?? 0) : null);
+	const mkt = $derived(m?.marketInfo ?? null); // { kind, label, …, price, iAmReporter, source } | null
 	const bal = $derived(Number(myGbtc()));
 	const tape = $derived(m?.tape ?? []);
 	const contracts = $derived(m?.myContracts ?? []);
@@ -75,13 +76,19 @@
 	<div class="price-block">
 		<div class="pair">{mkt?.label ?? "BTC"} <span class="muted">/ USD</span></div>
 		{#if priceNum != null}
-			<div class="price">${priceNum.toLocaleString()}</div>
-			<div class="src" title={mkt ? `reported by ${mkt.reporter} from ${mkt.endpoint}` : ""}>
-				<span class="dot live"></span> live · reported by {mkt ? short(mkt.reporter) : "—"}{mkt?.iAmReporter ? " (you)" : ""}
-			</div>
+			<div class="price">${priceNum.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
+			{#if mkt?.kind === "pyth"}
+				<div class="src" title="Pyth — attested by the Wormhole guardian network, verified on-chain">
+					<span class="dot live"></span> live · Pyth oracle{mkt.iAmReporter ? " · relayed by you" : ""}
+				</div>
+			{:else}
+				<div class="src" title={mkt ? `reported by ${mkt.reporter} from ${mkt.endpoint}` : ""}>
+					<span class="dot live"></span> live · reported by {mkt ? short(mkt.reporter) : "—"}{mkt?.iAmReporter ? " (you)" : ""}
+				</div>
+			{/if}
 		{:else}
 			<div class="price muted">—</div>
-			<div class="src"><span class="dot"></span> {mkt ? "waiting for the reporter…" : "not a market channel — no price"}</div>
+			<div class="src"><span class="dot"></span> {mkt ? (mkt.kind === "pyth" ? "waiting for a relayed Pyth update…" : "waiting for the reporter…") : "not a market channel — no price"}</div>
 		{/if}
 	</div>
 	<div class="bal-block">

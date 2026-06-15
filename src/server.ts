@@ -129,6 +129,7 @@ function serializeState() {
 		marketInfo,
 		myReporter: daemon.reporterPubkey(), // the reporter key a market THIS node creates would name
 		price: m != null ? m.toString() : null,
+		priceExpo: view.market.expo, // decimal exponent: display value = price · 10^expo
 		maxLeverage: Number(MAX_LEVERAGE),
 		// collateral = gBTC, a 1:1 claim on BTC in the custody fund
 		myGbtc: gbtcOf(view, me).toString(),
@@ -263,8 +264,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			return send(res, 200, { id: await daemon.unbondCustody(amt) });
 		}
 		if (path === "/api/market/test") {
-			// Fetch-test a candidate source before creating the market — catch a typo'd endpoint/key.
-			const r = await daemon.testSource(String(body.endpoint ?? ""), String(body.key ?? ""));
+			// Fetch-test a candidate source before creating the market. A Pyth market tests its feed id
+			// (fetch + verify the guardian-attested update); a custom market tests its endpoint/key.
+			const r = body.feedId ? await daemon.testPythFeed(String(body.feedId)) : await daemon.testSource(String(body.endpoint ?? ""), String(body.key ?? ""));
 			return send(res, 200, r);
 		}
 		if (path === "/api/market/report") {

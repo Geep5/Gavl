@@ -53,7 +53,7 @@ function makeView(rev = false): View {
 
 	return {
 		bridge,
-		market: { price: 61500n, seq: 3, at: 10 },
+		market: { price: 61500n, expo: 0, seq: 3, at: 10 },
 		custody: { fundKey: "deadbeef", epoch: 0 },
 		book,
 	};
@@ -90,7 +90,7 @@ test("a single changed balance changes the root", () => {
 });
 
 test("empty view has a stable, defined root", () => {
-	const empty: View = { bridge: emptyBridge(), market: { price: null, seq: -1, at: 0 }, custody: { fundKey: null, epoch: -1 }, book: emptyBook() };
+	const empty: View = { bridge: emptyBridge(), market: { price: null, expo: 0, seq: -1, at: 0 }, custody: { fundKey: null, epoch: -1 }, book: emptyBook() };
 	assert.equal(viewRoot(empty), viewRoot(empty));
 	assert.match(viewRoot(empty), /^[0-9a-f]{64}$/);
 });

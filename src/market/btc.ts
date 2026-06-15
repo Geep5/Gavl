@@ -49,9 +49,12 @@ export const BRIDGE_ATTESTOR = bridgePubHex(process.env.GAVL_BRIDGE_SEED);
  * lives in state; the source/reporter are the channel's identity, not consensus data.
  */
 export interface MarketPrice {
-	/** Latest reported price (null until the reporter first posts). */
+	/** Latest reported price (null until the reporter first posts). The integer mark; contracts use
+	 *  it ratio-wise, so the fold never needs the scale — but display does (real value = price·10^expo). */
 	price: bigint | null;
-	/** Reporter's monotonic seq — replay/ordering guard. */
+	/** Decimal exponent for display (0 for plain reporter prices; Pyth feeds carry their own, e.g. −8). */
+	expo: number;
+	/** Reporter's monotonic seq (or Pyth publish-time) — replay/ordering guard. */
 	seq: number;
 	/** Certified height of the last report — drives staleness checks. */
 	at: number;
@@ -63,7 +66,7 @@ export const MARKET_STALE_AFTER = 4_320; // ~3 days at 60s/anchor
 
 /** A fresh, unpriced market-price slot. */
 export function emptyMarket(): MarketPrice {
-	return { price: null, seq: -1, at: 0 };
+	return { price: null, expo: 0, seq: -1, at: 0 };
 }
 
 export interface CustodyState {
@@ -377,6 +380,7 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 				if (!p || p.price <= 0n) return; // unverified / wrong feed / non-positive
 				if (p.publishTime <= view.market.seq) return; // not newer
 				view.market.price = p.price;
+				view.market.expo = p.expo; // Pyth's scale (for display; mark stays the integer)
 				view.market.seq = p.publishTime; // monotonic guard = Pyth publish time (unix seconds)
 				view.market.at = bornHeight; // certified height → deterministic staleness
 				return;
@@ -389,6 +393,7 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			if (!reporter || w.writer !== reporter) return; // not this channel's authorized source
 			if (op.seq <= view.market.seq) return; // stale/replayed
 			view.market.price = price;
+			view.market.expo = 0; // a reporter posts the price in display units already
 			view.market.seq = op.seq;
 			view.market.at = bornHeight; // certified height → deterministic staleness
 			return;

@@ -45,7 +45,7 @@ export interface CanonBridge {
 	potEscrowTaken: string; // lifetime pot capital staked as backstop (budget counter)
 }
 
-export type CanonMarket = { price: string | null; seq: number; at: number };
+export type CanonMarket = { price: string | null; expo: number; seq: number; at: number };
 
 export interface CanonBook {
 	contracts: Entry<{ id: string; long: string; short: string; stake: string; entry: string; leverage: string; nonce: string; expiryHeight: number }>[]; // sorted by id
@@ -105,7 +105,7 @@ function serializeBook(book: MarketBook): CanonBook {
 export function serializeView(view: View): CanonState {
 	return {
 		bridge: serializeBridge(view.bridge),
-		market: { price: view.market.price === null ? null : view.market.price.toString(), seq: view.market.seq, at: view.market.at },
+		market: { price: view.market.price === null ? null : view.market.price.toString(), expo: view.market.expo, seq: view.market.seq, at: view.market.at },
 		custody: { fundKey: view.custody.fundKey, epoch: view.custody.epoch },
 		book: serializeBook(view.book),
 	};
@@ -138,7 +138,7 @@ function deserializeBridge(b: CanonBridge): BridgeState {
 }
 
 function deserializeMarket(m: CanonMarket): MarketPrice {
-	return { price: m.price === null ? null : BigInt(m.price), seq: m.seq, at: m.at };
+	return { price: m.price === null ? null : BigInt(m.price), expo: m.expo ?? 0, seq: m.seq, at: m.at };
 }
 
 function deserializeBook(b: CanonBook): MarketBook {

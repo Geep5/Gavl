@@ -28,6 +28,7 @@ export const api = {
 	settleContract: (contractId) => req("/contract/settle", "POST", { contractId }),
 	switchChannel: (name) => req("/channel", "POST", { name }),
 	testMarket: (endpoint, key) => req("/market/test", "POST", { endpoint, key }),
+	testPythFeed: (feedId) => req("/market/test", "POST", { feedId }),
 	rerollIdentity: (label) => req("/identity/reroll", "POST", { label }),
 	importIdentity: (seed, label) => req("/identity/import", "POST", { seed, label }),
 	exportSeed: () => req("/identity/export", "POST", {}),

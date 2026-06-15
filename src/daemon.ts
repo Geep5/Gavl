@@ -536,6 +536,18 @@ export class Daemon {
 		return readPrice({ url: endpoint, key }).then((r) => ({ value: r.value != null ? r.value.toString() : null, raw: r.raw, error: r.error }));
 	}
 
+	/** Fetch-test a Pyth feed before creating a `label::pyth::feedId` market: pull the latest Hermes
+	 *  update and VERIFY it (guardian quorum + Merkle), returning the attested price/expo or an error. */
+	async testPythFeed(feedId: string): Promise<{ value: string | null; expo: number | null; error?: string }> {
+		const id = feedId.toLowerCase().replace(/^0x/, "");
+		if (!/^[0-9a-f]{64}$/.test(id)) return { value: null, expo: null, error: "a Pyth feed id is 64 hex characters" };
+		const blob = await fetchPythUpdate(id);
+		if (!blob) return { value: null, expo: null, error: "couldn't fetch a Pyth update for that feed" };
+		const p = verifyPythUpdate(blob).find((x) => x.feedId === id);
+		if (!p) return { value: null, expo: null, error: "no verified price for that feed id" };
+		return { value: p.price.toString(), expo: p.expo };
+	}
+
 	// ── state-committed checkpoints — the ledger never replays from 0 ──────
 	/** View at the ledger's prune floor (the last checkpoint). The ledger holds only writes
 	 *  ABOVE it; every fold resumes from here. Undefined ⇒ full history (never checkpointed). */
