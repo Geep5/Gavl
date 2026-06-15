@@ -14,8 +14,8 @@ import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
 import { computeView, gbtcOf, marketConserved } from "../src/market/btc.ts";
-import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
-import { PARAMS, K , setupMarket, MARKET_REPORTER } from "./helpers.ts";
+import { bridgeKeyPair } from "../src/market/oracle.ts";
+import { PARAMS, K, priceBase, repriced } from "./helpers.ts";
 
 let depN = 0;
 function setup() {
@@ -23,20 +23,19 @@ function setup() {
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
-	const oracle = new Account({ node, params: PARAMS, k: K, now, keypair: oracleKeyPair() });
 	const attestor = new Account({ node, params: PARAMS, k: K, now, keypair: bridgeKeyPair() });
 	const fund = (acct, amount) => attestor.attestDeposit("dep" + depN++ + ":0", acct.pubHex, amount);
-	return { node, mk, oracle, fund };
+	return { node, mk, fund };
 }
-/** Fold the whole ledger with explicit per-write heights so we can drive the clock. */
-const viewAt = (node, bornAt, nowHeight) => computeView(node.ledger.allWrites(), { bornAt, nowHeight, reporter: MARKET_REPORTER });
+/** Fold the whole ledger with explicit per-write heights so we can drive the clock. The mark is
+ *  seeded into the fold base (a price enters consensus only via an attested Pyth update). */
+const viewAt = (node, bornAt, nowHeight, base) => computeView(node.ledger.allWrites(), { bornAt, nowHeight, base });
 
 test("a gossiped offer is taken on-chain, escrows both sides, and settles at the oracle mark", async () => {
-	const { node, mk, oracle, fund } = setup();
+	const { node, mk, fund } = setup();
 	const A = mk(); // maker, will be LONG
 	const B = mk(); // taker, takes the SHORT side
 
-	await setupMarket(oracle, 61000n);
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 
@@ -47,24 +46,24 @@ test("a gossiped offer is taken on-chain, escrows both sides, and settles at the
 	// B takes the opposite (short) side on-chain
 	const matchId = await B.matchOpen(offer, 1000n);
 
-	// fold with the match certified at height 5 (within the offer window)
+	// fold with the match certified at height 5 (within the offer window), mark = 61000
 	const born = new Map([[matchId, 5]]);
-	let v = viewAt(node, born, 5);
-	assert.equal(v.book.contracts.size, 1, "one open contract");
-	const c = v.book.contracts.get(matchId);
+	const open = viewAt(node, born, 5, priceBase(61000n));
+	assert.equal(open.book.contracts.size, 1, "one open contract");
+	const c = open.book.contracts.get(matchId);
 	assert.equal(c.long, A.pubHex);
 	assert.equal(c.short, B.pubHex);
 	assert.equal(c.stake, 1000n);
-	assert.equal(gbtcOf(v, A.pubHex), 4000n, "A staked 1000");
-	assert.equal(gbtcOf(v, B.pubHex), 4000n, "B staked 1000");
-	assert.ok(marketConserved(v), "conserved while the contract is open");
+	assert.equal(gbtcOf(open, A.pubHex), 4000n, "A staked 1000");
+	assert.equal(gbtcOf(open, B.pubHex), 4000n, "B staked 1000");
+	assert.ok(marketConserved(open), "conserved while the contract is open");
 
-	// price settles above the cap → long (A) takes the whole pot
-	await oracle.report(63000n, 1);
+	// the mark moves above the cap → long (A) takes the whole pot. The settle folds onto the open
+	// view with the mark repriced to 63000 (a newer attested update would have landed by then).
 	const settleW = await mk().settle(matchId); // a third party settles it (permissionless)
 	born.set(settleW.id, 20);
 
-	v = viewAt(node, born, 20);
+	const v = computeView([settleW], { bornAt: born, nowHeight: 20, base: repriced(open, 63000n) });
 	assert.equal(v.book.contracts.size, 0, "contract settled + removed");
 	assert.equal(gbtcOf(v, A.pubHex), 6000n, "A won the 2000 pot (1000 stake back + 1000 winnings)");
 	assert.equal(gbtcOf(v, B.pubHex), 4000n, "B lost its stake");
@@ -72,12 +71,11 @@ test("a gossiped offer is taken on-chain, escrows both sides, and settles at the
 });
 
 test("a maker who spent the collateral (ghost) just fails to match — reserves untouched", async () => {
-	const { node, mk, oracle, fund } = setup();
+	const { node, mk, fund } = setup();
 	const A = mk(); // maker
 	const B = mk(); // taker
 	const C = mk(); // A sends its funds away before B can match (the "ghost")
 
-	await setupMarket(oracle, 61000n);
 	await fund(A, 1000n);
 	await fund(B, 1000n);
 
@@ -85,7 +83,7 @@ test("a maker who spent the collateral (ghost) just fails to match — reserves 
 	await A.transfer(C.pubHex, 1000n); // A ghosts — moves the collateral it offered
 	const matchId = await B.matchOpen(offer, 1000n);
 
-	const v = viewAt(node, new Map([[matchId, 5]]), 5);
+	const v = viewAt(node, new Map([[matchId, 5]]), 5, priceBase(61000n));
 	assert.equal(v.book.contracts.size, 0, "no contract — the maker couldn't cover");
 	assert.equal(gbtcOf(v, B.pubHex), 1000n, "taker's funds untouched");
 	assert.equal(gbtcOf(v, C.pubHex), 1000n, "A's funds went to C");

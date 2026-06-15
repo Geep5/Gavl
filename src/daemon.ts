@@ -27,7 +27,7 @@ import type { Anchor } from "./consensus/anchor.ts";
 import type { Heads } from "./ledger/ledger.ts";
 import { longPayout, verifyOffer } from "./market/intent.ts";
 import type { Offer, Side } from "./market/intent.ts";
-import { bridgeKeyPair, oracleKeyPair, oraclePubHex } from "./market/oracle.ts";
+import { bridgeKeyPair } from "./market/oracle.ts";
 import { fundKeyFromSeed } from "./custody/threshold.ts";
 import type { FundKey } from "./custody/threshold.ts";
 import { DkgCoordinator } from "./custody/dkg-coordinator.ts";
@@ -50,9 +50,9 @@ import { isCeremonyTimeout } from "./custody/ceremony.ts";
 import { Esplora } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, confirmations, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
 import { pendingClaims, unsentWithdrawals, inFlightWithdrawals, slashable } from "./custody/bridge.ts";
-import { readPriceAggregate, readPrice, DEFAULT_SOURCE, fetchPythUpdate, HERMES_URL } from "./market/pricefeed.ts";
+import { fetchPythUpdate, HERMES_URL } from "./market/pricefeed.ts";
 import { verifyPythUpdate } from "./market/pyth.ts";
-import type { PriceSource, AggregateReading } from "./market/pricefeed.ts";
+import type { AggregateReading } from "./market/pricefeed.ts";
 import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
 import { defaultParams } from "./config.ts";
@@ -237,7 +237,7 @@ export class Daemon {
 	private publishing = false;
 	/** The oracle-publish config, remembered so it re-starts on a fresh chain after a
 	 *  channel switch (otherwise the new channel has no oracle → no price loads). */
-	private oraclePublishOpts?: { sources: PriceSource[]; everyMs: number };
+	private oraclePublishOpts?: { everyMs: number };
 	/** Bumped each time a publisher loop (re)starts, so an old loop bound to a torn-down
 	 *  node exits cleanly on a channel switch. */
 	private oracleGen = 0;
@@ -504,36 +504,16 @@ export class Daemon {
 	view(): View {
 		const root = this.node.ledger.stateRoot();
 		if (this.viewCache && this.viewCache.root === root) return this.viewCache.view;
-		const view = computeView(this.node.ledger.allWrites(), { base: this.checkpointBase, reporter: this.channelReporter(), pythFeedId: this.channelPyth() });
+		const view = computeView(this.node.ledger.allWrites(), { base: this.checkpointBase, pythFeedId: this.channelPyth() });
 		this.viewCache = { root, view };
 		return view;
 	}
 
-	/** This channel's authorized price reporter (parsed from the channel name), or undefined for a
-	 *  plain (non-market) channel. A per-channel constant every node agrees on → deterministic fold. */
-	channelReporter(): string | undefined {
-		const c = parseChannel(this.network);
-		return c?.kind === "reporter" ? c.reporter : undefined;
-	}
-
-	/** This channel's Pyth feed id, if it's a Pyth market (`label::pyth::feedId`) — else undefined.
-	 *  When set, the fold accepts a verified Pyth update from anyone (no reporter). */
+	/** This channel's Pyth feed id (`label::pyth::feedId`), or undefined for a plain (non-market)
+	 *  channel. A per-channel constant every node agrees on → deterministic fold. The fold accepts a
+	 *  verified Pyth update from anyone for this feed (no reporter). */
 	channelPyth(): string | undefined {
-		const c = parseChannel(this.network);
-		return c?.kind === "pyth" ? c.feedId : undefined;
-	}
-
-	/** This node's price-reporter identity — the key it signs `market.report` with (the dev oracle
-	 *  key, overridable via GAVL_ORACLE_SEED). A market this node CREATES names this reporter, so its
-	 *  own node will report it. Surfaced to the UI's "create a market" form. */
-	reporterPubkey(): string {
-		return oraclePubHex(process.env.GAVL_ORACLE_SEED);
-	}
-
-	/** Fetch-test a candidate market source before creating it: pull `endpoint` and extract `key`,
-	 *  returning the resolved value (or the error) so a typo'd source is caught up front. */
-	testSource(endpoint: string, key: string): Promise<{ value: string | null; raw: string | null; error?: string }> {
-		return readPrice({ url: endpoint, key }).then((r) => ({ value: r.value != null ? r.value.toString() : null, raw: r.raw, error: r.error }));
+		return parseChannel(this.network)?.feedId;
 	}
 
 	/** Fetch-test a Pyth feed before creating a `label::pyth::feedId` market: pull the latest Hermes
@@ -588,7 +568,7 @@ export class Daemon {
 		}
 		let r = this.appRootCache.get(prevId);
 		if (r === undefined) {
-			r = viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, prevId, this.checkpointBase, this.channelReporter(), this.channelPyth()));
+			r = viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, prevId, this.checkpointBase, this.channelPyth()));
 			this.appRootCache.set(prevId, r);
 		}
 		return r;
@@ -636,7 +616,7 @@ export class Daemon {
 		if (!ckpt || ckpt.height !== target) return; // the boundary anchor isn't reachable yet → wait
 		const heads = anchors.headsAt(ckpt.id);
 		if (Object.keys(heads).length === 0) return; // nothing certified yet
-		const view = viewAtAnchor(this.node.ledger.allWrites(), anchors, ckpt.id, this.checkpointBase, this.channelReporter(), this.channelPyth()); // state at the boundary
+		const view = viewAtAnchor(this.node.ledger.allWrites(), anchors, ckpt.id, this.checkpointBase, this.channelPyth()); // state at the boundary
 		this.lastCheckpointHeight = ckpt.height;
 		this.checkpointBase = view;
 		const snap: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(view) };
@@ -835,7 +815,7 @@ export class Daemon {
 		if (!this.node.anchors) return this.checkpointBase ? computeView([], { base: this.checkpointBase }) : computeView([]);
 		const finId = this.node.anchors.finalized(this.finalityDepth)?.id ?? null;
 		if (this.finalCache && this.finalCache.id === finId) return this.finalCache.view;
-		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase, this.channelReporter(), this.channelPyth());
+		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase, this.channelPyth());
 		this.finalCache = { id: finId, view };
 		return view;
 	}
@@ -938,7 +918,7 @@ export class Daemon {
 	}
 
 	/** Join the live mesh and (optionally) start farming anchors. Resilient to a missing network. */
-	async startConsensus(opts: { network?: string; mesh: boolean; farm: boolean; publishOracle?: { sources: PriceSource[]; everyMs: number } }): Promise<void> {
+	async startConsensus(opts: { network?: string; mesh: boolean; farm: boolean; publishOracle?: { everyMs: number } }): Promise<void> {
 		if (opts.network) this.network = opts.network;
 		this.meshOn = opts.mesh;
 		this.farmOn = opts.farm;
@@ -1025,86 +1005,41 @@ export class Daemon {
 	}
 
 	/**
-	 * Post THIS node's BTC price reading on a loop: fetch the feeds (avg the responders),
-	 * sign an `oracle.post` with the node's OWN stable key, every `everyMs`. EVERY node runs
-	 * this — there's no special publisher — and the fold takes the MEDIAN of recent posters
-	 * as the mark, so no single node is trusted for the price. Each fetch is recorded for
-	 * transparency, and the methodology is disclosed on-chain.
+	 * Relay THIS channel's Pyth price on a loop: fetch the latest Wormhole-attested update from
+	 * Hermes, verify it locally, and post it on-chain whenever the Pyth publish-time advances. A
+	 * CHANNEL IS A MARKET (`label::pyth::feedId`) with NO reporter — any node may relay; Hermes is
+	 * untrusted transport, the guardian quorum is the authority, and the fold re-verifies.
 	 */
-	private startOraclePublisher(opts: { sources: PriceSource[]; everyMs: number }): void {
-		// Report AS the channel's reporter identity (the dev oracle key; override via GAVL_ORACLE_SEED).
-		// A CHANNEL IS A MARKET: only the reporter named in the channel name may post, so this node
-		// posts only if it holds that key AND the channel names it — otherwise it just consumes.
-		const kp = oracleKeyPair(process.env.GAVL_ORACLE_SEED);
-		const myId = toHex(kp.publicKey);
-		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: kp });
+	private startOraclePublisher(opts: { everyMs: number }): void {
+		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: this.producerKey() });
 		const def = parseChannel(this.network);
 		this.publishing = true;
 		const myGen = ++this.oracleGen; // a channel switch bumps this → the old loop below exits
-
-		// Pyth market: relay the latest Wormhole-attested update from Hermes. No reporter — anyone
-		// may relay; the fold verifies the guardian quorum. This node relays as a public service.
-		if (def?.kind === "pyth") {
-			const feedId = def.feedId;
-			void (async () => {
-				let lastPub = this.view().market.seq; // last on-chain publish time
-				while (this.publishing && myGen === this.oracleGen) {
-					const blob = await fetchPythUpdate(feedId);
-					const p = blob ? verifyPythUpdate(blob).find((x) => x.feedId === feedId) : null;
-					if (p && p.price > 0n) {
-						this.lastOracleSource = { value: p.price, method: `Pyth ${feedId.slice(0, 10)}…`, used: 1, readings: [{ value: p.price, raw: `${p.price}e${p.expo}`, endpoint: HERMES_URL, key: feedId }], at: Date.now() };
-						if (p.publishTime > lastPub) {
-							try {
-								await acct.reportPythUpdate(blob!); // newer attested update → relay it
-								lastPub = p.publishTime;
-							} catch {
-								/* retry next tick */
-							}
-						}
-					}
-					await new Promise((r) => setTimeout(r, opts.everyMs));
-				}
-			})();
-			console.log(`  market ${def.label}: relaying Pyth feed ${feedId.slice(0, 10)}… from Hermes (verified on-chain; no reporter)`);
+		if (!def) {
+			console.log(`  channel ${this.network}: not a market channel — no price`);
 			return;
 		}
-
-		// Only the channel's reporter fetches + posts; a consumer / non-market channel has nothing to publish.
-		if (def?.kind !== "reporter" || def.reporter !== myId) {
-			console.log(`  channel ${this.network}: consuming on-chain price (this node isn't its reporter)`);
-			return;
-		}
-		// Fetch from THIS market's declared source (the channel name), not the boot-time defaults —
-		// so a created ETH-USD market reports ETH, not the BTC feed we happened to start with.
-		const sources: PriceSource[] = [{ url: def.endpoint, key: def.key }];
-		// Prune at the source: gate posts on move-or-heartbeat (see oracleShouldPost). Poll
-		// stays frequent (cheap); writes only happen when they carry new information.
-		const minMoveBps = Number(process.env.GAVL_ORACLE_MIN_BPS ?? "5"); // 0.05% default
-		const oracleHeartbeatMs = Number(process.env.GAVL_ORACLE_HEARTBEAT_MS ?? "300000"); // ≤5min stale
-		const loop = async () => {
-			const m0 = this.view().market;
-			let seq = m0.seq + 1; // continue from the channel's latest report
-			let lastPrice: bigint | null = m0.price;
-			let lastPostAt = 0;
+		const feedId = def.feedId;
+		void (async () => {
+			let lastPub = this.view().market.seq; // last on-chain publish time
 			while (this.publishing && myGen === this.oracleGen) {
-				const agg = await readPriceAggregate(sources); // fetch this market's declared source
-				this.lastOracleSource = { ...agg, at: Date.now() }; // display-only metadata
-				const v = agg.value;
-				if (v != null && oracleShouldPost({ v, lastPrice, lastPostAt, now: Date.now(), minMoveBps, heartbeatMs: oracleHeartbeatMs })) {
-					try {
-						await acct.report(v, seq);
-						seq++;
-						lastPrice = v;
-						lastPostAt = Date.now();
-					} catch {
-						/* a post failed (e.g. mid-restart) — retry next tick */
+				const blob = await fetchPythUpdate(feedId);
+				const p = blob ? verifyPythUpdate(blob).find((x) => x.feedId === feedId) : null;
+				if (p && p.price > 0n) {
+					this.lastOracleSource = { value: p.price, method: `Pyth ${feedId.slice(0, 10)}…`, used: 1, readings: [{ value: p.price, raw: `${p.price}e${p.expo}`, endpoint: HERMES_URL, key: feedId }], at: Date.now() };
+					if (p.publishTime > lastPub) {
+						try {
+							await acct.reportPythUpdate(blob!); // newer attested update → relay it
+							lastPub = p.publishTime;
+						} catch {
+							/* retry next tick */
+						}
 					}
 				}
 				await new Promise((r) => setTimeout(r, opts.everyMs));
 			}
-		};
-		void loop();
-		console.log(`  market ${def.label}: REPORTING as ${myId.slice(0, 16)}… from ${def.endpoint} (${def.key}) every ${opts.everyMs}ms`);
+		})();
+		console.log(`  market ${def.label}: relaying Pyth feed ${feedId.slice(0, 10)}… from Hermes (verified on-chain; no reporter)`);
 	}
 
 	/** The publisher's latest aggregate reading (per-source endpoint/key/raw/value +
@@ -1621,25 +1556,26 @@ function channelSlug(name: string): string {
 	return safe || "default";
 }
 
-/** A market channel's name IS its definition (and hashes to the DHT topic). Two kinds:
- *   - reporter: `label::endpoint::jsonKey::reporterHex` — one named reporter posts the price.
- *   - pyth:     `label::pyth::feedIdHex` — anyone relays a Wormhole-attested Pyth update; no reporter.
- *  A name that matches neither is a plain channel: no market, transfers only. */
-export type ChannelMarket = { kind: "reporter"; label: string; endpoint: string; key: string; reporter: string } | { kind: "pyth"; label: string; feedId: string };
+/** A market channel's name IS its definition (and hashes to the DHT topic): `label::pyth::feedIdHex`.
+ *  The price comes from a Wormhole-attested Pyth feed — anyone relays it, the fold verifies it, no
+ *  reporter. A name that doesn't match is a plain channel: no market, transfers only. */
+export interface ChannelMarket {
+	label: string;
+	feedId: string;
+}
 export function parseChannel(name: string): ChannelMarket | null {
 	const parts = name.split("::");
 	if (parts.length === 3 && parts[1].toLowerCase() === "pyth" && /^[0-9a-f]{64}$/i.test(parts[2])) {
-		return { kind: "pyth", label: parts[0], feedId: parts[2].toLowerCase() };
-	}
-	if (parts.length === 4 && /^[0-9a-f]{64}$/i.test(parts[3])) {
-		return { kind: "reporter", label: parts[0], endpoint: parts[1], key: parts[2], reporter: parts[3] };
+		return { label: parts[0], feedId: parts[2].toLowerCase() };
 	}
 	return null;
 }
 
-/** The default channel — the BTC-USD market we ship with: the public Coinbase spot feed, reported
- *  by the dev oracle key (override the seed with GAVL_ORACLE_SEED; a production deployment names its
- *  own reporter). This is the channel `npm run dev` joins, so the app prices + trades out of the box. */
+/** Pyth BTC/USD feed id — the instrument the shipped default market prices. */
+const BTC_USD_PYTH_FEED = "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
+
+/** The default channel — the BTC-USD Pyth market: a Wormhole-attested price anyone relays, no
+ *  reporter. This is the channel `npm run dev` joins, so the app prices + trades out of the box. */
 export function defaultMarketChannel(): string {
-	return `BTC-USD::${DEFAULT_SOURCE.url}::${DEFAULT_SOURCE.key}::${oraclePubHex(process.env.GAVL_ORACLE_SEED)}`;
+	return `BTC-USD::pyth::${BTC_USD_PYTH_FEED}`;
 }

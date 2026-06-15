@@ -20,8 +20,8 @@ import { viewRoot } from "../src/market/state.ts";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
-import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
-import { PARAMS, K, MARKET_REPORTER, setupMarket } from "./helpers.ts";
+import { bridgeKeyPair } from "../src/market/oracle.ts";
+import { PARAMS, K, priceBase } from "./helpers.ts";
 
 function stateWithOpenContract(mark: bigint): View {
 	const bridge = emptyBridge();
@@ -64,13 +64,11 @@ async function market() {
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
-	const oracle = mk(oracleKeyPair());
 	const attestor = mk(bridgeKeyPair());
 	const fund = (a: Account, amt: bigint) => attestor.attestDeposit("dep" + depN++ + ":0", a.pubHex, amt);
 	const A = mk(); // idle whale → its decay flows to the pot
 	const B = mk();
 	const C = mk();
-	await setupMarket(oracle, 61_000n);
 	await fund(A, 1_000_000n);
 	await fund(B, 50_000n);
 	await fund(C, 50_000n);
@@ -86,11 +84,11 @@ test("folding to the same target from two different checkpoint heights agrees (d
 	const grace = DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY;
 	const T = 43_300; // past the demurrage grace AND the contract's time-lock (born 0 → expiry 43200)
 
-	const full = computeView(writes, { bornAt: born, nowHeight: T, reporter: MARKET_REPORTER });
+	const full = computeView(writes, { bornAt: born, nowHeight: T, base: priceBase(61_000n) });
 	// checkpoint BEFORE the contract expires (still open in the base)
-	const resumeEarly = computeView([], { base: computeView(writes, { bornAt: born, nowHeight: grace + 5 * DEMURRAGE_DAY, reporter: MARKET_REPORTER }), nowHeight: T });
+	const resumeEarly = computeView([], { base: computeView(writes, { bornAt: born, nowHeight: grace + 5 * DEMURRAGE_DAY, base: priceBase(61_000n) }), nowHeight: T });
 	// checkpoint AFTER it expires (already unwound in the base)
-	const resumeLate = computeView([], { base: computeView(writes, { bornAt: born, nowHeight: 43_250, reporter: MARKET_REPORTER }), nowHeight: T });
+	const resumeLate = computeView([], { base: computeView(writes, { bornAt: born, nowHeight: 43_250, base: priceBase(61_000n) }), nowHeight: T });
 
 	assert.equal(viewRoot(resumeEarly), viewRoot(full), "early-checkpoint resume diverged from the full fold");
 	assert.equal(viewRoot(resumeLate), viewRoot(full), "late-checkpoint resume diverged from the full fold");

@@ -7,18 +7,26 @@ import { Plot } from "../src/pos/space.ts";
 import { StandinSpaceProver, StandinSpaceVerifier } from "../src/consensus/space.ts";
 import type { SpaceProver } from "../src/consensus/space.ts";
 import type { KeyPair } from "../src/det/ed25519.ts";
-import type { Account } from "../src/market/account.ts";
-import { oraclePubHex } from "../src/market/oracle.ts";
+import { computeView, cloneView } from "../src/market/btc.ts";
+import type { View } from "../src/market/btc.ts";
 
-/** The reporter the test `oracle` account (oracleKeyPair) reports as — pass to computeView as
- *  `{ reporter: MARKET_REPORTER }` so its market.report writes are authorized in the fold. */
-export const MARKET_REPORTER = oraclePubHex();
+/** A fold base carrying a market price — the test stand-in for a relayed Pyth update. Every market is
+ *  now a Pyth market: the only way a price enters consensus is a Wormhole-guardian-attested update,
+ *  which a unit test can't forge (it needs 13/19 real guardian signatures). The real verify+fold path
+ *  is covered by test/pyth.test.ts against a captured live update; the economic tests just need a
+ *  mark in the view, so they seed it directly as the fold's resume base. `at` drives mark staleness. */
+export function priceBase(price: bigint, seq = 0, at = 0): View {
+	const v = computeView([]);
+	v.market = { price, expo: 0, seq, at };
+	return v;
+}
 
-/** Report a price for the channel's market as `oracle`. A channel IS a market: the reporter is
- *  fixed by the channel name, so the FOLD must be told who it is — pass `{ reporter: oracle.pubHex }`
- *  to computeView. (`MARKET_REPORTER` is a convenience for tests that hardcode it.) */
-export async function setupMarket(oracle: Account, price: bigint, seq = 0): Promise<void> {
-	await oracle.report(price, seq);
+/** Clone a view with a changed market price — for tests that move the mark mid-stream (open at one
+ *  price, settle at another). Fold the next write segment with `{ base: repriced(view, p) }`. */
+export function repriced(view: View, price: bigint, seq = view.market.seq + 1, at = view.market.at): View {
+	const v = cloneView(view);
+	v.market = { price, expo: 0, seq, at };
+	return v;
 }
 
 /** Low difficulty so multi-write, multi-node tests stay quick. */

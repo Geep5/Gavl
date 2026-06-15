@@ -22,7 +22,6 @@ import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
 import { mark, gbtcOf, MAX_LEVERAGE, parseAmount, leverageOk } from "./market/btc.ts";
 import { escrowedInContracts } from "./market/intent.ts";
 import { totalGbtc, pendingTotal, backingBps as bridgeBackingBps } from "./custody/bridge.ts";
-import { DEFAULT_SOURCES } from "./market/pricefeed.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
@@ -47,8 +46,8 @@ const PERSIST = process.env.GAVL_PERSIST ?? "all";
 
 // Channel/network: the name IS the address (its DHT topic is sha256 of it). GAVL_NETWORK
 // sets the initial channel; the UI can switch at runtime. MESH/FARM gate consensus. Default is
-// the shipped BTC-USD market channel (name encodes the public source + reporter), so the app
-// prices + trades out of the box; a plain GAVL_NETWORK name = a transfers-only channel.
+// the shipped BTC-USD market channel (name encodes a Pyth feed id), so the app prices + trades
+// out of the box; a plain GAVL_NETWORK name = a transfers-only channel.
 const NETWORK = process.env.GAVL_NETWORK ?? defaultMarketChannel();
 const MESH = process.env.GAVL_MESH !== "0";
 const FARM = process.env.GAVL_FARM !== "0";
@@ -86,48 +85,34 @@ const daemon = new Daemon({
 function serializeState() {
 	const view = daemon.view(); // optimistic tip — reflects actions immediately
 	const me = daemon.wallet.active().pubHex;
-	const m = mark(view); // this channel's market price, null until the channel's reporter posts
+	const m = mark(view); // this channel's market price, null until a Pyth update is relayed
 
 	// gBTC balances: { pubkey: amount } (1:1 claims on BTC in the custody fund)
 	const gbtc: Record<string, string> = {};
 	for (const [pubkey, amt] of view.bridge.gbtc) gbtc[pubkey] = amt.toString();
 
-	// A CHANNEL IS A MARKET. Two kinds: a reporter market (one named reporter + public endpoint) or a
-	// Pyth market (anyone relays a guardian-attested Pyth feed — no reporter). Each channel is its own
-	// sandboxed economy: a malicious market can't touch funds in another channel.
+	// A CHANNEL IS A MARKET. Every market is a Pyth market: the channel name (`label::pyth::feedId`)
+	// names a Pyth feed, and ANYONE may relay a guardian-attested update — there's no reporter to run
+	// or trust. Each channel is its own sandboxed economy: a malicious market can't touch another's funds.
 	const def = parseChannel(daemon.currentChannel());
 	const live = def ? daemon.oracleSource() : null;
 	const marketInfo = def
-		? def.kind === "pyth"
-			? {
-					channel: daemon.currentChannel(),
-					kind: "pyth" as const,
-					label: def.label,
-					feedId: def.feedId,
-					reporter: null, // none — verified via the Wormhole guardian quorum
-					price: m != null ? m.toString() : null,
-					iAmReporter: !!live, // this node is relaying the Pyth feed
-					source: live ? { method: live.method, ageMs: Date.now() - live.at, feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })) } : null,
-				}
-			: {
-					channel: daemon.currentChannel(),
-					kind: "reporter" as const,
-					label: def.label,
-					endpoint: def.endpoint,
-					key: def.key,
-					reporter: def.reporter,
-					price: m != null ? m.toString() : null,
-					iAmReporter: !!live, // this node holds the channel's reporter key and is posting
-					source: live ? { method: live.method, ageMs: Date.now() - live.at, feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })) } : null,
-				}
+		? {
+				channel: daemon.currentChannel(),
+				kind: "pyth" as const,
+				label: def.label,
+				feedId: def.feedId,
+				price: m != null ? m.toString() : null,
+				iAmRelaying: !!live, // this node is relaying the Pyth feed (anyone may)
+				source: live ? { method: live.method, ageMs: Date.now() - live.at, feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })) } : null,
+			}
 		: null;
 
 	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)
 	const onChainR = rsv != null ? rsv.sats : null;
 	const market = {
-		oracle: "channel reporter", // mechanism: the channel name encodes one reporter + a public source
+		oracle: "pyth", // mechanism: the channel name encodes a Pyth feed; updates are guardian-attested
 		marketInfo,
-		myReporter: daemon.reporterPubkey(), // the reporter key a market THIS node creates would name
 		price: m != null ? m.toString() : null,
 		priceExpo: view.market.expo, // decimal exponent: display value = price · 10^expo
 		maxLeverage: Number(MAX_LEVERAGE),
@@ -264,15 +249,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			return send(res, 200, { id: await daemon.unbondCustody(amt) });
 		}
 		if (path === "/api/market/test") {
-			// Fetch-test a candidate source before creating the market. A Pyth market tests its feed id
-			// (fetch + verify the guardian-attested update); a custom market tests its endpoint/key.
-			const r = body.feedId ? await daemon.testPythFeed(String(body.feedId)) : await daemon.testSource(String(body.endpoint ?? ""), String(body.key ?? ""));
+			// Fetch-test a candidate Pyth feed before creating the market: fetch its latest update from
+			// Hermes and verify the guardian-attested quorum + Merkle proof, returning the decoded price.
+			const r = await daemon.testPythFeed(String(body.feedId ?? ""));
 			return send(res, 200, r);
-		}
-		if (path === "/api/market/report") {
-			// Post THIS channel's price (accepted only if this account is the channel's reporter).
-			await daemon.active().report(String(body.price), Number(body.seq));
-			return send(res, 200, { ok: true });
 		}
 		// ── peer-to-peer matched market (the real product: no pool, real counterparty) ──
 		if (path === "/api/intent/broadcast") {
@@ -388,18 +368,10 @@ createServer((req, res) => {
 		console.log(`  storage: in-memory only (GAVL_PERSIST=off) — writes are lost on restart`);
 	}
 
-	// Oracle: EVERY node posts its OWN reading by default (the mark is the median of all
-	// posters — no special publisher). Opt out with GAVL_ORACLE_PUBLISH=0 (e.g. a node with
-	// no internet to fetch feeds). Price source:
-	//   GAVL_BTC_PRICE       → a fixed dev price (overrides the feeds), else
-	//   GAVL_ORACLE_URL+_KEY → a single custom feed, else
-	//   default              → AVERAGE of 3 BTC feeds (Coinbase, Kraken, Bitstamp).
-	const sources = process.env.GAVL_BTC_PRICE
-		? [{ fixed: BigInt(process.env.GAVL_BTC_PRICE) }]
-		: process.env.GAVL_ORACLE_URL
-			? [{ url: process.env.GAVL_ORACLE_URL, key: process.env.GAVL_ORACLE_KEY }]
-			: DEFAULT_SOURCES;
-	const publishOracle = process.env.GAVL_ORACLE_PUBLISH === "0" ? undefined : { sources, everyMs: Number(process.env.GAVL_ORACLE_MS ?? "5000") };
+	// Pricing: this node RELAYS the channel's Wormhole-attested Pyth feed (no reporter — anyone may;
+	// the fold re-verifies). Opt out of relaying with GAVL_ORACLE_PUBLISH=0 (e.g. a node with no
+	// internet); it then just consumes whatever peers relay.
+	const publishOracle = process.env.GAVL_ORACLE_PUBLISH === "0" ? undefined : { everyMs: Number(process.env.GAVL_ORACLE_MS ?? "5000") };
 	await daemon.startConsensus({ network: NETWORK, mesh: MESH, farm: FARM, publishOracle });
 	const c = daemon.consensus();
 	console.log(`  → mesh ${c.mesh ? "joined" : "off"}, ${c.peers} peer(s), farming ${c.farming ? "live" : "off"}`);

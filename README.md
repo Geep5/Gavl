@@ -16,10 +16,11 @@ key-only node can hold nothing but its key and bootstrap from peers), and is bou
 write pays a **cooldown** (a proof of space *and* a proof of time), so an attacker can't spin
 up cheap identities to flood or grind the network.
 
-The price is **named, not voted**: a market is a channel whose name encodes its public source +
-the one reporter allowed to post it (`label::endpoint::jsonKey::reporter`), and each channel is
-its own sandboxed economy. Collateral is **gBTC** — a 1:1 claim on real Bitcoin held in a
-**threshold-custody fund** that only a quorum can spend (no single party ever holds the key).
+The price is **named, not voted**: a market is a channel whose name encodes a **Pyth feed**
+(`label::pyth::feedId`). Every Pyth price is attested by the Wormhole guardian network, so **anyone
+relays** the latest signed update and every node verifies it locally — no reporter to run or trust.
+Each channel is its own sandboxed economy. Collateral is **gBTC** — a 1:1 claim on real Bitcoin held
+in a **threshold-custody fund** that only a quorum can spend (no single party ever holds the key).
 
 > **Status:** the matched market (consensus + intents + per-channel pricing) is complete and runs live,
 > including cross-node intent gossip. The real-BTC bridge runs end-to-end on **testnet**.
@@ -116,25 +117,23 @@ No pool, no order book to babysit — just signed intents and matched bilateral 
 
 ### Pricing — a channel *is* a market (`src/market/btc.ts`, `src/daemon.ts`)
 
-The price isn't voted on — it's **named**. A market channel's name encodes the instrument:
-`label::endpoint::jsonKey::reporter`. That string IS the market's public, immutable definition
-(it hashes to the DHT topic), and each channel is its own economy (own ledger, bridge, pot, book).
+The price isn't voted on — it's **named**. A market channel's name encodes the instrument's **Pyth
+feed**: `label::pyth::feedId`. That string IS the market's public, immutable definition (it hashes
+to the DHT topic), and each channel is its own economy (own ledger, bridge, pot, book).
 
-- **One reporter per channel, fixed by the name.** Only the `reporter` pubkey encoded in the
-  channel name may post the price (`market.report {price, seq}`, per-reporter monotonic seq). The
-  fold learns that reporter from the channel name (a per-channel constant → deterministic) and
-  rejects everyone else. No median, no per-price voting → **nothing to sybil.**
-- **The public endpoint keeps it honest.** `endpoint::jsonKey` is in the name, so anyone can fetch
-  the source and audit the reporter *before even joining*. A bad reporter just doesn't attract
-  traders — and anyone can launch a rival market (a different channel) on the same source with a
-  better reporter. Trust is competed for at the market level, not aggregated per price.
-- **Each reporter averages independent feeds** (Coinbase, Kraken, Bitstamp) and posts gated on
-  move-or-heartbeat (`oracleShouldPost`), so it never floods the ledger with identical prices.
-- **Stale-source safe.** A price the reporter stops refreshing past `MARKET_STALE_AFTER` is
-  treated as no-price — matching/settling pauses rather than trade on a dead number.
+- **No reporter — a guardian-attested feed anyone relays.** Every Pyth price is signed by a 2/3+1
+  quorum of the Wormhole guardian set over a Merkle root of all feeds. A node posts the latest
+  signed update (`market.report {update}`); the fold verifies the guardian quorum + the Merkle proof
+  *locally* (`src/market/pyth.ts`) and matches the channel's feed id. **Anyone may relay** — a forged
+  update simply fails verification — so there's no reporter to run, bribe, or trust. (Trust anchor:
+  the Wormhole guardian set, a fixed public committee pinned by set index — a weak-subjectivity pin,
+  the same shape as bridge custody trusting its committee.)
+- **Newer wins, deterministically.** The verified Pyth publish-time is the monotonic guard (newer
+  update replaces older); the fold never fetches, it only verifies posted bytes, so every node agrees.
+- **Stale-feed safe.** A price that stops refreshing past `MARKET_STALE_AFTER` is treated as
+  no-price — matching/settling pauses rather than trade on a dead number.
 - **Sandboxed by construction.** Because the market is the channel, a malicious market can only
-  ever touch *its own* channel's pot/collateral — funds in another channel are unreachable. The
-  trust is "this channel's named reporter," which you opt into by joining (and can audit first).
+  ever touch *its own* channel's pot/collateral — funds in another channel are unreachable.
 
 ---
 
@@ -241,7 +240,7 @@ src/
   store/         durable hypercore write store + state snapshots/checkpoints + selective persist policy
   market/        the matched market: intents + bilateral contracts (intent.ts), btc fold, ops, account, price feeds
   custody/       real-BTC bridge: threshold (FROST) · DKG · Taproot · per-identity deposits · tx · ledger · watcher · esplora
-  daemon.ts      boots ledger + node + store + consensus + price reporter + bridge + intent book
+  daemon.ts      boots ledger + node + store + consensus + Pyth price relay + bridge + intent book
   server.ts      localhost JSON API for the web UI
 web/             Svelte SPA — the intent tape + bull/bear trading UI
 ```
@@ -275,11 +274,11 @@ npm run web:dev          # web UI only (expects a daemon on :6440)
 ```
 
 Tuning env vars (set inline on macOS/Linux; on Windows use `set VAR=…` or `$env:VAR=…`, or
-just edit the `daemon:dev` script): `GAVL_VDF=hash|chia` · `GAVL_ORACLE_PUBLISH=1` (this node is
-the channel's price reporter) · `GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_PERSIST=all|mine|off` ·
+just edit the `daemon:dev` script): `GAVL_VDF=hash|chia` · `GAVL_ORACLE_PUBLISH=1` (this node relays
+the channel's Pyth feed; anyone may) · `GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_PERSIST=all|mine|off` ·
 `GAVL_MESH=0` (disable the mesh — runs local-only; on by default) · `GAVL_NETWORK=<channel>`. A
-**market** channel is named `label::endpoint::jsonKey::reporterPubkey` (that name is the market's
-public definition); a plain name is a transfers-only channel with no price.
+**market** channel is named `label::pyth::feedId` (that name is the market's public definition);
+a plain name is a transfers-only channel with no price.
 The real chiavdf VDF (`GAVL_VDF=chia`, the daemon's default) needs a Python venv with
 `chiavdf`/`chiapos`; `npm run dev` sidesteps this by using `GAVL_VDF=hash`.
 
@@ -302,10 +301,10 @@ threshold signing (no one holds the fund key).
 
 What's **trusted** (and surfaced honestly in the UI):
 
-- **The market price** — each market channel names one **reporter** + a **public source** in its
-  name. You trust that reporter for that channel only (auditable against the public endpoint before
-  you join), and a malicious market is sandboxed to its own channel. A rival channel on the same
-  source with a better reporter is the recourse.
+- **The market price** — each market channel names a **Pyth feed** in its name. Every price is
+  attested by the **Wormhole guardian set** (a fixed public committee) and verified on-chain, so
+  there's no reporter to trust — you trust the guardian set (a weak-subjectivity pin), and a
+  malicious market is sandboxed to its own channel.
 - **The bridge, on testnet** — currently **single-operator**: the daemon holds all the
   fund's key shares (deterministic dev seed) and is the deposit attestor. Real BTC custody
   is never zero-trust; this pushes trust as thin as it goes, but it isn't there yet.
@@ -315,8 +314,8 @@ What's **trusted** (and surfaced honestly in the UI):
 1. **Independent audit.**
 2. **Real distributed DKG** across independent nodes (not in-process).
 3. **Bonding + slashing** so the honest-majority assumption is economically enforced.
-4. **Non-public keys** — the reporter / attestor / fund keys currently derive from public dev
-   seeds (fine for testnet, instant theft on mainnet).
+4. **Non-public keys** — the attestor / fund keys currently derive from public dev seeds (fine for
+   testnet, instant theft on mainnet).
 
 ## Roadmap
 
@@ -333,9 +332,9 @@ What's **trusted** (and surfaced honestly in the UI):
   drained) · bounded leverage · marked to the channel's market · close-early **+ time-locked
   auto-settle** · idle-balance **demurrage** → **liquidity backstop** (pot as counterparty of last
   resort) · cross-node intent tape · Svelte tape/trade UI
-- **Pricing** ✅ **a channel is a market** — the channel name encodes the public source + the one
-  reporter; sandboxed per channel (no shared pot, no registry) · reporter averages multiple feeds ·
-  move/heartbeat-gated posts · stale-source pause
+- **Pricing** ✅ **a channel is a market** — the channel name encodes a **Pyth feed**; every price is
+  Wormhole-guardian-attested and verified on-chain, so anyone relays it and there's **no reporter**;
+  sandboxed per channel (no shared pot, no registry) · newer-publish-time wins · stale-feed pause
 - **Real-BTC bridge (testnet)** ✅ FROST threshold signing · DKG · Taproot address +
   BIP340-valid spends · withdrawal tx build/sign/broadcast · deposit watcher · bridge
   ledger · proof of reserves

@@ -2,7 +2,7 @@
 	// Left-pane channel list (Discord-style). The current market sits up top; below it, markets you've
 	// visited this device (localStorage) for one-click hopping; each row copies its full name to share.
 	// "New market" opens the create/join view in the center (see CreateMarket.svelte). A CHANNEL IS A
-	// MARKET: its name encodes `label::endpoint::jsonKey::reporter` and is its own economy.
+	// MARKET: its name encodes `label::pyth::feedId` and is its own economy.
 	import { store, act } from "../lib/store.svelte.js";
 	import { api } from "../lib/api.js";
 
@@ -36,10 +36,10 @@
 		if (current && !recents.includes(current)) remember(current);
 	});
 
-	// A market channel is `label::endpoint::key::reporter(64hex)`. Show the friendly label.
+	// A market channel is `label::pyth::feedId(64hex)`. Show the friendly label.
 	function parse(name) {
 		const p = (name ?? "").split("::");
-		return p.length === 4 && /^[0-9a-f]{64}$/i.test(p[3]) ? { label: p[0] } : null;
+		return p.length === 3 && p[1] === "pyth" && /^[0-9a-f]{64}$/i.test(p[2]) ? { label: p[0] } : null;
 	}
 	const labelOf = (name) => parse(name)?.label ?? name;
 

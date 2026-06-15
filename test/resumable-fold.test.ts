@@ -15,8 +15,8 @@ import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
 import { computeView, marketConserved } from "../src/market/btc.ts";
 import { viewRoot } from "../src/market/state.ts";
-import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
-import { PARAMS, K , setupMarket, MARKET_REPORTER } from "./helpers.ts";
+import { bridgeKeyPair } from "../src/market/oracle.ts";
+import { PARAMS, K, priceBase } from "./helpers.ts";
 
 let depN = 0;
 function setup() {
@@ -24,10 +24,9 @@ function setup() {
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
-	const oracle = new Account({ node, params: PARAMS, k: K, now, keypair: oracleKeyPair() });
 	const attestor = new Account({ node, params: PARAMS, k: K, now, keypair: bridgeKeyPair() });
 	const fund = (acct: Account, amount: bigint) => attestor.attestDeposit("dep" + depN++ + ":0", acct.pubHex, amount);
-	return { node, mk, oracle, fund };
+	return { node, mk, fund };
 }
 
 /** cmpWrite — the default optimistic fold order; we split along it so prefix < rest. */
@@ -38,54 +37,51 @@ function cmpWrite(a: any, b: any): number {
 }
 
 test("folding the tail onto the head's view equals folding the whole stream", async () => {
-	const { node, mk, oracle, fund } = setup();
+	const { node, mk, fund } = setup();
 	const A = mk();
 	const B = mk();
 	const C = mk();
 
-	await setupMarket(oracle, 61000n);
+	// The mark lives in the fold base (a price enters consensus only via an attested Pyth update,
+	// which a unit test can't forge); resumability of that base is itself the property under test.
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 	await A.transfer(C.pubHex, 1000n);
-	await oracle.report(62000n, 1);
 	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "10", expiryHeight: 100, nonce: "n1" });
 	const matchId = await B.matchOpen(offer, 1000n);
-	await oracle.report(64000n, 2);
 	await mk().settle(matchId);
 	await C.transfer(B.pubHex, 200n);
-	await oracle.report(63000n, 3);
 
 	const all = [...node.ledger.allWrites()].sort(cmpWrite);
-	const full = computeView(all, { reporter: MARKET_REPORTER });
+	const full = computeView(all, { base: priceBase(61000n) });
 	assert.ok(marketConserved(full), "full fold conserves");
 	const fullRoot = viewRoot(full);
 
-	// Split at EVERY boundary: base = computeView(prefix, { reporter: MARKET_REPORTER }), then resume with the tail.
+	// Split at EVERY boundary: base = computeView(prefix, { base: priceBase(...) }), then resume with the tail.
 	for (let i = 0; i <= all.length; i++) {
 		const prefix = all.slice(0, i);
 		const rest = all.slice(i);
-		const base = computeView(prefix, { reporter: MARKET_REPORTER });
-		const resumed = computeView(rest, { base, reporter: MARKET_REPORTER });
+		const base = computeView(prefix, { base: priceBase(61000n) });
+		const resumed = computeView(rest, { base });
 		assert.equal(viewRoot(resumed), fullRoot, `resume at split ${i} diverged`);
 		assert.ok(marketConserved(resumed), `resume at split ${i} broke conservation`);
 	}
 });
 
 test("resuming does not mutate the base view (deep copy)", async () => {
-	const { node, mk, oracle, fund } = setup();
+	const { node, mk, fund } = setup();
 	const A = mk();
 	const B = mk();
-	await setupMarket(oracle, 61000n);
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 
 	const all = [...node.ledger.allWrites()].sort(cmpWrite);
-	const base = computeView(all, { reporter: MARKET_REPORTER });
+	const base = computeView(all, { base: priceBase(61000n) });
 	const baseRootBefore = viewRoot(base);
 
 	await A.transfer(B.pubHex, 1234n);
 	const tail = [...node.ledger.allWrites()].sort(cmpWrite).slice(all.length);
-	computeView(tail, { base, reporter: MARKET_REPORTER }); // resume — must NOT touch `base`
+	computeView(tail, { base }); // resume — must NOT touch `base`
 
 	assert.equal(viewRoot(base), baseRootBefore, "base view was mutated by a resumed fold");
 });

@@ -6,9 +6,9 @@
 	import { api } from "../lib/api.js";
 
 	const m = $derived(store.market);
-	// display value = integer price · 10^expo (Pyth feeds carry an expo; reporter prices use 0)
+	// display value = integer price · 10^expo (Pyth feeds carry an expo, e.g. −8)
 	const priceNum = $derived(m?.price != null ? Number(m.price) * 10 ** (m.priceExpo ?? 0) : null);
-	const mkt = $derived(m?.marketInfo ?? null); // { kind, label, …, price, iAmReporter, source } | null
+	const mkt = $derived(m?.marketInfo ?? null); // { kind, label, feedId, price, iAmRelaying, source } | null
 	const bal = $derived(Number(myGbtc()));
 	const tape = $derived(m?.tape ?? []);
 	const contracts = $derived(m?.myContracts ?? []);
@@ -77,18 +77,12 @@
 		<div class="pair">{mkt?.label ?? "BTC"} <span class="muted">/ USD</span></div>
 		{#if priceNum != null}
 			<div class="price">${priceNum.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
-			{#if mkt?.kind === "pyth"}
-				<div class="src" title="Pyth — attested by the Wormhole guardian network, verified on-chain">
-					<span class="dot live"></span> live · Pyth oracle{mkt.iAmReporter ? " · relayed by you" : ""}
-				</div>
-			{:else}
-				<div class="src" title={mkt ? `reported by ${mkt.reporter} from ${mkt.endpoint}` : ""}>
-					<span class="dot live"></span> live · reported by {mkt ? short(mkt.reporter) : "—"}{mkt?.iAmReporter ? " (you)" : ""}
-				</div>
-			{/if}
+			<div class="src" title="Pyth — attested by the Wormhole guardian network, verified on-chain">
+				<span class="dot live"></span> live · Pyth oracle{mkt?.iAmRelaying ? " · relayed by you" : ""}
+			</div>
 		{:else}
 			<div class="price muted">—</div>
-			<div class="src"><span class="dot"></span> {mkt ? (mkt.kind === "pyth" ? "waiting for a relayed Pyth update…" : "waiting for the reporter…") : "not a market channel — no price"}</div>
+			<div class="src"><span class="dot"></span> {mkt ? "waiting for a relayed Pyth update…" : "not a market channel — no price"}</div>
 		{/if}
 	</div>
 	<div class="bal-block">
@@ -204,18 +198,18 @@
 	<details class="more">
 		<summary>
 			<span class="s-title">Price &amp; trust</span>
-			<span class="s-meta">{mkt ? "channel reporter" : "no market"}</span>
+			<span class="s-meta">{mkt ? "Pyth oracle" : "no market"}</span>
 			<span class="chev">▾</span>
 		</summary>
 		<div class="more-body">
 			{#if mkt}
 				<div class="orow">
 					<span class="dot" class:live={priceNum != null}></span>
-					<span class="oname">{mkt.label}{#if mkt.iAmReporter}<span class="tag">this node reports</span>{/if}</span>
+					<span class="oname">{mkt.label}{#if mkt.iAmRelaying}<span class="tag">this node relays</span>{/if}</span>
 					<span class="oprice mono">{priceNum != null ? priceNum.toLocaleString() : "—"}</span>
 				</div>
 				<div class="sources">
-					<div class="smeta">reporter <span class="mono">{short(mkt.reporter)}</span> · source <a class="fhost mono" href={mkt.endpoint} target="_blank" rel="noopener">{(mkt.endpoint || "").split("/")[2] || "?"}</a> <span class="muted">→ {mkt.key}</span></div>
+					<div class="smeta">Pyth feed <a class="fhost mono" href={`https://pyth.network/price-feeds?search=${mkt.feedId}`} target="_blank" rel="noopener">{short(mkt.feedId)}</a> <span class="muted">· Wormhole-attested</span></div>
 					{#if mkt.source}
 						<div class="smeta">{mkt.source.method}{#if mkt.source.ageMs != null}<span class="muted"> · {(mkt.source.ageMs / 1000).toFixed(0)}s ago</span>{/if}</div>
 						{#each mkt.source.feeds as f}
@@ -229,8 +223,8 @@
 			{/if}
 			<div class="trust">
 				<p><span class="ok">✓</span> Every node verifies the ledger, the ordering, and each write's signature — no server, no single node trusted.</p>
-				<p><span class="ok">✓</span> <strong>A channel is a market.</strong> Its name fixes the public source + the one reporter, so anyone can re-fetch the endpoint and audit the posted price — before even joining.</p>
-				<p><span class="ok">✓</span> Each channel is its own economy: a bad market can only ever touch its own pot/collateral. The recourse to a bad reporter is a rival channel on the same source.</p>
+				<p><span class="ok">✓</span> <strong>A channel is a market.</strong> Its name fixes the Pyth feed, and every price is attested by the Wormhole guardian network and verified on-chain — so anyone can relay it and no reporter is trusted.</p>
+				<p><span class="ok">✓</span> Each channel is its own economy: a bad market can only ever touch its own pot/collateral.</p>
 			</div>
 		</div>
 	</details>

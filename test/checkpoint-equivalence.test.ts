@@ -20,9 +20,9 @@ import { AnchorChain } from "../src/consensus/chain.ts";
 import type { Heads } from "../src/ledger/ledger.ts";
 import { viewAtAnchor, marketConserved } from "../src/market/btc.ts";
 import { viewRoot } from "../src/market/state.ts";
-import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
+import { bridgeKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver , setupMarket, MARKET_REPORTER } from "./helpers.ts";
+import { PARAMS, K, STANDIN_VERIFIER, standinProver, priceBase } from "./helpers.ts";
 
 let depN = 0;
 
@@ -32,7 +32,6 @@ test("a checkpoint-pruned node folds forward to the same state + appRoot as a fu
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
-	const oracle = mk(oracleKeyPair());
 	const attestor = mk(bridgeKeyPair());
 	const fund = (a: Account, amt: bigint) => attestor.attestDeposit("dep" + depN++ + ":0", a.pubHex, amt);
 
@@ -51,8 +50,11 @@ test("a checkpoint-pruned node folds forward to the same state + appRoot as a fu
 	const B = mk();
 	const C = mk();
 
+	// The market mark lives in the fold base (a price enters consensus only via an attested Pyth
+	// update; both the full and pruned folds start from the same agreed base, which is the point).
+	const priced = () => priceBase(61000n);
+
 	// ── activity round 1, then an anchor ──
-	await setupMarket(oracle, 61000n);
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 	await A.transfer(C.pubHex, 500n);
@@ -61,34 +63,32 @@ test("a checkpoint-pruned node folds forward to the same state + appRoot as a fu
 	const a1 = await mine();
 
 	// ── activity round 2, then anchors ──
-	await oracle.report(64000n, 1);
 	await mk().settle(matchId); // permissionless settle
 	await A.transfer(B.pubHex, 100n);
 	await mine(); // a2
-	await oracle.report(63000n, 2);
 	const a3 = await mine();
 
 	const allWrites = node.ledger.allWrites();
 
 	// FULL node: state at the latest anchor, folding all history.
-	const full = viewAtAnchor(allWrites, chain, a3.id, undefined, MARKET_REPORTER);
+	const full = viewAtAnchor(allWrites, chain, a3.id, priced());
 	assert.ok(marketConserved(full), "full-node state conserves");
 
 	// PRUNED node: checkpoint at a1. It keeps a1's committed state as the base and only the
 	// writes ABOVE a1's certified heads; it has dropped everything a1 covered.
 	const ckptHeads: Heads = chain.headsAt(a1.id);
-	const base = viewAtAnchor(allWrites, chain, a1.id, undefined, MARKET_REPORTER);
+	const base = viewAtAnchor(allWrites, chain, a1.id, priced());
 	const tail = allWrites.filter((w) => {
 		const h = ckptHeads[w.writer];
 		return h === undefined || w.seq > h.seq; // strictly post-checkpoint
 	});
 	assert.ok(tail.length < allWrites.length, "checkpoint must actually drop some writes");
 
-	const pruned = viewAtAnchor(tail, chain, a3.id, base, MARKET_REPORTER);
+	const pruned = viewAtAnchor(tail, chain, a3.id, base);
 
 	assert.equal(viewRoot(pruned), viewRoot(full), "pruned node's state root diverged from the full node");
 	assert.ok(marketConserved(pruned), "pruned-node state conserves");
 
 	// And at the checkpoint anchor's child too (appRoot is lag-by-parent → exercises a3's appRoot).
-	assert.equal(viewRoot(viewAtAnchor(tail, chain, anchors[1].id, base, MARKET_REPORTER)), viewRoot(viewAtAnchor(allWrites, chain, anchors[1].id, undefined, MARKET_REPORTER)), "pruned == full at the intermediate anchor as well");
+	assert.equal(viewRoot(viewAtAnchor(tail, chain, anchors[1].id, base)), viewRoot(viewAtAnchor(allWrites, chain, anchors[1].id, priced())), "pruned == full at the intermediate anchor as well");
 });

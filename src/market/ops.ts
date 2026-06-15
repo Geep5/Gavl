@@ -30,12 +30,10 @@ export type Op =
 	/** Mark a withdrawal's BTC payout confirmed (reserves drop). Attestor key (seed) OR
 	 *  a committee threshold signature over the settle digest (committee mode, `sig`). */
 	| { kind: "bridge.settle"; withdrawalId: string; sig?: string }
-	/** Post THIS channel's market price. Two channel kinds:
-	 *   - reporter market (`label::endpoint::key::reporter`): `{price, seq}`, accepted only from the
-	 *     named reporter; per-reporter monotonic `seq` guards replay.
-	 *   - Pyth market (`label::pyth::feedId`): `{update}` — a Wormhole-attested Pyth update blob (hex)
-	 *     that ANYONE may relay; the fold verifies the guardian quorum + Merkle proof, no reporter. */
-	| { kind: "market.report"; price?: string; seq?: number; update?: string }
+	/** Relay THIS channel's market price: a Wormhole-attested Pyth update blob (hex). A CHANNEL IS A
+	 *  MARKET (`label::pyth::feedId`) and ANYONE may relay — the fold verifies the guardian quorum +
+	 *  Merkle proof, so there's no reporter to run or trust. Newer publish-time wins. */
+	| { kind: "market.report"; update: string }
 	/** Take the opposite side of a peer's signed intent: carries the maker's signed
 	 *  `offer` (gossiped, non-binding) and the stake the taker wants to `fill`. The fold
 	 *  verifies the maker's sig + that both peers can cover, escrows both, and opens a

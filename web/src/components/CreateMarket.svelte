@@ -1,56 +1,40 @@
 <script>
-	// "Create a market" — a focused middle-panel view. A market IS a channel: its name encodes the
-	// price source, and each channel is its own sandboxed economy. Two kinds:
-	//   • Pyth oracle  → `label::pyth::feedId`     — anyone relays a guardian-attested update, NO reporter.
-	//   • Custom feed  → `label::endpoint::key::reporter` — your node reports a plain HTTP endpoint.
-	import { store, act } from "../lib/store.svelte.js";
+	// "Create a market" — a focused middle-panel view. A market IS a channel: its name encodes a Pyth
+	// price feed (`label::pyth::feedId`) and each channel is its own sandboxed economy. The price is
+	// attested by the Wormhole guardian network and verified on-chain, so anyone can relay it — there's
+	// no reporter to run or trust.
+	import { act } from "../lib/store.svelte.js";
 	import { api } from "../lib/api.js";
 
 	let { goto } = $props();
-	const myReporter = $derived(store.market?.myReporter ?? "");
 
-	let kind = $state("pyth"); // "pyth" | "custom"
 	let label = $state("");
 	let collateral = $state("gBTC"); // BTC/gBTC only for now
 	let busy = $state(false);
 	let testing = $state(false);
 	let tested = $state(null); // { value, expo?, error } | null — must pass before create
 
-	// pyth fields
 	const PYTH_PRESETS = [
 		{ label: "BTC / USD", id: "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43" },
 		{ label: "ETH / USD", id: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace" },
 		{ label: "SOL / USD", id: "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d" },
 	];
 	let feedId = $state(PYTH_PRESETS[0].id);
-	// custom fields
-	let endpoint = $state("https://api.coinbase.com/v2/prices/ETH-USD/spot");
-	let key = $state("data.amount");
 
-	// any source edit invalidates a prior test
+	// any feed edit invalidates a prior verification
 	$effect(() => {
-		kind;
 		feedId;
-		endpoint;
-		key;
 		tested = null;
 	});
 
 	const norm = (s) => s.trim().toLowerCase().replace(/^0x/, "");
-	const composed = $derived(kind === "pyth" ? `${label.trim()}::pyth::${norm(feedId)}` : `${label.trim()}::${endpoint.trim()}::${key.trim()}::${myReporter}`);
-	const fieldsOk = $derived(
-		kind === "pyth"
-			? !!label.trim() && /^[0-9a-f]{64}$/.test(norm(feedId)) && !label.includes("::")
-			: !!label.trim() && !!endpoint.trim() && !!key.trim() && !!myReporter && ![label, endpoint, key].some((x) => x.includes("::")),
-	);
+	const composed = $derived(`${label.trim()}::pyth::${norm(feedId)}`);
+	const fieldsOk = $derived(!!label.trim() && /^[0-9a-f]{64}$/.test(norm(feedId)) && !label.includes("::"));
 	const createOk = $derived(fieldsOk && tested?.value != null);
 
 	async function testSource() {
 		testing = true;
-		tested =
-			kind === "pyth"
-				? await api.testPythFeed(norm(feedId)).catch((e) => ({ value: null, error: String(e?.message ?? e) }))
-				: await api.testMarket(endpoint.trim(), key.trim()).catch((e) => ({ value: null, error: String(e?.message ?? e) }));
+		tested = await api.testPythFeed(norm(feedId)).catch((e) => ({ value: null, error: String(e?.message ?? e) }));
 		testing = false;
 	}
 	function fmtPrice(t) {
@@ -87,22 +71,13 @@
 			lands in the <em>same</em> market.
 		</p>
 
-		<div class="seg">
-			<button class:on={kind === "pyth"} onclick={() => (kind = "pyth")}>Pyth oracle <span class="tag">no reporter</span></button>
-			<button class:on={kind === "custom"} onclick={() => (kind = "custom")}>Custom feed</button>
-		</div>
 		<p class="note kindnote">
-			{#if kind === "pyth"}
-				Price comes from <strong>Pyth</strong> — attested by the Wormhole guardian network and verified on-chain.
-				Anyone can relay it; there's no reporter to run or trust.
-			{:else}
-				Price comes from an HTTP endpoint that <strong>your node reports</strong> on-chain (signed as your reporter
-				key). Use this for any source Pyth doesn't cover.
-			{/if}
+			Price comes from <strong>Pyth</strong> — attested by the Wormhole guardian network and verified
+			on-chain. Anyone can relay it; there's no reporter to run or trust.
 		</p>
 
 		<label class="fl"><span>Market name</span>
-			<input class="in" placeholder={kind === "pyth" ? "BTC-USD" : "ETH-USD"} bind:value={label} disabled={busy} />
+			<input class="in" placeholder="BTC-USD" bind:value={label} disabled={busy} />
 		</label>
 
 		<label class="fl"><span>Collateral</span>
@@ -112,34 +87,25 @@
 			</select>
 		</label>
 
-		{#if kind === "pyth"}
-			<label class="fl"><span>Pyth feed</span>
-				<select class="in" value={PYTH_PRESETS.find((p) => p.id === norm(feedId))?.id ?? "custom"} onchange={(e) => e.target.value !== "custom" && (feedId = e.target.value)} disabled={busy}>
-					{#each PYTH_PRESETS as p}<option value={p.id}>{p.label}</option>{/each}
-					<option value="custom">custom feed id…</option>
-				</select>
-				<input class="in mono ff" placeholder="64-hex Pyth feed id" bind:value={feedId} disabled={busy} />
-				<span class="note">Feed ids are at <a href="https://pyth.network/price-feeds" target="_blank" rel="noopener">pyth.network/price-feeds</a>.</span>
-			</label>
-		{:else}
-			<label class="fl"><span>Price endpoint</span>
-				<input class="in mono" placeholder="https://…" bind:value={endpoint} disabled={busy} />
-			</label>
-			<label class="fl"><span>JSON key path</span>
-				<input class="in mono" placeholder="data.amount" bind:value={key} disabled={busy} />
-			</label>
-		{/if}
+		<label class="fl"><span>Pyth feed</span>
+			<select class="in" value={PYTH_PRESETS.find((p) => p.id === norm(feedId))?.id ?? "custom"} onchange={(e) => e.target.value !== "custom" && (feedId = e.target.value)} disabled={busy}>
+				{#each PYTH_PRESETS as p}<option value={p.id}>{p.label}</option>{/each}
+				<option value="custom">custom feed id…</option>
+			</select>
+			<input class="in mono ff" placeholder="64-hex Pyth feed id" bind:value={feedId} disabled={busy} />
+			<span class="note">Feed ids are at <a href="https://pyth.network/price-feeds" target="_blank" rel="noopener">pyth.network/price-feeds</a>.</span>
+		</label>
 
 		<div class="testrow">
-			<button class="test" onclick={testSource} disabled={busy || testing || !fieldsOk}>{testing ? "testing…" : kind === "pyth" ? "Verify feed" : "Test source"}</button>
+			<button class="test" onclick={testSource} disabled={busy || testing || !fieldsOk}>{testing ? "testing…" : "Verify feed"}</button>
 			{#if tested}
 				{#if tested.value != null}
-					<span class="ok">✓ {kind === "pyth" ? "verified" : "resolves"} — {fmtPrice(tested)}</span>
+					<span class="ok">✓ verified — {fmtPrice(tested)}</span>
 				{:else}
 					<span class="bad">✗ {tested.error || "no value"}</span>
 				{/if}
 			{:else}
-				<span class="muted">{kind === "pyth" ? "verify the feed before creating" : "test the source before creating"}</span>
+				<span class="muted">verify the feed before creating</span>
 			{/if}
 		</div>
 
@@ -151,14 +117,13 @@
 			<button class="primary" onclick={create} disabled={busy || !createOk}>{busy ? "creating…" : "Create & join"}</button>
 			<button class="ghost" onclick={() => goto?.("trade")} disabled={busy}>cancel</button>
 		</div>
-		{#if kind === "custom"}<p class="rep">Reported by your node as <span class="mono">{myReporter ? myReporter.slice(0, 16) + "…" : "—"}</span>.</p>{/if}
 	</div>
 
 	<div class="card alt">
 		<h3>Join an existing market</h3>
 		<p class="lede">Have a market's full name? Paste it to join exactly that economy — same parameters, same market.</p>
 		<div class="joinrow">
-			<input class="in mono" placeholder="label::pyth::feedId  ·or·  label::endpoint::key::reporter" bind:value={joinName} disabled={busy} onkeydown={(e) => e.key === "Enter" && join()} />
+			<input class="in mono" placeholder="label::pyth::feedId" bind:value={joinName} disabled={busy} onkeydown={(e) => e.key === "Enter" && join()} />
 			<button class="primary" onclick={join} disabled={busy || !joinName.trim()}>Join</button>
 		</div>
 	</div>
@@ -172,10 +137,6 @@
 	h3 { margin: 0 0 0.4rem; font-size: 1rem; }
 	.lede { margin: 0 0 1rem; color: var(--muted); font-size: 0.85rem; line-height: 1.5; }
 	.lede em { color: var(--text); font-style: normal; font-weight: 600; }
-	.seg { display: flex; gap: 0.4rem; margin-bottom: 0.5rem; }
-	.seg button { flex: 1; background: var(--bg); border: 1px solid var(--accent-dim); color: var(--muted); border-radius: 7px; padding: 0.45rem; cursor: pointer; font-size: 0.85rem; }
-	.seg button.on { border-color: var(--accent); color: var(--text); background: color-mix(in srgb, var(--accent) 12%, transparent); }
-	.seg .tag { font-size: 0.6rem; color: var(--green); margin-left: 0.2rem; }
 	.kindnote { margin: 0 0 0.9rem; }
 	.fl { display: block; margin-bottom: 0.8rem; }
 	.fl > span { display: block; font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); margin-bottom: 0.3rem; }
@@ -198,7 +159,6 @@
 	.primary { background: var(--accent); color: #1a1303; border: none; padding: 0.55rem 1.1rem; border-radius: 7px; font-weight: 700; cursor: pointer; font-size: 0.9rem; }
 	.primary:disabled { opacity: 0.5; cursor: not-allowed; }
 	.ghost { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 0.85rem; }
-	.rep { margin: 0.7rem 0 0; font-size: 0.74rem; color: var(--muted); }
 	.joinrow { display: flex; gap: 0.6rem; }
 	.joinrow .in { flex: 1; }
 </style>

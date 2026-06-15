@@ -54,7 +54,7 @@ export interface CanonBook {
 
 export interface CanonState {
 	bridge: CanonBridge;
-	market: CanonMarket; // the channel's single market price (source/reporter come from the channel name)
+	market: CanonMarket; // the channel's single market price (Pyth feed id comes from the channel name)
 	custody: CustodyState; // already plain (string|null, number)
 	book: CanonBook;
 }

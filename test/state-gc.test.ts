@@ -12,14 +12,10 @@ import assert from "node:assert/strict";
 
 import { emptyBridge, mintFromDeposit, recordClaim, recordBroadcast, completeWithdrawal, requestWithdrawal, addGbtc, pruneStaleClaims, CLAIM_RECLAIM_GRACE } from "../src/custody/bridge.ts";
 import { emptyBook, signOffer, applyMatch, pruneExpiredOffers } from "../src/market/intent.ts";
-import { Ledger } from "../src/ledger/ledger.ts";
-import { GavlNode } from "../src/sync/node.ts";
-import { Account } from "../src/market/account.ts";
 import { computeView, mark, MARKET_STALE_AFTER } from "../src/market/btc.ts";
-import { oracleKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
 import { toHex } from "../src/det/canonical.ts";
-import { PARAMS, K, setupMarket, MARKET_REPORTER } from "./helpers.ts";
+import { PARAMS, K, priceBase } from "./helpers.ts";
 
 test("a deposit-claim marker is retired once the deposit mints, and not re-added", () => {
 	const s = emptyBridge();
@@ -73,15 +69,11 @@ test("offer fill-tracking is pruned once the offer can no longer be matched", ()
 	assert.equal(book.contracts.size, 1, "the contract it opened is untouched");
 });
 
-test("a market's mark goes stale once its reporter stops refreshing", async () => {
-	const node = new GavlNode(new Ledger(PARAMS));
-	let t = 0;
-	const A = new Account({ node, params: PARAMS, k: K, now: () => ++t, keypair: oracleKeyPair() });
-	await setupMarket(A, 61000n); // create + report BTC-USD (reporter = A)
-
-	const born = new Map(node.ledger.allWrites().map((w) => [w.id, 0] as [string, number])); // reported at height 0
-	const v = computeView(node.ledger.allWrites(), { bornAt: born, reporter: MARKET_REPORTER });
+test("a market's mark goes stale once relayed updates stop refreshing", async () => {
+	// A price enters consensus only via an attested Pyth update relayed at some height; here it
+	// landed at height 0 (market.at = 0), so the staleness clock runs from there.
+	const v = computeView([], { base: priceBase(61000n, 0, 0) });
 	assert.equal(mark(v, MARKET_STALE_AFTER - 1), 61000n, "fresh within the staleness window");
-	assert.equal(mark(v, MARKET_STALE_AFTER), null, "stale once the reporter goes quiet past the bound");
+	assert.equal(mark(v, MARKET_STALE_AFTER), null, "stale once updates stop past the bound");
 	assert.equal(mark(v), 61000n, "no staleness gate when nowHeight is omitted (last known price)");
 });

@@ -10,11 +10,11 @@
  * match/settle logic lives in ./intent.ts; this fold wires it (match.open / contract.
  * settle) alongside the gBTC bridge and the oracle.
  *
- * Pricing = a permissionless MARKET REGISTRY, not a vote. Anyone creates a market naming a public
- * source (endpoint + key) and a single reporter; only that reporter posts the market's price, and
- * the public endpoint keeps it auditable. The fold uses the POSTED price (deterministic); what's
- * banned is a node using its own live fetch as the mark (that diverges). Trust is competed for at
- * the market level — launch a rival market on the same source with a better reporter.
+ * Pricing = a Pyth feed, NO reporter. A CHANNEL IS A MARKET: the channel name encodes a Pyth feed id
+ * (`label::pyth::feedId`), and ANYONE may relay the latest signed update. The fold verifies it
+ * locally — the Wormhole guardian quorum + the Merkle proof (see ./pyth.ts) — so a forged update
+ * fails and there's no reporter to run or trust. The fold uses the POSTED, verified price
+ * (deterministic); what's banned is a node using its own live fetch as the mark (that diverges).
  */
 
 import type { Write } from "../chain/writer.ts";
@@ -41,27 +41,27 @@ import { fromHex } from "../det/canonical.ts";
 export const BRIDGE_ATTESTOR = bridgePubHex(process.env.GAVL_BRIDGE_SEED);
 
 /**
- * The channel's market price. A CHANNEL IS A MARKET: the channel name encodes the instrument's
- * public source (`label::endpoint::jsonKey::reporter`), so there's no in-state registry and no
- * per-price vote — only the channel's named reporter (passed into the fold from the name) may post,
- * and the public endpoint keeps it auditable. Each channel is its own economy (own ledger/pot), so
- * a market is a sandbox: a malicious market can't touch funds in another channel. Only the price
- * lives in state; the source/reporter are the channel's identity, not consensus data.
+ * The channel's market price. A CHANNEL IS A MARKET: the channel name encodes the instrument's Pyth
+ * feed (`label::pyth::feedId`), so there's no in-state registry and no per-price vote — anyone relays
+ * a Wormhole-attested update and the fold verifies it (the feed id, passed into the fold from the
+ * name, is what it matches against). Each channel is its own economy (own ledger/pot), so a market is
+ * a sandbox: a malicious market can't touch funds in another channel. Only the price lives in state;
+ * the feed id is the channel's identity, not consensus data.
  */
 export interface MarketPrice {
-	/** Latest reported price (null until the reporter first posts). The integer mark; contracts use
+	/** Latest verified price (null until the first update is relayed). The integer mark; contracts use
 	 *  it ratio-wise, so the fold never needs the scale — but display does (real value = price·10^expo). */
 	price: bigint | null;
-	/** Decimal exponent for display (0 for plain reporter prices; Pyth feeds carry their own, e.g. −8). */
+	/** Pyth's decimal exponent for display (e.g. −8). */
 	expo: number;
-	/** Reporter's monotonic seq (or Pyth publish-time) — replay/ordering guard. */
+	/** Pyth publish-time (unix seconds) — replay/ordering guard (newer wins). */
 	seq: number;
-	/** Certified height of the last report — drives staleness checks. */
+	/** Certified height of the last update — drives staleness checks. */
 	at: number;
 }
 
-/** Reports older than this many anchors are STALE — a market won't match/settle on a price the
- *  reporter stopped refreshing, so a dead source can't freeze trades at an old number. */
+/** Updates older than this many anchors are STALE — a market won't match/settle on a price that
+ *  stopped refreshing, so a dead feed can't freeze trades at an old number. */
 export const MARKET_STALE_AFTER = 4_320; // ~3 days at 60s/anchor
 
 /** A fresh, unpriced market-price slot. */
@@ -81,7 +81,7 @@ export interface View {
 	/** The BTC bridge: gBTC balances + BTC reserves + processed deposits + pending
 	 *  withdrawals. gBTC is the collateral — a 1:1 claim on real Bitcoin in the fund. */
 	bridge: BridgeState;
-	/** This channel's single market price (the source/reporter come from the channel name). */
+	/** This channel's single market price (the Pyth feed id comes from the channel name). */
 	market: MarketPrice;
 	/** The threshold-custody fund key, announced on-chain at genesis (committee mode). */
 	custody: CustodyState;
@@ -161,12 +161,9 @@ export interface ViewOptions {
 	 *  agrees on, so the budget is deterministic and the free pot can't go negative. Absent (pure
 	 *  folds / no finalized state yet) → budget 0 → the backstop is simply unavailable. */
 	backstop?: { pot: bigint; taken: bigint };
-	/** The channel's authorized price reporter (parsed from the channel name). Only its
-	 *  `market.report` writes set the mark; absent → no reporter → the market stays unpriced.
-	 *  A per-channel constant (same for every node on the channel), so the fold is deterministic. */
-	reporter?: string;
-	/** For a Pyth market (`label::pyth::feedId`): the feed id. When set, `market.report` carries a
-	 *  guardian-attested Pyth update that ANYONE may relay — the fold verifies it (no reporter). */
+	/** The channel's Pyth feed id (`label::pyth::feedId`). When set, `market.report` carries a
+	 *  guardian-attested Pyth update that ANYONE may relay — the fold verifies it and matches this
+	 *  feed. A per-channel constant (same for every node), so the fold is deterministic. */
 	pythFeedId?: string;
 }
 
@@ -276,7 +273,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 		// Effects timed by height (unbond maturity) use the write's STABLE certifying
 		// height (bornAt) so they don't drift as the global nowHeight advances; others
 		// use nowHeight (the current anchor clock).
-		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, opts.reporter, opts.pythFeedId);
+		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, opts.pythFeedId);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
 	settleExpired(view.bridge, view.book, nowHeight); // time-locked perps unwind at entry (base-independent)
@@ -286,9 +283,9 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	return view;
 }
 
-/** Mark price for the channel's market = the reporter's latest price, or null if unpriced or STALE
- *  (reporter stopped refreshing past MARKET_STALE_AFTER). `nowHeight` gates staleness; pass the
- *  write's certified height so it's base-independent (omit → no stale check). */
+/** Mark price for the channel's market = the latest verified Pyth price, or null if unpriced or STALE
+ *  (updates stopped past MARKET_STALE_AFTER). `nowHeight` gates staleness; pass the write's certified
+ *  height so it's base-independent (omit → no stale check). */
 export function mark(view: View, nowHeight?: number): bigint | null {
 	const m = view.market;
 	if (m.price === null) return null;
@@ -301,10 +298,10 @@ export function mark(view: View, nowHeight?: number): bigint | null {
  * PoST-bound order. Composes the pure consensus ordering with this app fold —
  * consensus never imports app state; the app calls consensus.
  */
-export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, base?: View, reporter?: string, pythFeedId?: string): View {
+export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, base?: View, pythFeedId?: string): View {
 	const { included, order, bornAt, nowHeight } = finalizedOrdering(writes, anchors, k);
-	if (nowHeight === null) return base ? computeView([], { base, reporter, pythFeedId }) : computeView([], { reporter, pythFeedId });
-	return computeView(included, { order, nowHeight, bornAt, base, reporter, pythFeedId });
+	if (nowHeight === null) return base ? computeView([], { base, pythFeedId }) : computeView([], { pythFeedId });
+	return computeView(included, { order, nowHeight, bornAt, base, pythFeedId });
 }
 
 /**
@@ -314,14 +311,14 @@ export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, 
  * verifier recomputes it to accept the anchor. Optionally resumes from a checkpoint
  * `base` (a pruned node folds forward from its snapshot instead of from genesis).
  */
-export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: string, base?: View, reporter?: string, pythFeedId?: string): View {
+export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: string, base?: View, pythFeedId?: string): View {
 	const anchor = anchors.get(anchorId);
 	const { included, order, bornAt, nowHeight } = orderingFor(writes, anchors, anchor ?? null);
-	if (nowHeight === null) return base ? computeView([], { base, reporter, pythFeedId }) : computeView([], { reporter, pythFeedId });
-	return computeView(included, { order, nowHeight, bornAt, base, reporter, pythFeedId });
+	if (nowHeight === null) return base ? computeView([], { base, pythFeedId }) : computeView([], { pythFeedId });
+	return computeView(included, { order, nowHeight, bornAt, base, pythFeedId });
 }
 
-function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, reporter?: string, pythFeedId?: string): void {
+function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, pythFeedId?: string): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized by the committee
@@ -371,30 +368,16 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			return;
 		}
 		case "market.report": {
-			if (pythFeedId) {
-				// Pyth market: ANYONE may relay a Wormhole-attested update — the fold verifies the
-				// guardian quorum + Merkle proof, so no reporter is trusted. Newer publish-time wins
-				// (monotonic, stored in `seq`); a forged update simply fails verification.
-				if (typeof op.update !== "string") return;
-				const p = verifyPythUpdate(op.update).find((x) => x.feedId === pythFeedId);
-				if (!p || p.price <= 0n) return; // unverified / wrong feed / non-positive
-				if (p.publishTime <= view.market.seq) return; // not newer
-				view.market.price = p.price;
-				view.market.expo = p.expo; // Pyth's scale (for display; mark stays the integer)
-				view.market.seq = p.publishTime; // monotonic guard = Pyth publish time (unix seconds)
-				view.market.at = bornHeight; // certified height → deterministic staleness
-				return;
-			}
-			// Reporter market: accepted ONLY from the channel's named reporter (encoded in the channel
-			// name, passed into the fold) — not a vote. The public endpoint keeps it honest; a rival
-			// market = a different channel. Per-reporter monotonic seq guards replay.
-			const price = typeof op.price === "string" ? parseAmount(op.price) : null;
-			if (price === null || typeof op.seq !== "number") return;
-			if (!reporter || w.writer !== reporter) return; // not this channel's authorized source
-			if (op.seq <= view.market.seq) return; // stale/replayed
-			view.market.price = price;
-			view.market.expo = 0; // a reporter posts the price in display units already
-			view.market.seq = op.seq;
+			// A CHANNEL IS A MARKET (`label::pyth::feedId`): ANYONE may relay a Wormhole-attested Pyth
+			// update — the fold verifies the guardian quorum + Merkle proof, so no reporter is trusted.
+			// Newer publish-time wins (monotonic, stored in `seq`); a forged update simply fails.
+			if (!pythFeedId || typeof op.update !== "string") return;
+			const p = verifyPythUpdate(op.update).find((x) => x.feedId === pythFeedId);
+			if (!p || p.price <= 0n) return; // unverified / wrong feed / non-positive
+			if (p.publishTime <= view.market.seq) return; // not newer
+			view.market.price = p.price;
+			view.market.expo = p.expo; // Pyth's scale (for display; the mark stays the integer)
+			view.market.seq = p.publishTime; // monotonic guard = Pyth publish time (unix seconds)
 			view.market.at = bornHeight; // certified height → deterministic staleness
 			return;
 		}
