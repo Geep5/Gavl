@@ -21,7 +21,7 @@ import { Ledger, rootOfHeads } from "./ledger/ledger.ts";
 import { GavlNode } from "./sync/node.ts";
 import { Account } from "./market/account.ts";
 import { computeView, finalizedView, viewAtAnchor, mark, gbtcOf } from "./market/btc.ts";
-import type { View } from "./market/btc.ts";
+import type { View, MarketDef } from "./market/btc.ts";
 import { serializeView, deserializeView, viewRoot } from "./market/state.ts";
 import type { Anchor } from "./consensus/anchor.ts";
 import type { Heads } from "./ledger/ledger.ts";
@@ -50,8 +50,9 @@ import { isCeremonyTimeout } from "./custody/ceremony.ts";
 import { Esplora } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, confirmations, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
 import { pendingClaims, unsentWithdrawals, inFlightWithdrawals, slashable } from "./custody/bridge.ts";
-import { fetchPythUpdate, HERMES_URL } from "./market/pricefeed.ts";
+import { fetchPythUpdate, fetchSignedUpdate, HERMES_URL } from "./market/pricefeed.ts";
 import { verifyPythUpdate } from "./market/pyth.ts";
+import { verifySignedReading } from "./market/signed-feed.ts";
 import type { AggregateReading } from "./market/pricefeed.ts";
 import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
@@ -504,16 +505,18 @@ export class Daemon {
 	view(): View {
 		const root = this.node.ledger.stateRoot();
 		if (this.viewCache && this.viewCache.root === root) return this.viewCache.view;
-		const view = computeView(this.node.ledger.allWrites(), { base: this.checkpointBase, pythFeedId: this.channelPyth() });
+		const view = computeView(this.node.ledger.allWrites(), { base: this.checkpointBase, market: this.channelMarket() });
 		this.viewCache = { root, view };
 		return view;
 	}
 
-	/** This channel's Pyth feed id (`label::pyth::feedId`), or undefined for a plain (non-market)
-	 *  channel. A per-channel constant every node agrees on → deterministic fold. The fold accepts a
-	 *  verified Pyth update from anyone for this feed (no reporter). */
-	channelPyth(): string | undefined {
-		return parseChannel(this.network)?.feedId;
+	/** This channel's market definition (`label::pyth::feedId` / `label::signed::sourcePubkey`), or
+	 *  undefined for a plain (non-market) channel. A per-channel constant every node agrees on →
+	 *  deterministic fold. The fold accepts a SIGNED update from anyone, verified against this def. */
+	channelMarket(): MarketDef | undefined {
+		const c = parseChannel(this.network);
+		if (!c) return undefined;
+		return c.kind === "pyth" ? { kind: "pyth", feedId: c.feedId } : { kind: "signed", source: c.source };
 	}
 
 	/** Fetch-test a Pyth feed before creating a `label::pyth::feedId` market: pull the latest Hermes
@@ -568,7 +571,7 @@ export class Daemon {
 		}
 		let r = this.appRootCache.get(prevId);
 		if (r === undefined) {
-			r = viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, prevId, this.checkpointBase, this.channelPyth()));
+			r = viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, prevId, this.checkpointBase, this.channelMarket()));
 			this.appRootCache.set(prevId, r);
 		}
 		return r;
@@ -616,7 +619,7 @@ export class Daemon {
 		if (!ckpt || ckpt.height !== target) return; // the boundary anchor isn't reachable yet → wait
 		const heads = anchors.headsAt(ckpt.id);
 		if (Object.keys(heads).length === 0) return; // nothing certified yet
-		const view = viewAtAnchor(this.node.ledger.allWrites(), anchors, ckpt.id, this.checkpointBase, this.channelPyth()); // state at the boundary
+		const view = viewAtAnchor(this.node.ledger.allWrites(), anchors, ckpt.id, this.checkpointBase, this.channelMarket()); // state at the boundary
 		this.lastCheckpointHeight = ckpt.height;
 		this.checkpointBase = view;
 		const snap: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(view) };
@@ -815,7 +818,7 @@ export class Daemon {
 		if (!this.node.anchors) return this.checkpointBase ? computeView([], { base: this.checkpointBase }) : computeView([]);
 		const finId = this.node.anchors.finalized(this.finalityDepth)?.id ?? null;
 		if (this.finalCache && this.finalCache.id === finId) return this.finalCache.view;
-		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase, this.channelPyth());
+		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase, this.channelMarket());
 		this.finalCache = { id: finId, view };
 		return view;
 	}
@@ -1005,10 +1008,12 @@ export class Daemon {
 	}
 
 	/**
-	 * Relay THIS channel's Pyth price on a loop: fetch the latest Wormhole-attested update from
-	 * Hermes, verify it locally, and post it on-chain whenever the Pyth publish-time advances. A
-	 * CHANNEL IS A MARKET (`label::pyth::feedId`) with NO reporter — any node may relay; Hermes is
-	 * untrusted transport, the guardian quorum is the authority, and the fold re-verifies.
+	 * Relay THIS channel's price on a loop. A CHANNEL IS A MARKET with NO reporter — any node may
+	 * relay, the SOURCE signature is the authority, and the fold re-verifies the bytes:
+	 *   • `label::pyth::feedId`      → the latest Wormhole-attested update from Hermes.
+	 *   • `label::signed::sourcePub` → the latest signed reading from that source's signer endpoint
+	 *                                  (GAVL_FEED_URL); the source's Ed25519 key is the trust anchor.
+	 * Post it whenever the source's publish-time advances; other nodes fold + verify independently.
 	 */
 	private startOraclePublisher(opts: { everyMs: number }): void {
 		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: this.producerKey() });
@@ -1019,7 +1024,13 @@ export class Daemon {
 			console.log(`  channel ${this.network}: not a market channel — no price`);
 			return;
 		}
-		const feedId = def.feedId;
+		if (def.kind === "pyth") this.relayPyth(acct, def.feedId, def.label, myGen, opts.everyMs);
+		else this.relaySigned(acct, def.source, def.label, myGen, opts.everyMs);
+	}
+
+	/** Relay loop for a Pyth market: Hermes → verify the guardian quorum + Merkle proof → post when
+	 *  the attested publish-time advances. Hermes is untrusted transport; the guardians are the authority. */
+	private relayPyth(acct: Account, feedId: string, label: string, myGen: number, everyMs: number): void {
 		void (async () => {
 			let lastPub = this.view().market.seq; // last on-chain publish time
 			while (this.publishing && myGen === this.oracleGen) {
@@ -1029,17 +1040,52 @@ export class Daemon {
 					this.lastOracleSource = { value: p.price, method: `Pyth ${feedId.slice(0, 10)}…`, used: 1, readings: [{ value: p.price, raw: `${p.price}e${p.expo}`, endpoint: HERMES_URL, key: feedId }], at: Date.now() };
 					if (p.publishTime > lastPub) {
 						try {
-							await acct.reportPythUpdate(blob!); // newer attested update → relay it
+							await acct.reportMarketUpdate(blob!); // newer attested update → relay it
 							lastPub = p.publishTime;
 						} catch {
 							/* retry next tick */
 						}
 					}
 				}
-				await new Promise((r) => setTimeout(r, opts.everyMs));
+				await new Promise((res) => setTimeout(res, everyMs));
 			}
 		})();
-		console.log(`  market ${def.label}: relaying Pyth feed ${feedId.slice(0, 10)}… from Hermes (verified on-chain; no reporter)`);
+		console.log(`  market ${label}: relaying Pyth feed ${feedId.slice(0, 10)}… from Hermes (verified on-chain; no reporter)`);
+	}
+
+	/** Relay loop for a generic SIGNED market: fetch the source's signed reading from its signer
+	 *  endpoint (GAVL_FEED_URL), verify the signature against the channel's committed source key, and
+	 *  post when the source's publish-time advances. No URL ⇒ this node only TRADES on updates others
+	 *  relay (it never forges — the fold would reject anything not signed by the committed source). */
+	private relaySigned(acct: Account, source: string, label: string, myGen: number, everyMs: number): void {
+		const url = process.env.GAVL_FEED_URL;
+		if (!url) {
+			console.log(`  market ${label}: signed feed ${source.slice(0, 10)}… — set GAVL_FEED_URL to relay it (trading on others' relays either way)`);
+			return;
+		}
+		void (async () => {
+			let lastPub = this.view().market.seq; // last on-chain publish time
+			while (this.publishing && myGen === this.oracleGen) {
+				const raw = await fetchSignedUpdate(url);
+				const r = raw != null ? verifySignedReading(raw, source) : null;
+				if (r && r.price > 0n) {
+					this.lastOracleSource = { value: r.price, method: `signed ${source.slice(0, 10)}…`, used: 1, readings: [{ value: r.price, raw: `${r.price}e${r.expo}`, endpoint: url, key: source }], at: Date.now() };
+					if (r.publishTime > lastPub) {
+						try {
+							await acct.reportMarketUpdate(JSON.stringify(raw)); // genuine source-signed reading → relay it
+							lastPub = r.publishTime;
+						} catch {
+							/* retry next tick */
+						}
+					}
+				} else if (raw != null) {
+					// the endpoint answered but the signature didn't match the channel's committed source key
+					this.lastOracleSource = { value: null, method: `signed ${source.slice(0, 10)}…`, used: 0, readings: [{ value: null, raw: null, endpoint: url, key: source, error: "signature didn't verify against this channel's source key" }], at: Date.now() };
+				}
+				await new Promise((res) => setTimeout(res, everyMs));
+			}
+		})();
+		console.log(`  market ${label}: relaying signed feed ${source.slice(0, 10)}… from ${url} (verified on-chain; no reporter)`);
 	}
 
 	/** The publisher's latest aggregate reading (per-source endpoint/key/raw/value +
@@ -1556,17 +1602,20 @@ function channelSlug(name: string): string {
 	return safe || "default";
 }
 
-/** A market channel's name IS its definition (and hashes to the DHT topic): `label::pyth::feedIdHex`.
- *  The price comes from a Wormhole-attested Pyth feed — anyone relays it, the fold verifies it, no
- *  reporter. A name that doesn't match is a plain channel: no market, transfers only. */
-export interface ChannelMarket {
-	label: string;
-	feedId: string;
-}
+/** A market channel's name IS its definition (and hashes to the DHT topic). Two SIGNED-source
+ *  kinds — the price is signed AT THE SOURCE and relayed by anyone; the fold verifies a signature,
+ *  never the relayer:
+ *    `label::pyth::<feedId>`        — a Wormhole-attested Pyth feed (guardian-set trust anchor).
+ *    `label::signed::<sourcePubkey>` — any source's own Ed25519 key (wrap an endpoint in a signer).
+ *  A name that doesn't match is a plain channel: no market, transfers only. */
+export type ChannelMarket = { label: string } & MarketDef;
 export function parseChannel(name: string): ChannelMarket | null {
 	const parts = name.split("::");
 	if (parts.length === 3 && parts[1].toLowerCase() === "pyth" && /^[0-9a-f]{64}$/i.test(parts[2])) {
-		return { label: parts[0], feedId: parts[2].toLowerCase() };
+		return { label: parts[0], kind: "pyth", feedId: parts[2].toLowerCase() };
+	}
+	if (parts.length === 3 && parts[1].toLowerCase() === "signed" && /^[0-9a-f]{64}$/i.test(parts[2])) {
+		return { label: parts[0], kind: "signed", source: parts[2].toLowerCase() };
 	}
 	return null;
 }

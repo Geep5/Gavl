@@ -24,6 +24,7 @@ import { finalizedOrdering, orderingFor } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import { bridgePubHex } from "./oracle.ts";
 import { verifyPythUpdate } from "./pyth.ts";
+import { verifySignedReading } from "./signed-feed.ts";
 import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
@@ -161,11 +162,21 @@ export interface ViewOptions {
 	 *  agrees on, so the budget is deterministic and the free pot can't go negative. Absent (pure
 	 *  folds / no finalized state yet) → budget 0 → the backstop is simply unavailable. */
 	backstop?: { pot: bigint; taken: bigint };
-	/** The channel's Pyth feed id (`label::pyth::feedId`). When set, `market.report` carries a
-	 *  guardian-attested Pyth update that ANYONE may relay — the fold verifies it and matches this
-	 *  feed. A per-channel constant (same for every node), so the fold is deterministic. */
-	pythFeedId?: string;
+	/** The channel's market definition (what backs the price). When set, `market.report` carries a
+	 *  SIGNED update anyone may relay — the fold verifies it against this def's trust anchor (Pyth's
+	 *  guardian set, or a generic source key) and matches the feed/source. A per-channel constant
+	 *  (same for every node), so the fold is deterministic. Absent → a plain transfers-only channel. */
+	market?: MarketDef;
 }
+
+/**
+ * A channel's market = where its price comes from, and the trust anchor that signs it. Both kinds
+ * are SIGNED-at-the-source + relayed-by-anyone — the fold verifies a signature, never trusting the
+ * relayer. `pyth` uses Wormhole's guardian set; `signed` uses any source's own Ed25519 key (wrap an
+ * endpoint in a signer and its key backs the market). The channel NAME encodes this (see daemon
+ * parseChannel: `label::pyth::feedId` / `label::signed::sourcePubkey`).
+ */
+export type MarketDef = { kind: "pyth"; feedId: string } | { kind: "signed"; source: string };
 
 /**
  * Demurrage — the RAM ledger's "balances can't sit forever" rule, turned into liquidity. State
@@ -273,7 +284,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 		// Effects timed by height (unbond maturity) use the write's STABLE certifying
 		// height (bornAt) so they don't drift as the global nowHeight advances; others
 		// use nowHeight (the current anchor clock).
-		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, opts.pythFeedId);
+		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, opts.market);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
 	settleExpired(view.bridge, view.book, nowHeight); // time-locked perps unwind at entry (base-independent)
@@ -298,10 +309,10 @@ export function mark(view: View, nowHeight?: number): bigint | null {
  * PoST-bound order. Composes the pure consensus ordering with this app fold —
  * consensus never imports app state; the app calls consensus.
  */
-export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, base?: View, pythFeedId?: string): View {
+export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, base?: View, market?: MarketDef): View {
 	const { included, order, bornAt, nowHeight } = finalizedOrdering(writes, anchors, k);
-	if (nowHeight === null) return base ? computeView([], { base, pythFeedId }) : computeView([], { pythFeedId });
-	return computeView(included, { order, nowHeight, bornAt, base, pythFeedId });
+	if (nowHeight === null) return base ? computeView([], { base, market }) : computeView([], { market });
+	return computeView(included, { order, nowHeight, bornAt, base, market });
 }
 
 /**
@@ -311,14 +322,14 @@ export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, 
  * verifier recomputes it to accept the anchor. Optionally resumes from a checkpoint
  * `base` (a pruned node folds forward from its snapshot instead of from genesis).
  */
-export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: string, base?: View, pythFeedId?: string): View {
+export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: string, base?: View, market?: MarketDef): View {
 	const anchor = anchors.get(anchorId);
 	const { included, order, bornAt, nowHeight } = orderingFor(writes, anchors, anchor ?? null);
-	if (nowHeight === null) return base ? computeView([], { base, pythFeedId }) : computeView([], { pythFeedId });
-	return computeView(included, { order, nowHeight, bornAt, base, pythFeedId });
+	if (nowHeight === null) return base ? computeView([], { base, market }) : computeView([], { market });
+	return computeView(included, { order, nowHeight, bornAt, base, market });
 }
 
-function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, pythFeedId?: string): void {
+function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, market?: MarketDef): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized by the committee
@@ -368,16 +379,27 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			return;
 		}
 		case "market.report": {
-			// A CHANNEL IS A MARKET (`label::pyth::feedId`): ANYONE may relay a Wormhole-attested Pyth
-			// update — the fold verifies the guardian quorum + Merkle proof, so no reporter is trusted.
-			// Newer publish-time wins (monotonic, stored in `seq`); a forged update simply fails.
-			if (!pythFeedId || typeof op.update !== "string") return;
-			const p = verifyPythUpdate(op.update).find((x) => x.feedId === pythFeedId);
-			if (!p || p.price <= 0n) return; // unverified / wrong feed / non-positive
-			if (p.publishTime <= view.market.seq) return; // not newer
-			view.market.price = p.price;
-			view.market.expo = p.expo; // Pyth's scale (for display; the mark stays the integer)
-			view.market.seq = p.publishTime; // monotonic guard = Pyth publish time (unix seconds)
+			// A CHANNEL IS A MARKET: ANYONE may relay a SIGNED update; the fold verifies the
+			// signature against the channel's trust anchor (Pyth's guardian set, or a generic
+			// source key) — so no relayer is trusted, only the SOURCE's signature. Newer
+			// publish-time wins (monotonic, stored in `seq`); a forged update simply fails.
+			if (!market || typeof op.update !== "string") return;
+			let r: { price: bigint; expo: number; publishTime: number } | null = null;
+			if (market.kind === "pyth") {
+				r = verifyPythUpdate(op.update).find((x) => x.feedId === market.feedId) ?? null;
+			} else {
+				// generic signed source — the update is JSON {price,expo,publishTime,sig}.
+				try {
+					r = verifySignedReading(JSON.parse(op.update), market.source);
+				} catch {
+					r = null; // malformed JSON → reject
+				}
+			}
+			if (!r || r.price <= 0n) return; // unverified / wrong feed/source / non-positive
+			if (r.publishTime <= view.market.seq) return; // not newer
+			view.market.price = r.price;
+			view.market.expo = r.expo; // the source's scale (for display; the mark stays the integer)
+			view.market.seq = r.publishTime; // monotonic guard = publish time (unix seconds)
 			view.market.at = bornHeight; // certified height → deterministic staleness
 			return;
 		}

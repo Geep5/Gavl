@@ -54,17 +54,17 @@ test("in the FOLD: a relayed Pyth update sets a pyth market's mark — no report
 	let t = 0;
 	// A random account (NOT a designated reporter) relays the attested update.
 	const relayer = new Account({ node, params: PARAMS, k: K, now: () => ++t, keypair: generateKeyPair() });
-	await relayer.reportPythUpdate(fx.blob);
+	await relayer.reportMarketUpdate(fx.blob);
 	const writes = node.ledger.allWrites();
 	const born = new Map(writes.map((w) => [w.id, 0] as [string, number]));
 
 	// Fold WITH the channel's pyth feed id → the update verifies and sets the mark.
-	const v = computeView(writes, { bornAt: born, pythFeedId: fx.expected.feedId });
+	const v = computeView(writes, { bornAt: born, market: { kind: "pyth", feedId: fx.expected.feedId } });
 	assert.equal(mark(v), BigInt(fx.expected.price), "mark = the guardian-attested Pyth price");
 
-	// Fold WITHOUT a feed id (a plain/reporter channel) → the update is ignored, no mark.
-	assert.equal(mark(computeView(writes, { bornAt: born })), null, "no pyth feed configured → update ignored");
+	// Fold WITHOUT a market def (a plain channel) → the update is ignored, no mark.
+	assert.equal(mark(computeView(writes, { bornAt: born })), null, "no market configured → update ignored");
 
 	// Fold for a DIFFERENT feed id → the update doesn't match → no mark.
-	assert.equal(mark(computeView(writes, { bornAt: born, pythFeedId: "ab".repeat(32) })), null, "wrong feed → ignored");
+	assert.equal(mark(computeView(writes, { bornAt: born, market: { kind: "pyth", feedId: "ab".repeat(32) } })), null, "wrong feed → ignored");
 });

@@ -8,7 +8,7 @@
 	const m = $derived(store.market);
 	// display value = integer price · 10^expo (Pyth feeds carry an expo, e.g. −8)
 	const priceNum = $derived(m?.price != null ? Number(m.price) * 10 ** (m.priceExpo ?? 0) : null);
-	const mkt = $derived(m?.marketInfo ?? null); // { kind, label, feedId, price, iAmRelaying, source } | null
+	const mkt = $derived(m?.marketInfo ?? null); // { kind, label, feedId, sourceKey, price, iAmRelaying, source } | null
 	const bal = $derived(Number(myGbtc()));
 	const tape = $derived(m?.tape ?? []);
 	const contracts = $derived(m?.myContracts ?? []);
@@ -77,8 +77,8 @@
 		<div class="pair">{mkt?.label ?? "BTC"} <span class="muted">/ USD</span></div>
 		{#if priceNum != null}
 			<div class="price">${priceNum.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
-			<div class="src" title="Pyth — attested by the Wormhole guardian network, verified on-chain">
-				<span class="dot live"></span> live · Pyth oracle{mkt?.iAmRelaying ? " · relayed by you" : ""}
+			<div class="src" title={mkt?.kind === "signed" ? "Signed source — Ed25519-signed readings, verified on-chain" : "Pyth — attested by the Wormhole guardian network, verified on-chain"}>
+				<span class="dot live"></span> live · {mkt?.kind === "signed" ? "signed oracle" : "Pyth oracle"}{mkt?.iAmRelaying ? " · relayed by you" : ""}
 			</div>
 		{:else}
 			<div class="price muted">—</div>
@@ -209,7 +209,11 @@
 					<span class="oprice mono">{priceNum != null ? priceNum.toLocaleString() : "—"}</span>
 				</div>
 				<div class="sources">
-					<div class="smeta">Pyth feed <a class="fhost mono" href={`https://pyth.network/price-feeds?search=${mkt.feedId}`} target="_blank" rel="noopener">{short(mkt.feedId)}</a> <span class="muted">· Wormhole-attested</span></div>
+					{#if mkt.kind === "signed"}
+						<div class="smeta">Signed source <span class="fhost mono">{short(mkt.sourceKey)}</span> <span class="muted">· Ed25519, verified on-chain</span></div>
+					{:else}
+						<div class="smeta">Pyth feed <a class="fhost mono" href={`https://pyth.network/price-feeds?search=${mkt.feedId}`} target="_blank" rel="noopener">{short(mkt.feedId)}</a> <span class="muted">· Wormhole-attested</span></div>
+					{/if}
 					{#if mkt.source}
 						<div class="smeta">{mkt.source.method}{#if mkt.source.ageMs != null}<span class="muted"> · {(mkt.source.ageMs / 1000).toFixed(0)}s ago</span>{/if}</div>
 						{#each mkt.source.feeds as f}

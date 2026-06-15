@@ -91,19 +91,21 @@ function serializeState() {
 	const gbtc: Record<string, string> = {};
 	for (const [pubkey, amt] of view.bridge.gbtc) gbtc[pubkey] = amt.toString();
 
-	// A CHANNEL IS A MARKET. Every market is a Pyth market: the channel name (`label::pyth::feedId`)
-	// names a Pyth feed, and ANYONE may relay a guardian-attested update — there's no reporter to run
-	// or trust. Each channel is its own sandboxed economy: a malicious market can't touch another's funds.
+	// A CHANNEL IS A MARKET, named by its price SOURCE: `label::pyth::feedId` (a Wormhole-attested Pyth
+	// feed) or `label::signed::sourcePubkey` (any source that signs its readings with an Ed25519 key).
+	// Either way ANYONE may relay a signed update — the fold verifies the source signature, so there's no
+	// reporter to trust. Each channel is its own sandboxed economy: a malicious market can't touch another's.
 	const def = parseChannel(daemon.currentChannel());
 	const live = def ? daemon.oracleSource() : null;
 	const marketInfo = def
 		? {
 				channel: daemon.currentChannel(),
-				kind: "pyth" as const,
+				kind: def.kind, // "pyth" | "signed"
 				label: def.label,
-				feedId: def.feedId,
+				feedId: def.kind === "pyth" ? def.feedId : null, // Pyth feed id (pyth markets)
+				sourceKey: def.kind === "signed" ? def.source : null, // committed Ed25519 source key (signed markets)
 				price: m != null ? m.toString() : null,
-				iAmRelaying: !!live, // this node is relaying the Pyth feed (anyone may)
+				iAmRelaying: !!live, // this node is relaying the feed (anyone may; the source signature is the authority)
 				source: live ? { method: live.method, ageMs: Date.now() - live.at, feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })) } : null,
 			}
 		: null;
@@ -111,7 +113,7 @@ function serializeState() {
 	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)
 	const onChainR = rsv != null ? rsv.sats : null;
 	const market = {
-		oracle: "pyth", // mechanism: the channel name encodes a Pyth feed; updates are guardian-attested
+		oracle: def?.kind ?? "pyth", // mechanism: the channel name encodes the price source; updates are source-signed
 		marketInfo,
 		price: m != null ? m.toString() : null,
 		priceExpo: view.market.expo, // decimal exponent: display value = price · 10^expo

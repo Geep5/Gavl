@@ -109,9 +109,11 @@ export class Account {
 		return this.produce({ kind: "bridge.settle", withdrawalId, sig });
 	}
 
-	/** Relay a Wormhole-attested Pyth update to this market's channel (`label::pyth::feedId`). ANYONE
-	 *  may — the fold verifies the guardian quorum + Merkle proof, so there's no reporter to trust. */
-	reportPythUpdate(update: string): Promise<Write> {
+	/** Relay a SIGNED market update to this channel — a Pyth blob (`label::pyth::feedId`) or a generic
+	 *  signed reading (`label::signed::sourcePubkey`). ANYONE may relay: the fold verifies the source
+	 *  signature against the channel's committed key, so there's no reporter to trust. `update` is the
+	 *  wire form for the channel's kind (Pyth blob hex, or `JSON.stringify(SignedUpdate)`). */
+	reportMarketUpdate(update: string): Promise<Write> {
 		return this.produce({ kind: "market.report", update });
 	}
 

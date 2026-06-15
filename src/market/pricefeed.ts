@@ -40,3 +40,16 @@ export async function fetchPythUpdate(feedId: string): Promise<string | null> {
 		return null;
 	}
 }
+
+/** Fetch the latest signed reading (a `SignedUpdate` JSON) from a generic source's signer endpoint —
+ *  the open analog of Hermes for a `label::signed::sourcePubkey` market. The signer (the source) signs
+ *  each reading; this endpoint is untrusted transport, so the fold re-verifies the source signature. */
+export async function fetchSignedUpdate(url: string): Promise<unknown | null> {
+	try {
+		const res = await fetch(url, { headers: { accept: "application/json" } });
+		if (!res.ok) return null;
+		return await res.json();
+	} catch {
+		return null;
+	}
+}
