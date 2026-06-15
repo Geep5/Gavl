@@ -25,7 +25,6 @@
 	const viewTitle = $derived(view === "create" ? "new market" : view);
 
 	const NAV = [
-		{ id: "trade", label: "trade", icon: "₿", hint: "Go bullish or bearish on Bitcoin" },
 		{ id: "network", label: "network", icon: "⇄", hint: "Connectivity & consensus" },
 	];
 	const channel = $derived(store.consensus?.network ?? "—");

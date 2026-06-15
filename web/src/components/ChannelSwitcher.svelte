@@ -44,12 +44,23 @@
 	const labelOf = (name) => parse(name)?.label ?? name;
 
 	async function join(name) {
+		goto?.("trade"); // selecting a market shows its trade view
 		const n = (name ?? "").trim();
-		if (!n || n === current) return;
+		if (!n || n === current) return; // already here → just navigated the view
 		switching = true;
 		await act(() => api.switchChannel(n));
 		remember(n);
 		switching = false;
+	}
+
+	function forget(name, e) {
+		e?.stopPropagation();
+		recents = recents.filter((c) => c !== name);
+		try {
+			localStorage.setItem(KEY, JSON.stringify(recents));
+		} catch {
+			/* ignore */
+		}
 	}
 
 	async function copyName(name, e) {
@@ -75,6 +86,7 @@
 				{#if ch === current}<span class="live" title="connected"></span>{/if}
 			</button>
 			<button class="copy" title="copy this market's full name to share" onclick={(e) => copyName(ch, e)}>{copied === ch ? "✓" : "⧉"}</button>
+			{#if ch !== current}<button class="copy rm" title="remove from this list" onclick={(e) => forget(ch, e)}>×</button>{/if}
 		</div>
 	{/each}
 
@@ -95,6 +107,7 @@
 	}
 	.row:hover .copy { opacity: 0.7; }
 	.copy:hover { opacity: 1 !important; color: var(--accent); background: var(--bg); }
+	.copy.rm:hover { color: var(--red, #e06c6c); }
 	.chan {
 		display: flex; align-items: center; gap: 0.4rem; width: 100%;
 		background: none; border: none; margin: 0 0 1px; padding: 0.32rem 0.45rem;
