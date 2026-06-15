@@ -12,6 +12,12 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import { verifyPythUpdate, WORMHOLE_GUARDIANS } from "../src/market/pyth.ts";
+import { Ledger } from "../src/ledger/ledger.ts";
+import { GavlNode } from "../src/sync/node.ts";
+import { Account } from "../src/market/account.ts";
+import { computeView, mark } from "../src/market/btc.ts";
+import { generateKeyPair } from "../src/det/ed25519.ts";
+import { PARAMS, K } from "./helpers.ts";
 
 const fx = JSON.parse(readFileSync(new URL("./fixtures/pyth-btc-update.json", import.meta.url), "utf8"));
 
@@ -41,4 +47,24 @@ test("rejects garbage / non-Pyth bytes without throwing", () => {
 	assert.deepEqual(verifyPythUpdate("deadbeef"), []);
 	assert.deepEqual(verifyPythUpdate(""), []);
 	assert.equal(WORMHOLE_GUARDIANS.length, 19, "the trust anchor is the 19-guardian set");
+});
+
+test("in the FOLD: a relayed Pyth update sets a pyth market's mark — no reporter, anyone relays", async () => {
+	const node = new GavlNode(new Ledger(PARAMS));
+	let t = 0;
+	// A random account (NOT a designated reporter) relays the attested update.
+	const relayer = new Account({ node, params: PARAMS, k: K, now: () => ++t, keypair: generateKeyPair() });
+	await relayer.reportPythUpdate(fx.blob);
+	const writes = node.ledger.allWrites();
+	const born = new Map(writes.map((w) => [w.id, 0] as [string, number]));
+
+	// Fold WITH the channel's pyth feed id → the update verifies and sets the mark.
+	const v = computeView(writes, { bornAt: born, pythFeedId: fx.expected.feedId });
+	assert.equal(mark(v), BigInt(fx.expected.price), "mark = the guardian-attested Pyth price");
+
+	// Fold WITHOUT a feed id (a plain/reporter channel) → the update is ignored, no mark.
+	assert.equal(mark(computeView(writes, { bornAt: born })), null, "no pyth feed configured → update ignored");
+
+	// Fold for a DIFFERENT feed id → the update doesn't match → no mark.
+	assert.equal(mark(computeView(writes, { bornAt: born, pythFeedId: "ab".repeat(32) })), null, "wrong feed → ignored");
 });

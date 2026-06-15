@@ -109,10 +109,16 @@ export class Account {
 		return this.produce({ kind: "bridge.settle", withdrawalId, sig });
 	}
 
-	/** Post this channel's market price. Only accepted if THIS identity is the channel's reporter
-	 *  (encoded in the channel name). `seq` is per-reporter monotonic. */
+	/** Post this channel's market price (reporter market). Only accepted if THIS identity is the
+	 *  channel's reporter (encoded in the channel name). `seq` is per-reporter monotonic. */
 	report(price: bigint | number | string, seq: number): Promise<Write> {
 		return this.produce({ kind: "market.report", price: amountStr(price), seq });
+	}
+
+	/** Relay a Wormhole-attested Pyth update to a Pyth market (`label::pyth::feedId`). ANYONE may —
+	 *  the fold verifies the guardian quorum + Merkle proof, so no reporter is trusted. */
+	reportPythUpdate(update: string): Promise<Write> {
+		return this.produce({ kind: "market.report", update });
 	}
 
 	/** Announce the threshold-custody fund's group key on-chain (genesis). First write

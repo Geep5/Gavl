@@ -23,6 +23,7 @@ import { isOp } from "./ops.ts";
 import { finalizedOrdering, orderingFor } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import { bridgePubHex } from "./oracle.ts";
+import { verifyPythUpdate } from "./pyth.ts";
 import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
@@ -161,6 +162,9 @@ export interface ViewOptions {
 	 *  `market.report` writes set the mark; absent → no reporter → the market stays unpriced.
 	 *  A per-channel constant (same for every node on the channel), so the fold is deterministic. */
 	reporter?: string;
+	/** For a Pyth market (`label::pyth::feedId`): the feed id. When set, `market.report` carries a
+	 *  guardian-attested Pyth update that ANYONE may relay — the fold verifies it (no reporter). */
+	pythFeedId?: string;
 }
 
 /**
@@ -269,7 +273,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 		// Effects timed by height (unbond maturity) use the write's STABLE certifying
 		// height (bornAt) so they don't drift as the global nowHeight advances; others
 		// use nowHeight (the current anchor clock).
-		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, opts.reporter);
+		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, opts.reporter, opts.pythFeedId);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
 	settleExpired(view.bridge, view.book, nowHeight); // time-locked perps unwind at entry (base-independent)
@@ -294,10 +298,10 @@ export function mark(view: View, nowHeight?: number): bigint | null {
  * PoST-bound order. Composes the pure consensus ordering with this app fold —
  * consensus never imports app state; the app calls consensus.
  */
-export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, base?: View, reporter?: string): View {
+export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, base?: View, reporter?: string, pythFeedId?: string): View {
 	const { included, order, bornAt, nowHeight } = finalizedOrdering(writes, anchors, k);
-	if (nowHeight === null) return base ? computeView([], { base, reporter }) : computeView([], { reporter });
-	return computeView(included, { order, nowHeight, bornAt, base, reporter });
+	if (nowHeight === null) return base ? computeView([], { base, reporter, pythFeedId }) : computeView([], { reporter, pythFeedId });
+	return computeView(included, { order, nowHeight, bornAt, base, reporter, pythFeedId });
 }
 
 /**
@@ -307,14 +311,14 @@ export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, 
  * verifier recomputes it to accept the anchor. Optionally resumes from a checkpoint
  * `base` (a pruned node folds forward from its snapshot instead of from genesis).
  */
-export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: string, base?: View, reporter?: string): View {
+export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: string, base?: View, reporter?: string, pythFeedId?: string): View {
 	const anchor = anchors.get(anchorId);
 	const { included, order, bornAt, nowHeight } = orderingFor(writes, anchors, anchor ?? null);
-	if (nowHeight === null) return base ? computeView([], { base, reporter }) : computeView([], { reporter });
-	return computeView(included, { order, nowHeight, bornAt, base, reporter });
+	if (nowHeight === null) return base ? computeView([], { base, reporter, pythFeedId }) : computeView([], { reporter, pythFeedId });
+	return computeView(included, { order, nowHeight, bornAt, base, reporter, pythFeedId });
 }
 
-function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, reporter?: string): void {
+function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, reporter?: string, pythFeedId?: string): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized by the committee
@@ -364,11 +368,23 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			return;
 		}
 		case "market.report": {
-			// Post THIS channel's market price. Accepted ONLY from the channel's reporter (encoded
-			// in the channel name, passed into the fold) — not a vote. The public endpoint (also in
-			// the name) keeps the reporter honest; a rival market = a different channel. Per-reporter
-			// monotonic seq guards replay.
-			const price = parseAmount(op.price);
+			if (pythFeedId) {
+				// Pyth market: ANYONE may relay a Wormhole-attested update — the fold verifies the
+				// guardian quorum + Merkle proof, so no reporter is trusted. Newer publish-time wins
+				// (monotonic, stored in `seq`); a forged update simply fails verification.
+				if (typeof op.update !== "string") return;
+				const p = verifyPythUpdate(op.update).find((x) => x.feedId === pythFeedId);
+				if (!p || p.price <= 0n) return; // unverified / wrong feed / non-positive
+				if (p.publishTime <= view.market.seq) return; // not newer
+				view.market.price = p.price;
+				view.market.seq = p.publishTime; // monotonic guard = Pyth publish time (unix seconds)
+				view.market.at = bornHeight; // certified height → deterministic staleness
+				return;
+			}
+			// Reporter market: accepted ONLY from the channel's named reporter (encoded in the channel
+			// name, passed into the fold) — not a vote. The public endpoint keeps it honest; a rival
+			// market = a different channel. Per-reporter monotonic seq guards replay.
+			const price = typeof op.price === "string" ? parseAmount(op.price) : null;
 			if (price === null || typeof op.seq !== "number") return;
 			if (!reporter || w.writer !== reporter) return; // not this channel's authorized source
 			if (op.seq <= view.market.seq) return; // stale/replayed
