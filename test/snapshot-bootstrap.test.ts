@@ -24,7 +24,7 @@ import type { View } from "../src/market/btc.ts";
 import type { StoredSnapshot } from "../src/store/store.ts";
 import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver } from "./helpers.ts";
+import { PARAMS, K, STANDIN_VERIFIER, standinProver , MKT, setupMarket } from "./helpers.ts";
 
 let depN = 0;
 
@@ -51,13 +51,13 @@ test("a fresh peer bootstraps from a pruned peer's checkpoint and converges with
 
 	const acctA = mk();
 	const acctB = mk();
-	await oracle.postPrice(61000n, 0);
+	await setupMarket(oracle, 61000n);
 	await fund(acctA, 5000n);
 	await fund(acctB, 5000n);
 	await acctA.transfer(acctB.pubHex, 700n);
 	await mineOn(A); // a0 buries round 1
 	const F = await mineOn(A); // a1 → finalized(1) = a0 once a1 is tip; F's child exists
-	await oracle.postPrice(64000n, 1);
+	await oracle.report(MKT, 64000n, 1);
 	await acctA.transfer(acctB.pubHex, 50n);
 	await mineOn(A); // a2 (so a1 is now finalized and has a child)
 	await mineOn(A); // a3

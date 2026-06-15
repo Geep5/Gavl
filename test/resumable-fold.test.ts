@@ -16,7 +16,7 @@ import { Account } from "../src/market/account.ts";
 import { computeView, marketConserved } from "../src/market/btc.ts";
 import { viewRoot } from "../src/market/state.ts";
 import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
-import { PARAMS, K } from "./helpers.ts";
+import { PARAMS, K , MKT, setupMarket } from "./helpers.ts";
 
 let depN = 0;
 function setup() {
@@ -43,17 +43,17 @@ test("folding the tail onto the head's view equals folding the whole stream", as
 	const B = mk();
 	const C = mk();
 
-	await oracle.postPrice(61000n, 0);
+	await setupMarket(oracle, 61000n);
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 	await A.transfer(C.pubHex, 1000n);
-	await oracle.postPrice(62000n, 1);
-	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "10", expiryHeight: 100, nonce: "n1" });
+	await oracle.report(MKT, 62000n, 1);
+	const offer = A.makeOffer({ marketId: MKT, makerSide: "long", size: "1000", leverage: "10", expiryHeight: 100, nonce: "n1" });
 	const matchId = await B.matchOpen(offer, 1000n);
-	await oracle.postPrice(64000n, 2);
+	await oracle.report(MKT, 64000n, 2);
 	await mk().settle(matchId);
 	await C.transfer(B.pubHex, 200n);
-	await oracle.postPrice(63000n, 3);
+	await oracle.report(MKT, 63000n, 3);
 
 	const all = [...node.ledger.allWrites()].sort(cmpWrite);
 	const full = computeView(all);
@@ -75,7 +75,7 @@ test("resuming does not mutate the base view (deep copy)", async () => {
 	const { node, mk, oracle, fund } = setup();
 	const A = mk();
 	const B = mk();
-	await oracle.postPrice(61000n, 0);
+	await setupMarket(oracle, 61000n);
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 

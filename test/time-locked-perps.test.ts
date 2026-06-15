@@ -16,7 +16,7 @@ import { Account } from "../src/market/account.ts";
 import { computeView, gbtcOf, marketConserved } from "../src/market/btc.ts";
 import { CONTRACT_MAX_LIFE } from "../src/market/intent.ts";
 import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
-import { PARAMS, K } from "./helpers.ts";
+import { PARAMS, K , MKT, setupMarket } from "./helpers.ts";
 
 let depN = 0;
 function setup() {
@@ -35,11 +35,11 @@ test("a position auto-unwinds at entry once its time-lock elapses (no PnL — ba
 	const { node, mk, oracle, fund } = setup();
 	const A = mk(); // LONG (maker)
 	const B = mk(); // SHORT (taker)
-	await oracle.postPrice(61000n, 0);
+	await setupMarket(oracle, 61000n);
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 
-	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "10", expiryHeight: 10, nonce: "k1" });
+	const offer = A.makeOffer({ marketId: MKT, makerSide: "long", size: "1000", leverage: "10", expiryHeight: 10, nonce: "k1" });
 	const matchId = await B.matchOpen(offer, 1000n);
 	const born = new Map([[matchId, 5]]); // contract born at height 5 → expiry = 5 + CONTRACT_MAX_LIFE
 
@@ -51,7 +51,7 @@ test("a position auto-unwinds at entry once its time-lock elapses (no PnL — ba
 
 	// Price moves far past the cap, but expiry IGNORES the mark — it unwinds at entry so the
 	// settle price can't depend on a node's checkpoint position (the consensus-safe choice).
-	await oracle.postPrice(70000n, 1);
+	await oracle.report(MKT, 70000n, 1);
 	const expiry = 5 + CONTRACT_MAX_LIFE;
 	v = viewAt(node, born, expiry); // fold AT the expiry height
 	assert.equal(v.book.contracts.size, 0, "auto-unwound at the time-lock — no settle tx needed");
@@ -64,14 +64,14 @@ test("early close still works and pre-empts the time-lock", async () => {
 	const { node, mk, oracle, fund } = setup();
 	const A = mk();
 	const B = mk();
-	await oracle.postPrice(61000n, 0);
+	await setupMarket(oracle, 61000n);
 	await fund(A, 5000n);
 	await fund(B, 5000n);
-	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "10", expiryHeight: 10, nonce: "k2" });
+	const offer = A.makeOffer({ marketId: MKT, makerSide: "long", size: "1000", leverage: "10", expiryHeight: 10, nonce: "k2" });
 	const matchId = await B.matchOpen(offer, 1000n);
 	const born = new Map([[matchId, 5]]);
 
-	await oracle.postPrice(61000n, 1); // flat → both get their stake back
+	await oracle.report(MKT, 61000n, 1); // flat → both get their stake back
 	const settleW = await mk().settle(matchId); // closed EARLY (well before expiry)
 	born.set(settleW.id, 8);
 

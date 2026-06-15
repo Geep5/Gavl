@@ -15,11 +15,11 @@ import { emptyBook, signOffer, applyMatch, pruneExpiredOffers } from "../src/mar
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
-import { computeView, ORACLE_WINDOW } from "../src/market/btc.ts";
+import { computeView, mark, MARKET_STALE_AFTER } from "../src/market/btc.ts";
 import { oracleKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
 import { toHex } from "../src/det/canonical.ts";
-import { PARAMS, K } from "./helpers.ts";
+import { PARAMS, K, MKT, setupMarket } from "./helpers.ts";
 
 test("a deposit-claim marker is retired once the deposit mints, and not re-added", () => {
 	const s = emptyBridge();
@@ -59,7 +59,7 @@ test("offer fill-tracking is pruned once the offer can no longer be matched", ()
 	const bridge = emptyBridge();
 	addGbtc(bridge, maker, 1000n);
 	addGbtc(bridge, taker, 1000n);
-	const offer = signOffer({ maker, makerSide: "long", size: "500", leverage: "10", expiryHeight: 5, nonce: "x" }, mk.privateKey);
+	const offer = signOffer({ maker, marketId: "BTC-USD", makerSide: "long", size: "500", leverage: "10", expiryHeight: 5, nonce: "x" }, mk.privateKey);
 	const book = emptyBook();
 
 	const c = applyMatch(bridge, book, taker, "w1", offer, 100n, 3, 61000n); // matched at height 3 (≤ expiry)
@@ -73,18 +73,15 @@ test("offer fill-tracking is pruned once the offer can no longer be matched", ()
 	assert.equal(book.contracts.size, 1, "the contract it opened is untouched");
 });
 
-test("a stale oracle poster's reading is evicted from the freshness window", async () => {
+test("a market's mark goes stale once its reporter stops refreshing", async () => {
 	const node = new GavlNode(new Ledger(PARAMS));
 	let t = 0;
-	const now = () => ++t;
-	const A = new Account({ node, params: PARAMS, k: K, now, keypair: oracleKeyPair() });
-	const B = new Account({ node, params: PARAMS, k: K, now, keypair: generateKeyPair() });
+	const A = new Account({ node, params: PARAMS, k: K, now: () => ++t, keypair: oracleKeyPair() });
+	await setupMarket(A, 61000n); // create + report BTC-USD (reporter = A)
 
-	await A.postPrice(61000n, 0); // postCount → 1, A.at = 1
-	for (let i = 0; i < ORACLE_WINDOW; i++) await B.postPrice(62000n + BigInt(i), i); // postCount → 1 + WINDOW
-
-	const v = computeView(node.ledger.allWrites());
-	assert.equal(v.oracle.readings.has(A.pubHex), false, "A fell out of the window → evicted");
-	assert.equal(v.oracle.readings.has(B.pubHex), true, "B is fresh → kept");
-	assert.equal(v.oracle.price, 62000n + BigInt(ORACLE_WINDOW - 1), "mark = B's latest (only fresh poster)");
+	const born = new Map(node.ledger.allWrites().map((w) => [w.id, 0] as [string, number])); // reported at height 0
+	const v = computeView(node.ledger.allWrites(), { bornAt: born });
+	assert.equal(mark(v, MKT, MARKET_STALE_AFTER - 1), 61000n, "fresh within the staleness window");
+	assert.equal(mark(v, MKT, MARKET_STALE_AFTER), null, "stale once the reporter goes quiet past the bound");
+	assert.equal(mark(v, MKT), 61000n, "no staleness gate when nowHeight is omitted (last known price)");
 });

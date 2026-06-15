@@ -10,10 +10,11 @@
  * match/settle logic lives in ./intent.ts; this fold wires it (match.open / contract.
  * settle) alongside the gBTC bridge and the oracle.
  *
- * Oracle = DECENTRALIZED median, no special node. Every node posts its OWN signed
- * `oracle.post` reading; the fold takes the MEDIAN of recent posters as the mark.
- * Each node still folds the same on-chain posts → the same median (deterministic);
- * what's banned is each node using its *own* live fetch as the mark (that diverges).
+ * Pricing = a permissionless MARKET REGISTRY, not a vote. Anyone creates a market naming a public
+ * source (endpoint + key) and a single reporter; only that reporter posts the market's price, and
+ * the public endpoint keeps it auditable. The fold uses the POSTED price (deterministic); what's
+ * banned is a node using its own live fetch as the mark (that diverges). Trust is competed for at
+ * the market level — launch a rival market on the same source with a better reporter.
  */
 
 import type { Write } from "../chain/writer.ts";
@@ -21,7 +22,7 @@ import type { Op } from "./ops.ts";
 import { isOp } from "./ops.ts";
 import { finalizedOrdering, orderingFor } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
-import { oraclePubHex, bridgePubHex } from "./oracle.ts";
+import { bridgePubHex } from "./oracle.ts";
 import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
@@ -34,54 +35,36 @@ import { fromHex } from "../det/canonical.ts";
 
 // ── consensus constants (every node must agree) ──────────────────
 
-/** The default dev oracle pubkey. No longer an authority — the oracle is now a median of
- *  all posters — but kept as a convenient default poster identity (and for back-compat).
- *  Override the seed via GAVL_ORACLE_SEED. */
-export const BTC_ORACLE = oraclePubHex(process.env.GAVL_ORACLE_SEED);
-
 /** The BTC bridge attestor (committee) key. Only it may mint gBTC from a verified
  *  deposit or settle a withdrawal. v0 single signer; production = threshold committee. */
 export const BRIDGE_ATTESTOR = bridgePubHex(process.env.GAVL_BRIDGE_SEED);
 
-export interface OracleReading {
-	price: bigint;
-	seq: number; // per-poster monotonic (replay/ordering guard)
-	at: number; // global post index when folded (drives the recency window)
-}
-
-export interface OracleState {
-	/** The mark = MEDIAN of recent posters' latest readings; null until anyone posts. No
-	 *  single authority — every node posts its own reading and the median is the consensus. */
+/**
+ * A market — created permissionlessly by anyone, defining a single instrument and the PUBLIC
+ * source its price is drawn from. NOT a decentralized vote: the named `reporter` is the sole
+ * authority to post this market's price, and the public `endpoint` is the binding spec everyone can
+ * audit it against. Trust is competed for at the market level (launch a rival market with a better
+ * reporter/source), not aggregated per-price. The definition (endpoint/key/reporter) is immutable
+ * once created; only the price moves.
+ */
+export interface Market {
+	/** Public data source URL the price is drawn from (the binding, auditable definition). */
+	endpoint: string;
+	/** JSON key-path into the endpoint's response (e.g. "data.amount"). */
+	key: string;
+	/** The ONLY pubkey allowed to report this market's price. */
+	reporter: string;
+	/** Latest reported price (null until the reporter first posts). */
 	price: bigint | null;
-	/** Latest signed reading per poster (pubkey hex → reading). */
-	readings: Map<string, OracleReading>;
-	/** Count of oracle.post writes folded — a poster older than ORACLE_WINDOW posts is stale. */
-	postCount: number;
-	/** Disclosed methodology (latest from any poster) — transparency/audit, not authority. */
-	sources: { endpoint: string; key: string }[];
+	/** Reporter's monotonic seq — replay/ordering guard. */
+	seq: number;
+	/** Certified height of the last report — drives staleness checks. */
+	at: number;
 }
 
-/** How many recent posts define "fresh": a poster whose latest reading is older than this
- *  many folded posts drops out of the median, so departed/stale oracles stop counting. */
-export const ORACLE_WINDOW = 64;
-
-
-/** Drop readings that have fallen out of the freshness window — they no longer count toward
- *  the median, so this is behaviorally neutral, but it stops `readings` growing with every
- *  poster ever seen (a departed/rotated oracle's last reading lingered forever otherwise). */
-function evictStaleReadings(o: OracleState): void {
-	for (const [poster, r] of o.readings) if (o.postCount - r.at >= ORACLE_WINDOW) o.readings.delete(poster);
-}
-
-/** The median of the fresh posters' latest readings (even count → lower-mid average). */
-function medianMark(o: OracleState): bigint | null {
-	const fresh: bigint[] = [];
-	for (const r of o.readings.values()) if (o.postCount - r.at < ORACLE_WINDOW) fresh.push(r.price);
-	if (fresh.length === 0) return null;
-	fresh.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-	const mid = fresh.length >> 1;
-	return fresh.length % 2 === 1 ? fresh[mid] : (fresh[mid - 1] + fresh[mid]) / 2n;
-}
+/** Reports older than this many anchors are STALE — a market won't match/settle on a price the
+ *  reporter stopped refreshing, so a dead source can't freeze trades at an old number. */
+export const MARKET_STALE_AFTER = 4_320; // ~3 days at 60s/anchor
 
 export interface CustodyState {
 	/** The threshold-custody fund's group key (hex), or null until genesis announces it.
@@ -95,7 +78,8 @@ export interface View {
 	/** The BTC bridge: gBTC balances + BTC reserves + processed deposits + pending
 	 *  withdrawals. gBTC is the collateral — a 1:1 claim on real Bitcoin in the fund. */
 	bridge: BridgeState;
-	oracle: OracleState;
+	/** Permissionless market registry: marketId → its definition + latest reported price. */
+	markets: Map<string, Market>;
 	/** The threshold-custody fund key, announced on-chain at genesis (committee mode). */
 	custody: CustodyState;
 	/** The peer-to-peer intent market: bilateral matched contracts + offer-fill tracking.
@@ -253,7 +237,7 @@ export function cloneView(v: View): View {
 			pot: b.pot,
 			potEscrowTaken: b.potEscrowTaken,
 		},
-		oracle: { price: v.oracle.price, readings: cp(v.oracle.readings), postCount: v.oracle.postCount, sources: v.oracle.sources.map((s) => ({ ...s })) },
+		markets: cp(v.markets),
 		custody: { fundKey: v.custody.fundKey, epoch: v.custody.epoch },
 		book: { contracts: cp(v.book.contracts), offerFills: cp(v.book.offerFills) },
 	};
@@ -265,7 +249,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 		? cloneView(opts.base) // deep copy so the cached/snapshot base isn't mutated
 		: {
 				bridge: emptyBridge(),
-				oracle: { price: null, readings: new Map(), postCount: 0, sources: [] },
+				markets: new Map(),
 				custody: { fundKey: null, epoch: -1 },
 				book: emptyBook(),
 			};
@@ -287,15 +271,19 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
 	settleExpired(view.bridge, view.book, nowHeight); // time-locked perps unwind at entry (base-independent)
 	accrueDemurrage(view, nowHeight); // idle gBTC bleeds to capital working in open contracts
-	evictStaleReadings(view.oracle); // drop posters that fell out of the freshness window
 	pruneExpiredOffers(view.book, nowHeight); // drop fill-tracking for offers that can no longer be matched
 	pruneStaleClaims(view.bridge, nowHeight); // retire deposit-mint requests unminted past the reclaim grace
 	return view;
 }
 
-/** Mark price for an instrument = the oracle price (or null until first post). */
-export function mark(view: View): bigint | null {
-	return view.oracle.price;
+/** Mark price for a market = its reporter's latest price, or null if the market is unknown,
+ *  unpriced, or STALE (reporter stopped refreshing past MARKET_STALE_AFTER). `nowHeight` gates
+ *  staleness; pass the write's certified height so it's base-independent (omit → no stale check). */
+export function mark(view: View, marketId: string, nowHeight?: number): bigint | null {
+	const m = view.markets.get(marketId);
+	if (!m || m.price === null) return null;
+	if (nowHeight !== undefined && nowHeight - m.at >= MARKET_STALE_AFTER) return null; // source went dark
+	return m.price;
 }
 
 /**
@@ -372,22 +360,28 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			completeWithdrawal(view.bridge, op.withdrawalId);
 			return;
 		}
-		case "oracle.post": {
-			// ANY node posts its OWN reading (poster = the writer). Per-poster monotonic seq
-			// guards replay; the mark is the MEDIAN of recent posters — no single authority.
-			const price = parseAmount(op.price);
-			if (price === null || typeof op.seq !== "number") return;
-			const prev = view.oracle.readings.get(w.writer);
-			if (prev && op.seq <= prev.seq) return; // stale/replayed from this poster
-			view.oracle.postCount++;
-			view.oracle.readings.set(w.writer, { price, seq: op.seq, at: view.oracle.postCount });
-			view.oracle.price = medianMark(view.oracle);
+		case "market.create": {
+			// Permissionless market creation. FIRST write per id wins and is IMMUTABLE — the
+			// endpoint/key/reporter that define where the price comes from can never be changed
+			// (you'd launch a new market instead). Anyone may create one (PoST-gated like any write).
+			if (typeof op.id !== "string" || op.id.length === 0 || op.id.length > 64) return;
+			if (typeof op.endpoint !== "string" || typeof op.key !== "string" || !/^[0-9a-f]{64}$/i.test(op.reporter ?? "")) return;
+			if (view.markets.has(op.id)) return; // id taken → immutable, ignore
+			view.markets.set(op.id, { endpoint: op.endpoint, key: op.key, reporter: op.reporter, price: null, seq: -1, at: bornHeight });
 			return;
 		}
-		case "oracle.meta": {
-			// Any poster discloses its sources on-chain (latest-wins) — transparency, not authority.
-			if (!Array.isArray(op.sources)) return;
-			view.oracle.sources = op.sources.filter((s) => s && typeof s.endpoint === "string" && typeof s.key === "string").map((s) => ({ endpoint: s.endpoint, key: s.key }));
+		case "market.report": {
+			// ONLY the market's named reporter may post its price. Not a vote — the public endpoint
+			// is what keeps the reporter honest (anyone can audit), and rival markets can out-compete
+			// a bad one. Per-reporter monotonic seq guards replay.
+			const price = parseAmount(op.price);
+			const mk = typeof op.marketId === "string" ? view.markets.get(op.marketId) : undefined;
+			if (price === null || typeof op.seq !== "number" || !mk) return;
+			if (w.writer !== mk.reporter) return; // not the authorized source for this market
+			if (op.seq <= mk.seq) return; // stale/replayed
+			mk.price = price;
+			mk.seq = op.seq;
+			mk.at = bornHeight; // certified height → deterministic staleness
 			return;
 		}
 		case "custody.fund": {
@@ -407,33 +401,35 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			// stake right now — a maker who ghosted (spent the funds) simply no-ops. This is
 			// the zero-sum, protocol-is-never-counterparty path that can't deplete reserves.
 			const fill = parseAmount(op.fill);
-			const m = mark(view);
-			if (fill === null || m === null) return; // need an oracle mark for the entry price
-			// Timing uses the write's STABLE certified height (bornHeight), like unbond — so
-			// offer expiry / settle-window don't drift as the global tip advances on replay.
-			// Entry = the current oracle mark.
+			// Entry = the offer's MARKET mark (per-market reported price), at the write's stable
+			// certified height so expiry/staleness don't drift on replay.
+			const m = op.offer && typeof op.offer.marketId === "string" ? mark(view, op.offer.marketId, bornHeight) : null;
+			if (fill === null || m === null) return; // unknown/stale/unpriced market → no entry
 			applyMatch(view.bridge, view.book, w.writer, w.id, op.offer, fill, bornHeight, m);
 			return;
 		}
 		case "match.pot": {
-			// Open against the liquidity backstop: the pot takes the opposite side at the mark,
-			// staking from finalized pot capital. available = the finalized budget minus what the
-			// pot has already drawn (deterministic; keeps the free pot ≥ 0). Entry = the mark.
+			// Open against the liquidity backstop: the pot takes the opposite side at the market's
+			// mark, staking from finalized pot capital. available = the finalized budget minus what
+			// the pot has already drawn (deterministic; keeps the free pot ≥ 0).
 			const fill = parseAmount(op.fill);
 			const lev = parseAmount(op.leverage);
-			const m = mark(view);
+			const m = typeof op.marketId === "string" ? mark(view, op.marketId, bornHeight) : null;
 			if (fill === null || lev === null || m === null) return;
 			if (op.side !== "long" && op.side !== "short") return;
 			const available = backstopBudget - view.bridge.potEscrowTaken;
-			applyMatchPot(view.bridge, view.book, w.writer, w.id, op.side as Side, fill, lev, bornHeight, m, available);
+			applyMatchPot(view.bridge, view.book, w.writer, w.id, op.marketId, op.side as Side, fill, lev, bornHeight, m, available);
 			return;
 		}
 		case "contract.settle": {
-			// Permissionless close: split the 2·stake pot at the current oracle mark per the
-			// directional payoff. Perpetual — either side may close any time; the loser can't
-			// dodge the mark by stalling (the winner just closes it).
-			const m = mark(view);
-			if (m === null || typeof op.contractId !== "string") return;
+			// Permissionless close: split the 2·stake pot at the contract's MARKET mark per the
+			// directional payoff. Perpetual — either side may close any time; the loser can't dodge
+			// the mark by stalling (the winner just closes it).
+			if (typeof op.contractId !== "string") return;
+			const c = view.book.contracts.get(op.contractId);
+			if (!c) return;
+			const m = mark(view, c.marketId, bornHeight);
+			if (m === null) return; // market gone dark → can't settle at a trustworthy price (auto-unwinds at expiry)
 			applySettle(view.bridge, view.book, op.contractId, m, bornHeight);
 			return;
 		}

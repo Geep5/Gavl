@@ -20,7 +20,7 @@ import { sha256Hex, canonicalize } from "../det/canonical.ts";
 import type { View } from "./btc.ts";
 import { emptyBridge } from "../custody/bridge.ts";
 import type { BridgeState, PendingWithdrawal } from "../custody/bridge.ts";
-import type { OracleState, OracleReading, CustodyState } from "./btc.ts";
+import type { Market, CustodyState } from "./btc.ts";
 import { emptyBook } from "./intent.ts";
 import type { MarketBook, Contract } from "./intent.ts";
 
@@ -45,21 +45,16 @@ export interface CanonBridge {
 	potEscrowTaken: string; // lifetime pot capital staked as backstop (budget counter)
 }
 
-export interface CanonOracle {
-	price: string | null;
-	readings: Entry<{ price: string; seq: number; at: number }>[]; // poster → reading, sorted
-	postCount: number;
-	sources: { endpoint: string; key: string }[]; // latest disclosed, fold order
-}
+export type CanonMarket = { endpoint: string; key: string; reporter: string; price: string | null; seq: number; at: number };
 
 export interface CanonBook {
-	contracts: Entry<{ id: string; long: string; short: string; stake: string; entry: string; leverage: string; nonce: string; expiryHeight: number }>[]; // sorted by id
+	contracts: Entry<{ id: string; marketId: string; long: string; short: string; stake: string; entry: string; leverage: string; nonce: string; expiryHeight: number }>[]; // sorted by id
 	offerFills: Entry<{ filled: string; expiryHeight: number }>[]; // nonce → {filled sats, expiry}, sorted
 }
 
 export interface CanonState {
 	bridge: CanonBridge;
-	oracle: CanonOracle;
+	markets: Entry<CanonMarket>[]; // marketId → definition + latest price, sorted by id
 	custody: CustodyState; // already plain (string|null, number)
 	book: CanonBook;
 }
@@ -100,18 +95,13 @@ function serializeBridge(b: BridgeState): CanonBridge {
 	};
 }
 
-function serializeOracle(o: OracleState): CanonOracle {
-	return {
-		price: o.price === null ? null : o.price.toString(),
-		readings: mapEntries(o.readings, (r) => ({ price: r.price.toString(), seq: r.seq, at: r.at })),
-		postCount: o.postCount,
-		sources: o.sources.map((s) => ({ endpoint: s.endpoint, key: s.key })),
-	};
+function serializeMarkets(markets: Map<string, Market>): Entry<CanonMarket>[] {
+	return mapEntries(markets, (m) => ({ endpoint: m.endpoint, key: m.key, reporter: m.reporter, price: m.price === null ? null : m.price.toString(), seq: m.seq, at: m.at }));
 }
 
 function serializeBook(book: MarketBook): CanonBook {
 	return {
-		contracts: mapEntries(book.contracts, (c) => ({ id: c.id, long: c.long, short: c.short, stake: c.stake.toString(), entry: c.entry.toString(), leverage: c.leverage.toString(), nonce: c.nonce, expiryHeight: c.expiryHeight })),
+		contracts: mapEntries(book.contracts, (c) => ({ id: c.id, marketId: c.marketId, long: c.long, short: c.short, stake: c.stake.toString(), entry: c.entry.toString(), leverage: c.leverage.toString(), nonce: c.nonce, expiryHeight: c.expiryHeight })),
 		offerFills: mapEntries(book.offerFills, (f) => ({ filled: f.filled.toString(), expiryHeight: f.expiryHeight })),
 	};
 }
@@ -119,7 +109,7 @@ function serializeBook(book: MarketBook): CanonBook {
 export function serializeView(view: View): CanonState {
 	return {
 		bridge: serializeBridge(view.bridge),
-		oracle: serializeOracle(view.oracle),
+		markets: serializeMarkets(view.markets),
 		custody: { fundKey: view.custody.fundKey, epoch: view.custody.epoch },
 		book: serializeBook(view.book),
 	};
@@ -151,15 +141,15 @@ function deserializeBridge(b: CanonBridge): BridgeState {
 	return s;
 }
 
-function deserializeOracle(o: CanonOracle): OracleState {
-	const readings = new Map<string, OracleReading>();
-	for (const [k, r] of o.readings) readings.set(k, { price: BigInt(r.price), seq: r.seq, at: r.at });
-	return { price: o.price === null ? null : BigInt(o.price), readings, postCount: o.postCount, sources: o.sources.map((s) => ({ endpoint: s.endpoint, key: s.key })) };
+function deserializeMarkets(entries: Entry<CanonMarket>[]): Map<string, Market> {
+	const m = new Map<string, Market>();
+	for (const [id, x] of entries) m.set(id, { endpoint: x.endpoint, key: x.key, reporter: x.reporter, price: x.price === null ? null : BigInt(x.price), seq: x.seq, at: x.at });
+	return m;
 }
 
 function deserializeBook(b: CanonBook): MarketBook {
 	const book = emptyBook();
-	for (const [id, c] of b.contracts) book.contracts.set(id, { id: c.id, long: c.long, short: c.short, stake: BigInt(c.stake), entry: BigInt(c.entry), leverage: BigInt(c.leverage), nonce: c.nonce, expiryHeight: c.expiryHeight } as Contract);
+	for (const [id, c] of b.contracts) book.contracts.set(id, { id: c.id, marketId: c.marketId, long: c.long, short: c.short, stake: BigInt(c.stake), entry: BigInt(c.entry), leverage: BigInt(c.leverage), nonce: c.nonce, expiryHeight: c.expiryHeight } as Contract);
 	for (const [k, f] of b.offerFills) book.offerFills.set(k, { filled: BigInt(f.filled), expiryHeight: f.expiryHeight });
 	return book;
 }
@@ -167,7 +157,7 @@ function deserializeBook(b: CanonBook): MarketBook {
 export function deserializeView(s: CanonState): View {
 	return {
 		bridge: deserializeBridge(s.bridge),
-		oracle: deserializeOracle(s.oracle),
+		markets: deserializeMarkets(s.markets),
 		custody: { fundKey: s.custody.fundKey, epoch: s.custody.epoch },
 		book: deserializeBook(s.book),
 	};

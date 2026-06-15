@@ -84,61 +84,34 @@ const daemon = new Daemon({
 function serializeState() {
 	const view = daemon.view(); // optimistic tip — reflects actions immediately
 	const me = daemon.wallet.active().pubHex;
-	const m = mark(view); // the BTC oracle price (null until first post)
+	const defaultMarketId = process.env.GAVL_MARKET_ID ?? "BTC-USD";
+	const m = mark(view, defaultMarketId); // the default (BTC) market's reported price, null until reported
 
 	// gBTC balances: { pubkey: amount } (1:1 claims on BTC in the custody fund)
 	const gbtc: Record<string, string> = {};
 	for (const [pubkey, amt] of view.bridge.gbtc) gbtc[pubkey] = amt.toString();
 
-	// The oracle(s) this market depends on — the price-authority, hence the v1 trust
-	// point, surfaced explicitly. A LIST (future-proof for the multi-oracle design),
-	// though v1 ships exactly one: the BTC price oracle both instruments mark against.
-	// Provenance shown to clients. The METHODOLOGY (endpoints + keys) is disclosed
-	// ON-CHAIN by the oracle (view.oracle.sources) so EVERY client sees it. The live
-	// RAW values are publisher-local (only the node that fetches has them) and merged
-	// in by endpoint when present.
-	const disclosed = view.oracle.sources; // [{endpoint, key}] folded from oracle.meta — all clients
-	const live = daemon.oracleSource(); // publisher-only live readings (raw values)
-	let source: unknown = null;
-	if (disclosed.length > 0) {
-		source = {
-			onChain: true,
-			method: `average of ${disclosed.length} source${disclosed.length === 1 ? "" : "s"}`,
-			ageMs: live ? Date.now() - live.at : null,
-			feeds: disclosed.map((d) => {
-				const r = live?.readings.find((x) => x.endpoint === d.endpoint);
-				return { endpoint: d.endpoint, key: d.key, raw: r?.raw ?? null, value: r?.value != null ? r.value.toString() : null, error: r?.error ?? null };
-			}),
-		};
-	} else if (live) {
-		// publisher running but hasn't disclosed on-chain yet (e.g. fixed dev price)
-		source = {
-			onChain: false,
-			method: live.method,
-			ageMs: Date.now() - live.at,
-			feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })),
-		};
-	}
-	const posters = view.oracle.readings.size; // how many nodes have posted readings
-	const oracles = [
-		{
-			id: "BTC/USD", // a label — the mark is a MEDIAN across posters, not one key
-			label: "BTC / USD price",
-			feeds: ["BTC-BULL", "BTC-BEAR"], // which instruments it prices
-			price: m != null ? m.toString() : null,
-			posters, // independent nodes posting prices (median of these)
-			live: m != null,
-			source, // { onChain, method, ageMs, feeds:[{endpoint,key,raw,value,error}] } | null
-		},
-	];
+	// The market registry: each market names a PUBLIC source (endpoint + key) and the SINGLE
+	// reporter authorized to post its price — not a vote. The endpoint is the binding, auditable
+	// definition; anyone can launch a rival market on the same source with a better reporter.
+	const live = daemon.oracleSource(); // this node's own live feed readings (raw), if it's a reporter
+	const markets = [...view.markets.entries()].map(([id, mk]) => ({
+		id,
+		endpoint: mk.endpoint,
+		key: mk.key,
+		reporter: mk.reporter,
+		price: mk.price != null ? mk.price.toString() : null,
+		// live raw feed shown only on the node that reports this market (publisher-local)
+		source: mk.reporter === me && live ? { method: live.method, ageMs: Date.now() - live.at, feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })) } : null,
+	}));
 
 	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)
 	const onChainR = rsv != null ? rsv.sats : null;
 	const market = {
-		oracle: "median", // mechanism: median of all posters, no single authority
-		oracles,
+		oracle: "per-market reporter", // mechanism: each market names one reporter + a public source
+		markets,
 		price: m != null ? m.toString() : null,
-		oraclePosters: posters,
+		defaultMarketId,
 		maxLeverage: Number(MAX_LEVERAGE),
 		// collateral = gBTC, a 1:1 claim on BTC in the custody fund
 		myGbtc: gbtcOf(view, me).toString(),
@@ -272,34 +245,40 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			if (amt === null) throw new Error("amount must be a positive integer");
 			return send(res, 200, { id: await daemon.unbondCustody(amt) });
 		}
-		if (path === "/api/oracle/post") {
-			// Post this account's own signed BTC reading (any node may; the mark is the median).
-			await daemon.active().postPrice(String(body.price), Number(body.seq));
+		if (path === "/api/market/create") {
+			// Create a market: name its public source (endpoint + JSON key) + the sole reporter.
+			await daemon.active().createMarket(String(body.id), String(body.endpoint ?? ""), String(body.key ?? ""), body.reporter ? String(body.reporter) : undefined);
+			return send(res, 200, { ok: true });
+		}
+		if (path === "/api/market/report") {
+			// Post a market's price (accepted only if this account is that market's reporter).
+			await daemon.active().report(String(body.marketId), String(body.price), Number(body.seq));
 			return send(res, 200, { ok: true });
 		}
 		// ── peer-to-peer matched market (the real product: no pool, real counterparty) ──
 		if (path === "/api/intent/broadcast") {
 			// Post a non-binding signed intent to the tape. Nothing is escrowed yet.
-			if (mark(daemon.view()) === null) throw new Error("no oracle price yet — wait for the oracle's first post");
+			const mktId = String(body.marketId ?? process.env.GAVL_MARKET_ID ?? "BTC-USD");
+			if (mark(daemon.view(), mktId) === null) throw new Error(`market ${mktId} has no reported price yet`);
 			const side = body.side === "short" ? "short" : "long";
 			const lev = parseAmount(String(body.leverage ?? "2"));
 			if (lev === null || !leverageOk(lev)) throw new Error(`leverage must be a whole number from 2 to ${MAX_LEVERAGE}`);
 			requireSpendable(String(body.size), "size"); // advisory: be able to back it when taken
-			const offer = daemon.broadcastIntent(side, String(body.size), String(body.leverage ?? "2"));
+			const offer = daemon.broadcastIntent(side, String(body.size), String(body.leverage ?? "2"), mktId);
 			return send(res, 200, { nonce: offer.nonce });
 		}
 		if (path === "/api/intent/take") {
 			// Take a specific resting intent → opens a matched contract (you get the opposite side).
-			if (mark(daemon.view()) === null) throw new Error("no oracle price yet");
 			const id = await daemon.takeIntent(String(body.nonce), body.fill != null ? String(body.fill) : undefined);
 			return send(res, 200, { id });
 		}
 		if (path === "/api/intent/take-position") {
-			// Easy taker: go long/short by size, sweeping the best opposite intents.
-			if (mark(daemon.view()) === null) throw new Error("no oracle price yet");
+			// Easy taker: go long/short by size, sweeping the best opposite intents (+ backstop).
+			const mktId = String(body.marketId ?? process.env.GAVL_MARKET_ID ?? "BTC-USD");
+			if (mark(daemon.view(), mktId) === null) throw new Error(`market ${mktId} has no reported price yet`);
 			const side = body.side === "short" ? "short" : "long";
 			requireSpendable(String(body.size), "size");
-			const r = await daemon.takePosition(side, String(body.size));
+			const r = await daemon.takePosition(side, String(body.size), String(body.leverage ?? "2"), mktId);
 			return send(res, 200, r);
 		}
 		if (path === "/api/contract/settle") {

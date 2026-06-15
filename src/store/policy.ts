@@ -55,11 +55,11 @@ export class MinePolicy implements PersistPolicy {
 		const op = ctx.op;
 		if (!op) return false;
 		switch (op.kind) {
-			case "oracle.post":
-			case "oracle.meta":
+			case "market.create":
+			case "market.report":
 			case "bridge.deposit":
 			case "bridge.settle":
-				return true; // price/methodology + bridge mint/settle are shared infra — always keep
+				return true; // market defs/prices + bridge mint/settle are shared infra — always keep
 			case "gbtc.transfer":
 				return this.keys.has(op.to);
 			case "bridge.withdraw":

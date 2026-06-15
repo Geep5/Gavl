@@ -44,8 +44,8 @@ function makeView(rev = false): View {
 
 	const book = emptyBook();
 	const contracts: [string, any][] = [
-		["c1", { id: "c1", long: "aa", short: "bb", stake: 100n, entry: 61000n, leverage: 10n, nonce: "n1", expiryHeight: 43205 }],
-		["c2", { id: "c2", long: "cc", short: "aa", stake: 5n, entry: 62000n, leverage: 5n, nonce: "n2", expiryHeight: 43210 }],
+		["c1", { id: "c1", marketId: "BTC-USD", long: "aa", short: "bb", stake: 100n, entry: 61000n, leverage: 10n, nonce: "n1", expiryHeight: 43205 }],
+		["c2", { id: "c2", marketId: "ETH-USD", long: "cc", short: "aa", stake: 5n, entry: 62000n, leverage: 5n, nonce: "n2", expiryHeight: 43210 }],
 	];
 	const fills: [string, { filled: bigint; expiryHeight: number }][] = [["n1", { filled: 100n, expiryHeight: 50 }], ["n2", { filled: 5n, expiryHeight: 60 }], ["n3", { filled: 250n, expiryHeight: 70 }]];
 	for (const [k, v] of order(contracts)) book.contracts.set(k, v);
@@ -53,15 +53,10 @@ function makeView(rev = false): View {
 
 	return {
 		bridge,
-		oracle: {
-			price: 61500n,
-			readings: new Map(order([
-				["p1", { price: 61000n, seq: 3, at: 10 }],
-				["p2", { price: 62000n, seq: 1, at: 11 }],
-			] as [string, any][])),
-			postCount: 12,
-			sources: [{ endpoint: "https://a", key: "x" }, { endpoint: "https://b", key: "y" }],
-		},
+		markets: new Map(order([
+			["BTC-USD", { endpoint: "https://a", key: "price", reporter: "aa", price: 61500n, seq: 3, at: 10 }],
+			["ETH-USD", { endpoint: "https://b", key: "amount", reporter: "cc", price: 3200n, seq: 1, at: 11 }],
+		] as [string, any][])),
 		custody: { fundKey: "deadbeef", epoch: 0 },
 		book,
 	};
@@ -86,7 +81,7 @@ test("deserialize restores bigints / Maps / Sets as native types", () => {
 	assert.equal(typeof back.bridge.reserves, "bigint");
 	assert.ok(back.bridge.processed.has("dep1:0"));
 	assert.equal(back.book.contracts.get("c1")?.stake, 100n);
-	assert.equal(back.oracle.readings.get("p2")?.price, 62000n);
+	assert.equal(back.markets.get("BTC-USD")?.price, 61500n);
 	assert.equal(back.bridge.pending[0].id, "burn1", "pending FIFO order preserved");
 });
 
@@ -98,7 +93,7 @@ test("a single changed balance changes the root", () => {
 });
 
 test("empty view has a stable, defined root", () => {
-	const empty: View = { bridge: emptyBridge(), oracle: { price: null, readings: new Map(), postCount: 0, sources: [] }, custody: { fundKey: null, epoch: -1 }, book: emptyBook() };
+	const empty: View = { bridge: emptyBridge(), markets: new Map(), custody: { fundKey: null, epoch: -1 }, book: emptyBook() };
 	assert.equal(viewRoot(empty), viewRoot(empty));
 	assert.match(viewRoot(empty), /^[0-9a-f]{64}$/);
 });

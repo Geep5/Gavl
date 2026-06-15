@@ -109,15 +109,16 @@ export class Account {
 		return this.produce({ kind: "bridge.settle", withdrawalId, sig });
 	}
 
-	/** Post THIS node's signed BTC price reading. Any node may post its own; the mark is
-	 *  the median of recent posters. `seq` is per-poster monotonic. */
-	postPrice(price: bigint | number | string, seq: number): Promise<Write> {
-		return this.produce({ kind: "oracle.post", price: amountStr(price), seq });
+	/** Create a market (permissionless, first-wins, immutable): name its public price source
+	 *  (`endpoint` + JSON `key`) and the sole `reporter` pubkey (defaults to this identity). */
+	createMarket(id: string, endpoint: string, key: string, reporter?: string): Promise<Write> {
+		return this.produce({ kind: "market.create", id, endpoint, key, reporter: reporter ?? this.pubHex });
 	}
 
-	/** Disclose this poster's source methodology on-chain (transparency; latest-wins). */
-	postMeta(sources: { endpoint: string; key: string }[]): Promise<Write> {
-		return this.produce({ kind: "oracle.meta", sources });
+	/** Post a market's price. Only accepted if THIS identity is that market's reporter.
+	 *  `seq` is per-reporter monotonic. */
+	report(marketId: string, price: bigint | number | string, seq: number): Promise<Write> {
+		return this.produce({ kind: "market.report", marketId, price: amountStr(price), seq });
 	}
 
 	/** Announce the threshold-custody fund's group key on-chain (genesis). First write
@@ -141,8 +142,8 @@ export class Account {
 	/** Open a position directly against the liquidity BACKSTOP — no peer maker needed. The pot
 	 *  (idle-decay pool) takes the opposite side at the mark, capped by its finalized budget.
 	 *  Returns the contract id (= this write's id). */
-	async takePot(side: Side, fill: bigint | number | string, leverage: bigint | number | string): Promise<string> {
-		return (await this.produce({ kind: "match.pot", side, fill: amountStr(fill), leverage: amountStr(leverage) })).id;
+	async takePot(marketId: string, side: Side, fill: bigint | number | string, leverage: bigint | number | string): Promise<string> {
+		return (await this.produce({ kind: "match.pot", marketId, side, fill: amountStr(fill), leverage: amountStr(leverage) })).id;
 	}
 
 	/** Settle a matured matched contract at the current oracle mark (permissionless). */

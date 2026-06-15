@@ -22,7 +22,7 @@ import { viewAtAnchor, marketConserved } from "../src/market/btc.ts";
 import { viewRoot } from "../src/market/state.ts";
 import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver } from "./helpers.ts";
+import { PARAMS, K, STANDIN_VERIFIER, standinProver , MKT, setupMarket } from "./helpers.ts";
 
 let depN = 0;
 
@@ -52,20 +52,20 @@ test("a checkpoint-pruned node folds forward to the same state + appRoot as a fu
 	const C = mk();
 
 	// ── activity round 1, then an anchor ──
-	await oracle.postPrice(61000n, 0);
+	await setupMarket(oracle, 61000n);
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 	await A.transfer(C.pubHex, 500n);
-	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "10", expiryHeight: 1_000_000, nonce: "n1" });
+	const offer = A.makeOffer({ marketId: MKT, makerSide: "long", size: "1000", leverage: "10", expiryHeight: 1_000_000, nonce: "n1" });
 	const matchId = await B.matchOpen(offer, 1000n);
 	const a1 = await mine();
 
 	// ── activity round 2, then anchors ──
-	await oracle.postPrice(64000n, 1);
+	await oracle.report(MKT, 64000n, 1);
 	await mk().settle(matchId); // permissionless settle
 	await A.transfer(B.pubHex, 100n);
 	await mine(); // a2
-	await oracle.postPrice(63000n, 2);
+	await oracle.report(MKT, 63000n, 2);
 	const a3 = await mine();
 
 	const allWrites = node.ledger.allWrites();
