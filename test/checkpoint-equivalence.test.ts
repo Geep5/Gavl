@@ -22,7 +22,7 @@ import { viewAtAnchor, marketConserved } from "../src/market/btc.ts";
 import { viewRoot } from "../src/market/state.ts";
 import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver , MKT, setupMarket } from "./helpers.ts";
+import { PARAMS, K, STANDIN_VERIFIER, standinProver , setupMarket, MARKET_REPORTER } from "./helpers.ts";
 
 let depN = 0;
 
@@ -56,39 +56,39 @@ test("a checkpoint-pruned node folds forward to the same state + appRoot as a fu
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 	await A.transfer(C.pubHex, 500n);
-	const offer = A.makeOffer({ marketId: MKT, makerSide: "long", size: "1000", leverage: "10", expiryHeight: 1_000_000, nonce: "n1" });
+	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "10", expiryHeight: 1_000_000, nonce: "n1" });
 	const matchId = await B.matchOpen(offer, 1000n);
 	const a1 = await mine();
 
 	// ── activity round 2, then anchors ──
-	await oracle.report(MKT, 64000n, 1);
+	await oracle.report(64000n, 1);
 	await mk().settle(matchId); // permissionless settle
 	await A.transfer(B.pubHex, 100n);
 	await mine(); // a2
-	await oracle.report(MKT, 63000n, 2);
+	await oracle.report(63000n, 2);
 	const a3 = await mine();
 
 	const allWrites = node.ledger.allWrites();
 
 	// FULL node: state at the latest anchor, folding all history.
-	const full = viewAtAnchor(allWrites, chain, a3.id);
+	const full = viewAtAnchor(allWrites, chain, a3.id, undefined, MARKET_REPORTER);
 	assert.ok(marketConserved(full), "full-node state conserves");
 
 	// PRUNED node: checkpoint at a1. It keeps a1's committed state as the base and only the
 	// writes ABOVE a1's certified heads; it has dropped everything a1 covered.
 	const ckptHeads: Heads = chain.headsAt(a1.id);
-	const base = viewAtAnchor(allWrites, chain, a1.id);
+	const base = viewAtAnchor(allWrites, chain, a1.id, undefined, MARKET_REPORTER);
 	const tail = allWrites.filter((w) => {
 		const h = ckptHeads[w.writer];
 		return h === undefined || w.seq > h.seq; // strictly post-checkpoint
 	});
 	assert.ok(tail.length < allWrites.length, "checkpoint must actually drop some writes");
 
-	const pruned = viewAtAnchor(tail, chain, a3.id, base);
+	const pruned = viewAtAnchor(tail, chain, a3.id, base, MARKET_REPORTER);
 
 	assert.equal(viewRoot(pruned), viewRoot(full), "pruned node's state root diverged from the full node");
 	assert.ok(marketConserved(pruned), "pruned-node state conserves");
 
 	// And at the checkpoint anchor's child too (appRoot is lag-by-parent → exercises a3's appRoot).
-	assert.equal(viewRoot(viewAtAnchor(tail, chain, anchors[1].id, base)), viewRoot(viewAtAnchor(allWrites, chain, anchors[1].id)), "pruned == full at the intermediate anchor as well");
+	assert.equal(viewRoot(viewAtAnchor(tail, chain, anchors[1].id, base, MARKET_REPORTER)), viewRoot(viewAtAnchor(allWrites, chain, anchors[1].id, undefined, MARKET_REPORTER)), "pruned == full at the intermediate anchor as well");
 });

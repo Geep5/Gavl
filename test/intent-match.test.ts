@@ -36,7 +36,6 @@ function conserved(bridge: BridgeState, book: MarketBook): boolean {
 function offer(maker: ReturnType<typeof acct>, over: Partial<OfferCore> = {}) {
 	const core: OfferCore = {
 		maker: maker.pub,
-		marketId: "BTC-USD",
 		makerSide: "long",
 		size: "1000",
 		leverage: "2",

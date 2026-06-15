@@ -8,15 +8,17 @@ import { StandinSpaceProver, StandinSpaceVerifier } from "../src/consensus/space
 import type { SpaceProver } from "../src/consensus/space.ts";
 import type { KeyPair } from "../src/det/ed25519.ts";
 import type { Account } from "../src/market/account.ts";
+import { oraclePubHex } from "../src/market/oracle.ts";
 
-/** Default market id used across market/intent tests. */
-export const MKT = "BTC-USD";
+/** The reporter the test `oracle` account (oracleKeyPair) reports as — pass to computeView as
+ *  `{ reporter: MARKET_REPORTER }` so its market.report writes are authorized in the fold. */
+export const MARKET_REPORTER = oraclePubHex();
 
-/** Stand up the default test market (reporter = `oracle`) and report a price. Replaces the old
- *  median oracle's postPrice: a market names a public source + one reporter, then reports. */
-export async function setupMarket(oracle: Account, price: bigint, seq = 0, id: string = MKT): Promise<void> {
-	await oracle.createMarket(id, "https://test.example/" + id, "price", oracle.pubHex);
-	await oracle.report(id, price, seq);
+/** Report a price for the channel's market as `oracle`. A channel IS a market: the reporter is
+ *  fixed by the channel name, so the FOLD must be told who it is — pass `{ reporter: oracle.pubHex }`
+ *  to computeView. (`MARKET_REPORTER` is a convenience for tests that hardcode it.) */
+export async function setupMarket(oracle: Account, price: bigint, seq = 0): Promise<void> {
+	await oracle.report(price, seq);
 }
 
 /** Low difficulty so multi-write, multi-node tests stay quick. */

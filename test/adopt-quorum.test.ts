@@ -24,7 +24,7 @@ import type { View } from "../src/market/btc.ts";
 import type { StoredSnapshot } from "../src/store/store.ts";
 import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver , MKT, setupMarket } from "./helpers.ts";
+import { PARAMS, K, STANDIN_VERIFIER, standinProver , setupMarket } from "./helpers.ts";
 
 let depN = 0;
 

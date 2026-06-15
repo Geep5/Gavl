@@ -21,7 +21,7 @@ import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
 import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
-import { PARAMS, K, MKT, setupMarket } from "./helpers.ts";
+import { PARAMS, K, MARKET_REPORTER, setupMarket } from "./helpers.ts";
 
 function stateWithOpenContract(mark: bigint): View {
 	const bridge = emptyBridge();
@@ -29,8 +29,8 @@ function stateWithOpenContract(mark: bigint): View {
 	addGbtc(bridge, "bb", 4000n);
 	bridge.reserves = 10_000n; // 8000 free + 2000 escrow
 	const book = emptyBook();
-	book.contracts.set("c1", { id: "c1", marketId: "BTC-USD", long: "aa", short: "bb", stake: 1000n, entry: 61_000n, leverage: 10n, nonce: "n", expiryHeight: 50 });
-	return { bridge, markets: new Map([["BTC-USD", { endpoint: "t", key: "p", reporter: "rep", price: mark, seq: 0, at: 0 }]]), custody: { fundKey: null, epoch: -1 }, book };
+	book.contracts.set("c1", { id: "c1", long: "aa", short: "bb", stake: 1000n, entry: 61_000n, leverage: 10n, nonce: "n", expiryHeight: 50 });
+	return { bridge, market: { price: mark, seq: 0, at: 0 }, custody: { fundKey: null, epoch: -1 }, book };
 }
 
 test("an expired contract unwinds at entry — independent of the height it's processed at", () => {
@@ -74,7 +74,7 @@ async function market() {
 	await fund(A, 1_000_000n);
 	await fund(B, 50_000n);
 	await fund(C, 50_000n);
-	const offer = B.makeOffer({ marketId: MKT, makerSide: "long", size: "50000", leverage: "2", expiryHeight: 9_999_999, nonce: "z" });
+	const offer = B.makeOffer({ makerSide: "long", size: "50000", leverage: "2", expiryHeight: 9_999_999, nonce: "z" });
 	await C.matchOpen(offer, 50_000n);
 	return { node };
 }
@@ -86,11 +86,11 @@ test("folding to the same target from two different checkpoint heights agrees (d
 	const grace = DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY;
 	const T = 43_300; // past the demurrage grace AND the contract's time-lock (born 0 → expiry 43200)
 
-	const full = computeView(writes, { bornAt: born, nowHeight: T });
+	const full = computeView(writes, { bornAt: born, nowHeight: T, reporter: MARKET_REPORTER });
 	// checkpoint BEFORE the contract expires (still open in the base)
-	const resumeEarly = computeView([], { base: computeView(writes, { bornAt: born, nowHeight: grace + 5 * DEMURRAGE_DAY }), nowHeight: T });
+	const resumeEarly = computeView([], { base: computeView(writes, { bornAt: born, nowHeight: grace + 5 * DEMURRAGE_DAY, reporter: MARKET_REPORTER }), nowHeight: T });
 	// checkpoint AFTER it expires (already unwound in the base)
-	const resumeLate = computeView([], { base: computeView(writes, { bornAt: born, nowHeight: 43_250 }), nowHeight: T });
+	const resumeLate = computeView([], { base: computeView(writes, { bornAt: born, nowHeight: 43_250, reporter: MARKET_REPORTER }), nowHeight: T });
 
 	assert.equal(viewRoot(resumeEarly), viewRoot(full), "early-checkpoint resume diverged from the full fold");
 	assert.equal(viewRoot(resumeLate), viewRoot(full), "late-checkpoint resume diverged from the full fold");
@@ -105,7 +105,7 @@ test("a backstop position folds identically from two checkpoint heights (determi
 	const node = new GavlNode(new Ledger(PARAMS));
 	let t = 0;
 	const D = new Account({ node, params: PARAMS, k: K, now: () => ++t });
-	await D.takePot(MKT, "long", 40_000n, 3n); // D's only write: open long against the pot
+	await D.takePot("long", 40_000n, 3n); // D's only write: open long against the pot
 	const writes = node.ledger.allWrites();
 	const born = new Map(writes.map((w) => [w.id, 0] as [string, number]));
 
@@ -115,7 +115,7 @@ test("a backstop position folds identically from two checkpoint heights (determi
 		addGbtc(bridge, D.pubHex, 100_000n);
 		bridge.pot = 200_000n; // accumulated idle decay → the backstop's finalized capital
 		bridge.reserves = 300_000n; // 100k free + 200k pot
-		return { bridge, markets: new Map([["BTC-USD", { endpoint: "t", key: "p", reporter: "rep", price: 61_000n, seq: 0, at: 0 }]]), custody: { fundKey: null, epoch: -1 }, book: emptyBook() };
+		return { bridge, market: { price: 61_000n, seq: 0, at: 0 }, custody: { fundKey: null, epoch: -1 }, book: emptyBook() };
 	};
 	const T = 43_300; // past the backstop contract's time-lock (born 0 → expiry 43200)
 

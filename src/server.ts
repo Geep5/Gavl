@@ -18,7 +18,7 @@
 
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { Daemon } from "./daemon.ts";
+import { Daemon, parseChannel } from "./daemon.ts";
 import { mark, gbtcOf, MAX_LEVERAGE, parseAmount, leverageOk } from "./market/btc.ts";
 import { escrowedInContracts } from "./market/intent.ts";
 import { totalGbtc, pendingTotal, backingBps as bridgeBackingBps } from "./custody/bridge.ts";
@@ -84,34 +84,36 @@ const daemon = new Daemon({
 function serializeState() {
 	const view = daemon.view(); // optimistic tip — reflects actions immediately
 	const me = daemon.wallet.active().pubHex;
-	const defaultMarketId = process.env.GAVL_MARKET_ID ?? "BTC-USD";
-	const m = mark(view, defaultMarketId); // the default (BTC) market's reported price, null until reported
+	const m = mark(view); // this channel's market price, null until the channel's reporter posts
 
 	// gBTC balances: { pubkey: amount } (1:1 claims on BTC in the custody fund)
 	const gbtc: Record<string, string> = {};
 	for (const [pubkey, amt] of view.bridge.gbtc) gbtc[pubkey] = amt.toString();
 
-	// The market registry: each market names a PUBLIC source (endpoint + key) and the SINGLE
-	// reporter authorized to post its price — not a vote. The endpoint is the binding, auditable
-	// definition; anyone can launch a rival market on the same source with a better reporter.
-	const live = daemon.oracleSource(); // this node's own live feed readings (raw), if it's a reporter
-	const markets = [...view.markets.entries()].map(([id, mk]) => ({
-		id,
-		endpoint: mk.endpoint,
-		key: mk.key,
-		reporter: mk.reporter,
-		price: mk.price != null ? mk.price.toString() : null,
-		// live raw feed shown only on the node that reports this market (publisher-local)
-		source: mk.reporter === me && live ? { method: live.method, ageMs: Date.now() - live.at, feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })) } : null,
-	}));
+	// A CHANNEL IS A MARKET: the channel name encodes the instrument's public source + reporter.
+	// Not a vote — only that reporter posts, the public endpoint keeps it auditable, and each
+	// channel is its own economy (a malicious market can't touch funds in another channel).
+	const def = parseChannel(daemon.currentChannel()); // {label, endpoint, key, reporter} | null
+	const live = daemon.oracleSource(); // this node's own live feed readings (raw), if it's the reporter
+	const marketInfo = def
+		? {
+				channel: daemon.currentChannel(),
+				label: def.label,
+				endpoint: def.endpoint,
+				key: def.key,
+				reporter: def.reporter,
+				price: m != null ? m.toString() : null,
+				iAmReporter: def.reporter === me,
+				source: def.reporter === me && live ? { method: live.method, ageMs: Date.now() - live.at, feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })) } : null,
+			}
+		: null;
 
 	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)
 	const onChainR = rsv != null ? rsv.sats : null;
 	const market = {
-		oracle: "per-market reporter", // mechanism: each market names one reporter + a public source
-		markets,
+		oracle: "channel reporter", // mechanism: the channel name encodes one reporter + a public source
+		marketInfo,
 		price: m != null ? m.toString() : null,
-		defaultMarketId,
 		maxLeverage: Number(MAX_LEVERAGE),
 		// collateral = gBTC, a 1:1 claim on BTC in the custody fund
 		myGbtc: gbtcOf(view, me).toString(),
@@ -245,26 +247,20 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			if (amt === null) throw new Error("amount must be a positive integer");
 			return send(res, 200, { id: await daemon.unbondCustody(amt) });
 		}
-		if (path === "/api/market/create") {
-			// Create a market: name its public source (endpoint + JSON key) + the sole reporter.
-			await daemon.active().createMarket(String(body.id), String(body.endpoint ?? ""), String(body.key ?? ""), body.reporter ? String(body.reporter) : undefined);
-			return send(res, 200, { ok: true });
-		}
 		if (path === "/api/market/report") {
-			// Post a market's price (accepted only if this account is that market's reporter).
-			await daemon.active().report(String(body.marketId), String(body.price), Number(body.seq));
+			// Post THIS channel's price (accepted only if this account is the channel's reporter).
+			await daemon.active().report(String(body.price), Number(body.seq));
 			return send(res, 200, { ok: true });
 		}
 		// ── peer-to-peer matched market (the real product: no pool, real counterparty) ──
 		if (path === "/api/intent/broadcast") {
 			// Post a non-binding signed intent to the tape. Nothing is escrowed yet.
-			const mktId = String(body.marketId ?? process.env.GAVL_MARKET_ID ?? "BTC-USD");
-			if (mark(daemon.view(), mktId) === null) throw new Error(`market ${mktId} has no reported price yet`);
+			if (mark(daemon.view()) === null) throw new Error("this channel has no reported price yet (or isn't a market channel)");
 			const side = body.side === "short" ? "short" : "long";
 			const lev = parseAmount(String(body.leverage ?? "2"));
 			if (lev === null || !leverageOk(lev)) throw new Error(`leverage must be a whole number from 2 to ${MAX_LEVERAGE}`);
 			requireSpendable(String(body.size), "size"); // advisory: be able to back it when taken
-			const offer = daemon.broadcastIntent(side, String(body.size), String(body.leverage ?? "2"), mktId);
+			const offer = daemon.broadcastIntent(side, String(body.size), String(body.leverage ?? "2"));
 			return send(res, 200, { nonce: offer.nonce });
 		}
 		if (path === "/api/intent/take") {
@@ -274,11 +270,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		}
 		if (path === "/api/intent/take-position") {
 			// Easy taker: go long/short by size, sweeping the best opposite intents (+ backstop).
-			const mktId = String(body.marketId ?? process.env.GAVL_MARKET_ID ?? "BTC-USD");
-			if (mark(daemon.view(), mktId) === null) throw new Error(`market ${mktId} has no reported price yet`);
+			if (mark(daemon.view()) === null) throw new Error("this channel has no reported price yet (or isn't a market channel)");
 			const side = body.side === "short" ? "short" : "long";
 			requireSpendable(String(body.size), "size");
-			const r = await daemon.takePosition(side, String(body.size), String(body.leverage ?? "2"), mktId);
+			const r = await daemon.takePosition(side, String(body.size), String(body.leverage ?? "2"));
 			return send(res, 200, r);
 		}
 		if (path === "/api/contract/settle") {

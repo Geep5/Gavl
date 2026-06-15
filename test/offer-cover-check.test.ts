@@ -42,14 +42,14 @@ test("a gossiped offer is kept only if its maker can back it", async () => {
 		const ghost = new Account({ node: d.node, params: PARAMS, k: K, now }); // never funded
 		await attestor.attestDeposit("dep0:0", maker.pubHex, 5000n);
 
-		const backed = maker.makeOffer({ marketId: "BTC-USD", makerSide: "long", size: "1000", leverage: "2", expiryHeight: 9_999_999, nonce: "ok" });
-		const unbacked = ghost.makeOffer({ marketId: "BTC-USD", makerSide: "long", size: "1000", leverage: "2", expiryHeight: 9_999_999, nonce: "ghost" });
+		const backed = maker.makeOffer({ makerSide: "long", size: "1000", leverage: "2", expiryHeight: 9_999_999, nonce: "ok" });
+		const unbacked = ghost.makeOffer({ makerSide: "long", size: "1000", leverage: "2", expiryHeight: 9_999_999, nonce: "ghost" });
 
 		assert.equal(d.node.onIntent?.(unbacked), false, "an unbacked offer is dropped on arrival (not kept, not re-gossiped)");
 		assert.equal(d.node.onIntent?.(backed), true, "a backed offer is kept + re-gossiped");
 
 		// And a funded maker can't over-commit beyond their balance across multiple resting offers.
-		const over = maker.makeOffer({ marketId: "BTC-USD", makerSide: "long", size: "5000", leverage: "2", expiryHeight: 9_999_999, nonce: "over" });
+		const over = maker.makeOffer({ makerSide: "long", size: "5000", leverage: "2", expiryHeight: 9_999_999, nonce: "over" });
 		assert.equal(d.node.onIntent?.(over), false, "5000 more would exceed the maker's 5000 balance already committed to 'ok' (1000) → dropped");
 	} finally {
 		await rm(dir, { recursive: true, force: true });

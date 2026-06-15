@@ -15,7 +15,7 @@ import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
 import { computeView, gbtcOf, marketConserved } from "../src/market/btc.ts";
 import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
-import { PARAMS, K , MKT, setupMarket } from "./helpers.ts";
+import { PARAMS, K , setupMarket, MARKET_REPORTER } from "./helpers.ts";
 
 let depN = 0;
 function setup() {
@@ -29,7 +29,7 @@ function setup() {
 	return { node, mk, oracle, fund };
 }
 /** Fold the whole ledger with explicit per-write heights so we can drive the clock. */
-const viewAt = (node, bornAt, nowHeight) => computeView(node.ledger.allWrites(), { bornAt, nowHeight });
+const viewAt = (node, bornAt, nowHeight) => computeView(node.ledger.allWrites(), { bornAt, nowHeight, reporter: MARKET_REPORTER });
 
 test("a gossiped offer is taken on-chain, escrows both sides, and settles at the oracle mark", async () => {
 	const { node, mk, oracle, fund } = setup();
@@ -41,7 +41,7 @@ test("a gossiped offer is taken on-chain, escrows both sides, and settles at the
 	await fund(B, 5000n);
 
 	// A signs a non-binding offer off-chain (this would be gossiped over the mesh)
-	const offer = A.makeOffer({ marketId: MKT, makerSide: "long", size: "1000", leverage: "100", expiryHeight: 10, nonce: "k1" });
+	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "100", expiryHeight: 10, nonce: "k1" });
 	assert.equal(offer.maker, A.pubHex);
 
 	// B takes the opposite (short) side on-chain
@@ -60,7 +60,7 @@ test("a gossiped offer is taken on-chain, escrows both sides, and settles at the
 	assert.ok(marketConserved(v), "conserved while the contract is open");
 
 	// price settles above the cap → long (A) takes the whole pot
-	await oracle.report(MKT, 63000n, 1);
+	await oracle.report(63000n, 1);
 	const settleW = await mk().settle(matchId); // a third party settles it (permissionless)
 	born.set(settleW.id, 20);
 
@@ -81,7 +81,7 @@ test("a maker who spent the collateral (ghost) just fails to match — reserves 
 	await fund(A, 1000n);
 	await fund(B, 1000n);
 
-	const offer = A.makeOffer({ marketId: MKT, makerSide: "long", size: "1000", leverage: "10", expiryHeight: 10, nonce: "g1" });
+	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "10", expiryHeight: 10, nonce: "g1" });
 	await A.transfer(C.pubHex, 1000n); // A ghosts — moves the collateral it offered
 	const matchId = await B.matchOpen(offer, 1000n);
 

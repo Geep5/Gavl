@@ -19,7 +19,7 @@ import { computeView, mark, MARKET_STALE_AFTER } from "../src/market/btc.ts";
 import { oracleKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
 import { toHex } from "../src/det/canonical.ts";
-import { PARAMS, K, MKT, setupMarket } from "./helpers.ts";
+import { PARAMS, K, setupMarket, MARKET_REPORTER } from "./helpers.ts";
 
 test("a deposit-claim marker is retired once the deposit mints, and not re-added", () => {
 	const s = emptyBridge();
@@ -59,7 +59,7 @@ test("offer fill-tracking is pruned once the offer can no longer be matched", ()
 	const bridge = emptyBridge();
 	addGbtc(bridge, maker, 1000n);
 	addGbtc(bridge, taker, 1000n);
-	const offer = signOffer({ maker, marketId: "BTC-USD", makerSide: "long", size: "500", leverage: "10", expiryHeight: 5, nonce: "x" }, mk.privateKey);
+	const offer = signOffer({ maker, makerSide: "long", size: "500", leverage: "10", expiryHeight: 5, nonce: "x" }, mk.privateKey);
 	const book = emptyBook();
 
 	const c = applyMatch(bridge, book, taker, "w1", offer, 100n, 3, 61000n); // matched at height 3 (≤ expiry)
@@ -80,8 +80,8 @@ test("a market's mark goes stale once its reporter stops refreshing", async () =
 	await setupMarket(A, 61000n); // create + report BTC-USD (reporter = A)
 
 	const born = new Map(node.ledger.allWrites().map((w) => [w.id, 0] as [string, number])); // reported at height 0
-	const v = computeView(node.ledger.allWrites(), { bornAt: born });
-	assert.equal(mark(v, MKT, MARKET_STALE_AFTER - 1), 61000n, "fresh within the staleness window");
-	assert.equal(mark(v, MKT, MARKET_STALE_AFTER), null, "stale once the reporter goes quiet past the bound");
-	assert.equal(mark(v, MKT), 61000n, "no staleness gate when nowHeight is omitted (last known price)");
+	const v = computeView(node.ledger.allWrites(), { bornAt: born, reporter: MARKET_REPORTER });
+	assert.equal(mark(v, MARKET_STALE_AFTER - 1), 61000n, "fresh within the staleness window");
+	assert.equal(mark(v, MARKET_STALE_AFTER), null, "stale once the reporter goes quiet past the bound");
+	assert.equal(mark(v), 61000n, "no staleness gate when nowHeight is omitted (last known price)");
 });

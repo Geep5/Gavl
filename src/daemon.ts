@@ -187,8 +187,6 @@ export function oracleShouldPost(a: { v: bigint; lastPrice: bigint | null; lastP
 /** How many finalized anchors between durable checkpoints. Small enough to bound growth,
  *  large enough that snapshotting/pruning isn't a per-anchor cost. Override for tests/tuning. */
 const CHECKPOINT_EVERY = Number(process.env.GAVL_CHECKPOINT_EVERY ?? "16");
-/** The market the easy-button UI defaults to (the bridge's native BTC instrument). */
-const DEFAULT_MARKET_ID = process.env.GAVL_MARKET_ID ?? "BTC-USD";
 
 /** Default offer lifetime in anchors. Long enough to rest and get filled on a quiet market,
  *  finite so its consensus fill-tracking (offerFills) retires after expiry instead of forever. */
@@ -505,9 +503,15 @@ export class Daemon {
 	view(): View {
 		const root = this.node.ledger.stateRoot();
 		if (this.viewCache && this.viewCache.root === root) return this.viewCache.view;
-		const view = computeView(this.node.ledger.allWrites(), { base: this.checkpointBase });
+		const view = computeView(this.node.ledger.allWrites(), { base: this.checkpointBase, reporter: this.channelReporter() });
 		this.viewCache = { root, view };
 		return view;
+	}
+
+	/** This channel's authorized price reporter (parsed from the channel name), or undefined for a
+	 *  plain (non-market) channel. A per-channel constant every node agrees on → deterministic fold. */
+	channelReporter(): string | undefined {
+		return parseChannel(this.network)?.reporter;
 	}
 
 	// ── state-committed checkpoints — the ledger never replays from 0 ──────
@@ -550,7 +554,7 @@ export class Daemon {
 		}
 		let r = this.appRootCache.get(prevId);
 		if (r === undefined) {
-			r = viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, prevId, this.checkpointBase));
+			r = viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, prevId, this.checkpointBase, this.channelReporter()));
 			this.appRootCache.set(prevId, r);
 		}
 		return r;
@@ -598,7 +602,7 @@ export class Daemon {
 		if (!ckpt || ckpt.height !== target) return; // the boundary anchor isn't reachable yet → wait
 		const heads = anchors.headsAt(ckpt.id);
 		if (Object.keys(heads).length === 0) return; // nothing certified yet
-		const view = viewAtAnchor(this.node.ledger.allWrites(), anchors, ckpt.id, this.checkpointBase); // state at the boundary
+		const view = viewAtAnchor(this.node.ledger.allWrites(), anchors, ckpt.id, this.checkpointBase, this.channelReporter()); // state at the boundary
 		this.lastCheckpointHeight = ckpt.height;
 		this.checkpointBase = view;
 		const snap: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(view) };
@@ -627,7 +631,7 @@ export class Daemon {
 	private offers = new Map<string, Offer>(); // nonce → signed offer
 
 	/** Broadcast a non-binding intent from the active account → local book + the mesh. */
-	broadcastIntent(side: Side, size: string, leverage: string, marketId: string = DEFAULT_MARKET_ID): Offer {
+	broadcastIntent(side: Side, size: string, leverage: string): Offer {
 		const me = this.active();
 		// Globally-unique nonce (crypto-random) so it never collides with a previously-matched
 		// offer's nonce in the persisted offerFills — even across restarts / store resets.
@@ -635,7 +639,7 @@ export class Daemon {
 		// Finite TTL (anchors) so the offer's fill-tracking can be retired after it expires —
 		// otherwise offerFills (consensus state) grows with every offer ever broadcast.
 		const expiryHeight = (this.node.anchorTip()?.height ?? 0) + OFFER_TTL_ANCHORS;
-		const offer = me.makeOffer({ marketId, makerSide: side, size, leverage, expiryHeight, nonce });
+		const offer = me.makeOffer({ makerSide: side, size, leverage, expiryHeight, nonce });
 		if (!this.canBack(offer)) throw new Error("insufficient gBTC to back this offer"); // peers would drop it anyway
 		this.offers.set(nonce, offer);
 		this.node.gossipIntent(offer); // flood it to peers so their tapes show it
@@ -675,18 +679,18 @@ export class Daemon {
 	/** Live tape: resting offers with their remaining (unfilled) size, freshest first. Doubles
 	 *  as the gossip-tape GC — fully-filled or expired offers are evicted from the local book
 	 *  (it's RAM-only, non-consensus, but should still not grow with every offer ever seen). */
-	intentTape(): { nonce: string; marketId: string; maker: string; side: Side; remaining: string; leverage: string; mine: boolean }[] {
+	intentTape(): { nonce: string; maker: string; side: Side; remaining: string; leverage: string; mine: boolean }[] {
 		const fills = this.view().book.offerFills;
 		const me = this.wallet.active().pubHex;
 		const height = this.node.anchorTip()?.height ?? 0;
-		const out: { nonce: string; marketId: string; maker: string; side: Side; remaining: string; leverage: string; mine: boolean }[] = [];
+		const out: { nonce: string; maker: string; side: Side; remaining: string; leverage: string; mine: boolean }[] = [];
 		for (const o of [...this.offers.values()].reverse()) {
 			const remaining = BigInt(o.size) - (fills.get(o.nonce)?.filled ?? 0n);
 			if (remaining <= 0n || height > o.expiryHeight) {
 				this.offers.delete(o.nonce); // retire filled/expired offers from the local tape
 				continue;
 			}
-			out.push({ nonce: o.nonce, marketId: o.marketId, maker: o.maker, side: o.makerSide, remaining: remaining.toString(), leverage: o.leverage, mine: o.maker === me });
+			out.push({ nonce: o.nonce, maker: o.maker, side: o.makerSide, remaining: remaining.toString(), leverage: o.leverage, mine: o.maker === me });
 		}
 		return out;
 	}
@@ -725,7 +729,7 @@ export class Daemon {
 	 *  then falling back to the liquidity BACKSTOP (the idle-decay pot) for any remainder — so a
 	 *  trade can be placed even with no peer on the other side. `leverage` applies to the backstop
 	 *  leg (default 2×); peer fills keep the maker's offered leverage. */
-	async takePosition(side: Side, size: string, leverage = "2", marketId: string = DEFAULT_MARKET_ID): Promise<{ filled: string; contracts: string[]; viaBackstop: string }> {
+	async takePosition(side: Side, size: string, leverage = "2"): Promise<{ filled: string; contracts: string[]; viaBackstop: string }> {
 		const want = BigInt(size);
 		const opposite: Side = side === "long" ? "short" : "long";
 		const me = this.wallet.active().pubHex;
@@ -733,7 +737,7 @@ export class Daemon {
 		const contracts: string[] = [];
 		for (const t of this.intentTape()) {
 			if (left <= 0n) break;
-			if (t.marketId !== marketId || t.side !== opposite || t.maker === me) continue; // opposite side, same market, not me
+			if (t.side !== opposite || t.maker === me) continue; // opposite side, not me
 			const take = left < BigInt(t.remaining) ? left : BigInt(t.remaining);
 			try {
 				contracts.push(await this.takeIntent(t.nonce, take.toString()));
@@ -750,7 +754,7 @@ export class Daemon {
 			if (take > this.active().gbtc()) take = this.active().gbtc();
 			if (take > 0n) {
 				try {
-					const id = await this.active().takePot(marketId, side, take, leverage);
+					const id = await this.active().takePot(side, take, leverage);
 					if (this.view().book.contracts.has(id)) {
 						contracts.push(id);
 						left -= take;
@@ -771,22 +775,22 @@ export class Daemon {
 	}
 
 	/** The active account's open matched contracts, with live PnL at the current mark. */
-	myContracts(): { id: string; marketId: string; side: Side; stake: string; entry: string; leverage: string; counterparty: string; pnl: string | null; expiryHeight: number; expiresIn: number | null }[] {
+	myContracts(): { id: string; side: Side; stake: string; entry: string; leverage: string; counterparty: string; pnl: string | null; expiryHeight: number; expiresIn: number | null }[] {
 		const v = this.view();
+		const m = mark(v); // the channel's single market mark
 		const me = this.wallet.active().pubHex;
 		const height = this.node.anchorTip()?.height ?? 0;
-		const out: { id: string; marketId: string; side: Side; stake: string; entry: string; leverage: string; counterparty: string; pnl: string | null; expiryHeight: number; expiresIn: number | null }[] = [];
+		const out: { id: string; side: Side; stake: string; entry: string; leverage: string; counterparty: string; pnl: string | null; expiryHeight: number; expiresIn: number | null }[] = [];
 		for (const c of v.book.contracts.values()) {
 			const iAmLong = c.long === me;
 			if (!iAmLong && c.short !== me) continue;
-			const m = mark(v, c.marketId); // each contract marks to its own market
 			let pnl: string | null = null;
 			if (m !== null) {
 				const longGets = longPayout(c.stake, c.entry, c.leverage, m);
 				const mine = iAmLong ? longGets : c.stake * 2n - longGets;
 				pnl = (mine - c.stake).toString();
 			}
-			out.push({ id: c.id, marketId: c.marketId, side: iAmLong ? "long" : "short", stake: c.stake.toString(), entry: c.entry.toString(), leverage: c.leverage.toString(), counterparty: iAmLong ? c.short : c.long, pnl, expiryHeight: c.expiryHeight, expiresIn: height > 0 ? Math.max(0, c.expiryHeight - height) : null });
+			out.push({ id: c.id, side: iAmLong ? "long" : "short", stake: c.stake.toString(), entry: c.entry.toString(), leverage: c.leverage.toString(), counterparty: iAmLong ? c.short : c.long, pnl, expiryHeight: c.expiryHeight, expiresIn: height > 0 ? Math.max(0, c.expiryHeight - height) : null });
 		}
 		return out;
 	}
@@ -797,7 +801,7 @@ export class Daemon {
 		if (!this.node.anchors) return this.checkpointBase ? computeView([], { base: this.checkpointBase }) : computeView([]);
 		const finId = this.node.anchors.finalized(this.finalityDepth)?.id ?? null;
 		if (this.finalCache && this.finalCache.id === finId) return this.finalCache.view;
-		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase);
+		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase, this.channelReporter());
 		this.finalCache = { id: finId, view };
 		return view;
 	}
@@ -997,10 +1001,9 @@ export class Daemon {
 		const kp = this.producerKey(); // this node's stable identity = its oracle-poster id
 		const myId = toHex(kp.publicKey);
 		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: kp });
-		const marketId = process.env.GAVL_MARKET_ID ?? "BTC-USD";
-		const src0 = opts.sources.find((s) => s.url);
-		const endpoint = src0?.url ?? "";
-		const sourceKey = src0?.key ?? "";
+		// A CHANNEL IS A MARKET: only the channel's named reporter (encoded in the channel name) may
+		// post its price. If this node isn't that reporter, it just consumes the on-chain price.
+		const amReporter = this.channelReporter() === myId;
 		this.publishing = true;
 		const myGen = ++this.oracleGen; // a channel switch bumps this → the old loop below exits
 		// Prune at the source: gate posts on move-or-heartbeat (see oracleShouldPost). Poll
@@ -1008,27 +1011,17 @@ export class Daemon {
 		const minMoveBps = Number(process.env.GAVL_ORACLE_MIN_BPS ?? "5"); // 0.05% default
 		const oracleHeartbeatMs = Number(process.env.GAVL_ORACLE_HEARTBEAT_MS ?? "300000"); // ≤5min stale
 		const loop = async () => {
-			// Ensure the market exists (first creator wins, immutable). We become its reporter; if
-			// it already exists with another reporter, we simply consume it and never post.
-			if (!this.view().markets.has(marketId)) {
-				try {
-					await acct.createMarket(marketId, endpoint, sourceKey, myId);
-				} catch {
-					/* retry next tick */
-				}
-			}
-			const amReporter = () => this.view().markets.get(marketId)?.reporter === myId;
-			const m0 = this.view().markets.get(marketId);
-			let seq = (m0?.seq ?? -1) + 1; // reporter's monotonic seq, continuing from the market's latest
-			let lastPrice: bigint | null = m0?.price ?? null;
+			const m0 = this.view().market;
+			let seq = m0.seq + 1; // continue from the channel's latest report
+			let lastPrice: bigint | null = m0.price;
 			let lastPostAt = 0;
 			while (this.publishing && myGen === this.oracleGen) {
 				const agg = await readPriceAggregate(opts.sources); // fetch all, average the responders
 				this.lastOracleSource = { ...agg, at: Date.now() }; // display-only metadata
 				const v = agg.value;
-				if (v != null && amReporter() && oracleShouldPost({ v, lastPrice, lastPostAt, now: Date.now(), minMoveBps, heartbeatMs: oracleHeartbeatMs })) {
+				if (v != null && amReporter && oracleShouldPost({ v, lastPrice, lastPostAt, now: Date.now(), minMoveBps, heartbeatMs: oracleHeartbeatMs })) {
 					try {
-						await acct.report(marketId, v, seq);
+						await acct.report(v, seq);
 						seq++;
 						lastPrice = v;
 						lastPostAt = Date.now();
@@ -1040,7 +1033,7 @@ export class Daemon {
 			}
 		};
 		void loop();
-		console.log(`  market ${marketId}: reporting as ${myId.slice(0, 16)}… (avg of ${opts.sources.length} feed(s)) every ${opts.everyMs}ms`);
+		console.log(`  channel ${this.network}: ${amReporter ? `REPORTING as ${myId.slice(0, 16)}…` : "consuming on-chain price (not this channel's reporter)"} (avg of ${opts.sources.length} feed(s)) every ${opts.everyMs}ms`);
 	}
 
 	/** The publisher's latest aggregate reading (per-source endpoint/key/raw/value +
@@ -1555,4 +1548,23 @@ export class Daemon {
 function channelSlug(name: string): string {
 	const safe = name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 64);
 	return safe || "default";
+}
+
+/** A market channel's name encodes its instrument: `label::endpoint::jsonKey::reporterHex`.
+ *  This IS the market definition — public + auditable from the name, immutable (the name hashes to
+ *  the DHT topic). The fold only needs `reporter` (to authorize price posts); endpoint/key are
+ *  human-auditable metadata. A name without the 4 `::`-parts (or a bad reporter key) is a plain
+ *  channel: no market, no price, transfers only. */
+export interface ChannelMarket {
+	label: string;
+	endpoint: string;
+	key: string;
+	reporter: string;
+}
+export function parseChannel(name: string): ChannelMarket | null {
+	const parts = name.split("::");
+	if (parts.length !== 4) return null;
+	const [label, endpoint, key, reporter] = parts;
+	if (!/^[0-9a-f]{64}$/i.test(reporter)) return null;
+	return { label, endpoint, key, reporter };
 }

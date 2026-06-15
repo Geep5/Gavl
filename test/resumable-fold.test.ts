@@ -16,7 +16,7 @@ import { Account } from "../src/market/account.ts";
 import { computeView, marketConserved } from "../src/market/btc.ts";
 import { viewRoot } from "../src/market/state.ts";
 import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
-import { PARAMS, K , MKT, setupMarket } from "./helpers.ts";
+import { PARAMS, K , setupMarket, MARKET_REPORTER } from "./helpers.ts";
 
 let depN = 0;
 function setup() {
@@ -47,25 +47,25 @@ test("folding the tail onto the head's view equals folding the whole stream", as
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 	await A.transfer(C.pubHex, 1000n);
-	await oracle.report(MKT, 62000n, 1);
-	const offer = A.makeOffer({ marketId: MKT, makerSide: "long", size: "1000", leverage: "10", expiryHeight: 100, nonce: "n1" });
+	await oracle.report(62000n, 1);
+	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "10", expiryHeight: 100, nonce: "n1" });
 	const matchId = await B.matchOpen(offer, 1000n);
-	await oracle.report(MKT, 64000n, 2);
+	await oracle.report(64000n, 2);
 	await mk().settle(matchId);
 	await C.transfer(B.pubHex, 200n);
-	await oracle.report(MKT, 63000n, 3);
+	await oracle.report(63000n, 3);
 
 	const all = [...node.ledger.allWrites()].sort(cmpWrite);
-	const full = computeView(all);
+	const full = computeView(all, { reporter: MARKET_REPORTER });
 	assert.ok(marketConserved(full), "full fold conserves");
 	const fullRoot = viewRoot(full);
 
-	// Split at EVERY boundary: base = computeView(prefix), then resume with the tail.
+	// Split at EVERY boundary: base = computeView(prefix, { reporter: MARKET_REPORTER }), then resume with the tail.
 	for (let i = 0; i <= all.length; i++) {
 		const prefix = all.slice(0, i);
 		const rest = all.slice(i);
-		const base = computeView(prefix);
-		const resumed = computeView(rest, { base });
+		const base = computeView(prefix, { reporter: MARKET_REPORTER });
+		const resumed = computeView(rest, { base, reporter: MARKET_REPORTER });
 		assert.equal(viewRoot(resumed), fullRoot, `resume at split ${i} diverged`);
 		assert.ok(marketConserved(resumed), `resume at split ${i} broke conservation`);
 	}
@@ -80,12 +80,12 @@ test("resuming does not mutate the base view (deep copy)", async () => {
 	await fund(B, 5000n);
 
 	const all = [...node.ledger.allWrites()].sort(cmpWrite);
-	const base = computeView(all);
+	const base = computeView(all, { reporter: MARKET_REPORTER });
 	const baseRootBefore = viewRoot(base);
 
 	await A.transfer(B.pubHex, 1234n);
 	const tail = [...node.ledger.allWrites()].sort(cmpWrite).slice(all.length);
-	computeView(tail, { base }); // resume — must NOT touch `base`
+	computeView(tail, { base, reporter: MARKET_REPORTER }); // resume — must NOT touch `base`
 
 	assert.equal(viewRoot(base), baseRootBefore, "base view was mutated by a resumed fold");
 });

@@ -30,14 +30,10 @@ export type Op =
 	/** Mark a withdrawal's BTC payout confirmed (reserves drop). Attestor key (seed) OR
 	 *  a committee threshold signature over the settle digest (committee mode, `sig`). */
 	| { kind: "bridge.settle"; withdrawalId: string; sig?: string }
-	/** Create a market — permissionless, first-write-wins per `id`, IMMUTABLE. Defines the
-	 *  instrument's PUBLIC price source (`endpoint` + JSON `key`) and the sole `reporter` pubkey
-	 *  allowed to post its price. Trust is competed for at the market level + audited via the
-	 *  public endpoint; it is NOT a decentralized vote. */
-	| { kind: "market.create"; id: string; endpoint: string; key: string; reporter: string }
-	/** Post a market's price. Accepted ONLY from that market's named `reporter` (the write's
-	 *  signer must equal it); per-reporter monotonic `seq` guards replay. */
-	| { kind: "market.report"; marketId: string; price: string; seq: number }
+	/** Post THIS channel's market price. A CHANNEL IS A MARKET: the channel name encodes the
+	 *  instrument's public source + the sole reporter, so a report is accepted only from that
+	 *  reporter (the write's signer must equal it). Per-reporter monotonic `seq` guards replay. */
+	| { kind: "market.report"; price: string; seq: number }
 	/** Take the opposite side of a peer's signed intent: carries the maker's signed
 	 *  `offer` (gossiped, non-binding) and the stake the taker wants to `fill`. The fold
 	 *  verifies the maker's sig + that both peers can cover, escrows both, and opens a
@@ -46,7 +42,7 @@ export type Op =
 	/** Open a position directly against the liquidity BACKSTOP — no peer maker. The pot (idle-decay
 	 *  pool) stakes matching gBTC and takes the OPPOSITE side at the mark, capped by a deterministic
 	 *  finalized budget so the pot can never be drawn insolvent. The taker is the write's author. */
-	| { kind: "match.pot"; marketId: string; side: "long" | "short"; fill: string; leverage: string }
+	| { kind: "match.pot"; side: "long" | "short"; fill: string; leverage: string }
 	/** Settle a matured matched contract at the current oracle mark — permissionless. */
 	| { kind: "contract.settle"; contractId: string }
 	/** Lock gBTC as a custody-committee BOND — your committee selection WEIGHT, and
@@ -66,7 +62,7 @@ export type Op =
 	 *  alongside gate #4 non-public keys.) */
 	| { kind: "custody.fund"; groupKey: string; epoch: number };
 
-const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "market.create", "market.report", "match.open", "match.pot", "contract.settle", "custody.fund", "custody.bond", "custody.unbond", "custody.slash"]);
+const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "market.report", "match.open", "match.pot", "contract.settle", "custody.fund", "custody.bond", "custody.unbond", "custody.slash"]);
 
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);

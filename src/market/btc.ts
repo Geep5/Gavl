@@ -40,20 +40,14 @@ import { fromHex } from "../det/canonical.ts";
 export const BRIDGE_ATTESTOR = bridgePubHex(process.env.GAVL_BRIDGE_SEED);
 
 /**
- * A market — created permissionlessly by anyone, defining a single instrument and the PUBLIC
- * source its price is drawn from. NOT a decentralized vote: the named `reporter` is the sole
- * authority to post this market's price, and the public `endpoint` is the binding spec everyone can
- * audit it against. Trust is competed for at the market level (launch a rival market with a better
- * reporter/source), not aggregated per-price. The definition (endpoint/key/reporter) is immutable
- * once created; only the price moves.
+ * The channel's market price. A CHANNEL IS A MARKET: the channel name encodes the instrument's
+ * public source (`label::endpoint::jsonKey::reporter`), so there's no in-state registry and no
+ * per-price vote — only the channel's named reporter (passed into the fold from the name) may post,
+ * and the public endpoint keeps it auditable. Each channel is its own economy (own ledger/pot), so
+ * a market is a sandbox: a malicious market can't touch funds in another channel. Only the price
+ * lives in state; the source/reporter are the channel's identity, not consensus data.
  */
-export interface Market {
-	/** Public data source URL the price is drawn from (the binding, auditable definition). */
-	endpoint: string;
-	/** JSON key-path into the endpoint's response (e.g. "data.amount"). */
-	key: string;
-	/** The ONLY pubkey allowed to report this market's price. */
-	reporter: string;
+export interface MarketPrice {
 	/** Latest reported price (null until the reporter first posts). */
 	price: bigint | null;
 	/** Reporter's monotonic seq — replay/ordering guard. */
@@ -65,6 +59,11 @@ export interface Market {
 /** Reports older than this many anchors are STALE — a market won't match/settle on a price the
  *  reporter stopped refreshing, so a dead source can't freeze trades at an old number. */
 export const MARKET_STALE_AFTER = 4_320; // ~3 days at 60s/anchor
+
+/** A fresh, unpriced market-price slot. */
+export function emptyMarket(): MarketPrice {
+	return { price: null, seq: -1, at: 0 };
+}
 
 export interface CustodyState {
 	/** The threshold-custody fund's group key (hex), or null until genesis announces it.
@@ -78,8 +77,8 @@ export interface View {
 	/** The BTC bridge: gBTC balances + BTC reserves + processed deposits + pending
 	 *  withdrawals. gBTC is the collateral — a 1:1 claim on real Bitcoin in the fund. */
 	bridge: BridgeState;
-	/** Permissionless market registry: marketId → its definition + latest reported price. */
-	markets: Map<string, Market>;
+	/** This channel's single market price (the source/reporter come from the channel name). */
+	market: MarketPrice;
 	/** The threshold-custody fund key, announced on-chain at genesis (committee mode). */
 	custody: CustodyState;
 	/** The peer-to-peer intent market: bilateral matched contracts + offer-fill tracking.
@@ -158,6 +157,10 @@ export interface ViewOptions {
 	 *  agrees on, so the budget is deterministic and the free pot can't go negative. Absent (pure
 	 *  folds / no finalized state yet) → budget 0 → the backstop is simply unavailable. */
 	backstop?: { pot: bigint; taken: bigint };
+	/** The channel's authorized price reporter (parsed from the channel name). Only its
+	 *  `market.report` writes set the mark; absent → no reporter → the market stays unpriced.
+	 *  A per-channel constant (same for every node on the channel), so the fold is deterministic. */
+	reporter?: string;
 }
 
 /**
@@ -237,7 +240,7 @@ export function cloneView(v: View): View {
 			pot: b.pot,
 			potEscrowTaken: b.potEscrowTaken,
 		},
-		markets: cp(v.markets),
+		market: { ...v.market },
 		custody: { fundKey: v.custody.fundKey, epoch: v.custody.epoch },
 		book: { contracts: cp(v.book.contracts), offerFills: cp(v.book.offerFills) },
 	};
@@ -249,7 +252,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 		? cloneView(opts.base) // deep copy so the cached/snapshot base isn't mutated
 		: {
 				bridge: emptyBridge(),
-				markets: new Map(),
+				market: emptyMarket(),
 				custody: { fundKey: null, epoch: -1 },
 				book: emptyBook(),
 			};
@@ -266,7 +269,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 		// Effects timed by height (unbond maturity) use the write's STABLE certifying
 		// height (bornAt) so they don't drift as the global nowHeight advances; others
 		// use nowHeight (the current anchor clock).
-		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget);
+		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, opts.reporter);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
 	settleExpired(view.bridge, view.book, nowHeight); // time-locked perps unwind at entry (base-independent)
@@ -276,12 +279,12 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	return view;
 }
 
-/** Mark price for a market = its reporter's latest price, or null if the market is unknown,
- *  unpriced, or STALE (reporter stopped refreshing past MARKET_STALE_AFTER). `nowHeight` gates
- *  staleness; pass the write's certified height so it's base-independent (omit → no stale check). */
-export function mark(view: View, marketId: string, nowHeight?: number): bigint | null {
-	const m = view.markets.get(marketId);
-	if (!m || m.price === null) return null;
+/** Mark price for the channel's market = the reporter's latest price, or null if unpriced or STALE
+ *  (reporter stopped refreshing past MARKET_STALE_AFTER). `nowHeight` gates staleness; pass the
+ *  write's certified height so it's base-independent (omit → no stale check). */
+export function mark(view: View, nowHeight?: number): bigint | null {
+	const m = view.market;
+	if (m.price === null) return null;
 	if (nowHeight !== undefined && nowHeight - m.at >= MARKET_STALE_AFTER) return null; // source went dark
 	return m.price;
 }
@@ -291,10 +294,10 @@ export function mark(view: View, marketId: string, nowHeight?: number): bigint |
  * PoST-bound order. Composes the pure consensus ordering with this app fold —
  * consensus never imports app state; the app calls consensus.
  */
-export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, base?: View): View {
+export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, base?: View, reporter?: string): View {
 	const { included, order, bornAt, nowHeight } = finalizedOrdering(writes, anchors, k);
-	if (nowHeight === null) return base ? computeView([], { base }) : computeView([]);
-	return computeView(included, { order, nowHeight, bornAt, base });
+	if (nowHeight === null) return base ? computeView([], { base, reporter }) : computeView([], { reporter });
+	return computeView(included, { order, nowHeight, bornAt, base, reporter });
 }
 
 /**
@@ -304,14 +307,14 @@ export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, 
  * verifier recomputes it to accept the anchor. Optionally resumes from a checkpoint
  * `base` (a pruned node folds forward from its snapshot instead of from genesis).
  */
-export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: string, base?: View): View {
+export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: string, base?: View, reporter?: string): View {
 	const anchor = anchors.get(anchorId);
 	const { included, order, bornAt, nowHeight } = orderingFor(writes, anchors, anchor ?? null);
-	if (nowHeight === null) return base ? computeView([], { base }) : computeView([]);
-	return computeView(included, { order, nowHeight, bornAt, base });
+	if (nowHeight === null) return base ? computeView([], { base, reporter }) : computeView([], { reporter });
+	return computeView(included, { order, nowHeight, bornAt, base, reporter });
 }
 
-function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n): void {
+function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, reporter?: string): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized by the committee
@@ -360,28 +363,18 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			completeWithdrawal(view.bridge, op.withdrawalId);
 			return;
 		}
-		case "market.create": {
-			// Permissionless market creation. FIRST write per id wins and is IMMUTABLE — the
-			// endpoint/key/reporter that define where the price comes from can never be changed
-			// (you'd launch a new market instead). Anyone may create one (PoST-gated like any write).
-			if (typeof op.id !== "string" || op.id.length === 0 || op.id.length > 64) return;
-			if (typeof op.endpoint !== "string" || typeof op.key !== "string" || !/^[0-9a-f]{64}$/i.test(op.reporter ?? "")) return;
-			if (view.markets.has(op.id)) return; // id taken → immutable, ignore
-			view.markets.set(op.id, { endpoint: op.endpoint, key: op.key, reporter: op.reporter, price: null, seq: -1, at: bornHeight });
-			return;
-		}
 		case "market.report": {
-			// ONLY the market's named reporter may post its price. Not a vote — the public endpoint
-			// is what keeps the reporter honest (anyone can audit), and rival markets can out-compete
-			// a bad one. Per-reporter monotonic seq guards replay.
+			// Post THIS channel's market price. Accepted ONLY from the channel's reporter (encoded
+			// in the channel name, passed into the fold) — not a vote. The public endpoint (also in
+			// the name) keeps the reporter honest; a rival market = a different channel. Per-reporter
+			// monotonic seq guards replay.
 			const price = parseAmount(op.price);
-			const mk = typeof op.marketId === "string" ? view.markets.get(op.marketId) : undefined;
-			if (price === null || typeof op.seq !== "number" || !mk) return;
-			if (w.writer !== mk.reporter) return; // not the authorized source for this market
-			if (op.seq <= mk.seq) return; // stale/replayed
-			mk.price = price;
-			mk.seq = op.seq;
-			mk.at = bornHeight; // certified height → deterministic staleness
+			if (price === null || typeof op.seq !== "number") return;
+			if (!reporter || w.writer !== reporter) return; // not this channel's authorized source
+			if (op.seq <= view.market.seq) return; // stale/replayed
+			view.market.price = price;
+			view.market.seq = op.seq;
+			view.market.at = bornHeight; // certified height → deterministic staleness
 			return;
 		}
 		case "custody.fund": {
@@ -401,34 +394,34 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			// stake right now — a maker who ghosted (spent the funds) simply no-ops. This is
 			// the zero-sum, protocol-is-never-counterparty path that can't deplete reserves.
 			const fill = parseAmount(op.fill);
-			// Entry = the offer's MARKET mark (per-market reported price), at the write's stable
-			// certified height so expiry/staleness don't drift on replay.
-			const m = op.offer && typeof op.offer.marketId === "string" ? mark(view, op.offer.marketId, bornHeight) : null;
-			if (fill === null || m === null) return; // unknown/stale/unpriced market → no entry
+			// Entry = the channel's market mark, at the write's stable certified height so
+			// expiry/staleness don't drift on replay.
+			const m = mark(view, bornHeight);
+			if (fill === null || m === null) return; // stale/unpriced market → no entry
 			applyMatch(view.bridge, view.book, w.writer, w.id, op.offer, fill, bornHeight, m);
 			return;
 		}
 		case "match.pot": {
-			// Open against the liquidity backstop: the pot takes the opposite side at the market's
+			// Open against the liquidity backstop: the pot takes the opposite side at the channel's
 			// mark, staking from finalized pot capital. available = the finalized budget minus what
 			// the pot has already drawn (deterministic; keeps the free pot ≥ 0).
 			const fill = parseAmount(op.fill);
 			const lev = parseAmount(op.leverage);
-			const m = typeof op.marketId === "string" ? mark(view, op.marketId, bornHeight) : null;
+			const m = mark(view, bornHeight);
 			if (fill === null || lev === null || m === null) return;
 			if (op.side !== "long" && op.side !== "short") return;
 			const available = backstopBudget - view.bridge.potEscrowTaken;
-			applyMatchPot(view.bridge, view.book, w.writer, w.id, op.marketId, op.side as Side, fill, lev, bornHeight, m, available);
+			applyMatchPot(view.bridge, view.book, w.writer, w.id, op.side as Side, fill, lev, bornHeight, m, available);
 			return;
 		}
 		case "contract.settle": {
-			// Permissionless close: split the 2·stake pot at the contract's MARKET mark per the
-			// directional payoff. Perpetual — either side may close any time; the loser can't dodge
-			// the mark by stalling (the winner just closes it).
+			// Permissionless close: split the 2·stake pot at the channel's mark per the directional
+			// payoff. Perpetual — either side may close any time; the loser can't dodge the mark by
+			// stalling (the winner just closes it).
 			if (typeof op.contractId !== "string") return;
 			const c = view.book.contracts.get(op.contractId);
 			if (!c) return;
-			const m = mark(view, c.marketId, bornHeight);
+			const m = mark(view, bornHeight);
 			if (m === null) return; // market gone dark → can't settle at a trustworthy price (auto-unwinds at expiry)
 			applySettle(view.bridge, view.book, op.contractId, m, bornHeight);
 			return;

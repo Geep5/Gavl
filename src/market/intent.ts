@@ -50,8 +50,6 @@ export const CONTRACT_MAX_LIFE = 43_200;
 export interface OfferCore {
 	/** Maker pubkey (hex). The signature is by this key. */
 	maker: string;
-	/** Which market this bet is on (its price source). The taker's match marks to this market. */
-	marketId: string;
 	/** The side the MAKER takes; the taker gets the opposite. */
 	makerSide: Side;
 	/** Total stake (decimal sats) the maker offers — fillable in parts by many takers. */
@@ -73,7 +71,6 @@ export interface Offer extends OfferCore {
  *  current mark. Perpetual — either side may close it any time (no expiry). */
 export interface Contract {
 	id: string; // the match write's id
-	marketId: string; // which market this contract marks to (entry + settle price source)
 	long: string; // pubkey holding the long side
 	short: string; // pubkey holding the short side
 	stake: bigint; // each side staked this; pot = 2·stake
@@ -132,7 +129,6 @@ function isHex(s: unknown, bytes: number): boolean {
 export function offerDigest(core: OfferCore): Uint8Array {
 	return canonicalBytes({
 		maker: core.maker,
-		marketId: core.marketId,
 		makerSide: core.makerSide,
 		size: core.size,
 		leverage: core.leverage,
@@ -150,7 +146,6 @@ export function signOffer(core: OfferCore, makerPriv: Uint8Array): Offer {
 export function verifyOffer(o: Offer): boolean {
 	if (!o || typeof o !== "object") return false;
 	if (!isHex(o.maker, 32)) return false;
-	if (typeof o.marketId !== "string" || o.marketId.length === 0 || o.marketId.length > 64) return false;
 	if (o.makerSide !== "long" && o.makerSide !== "short") return false;
 	if (parseSats(o.size) === null) return false;
 	const lev = parseSats(o.leverage);
@@ -211,7 +206,7 @@ export function applyMatch(bridge: BridgeState, book: MarketBook, taker: string,
 
 	const long = offer.makerSide === "long" ? offer.maker : taker;
 	const short = offer.makerSide === "long" ? taker : offer.maker;
-	const c: Contract = { id: writeId, marketId: offer.marketId, long, short, stake: take, entry: mark, leverage: parseSats(offer.leverage)!, nonce: offer.nonce, expiryHeight: nowHeight + CONTRACT_MAX_LIFE };
+	const c: Contract = { id: writeId, long, short, stake: take, entry: mark, leverage: parseSats(offer.leverage)!, nonce: offer.nonce, expiryHeight: nowHeight + CONTRACT_MAX_LIFE };
 	book.contracts.set(writeId, c);
 	return c;
 }
@@ -250,7 +245,7 @@ function creditParty(bridge: BridgeState, who: string, amount: bigint, height?: 
  * mark, bad leverage, id reuse, or no budget/coverage). The pot's PnL flows back into `bridge.pot`
  * at settle — winning trades drain idle capital out to traders; losing trades refill it.
  */
-export function applyMatchPot(bridge: BridgeState, book: MarketBook, taker: string, writeId: string, marketId: string, takerSide: Side, fill: bigint, leverage: bigint, nowHeight: number, mark: bigint, available: bigint): Contract | null {
+export function applyMatchPot(bridge: BridgeState, book: MarketBook, taker: string, writeId: string, takerSide: Side, fill: bigint, leverage: bigint, nowHeight: number, mark: bigint, available: bigint): Contract | null {
 	if (mark <= 0n) return null; // no market price yet → no entry
 	if (taker === POT) return null; // the pot can't take its own side
 	if (book.contracts.has(writeId)) return null; // id reuse
@@ -269,7 +264,7 @@ export function applyMatchPot(bridge: BridgeState, book: MarketBook, taker: stri
 	bridge.potEscrowTaken += take; // committed counter the budget is measured against
 	const long = takerSide === "long" ? taker : POT;
 	const short = takerSide === "long" ? POT : taker;
-	const c: Contract = { id: writeId, marketId, long, short, stake: take, entry: mark, leverage, nonce: writeId, expiryHeight: nowHeight + CONTRACT_MAX_LIFE };
+	const c: Contract = { id: writeId, long, short, stake: take, entry: mark, leverage, nonce: writeId, expiryHeight: nowHeight + CONTRACT_MAX_LIFE };
 	book.contracts.set(writeId, c);
 	return c;
 }
