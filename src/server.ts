@@ -117,6 +117,7 @@ function serializeState() {
 	const market = {
 		oracle: "channel reporter", // mechanism: the channel name encodes one reporter + a public source
 		marketInfo,
+		myReporter: daemon.reporterPubkey(), // the reporter key a market THIS node creates would name
 		price: m != null ? m.toString() : null,
 		maxLeverage: Number(MAX_LEVERAGE),
 		// collateral = gBTC, a 1:1 claim on BTC in the custody fund

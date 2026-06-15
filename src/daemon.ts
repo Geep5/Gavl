@@ -514,6 +514,13 @@ export class Daemon {
 		return parseChannel(this.network)?.reporter;
 	}
 
+	/** This node's price-reporter identity — the key it signs `market.report` with (the dev oracle
+	 *  key, overridable via GAVL_ORACLE_SEED). A market this node CREATES names this reporter, so its
+	 *  own node will report it. Surfaced to the UI's "create a market" form. */
+	reporterPubkey(): string {
+		return oraclePubHex(process.env.GAVL_ORACLE_SEED);
+	}
+
 	// ── state-committed checkpoints — the ledger never replays from 0 ──────
 	/** View at the ledger's prune floor (the last checkpoint). The ledger holds only writes
 	 *  ABOVE it; every fold resumes from here. Undefined ⇒ full history (never checkpointed). */
@@ -1004,14 +1011,18 @@ export class Daemon {
 		const kp = oracleKeyPair(process.env.GAVL_ORACLE_SEED);
 		const myId = toHex(kp.publicKey);
 		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: kp });
-		const amReporter = this.channelReporter() === myId;
+		const def = parseChannel(this.network);
+		const amReporter = def?.reporter === myId;
 		this.publishing = true;
 		const myGen = ++this.oracleGen; // a channel switch bumps this → the old loop below exits
 		// Only the channel's reporter fetches + posts; a consumer node has nothing to publish.
-		if (!amReporter) {
+		if (!amReporter || !def) {
 			console.log(`  channel ${this.network}: consuming on-chain price (this node isn't its reporter)`);
 			return;
 		}
+		// Fetch from THIS market's declared source (the channel name), not the boot-time defaults —
+		// so a created ETH-USD market reports ETH, not the BTC feed we happened to start with.
+		const sources: PriceSource[] = [{ url: def.endpoint, key: def.key }];
 		// Prune at the source: gate posts on move-or-heartbeat (see oracleShouldPost). Poll
 		// stays frequent (cheap); writes only happen when they carry new information.
 		const minMoveBps = Number(process.env.GAVL_ORACLE_MIN_BPS ?? "5"); // 0.05% default
@@ -1022,7 +1033,7 @@ export class Daemon {
 			let lastPrice: bigint | null = m0.price;
 			let lastPostAt = 0;
 			while (this.publishing && myGen === this.oracleGen) {
-				const agg = await readPriceAggregate(opts.sources); // fetch all, average the responders
+				const agg = await readPriceAggregate(sources); // fetch this market's declared source
 				this.lastOracleSource = { ...agg, at: Date.now() }; // display-only metadata
 				const v = agg.value;
 				if (v != null && oracleShouldPost({ v, lastPrice, lastPostAt, now: Date.now(), minMoveBps, heartbeatMs: oracleHeartbeatMs })) {
@@ -1039,7 +1050,7 @@ export class Daemon {
 			}
 		};
 		void loop();
-		console.log(`  channel ${this.network}: REPORTING as ${myId.slice(0, 16)}… (avg of ${opts.sources.length} feed(s)) every ${opts.everyMs}ms`);
+		console.log(`  market ${def.label}: REPORTING as ${myId.slice(0, 16)}… from ${def.endpoint} (${def.key}) every ${opts.everyMs}ms`);
 	}
 
 	/** The publisher's latest aggregate reading (per-source endpoint/key/raw/value +
