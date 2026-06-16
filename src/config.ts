@@ -16,15 +16,18 @@
 
 import type { Vdf } from "./pot/vdf.ts";
 import { HashVdf } from "./pot/hash-vdf.ts";
+import { WorkerHashVdf } from "./pot/worker-hash-vdf.ts";
 import { ChiaVdf } from "./pot/chia-vdf.ts";
 import { chiaAvailable } from "./chia/proc.ts";
 import type { ChainParams } from "./chain/writer.ts";
 
 export type VdfKind = "chia" | "hash";
 
-/** Resolve which VDF to use. Defaults to the real chiavdf. */
+/** Resolve which VDF to use. Defaults to the real chiavdf. The hash stand-in runs in a worker pool
+ *  so its multi-second cooldown doesn't block the daemon's event loop (mesh keepalives / HTTP API).
+ *  GAVL_VDF_INLINE=1 forces the inline HashVdf (e.g. for single-shot tooling that wants no workers). */
 export function resolveVdf(kind: VdfKind = (process.env.GAVL_VDF as VdfKind) || "chia"): Vdf {
-	if (kind === "hash") return new HashVdf();
+	if (kind === "hash") return process.env.GAVL_VDF_INLINE === "1" ? new HashVdf() : new WorkerHashVdf();
 	if (kind === "chia") {
 		if (!chiaAvailable()) {
 			throw new Error(

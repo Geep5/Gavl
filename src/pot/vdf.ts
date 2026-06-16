@@ -37,4 +37,13 @@ export interface Vdf {
 	 * gossip-receive path (verifyWrite / ledger apply) stays synchronous.
 	 */
 	verify(challenge: Uint8Array, proof: TimeProof): boolean;
+	/**
+	 * Optional off-thread verify. For an UNSUCCINCT VDF (HashVdf) where `verify` re-walks O(iters)
+	 * and would block the event loop, an implementation may offload to a worker and expose it here.
+	 * Used only on already-async paths (anchor ingestion). Absent / for an O(1) VDF → callers fall
+	 * back to the synchronous `verify`. The result MUST equal `verify` for the same inputs.
+	 */
+	verifyAsync?(challenge: Uint8Array, proof: TimeProof): Promise<boolean>;
+	/** Optional cleanup (e.g. terminate a worker pool) when the node shuts down. */
+	close?(): Promise<void>;
 }

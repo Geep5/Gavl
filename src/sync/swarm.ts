@@ -12,9 +12,17 @@
 
 import type { Duplex } from "node:stream";
 import Hyperswarm from "hyperswarm";
+import DHT from "hyperdht";
 import type { Connection, GavlNode } from "./node.ts";
 import type { SyncMessage } from "./messages.ts";
 import { sha256 } from "../det/canonical.ts";
+
+/** Derive a STABLE Hyperswarm/Noise keypair from a 32-byte seed (so this node's nodeKey survives
+ *  restarts and direct-dial pins stay valid). Omitting the keyPair gives a random per-process
+ *  identity — which is why pre-persistence pairings went stale on every restart. */
+export function swarmKeyPair(seed: Buffer): { publicKey: Buffer; secretKey: Buffer } {
+	return DHT.keyPair(seed);
+}
 
 class SwarmConnection implements Connection {
 	private readonly socket: Duplex;

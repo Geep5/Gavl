@@ -177,7 +177,11 @@ export async function verifyAnchor(anchor: Anchor, prev: Anchor | null, prevHead
 	// cooldown check matches what an honest producer at this height would serve.
 	const need = requiredIters(v.quality, params, spaceWeightFor(anchor.space), expectedDifficulty);
 	if (BigInt(anchor.time.iters) < need) return { ok: false, reason: "insufficient cooldown" };
-	if (!params.vdf.verify(vdfChallenge(challenge, v.quality), anchor.time)) return { ok: false, reason: "bad time proof" };
+	// Off-thread when the VDF offers it (HashVdf re-walks O(iters) — verifying inline would block the
+	// event loop and starve mesh keepalives). Falls back to the sync verify for an O(1) VDF (chiavdf).
+	const tc = vdfChallenge(challenge, v.quality);
+	const timeOk = params.vdf.verifyAsync ? await params.vdf.verifyAsync(tc, anchor.time) : params.vdf.verify(tc, anchor.time);
+	if (!timeOk) return { ok: false, reason: "bad time proof" };
 
 	if (idOf(bodyOf(anchor), anchor.time) !== anchor.id) return { ok: false, reason: "id mismatch" };
 	if (!ed.verify(fromHex(anchor.producer), fromHex(anchor.id), fromHex(anchor.sig))) return { ok: false, reason: "bad signature" };

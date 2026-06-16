@@ -65,7 +65,7 @@ import { StandinSpaceProver, StandinSpaceVerifier } from "./consensus/space.ts";
 import type { SpaceVerifier, SpaceProver } from "./consensus/space.ts";
 import { ChiaSpaceProver, ChiaSpaceVerifier, ensurePlot } from "./pos/chia.ts";
 import { Plot } from "./pos/space.ts";
-import { SwarmTransport } from "./sync/swarm.ts";
+import { SwarmTransport, swarmKeyPair } from "./sync/swarm.ts";
 import { KnownPeers } from "./sync/known-peers.ts";
 import { BootstrapList } from "./sync/bootstrap.ts";
 import { generateKeyPair, keyPairFromSeed } from "./det/ed25519.ts";
@@ -903,7 +903,7 @@ export class Daemon {
 		try {
 			// Custom bootstrap nodes (the DHT entry/"DNS" layer) are added alongside
 			// Holepunch's defaults; undefined → defaults only.
-			this.transport = new SwarmTransport(this.node, { bootstrap: this.bootstrap.forSwarm() });
+			this.transport = new SwarmTransport(this.node, { bootstrap: this.bootstrap.forSwarm(), keyPair: this.swarmKeyPair() });
 			const joined = this.transport.join(this.network); // resolved channel, not a param
 			await Promise.race([joined, new Promise((r) => setTimeout(r, 8000))]);
 			// Re-dial pinned peers directly (independent of DHT discovery) — eclipse resistance.
@@ -1159,6 +1159,25 @@ export class Daemon {
 			this.producerKeyCache = kp;
 		}
 		return this.producerKeyCache;
+	}
+
+	/** This node's STABLE Hyperswarm/Noise keypair (persisted). Without this Hyperswarm mints a fresh
+	 *  identity every boot, so this node's nodeKey changes each restart and any direct-dial pin from a
+	 *  peer goes stale. Pinned to disk (like the producer key) so a restart keeps the same nodeKey. */
+	private swarmKeyCache?: { publicKey: Buffer; secretKey: Buffer };
+	private swarmKeyPair(): { publicKey: Buffer; secretKey: Buffer } {
+		if (this.swarmKeyCache) return this.swarmKeyCache;
+		const path = join(this.dataDir, "swarm-key.json");
+		let seed: Buffer;
+		if (existsSync(path)) {
+			seed = Buffer.from(fromHex(JSON.parse(readFileSync(path, "utf8")).seed));
+		} else {
+			seed = Buffer.from(generateKeyPair().privateKey); // 32-byte seed
+			mkdirSync(this.dataDir, { recursive: true });
+			writeFileSync(path, JSON.stringify({ seed: seed.toString("hex") }), { mode: 0o600 });
+		}
+		this.swarmKeyCache = swarmKeyPair(seed);
+		return this.swarmKeyCache;
 	}
 
 	/** This node's committee id (stable producer pubkey hex). */
@@ -1593,6 +1612,7 @@ export class Daemon {
 		this.producer?.stop();
 		if (this.transport) await this.transport.destroy().catch(() => {});
 		if (this.store) await this.store.close().catch(() => {});
+		await this.params.vdf.close?.().catch(() => {}); // terminate the VDF worker pool, if any
 	}
 }
 
