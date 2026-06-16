@@ -117,23 +117,41 @@ No pool, no order book to babysit — just signed intents and matched bilateral 
 
 ### Pricing — a channel *is* a market (`src/market/btc.ts`, `src/daemon.ts`)
 
-The price isn't voted on — it's **named**. A market channel's name encodes the instrument's **Pyth
-feed**: `label::pyth::feedId`. That string IS the market's public, immutable definition (it hashes
-to the DHT topic), and each channel is its own economy (own ledger, bridge, pot, book).
+The price isn't voted on — it's **named**. A market channel's name encodes the instrument's price
+source, and that string IS the market's public, immutable definition (it hashes to the DHT topic).
+Two source kinds, both **M-of-N quorum-signed + relayed by anyone** — the fold verifies a quorum
+signature, never the relayer, and no single signer can forge:
 
-- **No reporter — a guardian-attested feed anyone relays.** Every Pyth price is signed by a 2/3+1
-  quorum of the Wormhole guardian set over a Merkle root of all feeds. A node posts the latest
-  signed update (`market.report {update}`); the fold verifies the guardian quorum + the Merkle proof
-  *locally* (`src/market/pyth.ts`) and matches the channel's feed id. **Anyone may relay** — a forged
-  update simply fails verification — so there's no reporter to run, bribe, or trust. (Trust anchor:
-  the Wormhole guardian set, a fixed public committee pinned by set index — a weak-subjectivity pin,
-  the same shape as bridge custody trusting its committee.)
-- **Newer wins, deterministically.** The verified Pyth publish-time is the monotonic guard (newer
-  update replaces older); the fold never fetches, it only verifies posted bytes, so every node agrees.
+- `label::pyth::feedId` — a **Wormhole-attested Pyth feed** (`src/market/pyth.ts`). Every price is
+  signed by a 2/3+1 quorum (13-of-19) of the Wormhole guardian set over a Merkle root of all feeds;
+  the fold verifies the guardian quorum + Merkle proof *locally* and matches the channel's feed id.
+- `label::signed::setHash` — **your own M-of-N Ed25519 signer set** (`src/market/signed-feed.ts`),
+  the open generalization of the same idea. The channel commits the set by hash (`signerSetHash`
+  binds the member keys *and* the threshold M, the analog of Pyth committing its guardian set by
+  index); an update carries the set + member signatures, and the fold requires ≥ M signatures from
+  distinct members. A relayer can't swap keys, lower the threshold, double-count, or sub-quorum forge.
+
+Either way:
+
+- **No reporter.** A node posts the latest signed update (`market.report {update}`); the fold
+  verifies the quorum and accepts it from **anyone**. There's no reporter to run, bribe, or trust —
+  the trust anchor is a fixed public committee (the guardian set, or your committed signer set), a
+  weak-subjectivity pin, the same shape as bridge custody trusting its committee.
+- **Newer wins, deterministically.** The verified publish-time is the monotonic guard (newer update
+  replaces older); the fold never fetches, it only verifies posted bytes, so every node agrees.
 - **Stale-feed safe.** A price that stops refreshing past `MARKET_STALE_AFTER` is treated as
   no-price — matching/settling pauses rather than trade on a dead number.
 - **Sandboxed by construction.** Because the market is the channel, a malicious market can only
   ever touch *its own* channel's pot/collateral — funds in another channel are unreachable.
+
+**Running a signed set.** `feed-signer.ts` runs the whole set in one process (`--keys a,b,c
+--threshold 2`) — fine for a solo operator or demo, but one machine holds every key. For a genuinely
+decentralized set, each member runs `feed-member.ts` on its own host with its own key and price
+source — it co-signs a proposed reading *only* if the price is within tolerance of what it fetches
+**itself** — and one untrusted `feed-aggregator.ts` collects ≥ M agreeing signatures, assembles the
+update, and serves it at `GAVL_FEED_URL`. A bad proposal makes members refuse → no quorum → no price;
+the aggregator can never forge. (Pyth is exactly this shape: members are guardians, the aggregator
+is Hermes, the chain verifies.)
 
 ---
 
@@ -332,9 +350,11 @@ What's **trusted** (and surfaced honestly in the UI):
   drained) · bounded leverage · marked to the channel's market · close-early **+ time-locked
   auto-settle** · idle-balance **demurrage** → **liquidity backstop** (pot as counterparty of last
   resort) · cross-node intent tape · Svelte tape/trade UI
-- **Pricing** ✅ **a channel is a market** — the channel name encodes a **Pyth feed**; every price is
-  Wormhole-guardian-attested and verified on-chain, so anyone relays it and there's **no reporter**;
-  sandboxed per channel (no shared pot, no registry) · newer-publish-time wins · stale-feed pause
+- **Pricing** ✅ **a channel is a market** — the channel name encodes the price source: a **Pyth feed**
+  (13-of-19 guardians) or **your own M-of-N Ed25519 signer set**; every price is quorum-signed and
+  verified on-chain, so anyone relays it, there's **no reporter**, and no single signer can forge ·
+  decentralized signer tooling (independent members + untrusted aggregator) · sandboxed per channel
+  (no shared pot, no registry) · newer-publish-time wins · stale-feed pause
 - **Real-BTC bridge (testnet)** ✅ FROST threshold signing · DKG · Taproot address +
   BIP340-valid spends · withdrawal tx build/sign/broadcast · deposit watcher · bridge
   ledger · proof of reserves

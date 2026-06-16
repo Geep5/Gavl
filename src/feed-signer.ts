@@ -10,9 +10,10 @@
  *
  * QUORUM. Point `--keys` at the member keyfiles this process holds and `--threshold` at M. It signs
  * each reading with every held member key and serves a complete update (the committed set + ≥ M
- * signatures). One key is the degenerate 1-of-1 set. For a REAL M-of-N you'd run the members on
- * independent machines and aggregate their signatures over an agreed reading; this single-process
- * multi-key signer is the reference that exercises the same wire format + fold path end to end.
+ * signatures). One key is the degenerate 1-of-1 set. This single-process multi-key signer is for a
+ * solo operator or a demo — it exercises the same wire format + fold path end to end, but ONE machine
+ * holds every key. For a genuinely decentralized M-of-N (members on independent machines, each
+ * validating the price against its OWN source), run `feed-member.ts` per member + one `feed-aggregator.ts`.
  *
  * IMPORTANT: `--upstream` is only where this source READS its number — your own pricing infra, or
  * a public API for testing/bootstrapping. It does NOT make that upstream trustworthy: wrapping an
@@ -46,6 +47,7 @@ import os from "node:os";
 import { generateKeyPair, keyPairFromSeed } from "./det/ed25519.ts";
 import { toHex, fromHex } from "./det/canonical.ts";
 import { signReading, signerSetHash, buildSignedUpdate, type SignerSet, type SignedUpdate } from "./market/signed-feed.ts";
+import { readUpstreamPrice } from "./market/feed-source.ts";
 
 // ── flags ────────────────────────────────────────────────────────────────
 function flag(name: string, fallback?: string): string | undefined {
@@ -97,52 +99,18 @@ const setHash = signerSetHash(set);
 const channel = `${label}::signed::${setHash}`;
 
 // ── read the upstream value ────────────────────────────────────────────────
-/** Walk a dot-path (`a.b.c`) into a parsed JSON object; undefined if any hop is missing. */
-function atPath(obj: unknown, dotted: string): unknown {
-	return dotted.split(".").reduce<unknown>((o, k) => (o != null && typeof o === "object" ? (o as Record<string, unknown>)[k] : undefined), obj);
-}
-
-/** Exactly scale a decimal string to an integer at 10^expo — no float rounding. "640.5", -2 → 64050. */
-function scaleDecimal(s: string, e: number): bigint {
-	const decimals = -e; // fractional digits to keep
-	const neg = s.trim().startsWith("-");
-	const t = s.trim().replace(/^[-+]/, "");
-	const dot = t.indexOf(".");
-	const intPart = dot < 0 ? t : t.slice(0, dot);
-	const fracRaw = dot < 0 ? "" : t.slice(dot + 1);
-	const frac = (fracRaw + "0".repeat(Math.max(0, decimals))).slice(0, Math.max(0, decimals));
-	const digits = ((intPart || "0") + frac).replace(/^0+(?=\d)/, "") || "0";
-	const v = BigInt(digits);
-	return neg ? -v : v;
-}
-
 /** Fetch the upstream, extract the price at `pricePath`, and produce a fresh quorum update — every
  *  held member signs the SAME reading, assembled into the committed set's wire form. */
 async function readAndSign(): Promise<SignedUpdate | null> {
-	try {
-		const res = await fetch(upstream!, { headers: { accept: "application/json" } });
-		if (!res.ok) {
-			console.error(`  upstream ${res.status}`);
-			return null;
-		}
-		const raw = atPath(await res.json(), pricePath!);
-		if (raw == null) {
-			console.error(`  no value at path "${pricePath}"`);
-			return null;
-		}
-		const price = scaleDecimal(String(raw), expo);
-		if (price <= 0n) {
-			console.error(`  non-positive price (${raw}) — skipping`);
-			return null;
-		}
-		const publishTime = Math.floor(Date.now() / 1000);
-		const sigBySigner: Record<string, string> = {};
-		for (const m of members) sigBySigner[toHex(m.publicKey)] = signReading(price, expo, publishTime, m.privateKey);
-		return buildSignedUpdate(price, expo, publishTime, set, sigBySigner);
-	} catch (e) {
-		console.error(`  fetch failed: ${(e as Error).message}`);
+	const price = await readUpstreamPrice(upstream!, pricePath!, expo);
+	if (price == null) {
+		console.error(`  no usable price from ${upstream} at "${pricePath}"`);
 		return null;
 	}
+	const publishTime = Math.floor(Date.now() / 1000);
+	const sigBySigner: Record<string, string> = {};
+	for (const m of members) sigBySigner[toHex(m.publicKey)] = signReading(price, expo, publishTime, m.privateKey);
+	return buildSignedUpdate(price, expo, publishTime, set, sigBySigner);
 }
 
 // ── serve + refresh ────────────────────────────────────────────────────────
