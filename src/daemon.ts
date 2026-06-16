@@ -52,7 +52,7 @@ import { checkDeposit, utxosToInputs, confirmations, MIN_CONFIRMATIONS } from ".
 import { pendingClaims, unsentWithdrawals, inFlightWithdrawals, slashable } from "./custody/bridge.ts";
 import { fetchPythUpdate, fetchSignedUpdate, HERMES_URL } from "./market/pricefeed.ts";
 import { verifyPythUpdate } from "./market/pyth.ts";
-import { verifySignedReading } from "./market/signed-feed.ts";
+import { verifySignedQuorum } from "./market/signed-feed.ts";
 import type { AggregateReading } from "./market/pricefeed.ts";
 import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
@@ -510,13 +510,13 @@ export class Daemon {
 		return view;
 	}
 
-	/** This channel's market definition (`label::pyth::feedId` / `label::signed::sourcePubkey`), or
+	/** This channel's market definition (`label::pyth::feedId` / `label::signed::setHash`), or
 	 *  undefined for a plain (non-market) channel. A per-channel constant every node agrees on →
-	 *  deterministic fold. The fold accepts a SIGNED update from anyone, verified against this def. */
+	 *  deterministic fold. The fold accepts a quorum-SIGNED update from anyone, verified against this def. */
 	channelMarket(): MarketDef | undefined {
 		const c = parseChannel(this.network);
 		if (!c) return undefined;
-		return c.kind === "pyth" ? { kind: "pyth", feedId: c.feedId } : { kind: "signed", source: c.source };
+		return c.kind === "pyth" ? { kind: "pyth", feedId: c.feedId } : { kind: "signed", signerSet: c.signerSet };
 	}
 
 	/** Fetch-test a Pyth feed before creating a `label::pyth::feedId` market: pull the latest Hermes
@@ -1009,11 +1009,11 @@ export class Daemon {
 
 	/**
 	 * Relay THIS channel's price on a loop. A CHANNEL IS A MARKET with NO reporter — any node may
-	 * relay, the SOURCE signature is the authority, and the fold re-verifies the bytes:
-	 *   • `label::pyth::feedId`      → the latest Wormhole-attested update from Hermes.
-	 *   • `label::signed::sourcePub` → the latest signed reading from that source's signer endpoint
-	 *                                  (GAVL_FEED_URL); the source's Ed25519 key is the trust anchor.
-	 * Post it whenever the source's publish-time advances; other nodes fold + verify independently.
+	 * relay, an M-of-N quorum signature is the authority, and the fold re-verifies the bytes:
+	 *   • `label::pyth::feedId`   → the latest Wormhole-attested update from Hermes (13-of-19 guardians).
+	 *   • `label::signed::setHash` → the latest quorum-signed update from the set's aggregator endpoint
+	 *                                (GAVL_FEED_URL); the committed signer set is the trust anchor.
+	 * Post it whenever the publish-time advances; other nodes fold + verify the quorum independently.
 	 */
 	private startOraclePublisher(opts: { everyMs: number }): void {
 		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: this.producerKey() });
@@ -1025,7 +1025,7 @@ export class Daemon {
 			return;
 		}
 		if (def.kind === "pyth") this.relayPyth(acct, def.feedId, def.label, myGen, opts.everyMs);
-		else this.relaySigned(acct, def.source, def.label, myGen, opts.everyMs);
+		else this.relaySigned(acct, def.signerSet, def.label, myGen, opts.everyMs);
 	}
 
 	/** Relay loop for a Pyth market: Hermes → verify the guardian quorum + Merkle proof → post when
@@ -1053,39 +1053,39 @@ export class Daemon {
 		console.log(`  market ${label}: relaying Pyth feed ${feedId.slice(0, 10)}… from Hermes (verified on-chain; no reporter)`);
 	}
 
-	/** Relay loop for a generic SIGNED market: fetch the source's signed reading from its signer
-	 *  endpoint (GAVL_FEED_URL), verify the signature against the channel's committed source key, and
-	 *  post when the source's publish-time advances. No URL ⇒ this node only TRADES on updates others
-	 *  relay (it never forges — the fold would reject anything not signed by the committed source). */
-	private relaySigned(acct: Account, source: string, label: string, myGen: number, everyMs: number): void {
+	/** Relay loop for a generic SIGNED market: fetch the latest quorum-signed update from the set's
+	 *  aggregator endpoint (GAVL_FEED_URL), verify the M-of-N quorum against the channel's committed
+	 *  set hash, and post when the publish-time advances. No URL ⇒ this node only TRADES on updates
+	 *  others relay (it never forges — the fold rejects anything not signed by a quorum of the set). */
+	private relaySigned(acct: Account, signerSet: string, label: string, myGen: number, everyMs: number): void {
 		const url = process.env.GAVL_FEED_URL;
 		if (!url) {
-			console.log(`  market ${label}: signed feed ${source.slice(0, 10)}… — set GAVL_FEED_URL to relay it (trading on others' relays either way)`);
+			console.log(`  market ${label}: signed set ${signerSet.slice(0, 10)}… — set GAVL_FEED_URL to relay it (trading on others' relays either way)`);
 			return;
 		}
 		void (async () => {
 			let lastPub = this.view().market.seq; // last on-chain publish time
 			while (this.publishing && myGen === this.oracleGen) {
 				const raw = await fetchSignedUpdate(url);
-				const r = raw != null ? verifySignedReading(raw, source) : null;
+				const r = raw != null ? verifySignedQuorum(raw, signerSet) : null;
 				if (r && r.price > 0n) {
-					this.lastOracleSource = { value: r.price, method: `signed ${source.slice(0, 10)}…`, used: 1, readings: [{ value: r.price, raw: `${r.price}e${r.expo}`, endpoint: url, key: source }], at: Date.now() };
+					this.lastOracleSource = { value: r.price, method: `signed ${signerSet.slice(0, 10)}…`, used: 1, readings: [{ value: r.price, raw: `${r.price}e${r.expo}`, endpoint: url, key: signerSet }], at: Date.now() };
 					if (r.publishTime > lastPub) {
 						try {
-							await acct.reportMarketUpdate(JSON.stringify(raw)); // genuine source-signed reading → relay it
+							await acct.reportMarketUpdate(JSON.stringify(raw)); // genuine quorum-signed update → relay it
 							lastPub = r.publishTime;
 						} catch {
 							/* retry next tick */
 						}
 					}
 				} else if (raw != null) {
-					// the endpoint answered but the signature didn't match the channel's committed source key
-					this.lastOracleSource = { value: null, method: `signed ${source.slice(0, 10)}…`, used: 0, readings: [{ value: null, raw: null, endpoint: url, key: source, error: "signature didn't verify against this channel's source key" }], at: Date.now() };
+					// the endpoint answered but the update didn't meet the channel's committed quorum
+					this.lastOracleSource = { value: null, method: `signed ${signerSet.slice(0, 10)}…`, used: 0, readings: [{ value: null, raw: null, endpoint: url, key: signerSet, error: "update didn't meet this channel's committed signer-set quorum" }], at: Date.now() };
 				}
 				await new Promise((res) => setTimeout(res, everyMs));
 			}
 		})();
-		console.log(`  market ${label}: relaying signed feed ${source.slice(0, 10)}… from ${url} (verified on-chain; no reporter)`);
+		console.log(`  market ${label}: relaying signed set ${signerSet.slice(0, 10)}… from ${url} (quorum-verified on-chain; no reporter)`);
 	}
 
 	/** The publisher's latest aggregate reading (per-source endpoint/key/raw/value +
@@ -1602,11 +1602,11 @@ function channelSlug(name: string): string {
 	return safe || "default";
 }
 
-/** A market channel's name IS its definition (and hashes to the DHT topic). Two SIGNED-source
- *  kinds — the price is signed AT THE SOURCE and relayed by anyone; the fold verifies a signature,
- *  never the relayer:
- *    `label::pyth::<feedId>`        — a Wormhole-attested Pyth feed (guardian-set trust anchor).
- *    `label::signed::<sourcePubkey>` — any source's own Ed25519 key (wrap an endpoint in a signer).
+/** A market channel's name IS its definition (and hashes to the DHT topic). Two QUORUM-SIGNED kinds
+ *  — the price is signed by an M-of-N set and relayed by anyone; the fold verifies the quorum, never
+ *  the relayer, and no single signer can forge:
+ *    `label::pyth::<feedId>`     — a Wormhole-attested Pyth feed (13-of-19 guardian-set trust anchor).
+ *    `label::signed::<setHash>`  — your own Ed25519 signer set, committed by `signerSetHash`.
  *  A name that doesn't match is a plain channel: no market, transfers only. */
 export type ChannelMarket = { label: string } & MarketDef;
 export function parseChannel(name: string): ChannelMarket | null {
@@ -1615,7 +1615,7 @@ export function parseChannel(name: string): ChannelMarket | null {
 		return { label: parts[0], kind: "pyth", feedId: parts[2].toLowerCase() };
 	}
 	if (parts.length === 3 && parts[1].toLowerCase() === "signed" && /^[0-9a-f]{64}$/i.test(parts[2])) {
-		return { label: parts[0], kind: "signed", source: parts[2].toLowerCase() };
+		return { label: parts[0], kind: "signed", signerSet: parts[2].toLowerCase() };
 	}
 	return null;
 }

@@ -1,8 +1,8 @@
 <script>
 	// "Create a market" — a focused middle-panel view. A market IS a channel: its name encodes the price
-	// SOURCE (`label::pyth::feedId` or `label::signed::sourcePubkey`) and each channel is its own
-	// sandboxed economy. The source signs its readings, so anyone can relay them — there's no reporter to
-	// run or trust; the fold verifies the source signature against the name.
+	// source (`label::pyth::feedId` or `label::signed::setHash`) and each channel is its own sandboxed
+	// economy. A quorum of the source set signs each reading, so anyone can relay it — there's no reporter
+	// to run or trust, and no single signer can forge; the fold verifies the quorum against the name.
 	import { act } from "../lib/store.svelte.js";
 	import { api } from "../lib/api.js";
 
@@ -21,19 +21,19 @@
 		{ label: "SOL / USD", id: "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d" },
 	];
 	let feedId = $state(PYTH_PRESETS[0].id);
-	let sourceKey = $state(""); // signed: the source's Ed25519 public key (the market's trust anchor)
+	let setHash = $state(""); // signed: the committed signer-set hash (the market's M-of-N trust anchor)
 
 	const norm = (s) => s.trim().toLowerCase().replace(/^0x/, "");
 
 	// any source/kind edit invalidates a prior verification
 	$effect(() => {
-		feedId; sourceKey; kind;
+		feedId; setHash; kind;
 		tested = null;
 	});
 
 	const labelOk = $derived(!!label.trim() && !label.includes("::"));
-	const idOk = $derived(/^[0-9a-f]{64}$/.test(norm(kind === "pyth" ? feedId : sourceKey)));
-	const composed = $derived(kind === "pyth" ? `${label.trim()}::pyth::${norm(feedId)}` : `${label.trim()}::signed::${norm(sourceKey)}`);
+	const idOk = $derived(/^[0-9a-f]{64}$/.test(norm(kind === "pyth" ? feedId : setHash)));
+	const composed = $derived(kind === "pyth" ? `${label.trim()}::pyth::${norm(feedId)}` : `${label.trim()}::signed::${norm(setHash)}`);
 	const fieldsOk = $derived(labelOk && idOk);
 	// pyth markets verify a live attested update first; signed markets are structural (the source signs)
 	const createOk = $derived(fieldsOk && (kind === "signed" || tested?.value != null));
@@ -89,10 +89,10 @@
 			</p>
 		{:else}
 			<p class="note kindnote">
-				Price comes from a <strong>signed source</strong> — any endpoint that signs its readings with an
-				Ed25519 key (Pyth, generalized to another domain). The channel commits the source's public key;
-				anyone relays its signed updates and the fold verifies the signature. Run one with
-				<code class="mono">npm run feed:signer</code>.
+				Price comes from a <strong>signer set</strong> — an M-of-N group of Ed25519 keys you stand up
+				(Pyth's 13-of-19 guardians, generalized to your own domain). The channel commits the set; anyone
+				relays its quorum-signed updates and the fold verifies the quorum, so no single signer can forge.
+				Run one with <code class="mono">npm run feed:signer</code>.
 			</p>
 		{/if}
 
@@ -130,9 +130,9 @@
 				{/if}
 			</div>
 		{:else}
-			<label class="fl"><span>Source public key</span>
-				<input class="in mono ff" placeholder="64-hex Ed25519 source key" bind:value={sourceKey} disabled={busy} />
-				<span class="note">The signer prints this (and the channel name) on start. Relayers point a node at it with <code class="mono">GAVL_FEED_URL</code> — the fold verifies the signature, so the relay is untrusted.</span>
+			<label class="fl"><span>Signer-set hash</span>
+				<input class="in mono ff" placeholder="64-hex signer-set hash" bind:value={setHash} disabled={busy} />
+				<span class="note">The signer prints this (and the channel name) on start. Relayers point a node at the set's aggregator with <code class="mono">GAVL_FEED_URL</code> — the fold verifies the quorum, so the relay is untrusted.</span>
 			</label>
 		{/if}
 
@@ -150,7 +150,7 @@
 		<h3>Join an existing market</h3>
 		<p class="lede">Have a market's full name? Paste it to join exactly that economy — same parameters, same market.</p>
 		<div class="joinrow">
-			<input class="in mono" placeholder="label::pyth::feedId  or  label::signed::sourceKey" bind:value={joinName} disabled={busy} onkeydown={(e) => e.key === "Enter" && join()} />
+			<input class="in mono" placeholder="label::pyth::feedId  or  label::signed::setHash" bind:value={joinName} disabled={busy} onkeydown={(e) => e.key === "Enter" && join()} />
 			<button class="primary" onclick={join} disabled={busy || !joinName.trim()}>Join</button>
 		</div>
 	</div>

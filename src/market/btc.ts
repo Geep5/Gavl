@@ -24,7 +24,7 @@ import { finalizedOrdering, orderingFor } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import { bridgePubHex } from "./oracle.ts";
 import { verifyPythUpdate } from "./pyth.ts";
-import { verifySignedReading } from "./signed-feed.ts";
+import { verifySignedQuorum } from "./signed-feed.ts";
 import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
@@ -163,20 +163,20 @@ export interface ViewOptions {
 	 *  folds / no finalized state yet) → budget 0 → the backstop is simply unavailable. */
 	backstop?: { pot: bigint; taken: bigint };
 	/** The channel's market definition (what backs the price). When set, `market.report` carries a
-	 *  SIGNED update anyone may relay — the fold verifies it against this def's trust anchor (Pyth's
-	 *  guardian set, or a generic source key) and matches the feed/source. A per-channel constant
-	 *  (same for every node), so the fold is deterministic. Absent → a plain transfers-only channel. */
+	 *  SIGNED update anyone may relay — the fold verifies an M-of-N quorum against this def's trust
+	 *  anchor (Pyth's guardian set, or a generic signer set) and matches the feed/set. A per-channel
+	 *  constant (same for every node), so the fold is deterministic. Absent → a transfers-only channel. */
 	market?: MarketDef;
 }
 
 /**
- * A channel's market = where its price comes from, and the trust anchor that signs it. Both kinds
- * are SIGNED-at-the-source + relayed-by-anyone — the fold verifies a signature, never trusting the
- * relayer. `pyth` uses Wormhole's guardian set; `signed` uses any source's own Ed25519 key (wrap an
- * endpoint in a signer and its key backs the market). The channel NAME encodes this (see daemon
- * parseChannel: `label::pyth::feedId` / `label::signed::sourcePubkey`).
+ * A channel's market = where its price comes from, and the trust anchor that signs it. Both kinds are
+ * SIGNED-by-a-QUORUM + relayed-by-anyone — the fold verifies an M-of-N signature set, never trusting
+ * the relayer or any single signer. `pyth` uses Wormhole's guardian set (13-of-19), committed by
+ * feed id; `signed` uses any Ed25519 signer set you stand up, committed by `signerSetHash`. The
+ * channel NAME encodes this (see daemon parseChannel: `label::pyth::feedId` / `label::signed::setHash`).
  */
-export type MarketDef = { kind: "pyth"; feedId: string } | { kind: "signed"; source: string };
+export type MarketDef = { kind: "pyth"; feedId: string } | { kind: "signed"; signerSet: string };
 
 /**
  * Demurrage — the RAM ledger's "balances can't sit forever" rule, turned into liquidity. State
@@ -379,18 +379,18 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			return;
 		}
 		case "market.report": {
-			// A CHANNEL IS A MARKET: ANYONE may relay a SIGNED update; the fold verifies the
-			// signature against the channel's trust anchor (Pyth's guardian set, or a generic
-			// source key) — so no relayer is trusted, only the SOURCE's signature. Newer
-			// publish-time wins (monotonic, stored in `seq`); a forged update simply fails.
+			// A CHANNEL IS A MARKET: ANYONE may relay a SIGNED update; the fold verifies an M-of-N
+			// quorum against the channel's trust anchor (Pyth's guardian set, or a generic signer
+			// set) — so no relayer is trusted, and no single signer can forge. Newer publish-time
+			// wins (monotonic, stored in `seq`); a forged or sub-quorum update simply fails.
 			if (!market || typeof op.update !== "string") return;
 			let r: { price: bigint; expo: number; publishTime: number } | null = null;
 			if (market.kind === "pyth") {
 				r = verifyPythUpdate(op.update).find((x) => x.feedId === market.feedId) ?? null;
 			} else {
-				// generic signed source — the update is JSON {price,expo,publishTime,sig}.
+				// generic signer set — the update is JSON {price,expo,publishTime,set,sigs}.
 				try {
-					r = verifySignedReading(JSON.parse(op.update), market.source);
+					r = verifySignedQuorum(JSON.parse(op.update), market.signerSet);
 				} catch {
 					r = null; // malformed JSON → reject
 				}

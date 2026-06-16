@@ -1,35 +1,41 @@
 /**
  * Gavl feed signer — run a SIGNED price source, the open analog of a Pyth publisher.
  *
- * A Gavl market is named by its price SOURCE. `label::pyth::feedId` trusts Pyth's guardian set;
- * `label::signed::<sourcePubkey>` trusts ONE Ed25519 key — this signer's. It behaves just like
- * Pyth's Hermes, only at your own domain: it signs each reading and serves it, ANYONE relays it
- * on-chain, and the fold verifies the signature against the channel's committed key. So a reading
- * is provably from THIS source no matter who posts it — the trust is in whoever holds this KEY
- * (exactly as Pyth's users trust the guardians). One key is a single trust point; Pyth's 13/19
- * quorum is the multi-party version of the same idea.
+ * A Gavl market is named by its price source. `label::pyth::feedId` trusts Pyth's 13-of-19 guardian
+ * set; `label::signed::<setHash>` trusts an M-of-N Ed25519 set YOU stand up. This utility runs a
+ * source like Pyth's Hermes, only at your own domain: it signs each reading and serves a quorum
+ * update, ANYONE relays it on-chain, and the fold verifies the quorum against the channel's committed
+ * set. So a reading is provably from THIS set no matter who posts it, and — exactly like Pyth — no
+ * single member can forge it.
+ *
+ * QUORUM. Point `--keys` at the member keyfiles this process holds and `--threshold` at M. It signs
+ * each reading with every held member key and serves a complete update (the committed set + ≥ M
+ * signatures). One key is the degenerate 1-of-1 set. For a REAL M-of-N you'd run the members on
+ * independent machines and aggregate their signatures over an agreed reading; this single-process
+ * multi-key signer is the reference that exercises the same wire format + fold path end to end.
  *
  * IMPORTANT: `--upstream` is only where this source READS its number — your own pricing infra, or
  * a public API for testing/bootstrapping. It does NOT make that upstream trustworthy: wrapping an
- * unsigned API (e.g. Coinbase) means the market trusts YOU to relay it faithfully, not the API.
- * The signer's KEY is the authority. For a real market, be a source people choose to trust.
+ * unsigned API (e.g. Coinbase) means the market trusts the SET to relay it faithfully, not the API.
+ * The set's KEYS are the authority. For a real market, be a set people choose to trust.
  *
  * Run it:
  *   node src/feed-signer.ts \
  *     --upstream "https://api.coinbase.com/v2/prices/BTC-USD/spot" \
- *     --path data.amount --expo -2 --label BTC-USD
+ *     --path data.amount --expo -2 --label BTC-USD --keys a.json,b.json,c.json --threshold 2
  *
  *   # generic JSON endpoint → dot-path to the price, expo = -(decimal places to keep)
  *   --upstream <url>   the HTTP endpoint THIS source reads (GET, JSON)
  *   --path <a.b.c>     dot-path to the price within the JSON (e.g. data.amount)
  *   --expo <n>         decimal exponent; real price = integer · 10^expo (e.g. -2 keeps cents)
  *   --label <name>     market label for the printed channel name (default: "feed")
- *   --key <file>       keyfile to load/create (default: ~/.gavl/feed-key.json) — the SOURCE key
+ *   --keys <f1,f2,…>   member keyfiles to load/create (default: ~/.gavl/feed-key.json) — the SET
+ *   --threshold <M>    min member sigs an update needs (default: ⌊2N/3⌋+1, Pyth-style)
  *   --port <n>         HTTP port to serve the signed update on (default: 8787)
  *   --every <ms>       refresh interval (default: 3000)
  *
- * It prints the channel name to share (`label::signed::<pubkey>`) and the URL relayers point a
- * node at (`GAVL_FEED_URL`). Guard the keyfile: whoever holds it IS the source for this market.
+ * It prints the channel name to share (`label::signed::<setHash>`) and the URL relayers point a
+ * node at (`GAVL_FEED_URL`). Guard the keyfiles: whoever holds a quorum of them IS the source.
  */
 
 import http from "node:http";
@@ -39,7 +45,7 @@ import os from "node:os";
 
 import { generateKeyPair, keyPairFromSeed } from "./det/ed25519.ts";
 import { toHex, fromHex } from "./det/canonical.ts";
-import { signReading, type SignedUpdate } from "./market/signed-feed.ts";
+import { signReading, signerSetHash, buildSignedUpdate, type SignerSet, type SignedUpdate } from "./market/signed-feed.ts";
 
 // ── flags ────────────────────────────────────────────────────────────────
 function flag(name: string, fallback?: string): string | undefined {
@@ -51,36 +57,44 @@ const upstream = flag("upstream");
 const pricePath = flag("path");
 const expo = Number(flag("expo", "-8"));
 const label = flag("label", "feed")!;
-const keyFile = (flag("key", path.join(os.homedir(), ".gavl", "feed-key.json")) as string).replace(/^~(?=$|\/)/, os.homedir());
+// --keys takes precedence; --key stays as a single-file alias for the 1-of-1 case.
+const keyFiles = (flag("keys", flag("key", path.join(os.homedir(), ".gavl", "feed-key.json"))) as string).split(",").map((f) => f.trim().replace(/^~(?=$|\/)/, os.homedir()));
 const port = Number(flag("port", "8787"));
 const everyMs = Number(flag("every", "3000"));
 
 if (!upstream || !pricePath || !Number.isInteger(expo)) {
-	console.error("usage: node src/feed-signer.ts --upstream <url> --path <a.b.c> --expo <n> [--label NAME] [--key FILE] [--port N] [--every MS]");
+	console.error("usage: node src/feed-signer.ts --upstream <url> --path <a.b.c> --expo <n> [--label NAME] [--keys F1,F2,…] [--threshold M] [--port N] [--every MS]");
 	process.exit(1);
 }
 
-// ── the SOURCE key (the market's trust anchor) ─────────────────────────────
-/** Load the signer's Ed25519 key from `keyFile`, or generate + persist a new one (0600). The
- *  stored secret is just the 32-byte seed; the public key is derived. This key IS the market. */
+// ── the SOURCE set (the market's trust anchor) ─────────────────────────────
+/** Load a member's Ed25519 key from `file`, or generate + persist a new one (0600). The stored
+ *  secret is just the 32-byte seed; the public key is derived. The SET of these keys IS the market. */
 function loadOrCreateKey(file: string): { publicKey: Uint8Array; privateKey: Uint8Array } {
 	try {
 		const seed = fromHex((JSON.parse(fs.readFileSync(file, "utf8")) as { seed: string }).seed);
 		const kp = keyPairFromSeed(seed);
-		console.log(`  loaded source key from ${file}`);
+		console.log(`  loaded member key from ${file}`);
 		return kp;
 	} catch {
 		const kp = generateKeyPair();
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		fs.writeFileSync(file, JSON.stringify({ seed: toHex(kp.privateKey) }), { mode: 0o600 });
-		console.log(`  generated a new source key → ${file} (keep it secret)`);
+		console.log(`  generated a new member key → ${file} (keep it secret)`);
 		return kp;
 	}
 }
 
-const key = loadOrCreateKey(keyFile);
-const sourcePub = toHex(key.publicKey);
-const channel = `${label}::signed::${sourcePub}`;
+const members = keyFiles.map(loadOrCreateKey);
+const N = members.length;
+const threshold = Number(flag("threshold", String(Math.floor((2 * N) / 3) + 1)));
+if (!Number.isInteger(threshold) || threshold < 1 || threshold > N) {
+	console.error(`  --threshold must be an integer in 1..${N} (have ${N} key${N === 1 ? "" : "s"})`);
+	process.exit(1);
+}
+const set: SignerSet = { threshold, signers: members.map((m) => toHex(m.publicKey)) };
+const setHash = signerSetHash(set);
+const channel = `${label}::signed::${setHash}`;
 
 // ── read the upstream value ────────────────────────────────────────────────
 /** Walk a dot-path (`a.b.c`) into a parsed JSON object; undefined if any hop is missing. */
@@ -102,7 +116,8 @@ function scaleDecimal(s: string, e: number): bigint {
 	return neg ? -v : v;
 }
 
-/** Fetch the upstream, extract the price at `pricePath`, and produce a fresh signed reading. */
+/** Fetch the upstream, extract the price at `pricePath`, and produce a fresh quorum update — every
+ *  held member signs the SAME reading, assembled into the committed set's wire form. */
 async function readAndSign(): Promise<SignedUpdate | null> {
 	try {
 		const res = await fetch(upstream!, { headers: { accept: "application/json" } });
@@ -121,7 +136,9 @@ async function readAndSign(): Promise<SignedUpdate | null> {
 			return null;
 		}
 		const publishTime = Math.floor(Date.now() / 1000);
-		return signReading(price, expo, publishTime, key.privateKey);
+		const sigBySigner: Record<string, string> = {};
+		for (const m of members) sigBySigner[toHex(m.publicKey)] = signReading(price, expo, publishTime, m.privateKey);
+		return buildSignedUpdate(price, expo, publishTime, set, sigBySigner);
 	} catch (e) {
 		console.error(`  fetch failed: ${(e as Error).message}`);
 		return null;
@@ -154,6 +171,7 @@ async function tick(): Promise<void> {
 
 server.listen(port, () => {
 	console.log(`\nGavl feed signer — wrapping ${upstream}`);
+	console.log(`  signer set:                 ${threshold}-of-${N} (M-of-N quorum)`);
 	console.log(`  channel name (share this):  ${channel}`);
 	console.log(`  relayers run a node with:   GAVL_FEED_URL=http://localhost:${port}/`);
 	console.log(`  serving signed updates on:  http://localhost:${port}/\n`);

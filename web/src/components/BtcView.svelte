@@ -8,7 +8,7 @@
 	const m = $derived(store.market);
 	// display value = integer price · 10^expo (Pyth feeds carry an expo, e.g. −8)
 	const priceNum = $derived(m?.price != null ? Number(m.price) * 10 ** (m.priceExpo ?? 0) : null);
-	const mkt = $derived(m?.marketInfo ?? null); // { kind, label, feedId, sourceKey, price, iAmRelaying, source } | null
+	const mkt = $derived(m?.marketInfo ?? null); // { kind, label, feedId, signerSet, price, iAmRelaying, source } | null
 	const bal = $derived(Number(myGbtc()));
 	const tape = $derived(m?.tape ?? []);
 	const contracts = $derived(m?.myContracts ?? []);
@@ -77,8 +77,8 @@
 		<div class="pair">{mkt?.label ?? "BTC"} <span class="muted">/ USD</span></div>
 		{#if priceNum != null}
 			<div class="price">${priceNum.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
-			<div class="src" title={mkt?.kind === "signed" ? "Signed source — Ed25519-signed readings, verified on-chain" : "Pyth — attested by the Wormhole guardian network, verified on-chain"}>
-				<span class="dot live"></span> live · {mkt?.kind === "signed" ? "signed oracle" : "Pyth oracle"}{mkt?.iAmRelaying ? " · relayed by you" : ""}
+			<div class="src" title={mkt?.kind === "signed" ? "Signer set — an M-of-N Ed25519 quorum signs each reading, verified on-chain" : "Pyth — attested by the Wormhole guardian network, verified on-chain"}>
+				<span class="dot live"></span> live · {mkt?.kind === "signed" ? "signed quorum" : "Pyth oracle"}{mkt?.iAmRelaying ? " · relayed by you" : ""}
 			</div>
 		{:else}
 			<div class="price muted">—</div>
@@ -210,7 +210,7 @@
 				</div>
 				<div class="sources">
 					{#if mkt.kind === "signed"}
-						<div class="smeta">Signed source <span class="fhost mono">{short(mkt.sourceKey)}</span> <span class="muted">· Ed25519, verified on-chain</span></div>
+						<div class="smeta">Signer set <span class="fhost mono">{short(mkt.signerSet)}</span> <span class="muted">· M-of-N Ed25519 quorum, verified on-chain</span></div>
 					{:else}
 						<div class="smeta">Pyth feed <a class="fhost mono" href={`https://pyth.network/price-feeds?search=${mkt.feedId}`} target="_blank" rel="noopener">{short(mkt.feedId)}</a> <span class="muted">· Wormhole-attested</span></div>
 					{/if}
@@ -227,7 +227,7 @@
 			{/if}
 			<div class="trust">
 				<p><span class="ok">✓</span> Every node verifies the ledger, the ordering, and each write's signature — no server, no single node trusted.</p>
-				<p><span class="ok">✓</span> <strong>A channel is a market.</strong> Its name fixes the Pyth feed, and every price is attested by the Wormhole guardian network and verified on-chain — so anyone can relay it and no reporter is trusted.</p>
+				<p><span class="ok">✓</span> <strong>A channel is a market.</strong> Its name fixes the price source — a Pyth feed or your own M-of-N signer set — and every price is signed by a quorum and verified on-chain, so anyone can relay it, no reporter is trusted, and no single signer can forge.</p>
 				<p><span class="ok">✓</span> Each channel is its own economy: a bad market can only ever touch its own pot/collateral.</p>
 			</div>
 		</div>

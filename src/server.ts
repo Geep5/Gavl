@@ -91,10 +91,10 @@ function serializeState() {
 	const gbtc: Record<string, string> = {};
 	for (const [pubkey, amt] of view.bridge.gbtc) gbtc[pubkey] = amt.toString();
 
-	// A CHANNEL IS A MARKET, named by its price SOURCE: `label::pyth::feedId` (a Wormhole-attested Pyth
-	// feed) or `label::signed::sourcePubkey` (any source that signs its readings with an Ed25519 key).
-	// Either way ANYONE may relay a signed update — the fold verifies the source signature, so there's no
-	// reporter to trust. Each channel is its own sandboxed economy: a malicious market can't touch another's.
+	// A CHANNEL IS A MARKET, named by its price source: `label::pyth::feedId` (a Wormhole-attested Pyth
+	// feed, 13-of-19 guardians) or `label::signed::setHash` (any M-of-N Ed25519 signer set you stand up).
+	// Either way ANYONE may relay a quorum-signed update — the fold verifies the quorum, so there's no
+	// reporter to trust and no single signer can forge. Each channel is its own sandboxed economy.
 	const def = parseChannel(daemon.currentChannel());
 	const live = def ? daemon.oracleSource() : null;
 	const marketInfo = def
@@ -103,9 +103,9 @@ function serializeState() {
 				kind: def.kind, // "pyth" | "signed"
 				label: def.label,
 				feedId: def.kind === "pyth" ? def.feedId : null, // Pyth feed id (pyth markets)
-				sourceKey: def.kind === "signed" ? def.source : null, // committed Ed25519 source key (signed markets)
+				signerSet: def.kind === "signed" ? def.signerSet : null, // committed signer-set hash (signed markets)
 				price: m != null ? m.toString() : null,
-				iAmRelaying: !!live, // this node is relaying the feed (anyone may; the source signature is the authority)
+				iAmRelaying: !!live, // this node is relaying the feed (anyone may; the quorum signature is the authority)
 				source: live ? { method: live.method, ageMs: Date.now() - live.at, feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })) } : null,
 			}
 		: null;
