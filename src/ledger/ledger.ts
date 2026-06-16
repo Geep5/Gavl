@@ -57,8 +57,10 @@ export class Ledger {
 		this.params = params;
 	}
 
-	/** Apply a write: append in order, buffer if ahead, detect equivocation. */
-	apply(w: Write): ApplyResult {
+	/** Apply a write: append in order, buffer if ahead, detect equivocation. `opts.skipTimeProof`
+	 *  skips only the expensive VDF re-check — set ONLY when replaying already-accepted writes from
+	 *  the local store (so boot doesn't block re-walking every cooldown); never on live/gossip input. */
+	apply(w: Write, opts?: { skipTimeProof?: boolean }): ApplyResult {
 		this.tick++;
 		let chain = this.chains.get(w.writer);
 		if (!chain) {
@@ -84,14 +86,14 @@ export class Ledger {
 
 		// Ahead of the tip: verify now (so junk can't accumulate) and buffer (with its tick).
 		if (w.seq > nextSeq) {
-			const v = verifyWrite(w, this.params);
+			const v = verifyWrite(w, this.params, opts);
 			if (!v.ok) return { ok: false, reason: v.reason };
 			pend.set(w.seq, { w, tick: this.tick });
 			return { ok: true, applied: [], buffered: true };
 		}
 
 		// In order: append (this verifies, links prev, checks equivocation, accrues weight).
-		const r = chain.append(w);
+		const r = chain.append(w, opts);
 		if (!r.ok) return r;
 		const applied: Write[] = [w];
 
@@ -100,7 +102,7 @@ export class Ledger {
 		while (pend.has(s)) {
 			const next = pend.get(s)!.w;
 			pend.delete(s);
-			const rr = chain.append(next);
+			const rr = chain.append(next, opts);
 			if (!rr.ok) return { ok: false, reason: rr.reason, equivocation: rr.equivocation };
 			applied.push(next);
 			s++;

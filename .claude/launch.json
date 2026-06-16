@@ -8,6 +8,12 @@
       "port": 5180
     },
     {
+      "name": "gavl-fresh",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev:fresh"],
+      "port": 5180
+    },
+    {
       "name": "gavl-web",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "web:dev"],

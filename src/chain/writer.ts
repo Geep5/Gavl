@@ -97,7 +97,11 @@ function idOf(core: WriteCore, space: SpaceProof, time: TimeProof): string {
 
 // ── Self-contained verification ──────────────────────────────────
 
-export function verifyWrite(w: Write, params: ChainParams): VerifyResult {
+/** `skipTimeProof` skips ONLY the O(iters) VDF re-check — used when REPLAYING our own writes from the
+ *  local store (they passed full verification, VDF included, when first accepted, so re-walking the
+ *  cooldown for each on boot is redundant and would block the event loop). Every other check stays,
+ *  so disk corruption is still caught. Never set on the live/gossip path: remote writes are untrusted. */
+export function verifyWrite(w: Write, params: ChainParams, opts?: { skipTimeProof?: boolean }): VerifyResult {
 	// Difficulty must match what the network expects at this position.
 	if (w.difficulty !== params.difficulty.toString()) {
 		return { ok: false, reason: `wrong difficulty (${w.difficulty}, expected ${params.difficulty})` };
@@ -116,8 +120,9 @@ export function verifyWrite(w: Write, params: ChainParams): VerifyResult {
 		return { ok: false, reason: `insufficient cooldown (${w.time.iters} < ${needIters} required by proof quality)` };
 	}
 
-	// Proof of Time: the VDF, infused with the space proof, actually ran.
-	if (!params.vdf.verify(vdfChallenge(challenge, w.space.value), w.time)) {
+	// Proof of Time: the VDF, infused with the space proof, actually ran. (Skipped on local replay —
+	// see the opts note above — where the write was already verified before it was persisted.)
+	if (!opts?.skipTimeProof && !params.vdf.verify(vdfChallenge(challenge, w.space.value), w.time)) {
 		return { ok: false, reason: "bad time proof" };
 	}
 
@@ -224,11 +229,11 @@ export class WriterChain {
 		return this.writes.length > 0 ? this.writes[this.writes.length - 1].id : this.baseHeadId;
 	}
 
-	append(w: Write): AppendResult {
+	append(w: Write, opts?: { skipTimeProof?: boolean }): AppendResult {
 		if (w.writer !== this.writer) return { ok: false, reason: "wrong writer" };
 		if (this.plotRoot !== null && w.plot.root !== this.plotRoot) return { ok: false, reason: "wrong plot commitment" };
 
-		const v = verifyWrite(w, this.params);
+		const v = verifyWrite(w, this.params, opts);
 		if (!v.ok) return { ok: false, reason: `invalid write: ${v.reason}` };
 
 		// Equivocation: a different write already occupies this seq → fork proof.

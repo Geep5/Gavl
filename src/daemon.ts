@@ -454,7 +454,10 @@ export class Daemon {
 		// otherwise a restart resets ts to 0, colliding with persisted writes and
 		// scrambling the optimistic (ts-ordered) fold.
 		const { writes } = await this.store.replay((w) => {
-			this.node.ledger.apply(w);
+			// skipTimeProof: these writes already passed full verification (VDF included) before they
+			// were persisted, so re-walking each O(iters) cooldown here would block boot for minutes on
+			// a large backlog. The cheap sig/id/structure checks still run, catching disk corruption.
+			this.node.ledger.apply(w, { skipTimeProof: true });
 			if (w.ts > this.clock) this.clock = w.ts;
 		});
 

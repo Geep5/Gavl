@@ -6,8 +6,10 @@
   "description": "Gavl — a decentralized peer-to-peer Bitcoin bull/bear market (matched) on a Proof-of-Space-Time cooldown ledger (Holepunch).",
   "scripts": {
     "dev": "concurrently -k -n daemon,web -c blue,magenta \"npm:daemon:dev\" \"npm:web:dev\"",
+    "dev:fresh": "concurrently -k -n daemon,web -c blue,magenta \"npm:daemon:fresh\" \"npm:web:dev\"",
     "daemon": "node src/server.ts",
     "daemon:dev": "cross-env GAVL_VDF=hash GAVL_ORACLE_PUBLISH=1 node src/server.ts",
+    "daemon:fresh": "cross-env GAVL_VDF=hash GAVL_ORACLE_PUBLISH=1 GAVL_PERSIST=off node src/server.ts",
     "feed:signer": "node src/feed-signer.ts",
     "feed:member": "node src/feed-member.ts",
     "feed:aggregator": "node src/feed-aggregator.ts",
