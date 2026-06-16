@@ -71,8 +71,30 @@ const toSigned = (v: bigint, bits: number): bigint => (v >> (BigInt(bits) - 1n) 
  * Verify a Pyth accumulator price update (hex blob from Hermes). Returns every verified price
  * message, or [] if anything fails (bad magic, wrong guardian set, quorum not met, Merkle proof
  * fails, malformed). NEVER throws — an untrusted relayer can't crash the fold.
+ *
+ * MEMOIZED. Verification is a PURE function of the blob (~13 secp256k1 recoveries + keccak/Merkle),
+ * and the fold re-derives state by re-folding the same `market.report` writes many times (every boot,
+ * every cold view, once per catch-up anchor). Without this cache a node that has run a while
+ * re-verifies hundreds of past updates on boot and pegs the event loop — HTTP + swarm starve. Only
+ * the default guardian set/index (the consensus path) is cached; a custom set (tests) bypasses it.
+ * Bounded FIFO so it can't grow unboundedly — an eviction just costs one re-verify.
  */
+const verifyCache = new Map<string, PythPrice[]>();
+const VERIFY_CACHE_MAX = 2048;
+
 export function verifyPythUpdate(blobHex: string, guardians: readonly string[] = WORMHOLE_GUARDIANS, expectedSetIndex = WORMHOLE_GUARDIAN_SET_INDEX): PythPrice[] {
+	const cacheable = guardians === WORMHOLE_GUARDIANS && expectedSetIndex === WORMHOLE_GUARDIAN_SET_INDEX;
+	const hit = cacheable ? verifyCache.get(blobHex) : undefined;
+	if (hit) return hit;
+	const result = verifyPythUpdateUncached(blobHex, guardians, expectedSetIndex);
+	if (cacheable) {
+		if (verifyCache.size >= VERIFY_CACHE_MAX) verifyCache.delete(verifyCache.keys().next().value as string); // evict oldest
+		verifyCache.set(blobHex, result);
+	}
+	return result;
+}
+
+function verifyPythUpdateUncached(blobHex: string, guardians: readonly string[] = WORMHOLE_GUARDIANS, expectedSetIndex = WORMHOLE_GUARDIAN_SET_INDEX): PythPrice[] {
 	try {
 		const blob = hexToBytes(blobHex);
 		let o = 0;
