@@ -3,6 +3,7 @@
 	// IDENTITY (the channel name) is surfaced as a decoded, verifiable address — it IS the market.
 	import { store, act, refresh, myGbtc, short } from "../lib/store.svelte.js";
 	import { api } from "../lib/api.js";
+	import DecentralizationBar from "./DecentralizationBar.svelte";
 
 	const m = $derived(store.market);
 	const c = $derived(store.consensus);
@@ -248,6 +249,9 @@
 			{#if m.pendingCount > 0}<button class="ghost full" onclick={processPayouts}>Process {m.pendingCount} pending payout{m.pendingCount === 1 ? "" : "s"} → broadcast BTC</button>{/if}
 		</div>
 	</details>
+
+	<!-- ── decentralization progress (live backbone readout) ─────────────────────── -->
+	<DecentralizationBar />
 
 	<!-- ── how it works (optional) ──────────────────────────────────────────────── -->
 	<details class="card how">
