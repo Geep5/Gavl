@@ -73,8 +73,8 @@
 </section>
 
 <style>
-	.deco { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.1rem 1.25rem 1.2rem; margin-bottom: 1rem; transition: border-color 0.4s; }
-	.deco.complete { border-color: color-mix(in srgb, var(--green) 30%, var(--border)); }
+	/* sits inside the "How this works" body — a borderless subsection, not a nested card */
+	.deco { margin-top: 0.9rem; padding-top: 1rem; border-top: 1px solid var(--border); }
 	.head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 1.1rem; }
 	.title { font-size: 0.84rem; font-weight: 700; }
 	.count { font-size: 0.76rem; color: var(--muted); font-variant-numeric: tabular-nums; }

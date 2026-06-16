@@ -250,10 +250,7 @@
 		</div>
 	</details>
 
-	<!-- ── decentralization progress (live backbone readout) ─────────────────────── -->
-	<DecentralizationBar />
-
-	<!-- ── how it works (optional) ──────────────────────────────────────────────── -->
+	<!-- ── how it works (optional) — the live decentralization readout lives here ──── -->
 	<details class="card how">
 		<summary>
 			<span class="s-title">How this works</span>
@@ -263,6 +260,7 @@
 			<p><span class="ok">✓</span> <strong>No exchange, no operator.</strong> Every node runs the same rules and verifies the ledger, the ordering, and every signature itself — there's no server to trust or shut down.</p>
 			<p><span class="ok">✓</span> <strong>The price is verified, not reported.</strong> The mark is a {mechName} price signed by a quorum and checked on every node; anyone can relay it and no single party can forge it.</p>
 			<p><span class="ok">✓</span> <strong>Real counterparties, real Bitcoin.</strong> Longs and shorts are matched peer-to-peer (no pool, zero-sum, fully collateralized), and gBTC is a 1:1 claim on BTC in threshold custody.</p>
+			<DecentralizationBar />
 		</div>
 	</details>
 {/if}
