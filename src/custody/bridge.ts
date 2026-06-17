@@ -251,20 +251,20 @@ export function transferGbtc(s: BridgeState, from: string, to: string, amount: b
  * payout tx confirms. No-op (returns false) if the owner can't cover it or the id
  * was already used.
  */
-/** Minimum miner fee (sats) a withdrawer may choose — a relay-safe floor so a withdrawal can't be
- *  posted with a fee so low it never confirms (which would clog the pending set). Consensus-relevant. */
-export const MIN_WITHDRAW_FEE = 500n;
-/** Default miner fee when a withdrawer doesn't choose one. */
+/** Suggested default miner fee (sats) when a withdrawer doesn't choose one — the UI pre-fills this. */
 export const DEFAULT_WITHDRAW_FEE = 1_000n;
-/** A BTC payout below this many sats is dust (unspendable) — `amount − fee` must clear it. */
+/** A BTC payout below this many sats is dust (unspendable) — `amount − fee` must clear it, else the
+ *  withdrawal can't produce a valid output. A BUILDABILITY bound, NOT a fee-policy cap. */
 export const WITHDRAW_DUST = 546n;
 
 export function requestWithdrawal(s: BridgeState, w: PendingWithdrawal): boolean {
 	if (w.amount <= 0n || gbtcOf(s, w.owner) < w.amount) return false;
-	// The withdrawer's own fee comes out of their payout (they receive amount − fee); enforce a
-	// relay-safe floor and that the net payout clears dust. The fund's reserves still drop by exactly
-	// `amount`, so 1:1 backing is preserved (the fee is BTC the withdrawer forgoes, not the fund's).
-	if (w.fee < MIN_WITHDRAW_FEE || w.amount - w.fee < WITHDRAW_DUST) return false;
+	// The withdrawer's own fee comes out of their payout (they receive amount − fee). The PROTOCOL
+	// does NOT cap the fee — under the hood you can broadcast whatever you want; the sane upper bound
+	// is a UI guardrail only. It only rejects a fee that can't yield a VALID tx: negative (would
+	// overpay the fund / produce a negative miner fee) or one leaving a sub-dust/negative payout.
+	// Either way the fund's reserves drop by exactly `amount`, so 1:1 backing is preserved.
+	if (w.fee < 0n || w.amount - w.fee < WITHDRAW_DUST) return false;
 	if (s.pending.some((p) => p.id === w.id)) return false;
 	addG(s, w.owner, -w.amount); // burn gBTC
 	s.pending.push({ ...w }); // now owed as BTC (still backed by reserves)

@@ -21,7 +21,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
 import { mark, gbtcOf, MAX_LEVERAGE, parseAmount, leverageOk } from "./market/btc.ts";
 import { escrowedInContracts } from "./market/intent.ts";
-import { totalGbtc, pendingTotal, backingBps as bridgeBackingBps, MIN_WITHDRAW_FEE } from "./custody/bridge.ts";
+import { totalGbtc, pendingTotal, backingBps as bridgeBackingBps } from "./custody/bridge.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
@@ -222,11 +222,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		}
 		if (path === "/api/withdraw") {
 			// Burn gBTC to redeem BTC to a Bitcoin address → a pending withdrawal. `fee` (sats, optional)
-			// is the withdrawer's chosen miner fee, deducted from their own payout; must clear the floor.
+			// is the withdrawer's chosen miner fee, deducted from their own payout. The protocol does NOT
+			// cap it (broadcast what you want) — the sane upper bound is a UI guardrail; here we only
+			// require a non-negative integer so it can build. Omit it to use the daemon default.
 			if (!String(body.btcAddress ?? "").trim()) throw new Error("BTC address required");
 			requireSpendable(String(body.amount), "amount");
 			const feeStr = body.fee != null && String(body.fee).trim() !== "" ? String(body.fee) : undefined;
-			if (feeStr !== undefined && (!/^\d+$/.test(feeStr) || BigInt(feeStr) < MIN_WITHDRAW_FEE)) throw new Error(`fee must be ≥ ${MIN_WITHDRAW_FEE} sats`);
+			if (feeStr !== undefined && !/^\d+$/.test(feeStr)) throw new Error("fee must be a non-negative integer (sats)");
 			await daemon.active().withdraw(String(body.amount), String(body.btcAddress), feeStr);
 			return send(res, 200, { ok: true });
 		}

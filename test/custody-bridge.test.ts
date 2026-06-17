@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { emptyBridge, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, withdrawalPayouts, gbtcOf, totalGbtc, pendingTotal, conserved, backingBps, MIN_WITHDRAW_FEE, WITHDRAW_DUST } from "../src/custody/bridge.ts";
+import { emptyBridge, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, withdrawalPayouts, gbtcOf, totalGbtc, pendingTotal, conserved, backingBps, WITHDRAW_DUST } from "../src/custody/bridge.ts";
 import { generateFundKeyDKG, quorumOf } from "../src/custody/threshold.ts";
 import { fundAddress } from "../src/custody/bitcoin.ts";
 import { buildWithdrawalTx, signWithdrawalTx, verifyWithdrawalSigs } from "../src/custody/btctx.ts";
@@ -51,19 +51,22 @@ test("complete withdrawal: BTC leaves the fund, invariant preserved", () => {
 	assert.ok(conserved(b));
 });
 
-test("withdrawal fee: floor + dust enforced; the fee is the withdrawer's, not the fund's", () => {
+test("withdrawal fee: the protocol allows any VALID fee (no cap); the fee is the withdrawer's, not the fund's", () => {
 	const b = emptyBridge();
 	mintFromDeposit(b, { depositId: "f:0", depositor: "u", amount: 100_000n });
-	// fee below the relay floor → rejected, and the gBTC is NOT burned
-	assert.equal(requestWithdrawal(b, { id: "lo", owner: "u", amount: 50_000n, btcAddress: RECIPIENT, fee: MIN_WITHDRAW_FEE - 1n }), false);
-	assert.equal(gbtcOf(b, "u"), 100_000n, "a rejected withdrawal burns nothing");
-	// amount − fee would be dust → rejected (the payout must be spendable)
+	// negative fee → rejected (would overpay the fund / produce a negative miner fee); gBTC NOT burned
+	assert.equal(requestWithdrawal(b, { id: "neg", owner: "u", amount: 50_000n, btcAddress: RECIPIENT, fee: -1n }), false);
+	// amount − fee would be sub-dust → rejected (can't build a valid output)
 	assert.equal(requestWithdrawal(b, { id: "dust", owner: "u", amount: WITHDRAW_DUST + 100n, btcAddress: RECIPIENT, fee: 600n }), false);
-	// valid → accepted. The LEDGER burns/owes the FULL amount; the fee only comes off the BTC payout
-	// later (buildPayout pays amount − fee), so reserves still back it 1:1 and conservation holds.
-	assert.equal(requestWithdrawal(b, { id: "ok", owner: "u", amount: 50_000n, btcAddress: RECIPIENT, fee: 2_000n }), true);
-	assert.equal(pendingTotal(b), 50_000n, "pending owes the full burned amount, not amount − fee");
-	assert.equal(b.pending[0].fee, 2_000n, "the chosen fee is recorded for the payout tx");
+	assert.equal(gbtcOf(b, "u"), 100_000n, "a rejected withdrawal burns nothing");
+	// a TINY fee is fine under the hood — the protocol has no floor (the UI suggests a sane default)
+	assert.equal(requestWithdrawal(b, { id: "low", owner: "u", amount: 20_000n, btcAddress: RECIPIENT, fee: 1n }), true);
+	// a HIGH fee is also fine as long as the payout clears dust — no protocol cap (broadcast what you want)
+	assert.equal(requestWithdrawal(b, { id: "hi", owner: "u", amount: 50_000n, btcAddress: RECIPIENT, fee: 49_000n }), true);
+	// the LEDGER burns/owes the FULL amount; the fee only comes off the BTC payout later (buildPayout
+	// pays amount − fee), so reserves still back it 1:1 and conservation holds.
+	assert.equal(pendingTotal(b), 70_000n, "pending owes the full burned amounts (20k + 50k), not net");
+	assert.equal(b.pending.find((p) => p.id === "hi")!.fee, 49_000n, "the chosen fee is recorded for the payout tx");
 	assert.equal(b.reserves, 100_000n);
 	assert.ok(conserved(b), "reserves == gBTC + pending — the fee never touches the ledger");
 });

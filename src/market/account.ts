@@ -73,7 +73,8 @@ export class Account {
 	}
 
 	/** Burn gBTC to redeem BTC to `btcAddress` → a pending withdrawal. `fee` (sats) is the miner
-	 *  fee, deducted from the payout (you receive `amount − fee`); must be ≥ MIN_WITHDRAW_FEE. */
+	 *  fee, deducted from the payout (you receive `amount − fee`). The protocol caps nothing — any
+	 *  non-negative fee leaving a non-dust payout is valid; the sane upper bound is a UI guardrail. */
 	withdraw(amount: bigint | number | string, btcAddress: string, fee: bigint | number | string = DEFAULT_WITHDRAW_FEE): Promise<Write> {
 		return this.produce({ kind: "bridge.withdraw", amount: amountStr(amount), btcAddress, fee: amountStr(fee) });
 	}

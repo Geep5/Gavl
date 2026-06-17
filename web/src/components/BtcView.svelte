@@ -104,12 +104,18 @@
 			if (bal <= 0) fundsOpen = true; // first load with an empty wallet → invite funding
 		}
 	});
-	let wAmt = $state(""), wAddr = $state(""), depTx = $state(""), claimMsg = $state("");
+	let wAmt = $state(""), wAddr = $state(""), wFee = $state("1000"), depTx = $state(""), claimMsg = $state("");
+	// The fee guardrail lives ONLY in the UI: a sane default + an upper ceiling so a normal user can't
+	// foot-gun their payout. Under the hood (direct API) any non-negative fee is allowed.
+	const UI_MAX_FEE = 50_000; // sats — the "shouldn't go higher than this" ceiling
+	const wAmtNum = $derived(Number(wAmt) || 0);
+	const wFeeNum = $derived(Number(wFee) || 0);
+	const wFeeMax = $derived(Math.max(0, Math.min(wAmtNum - 546, UI_MAX_FEE))); // payout-minus-dust, capped at the ceiling
+	const wNet = $derived(wAmtNum - wFeeNum); // what you actually receive
+	const wFeeOk = $derived(wFee.trim() !== "" && Number.isInteger(wFeeNum) && wFeeNum >= 0 && wFeeNum <= wFeeMax && wNet >= 546);
 	async function withdraw() {
-		if (!wAmt || !wAddr) return;
-		// the UI always uses the daemon's default miner fee — a custom fee is an under-the-hood
-		// (direct API) capability only, so a normal user can't foot-gun their payout with a bad fee.
-		const ok = await act(() => api.withdraw(wAmt, wAddr));
+		if (!wAmt || !wAddr || !wFeeOk) return;
+		const ok = await act(() => api.withdraw(wAmt, wAddr, wFee.trim()));
 		if (ok) wAmt = "";
 	}
 	async function claim() {
@@ -250,9 +256,15 @@
 				{#if claimMsg}<div class="muted tiny msg">{claimMsg}</div>{/if}
 				<div class="sub">withdraw</div>
 				<div class="line">
-					<input placeholder="gBTC" bind:value={wAmt} inputmode="numeric" style="flex:0 0 7rem" />
+					<input placeholder="gBTC" bind:value={wAmt} inputmode="numeric" style="flex:0 0 6rem" />
 					<input placeholder="your BTC address (tb1…)" bind:value={wAddr} />
-					<button class="ghost" onclick={withdraw} disabled={!wAmt || !wAddr}>Withdraw</button>
+					<button class="ghost" onclick={withdraw} disabled={!wAmt || !wAddr || !wFeeOk}>Withdraw</button>
+				</div>
+				<div class="line">
+					<input placeholder="miner fee (sats)" bind:value={wFee} inputmode="numeric" style="flex:0 0 9rem" />
+					<span class="muted tiny" style="align-self:center">
+						{#if wAmtNum > 0 && wFeeNum > wFeeMax}fee too high — max {wFeeMax.toLocaleString()} sats{:else if wAmtNum > 0}you receive <strong>{wNet.toLocaleString()}</strong> sats — fee comes out of your payout{:else}miner fee, deducted from your payout{/if}
+					</span>
 				</div>
 				{#if m.pendingCount > 0}<button class="ghost full" onclick={processPayouts}>Process {m.pendingCount} pending payout{m.pendingCount === 1 ? "" : "s"} → broadcast BTC</button>{/if}
 			{:else}
