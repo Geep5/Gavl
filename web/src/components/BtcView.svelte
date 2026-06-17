@@ -47,6 +47,12 @@
 	const channel = $derived(mkt?.channel ?? c?.network ?? "");
 	const seg = $derived(channel.split("::"));
 	const mechName = $derived(seg[1] === "signed" ? "signed quorum" : "Pyth");
+	// the actual DHT rendezvous topic. With id-as-topic it EQUALS the coordinate; a mismatch means a
+	// node still on a derived (sha256-of-name) topic — a one-glance check that it's rendezvousing right.
+	const topic = $derived((c?.topic ?? "").toLowerCase());
+	const coordIsId = $derived(/^[0-9a-f]{64}$/.test((seg[2] ?? "").toLowerCase()));
+	const topicMatchesCoord = $derived(coordIsId && topic === (seg[2] ?? "").toLowerCase());
+	const topicShort = $derived(topic ? topic.slice(0, 8) + "…" + topic.slice(-6) : "—");
 
 	// price direction (vs the previous poll) for a subtle ▲/▼ tint
 	let dir = $state(0);
@@ -184,6 +190,16 @@
 				<span class="lg b">method</span>
 				<span class="lg c">coordinate</span>
 			</div>
+			{#if topic}
+				<div class="topic">
+					<span class="tk">dht topic</span>
+					<code class="tv">{topicShort}</code>
+					{#if coordIsId}
+						{#if topicMatchesCoord}<span class="tnote ok">✓ = coordinate</span>
+						{:else}<span class="tnote warn">⚠ derived hash — restart on the latest for the id-topic</span>{/if}
+					{/if}
+				</div>
+			{/if}
 		</div>
 	</div>
 </section>
@@ -359,6 +375,12 @@
 	.legend .lg.a::before { background: var(--panel-3); border: 1px solid var(--border); }
 	.legend .lg.b::before { background: var(--green); }
 	.legend .lg.c::before { background: var(--accent); }
+	.topic { display: flex; align-items: baseline; gap: 0.45rem; flex-wrap: wrap; }
+	.topic .tk { font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--faint); }
+	.topic .tv { font-family: var(--mono); font-size: 0.68rem; color: var(--muted); }
+	.topic .tnote { font-size: 0.62rem; }
+	.topic .tnote.ok { color: var(--green); }
+	.topic .tnote.warn { color: var(--accent); }
 
 	/* ── cards ── */
 	.card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.1rem 1.25rem; margin-bottom: 1rem; }
