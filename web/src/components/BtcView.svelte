@@ -47,7 +47,6 @@
 	const channel = $derived(mkt?.channel ?? c?.network ?? "");
 	const seg = $derived(channel.split("::"));
 	const mechName = $derived(seg[1] === "signed" ? "signed quorum" : "Pyth");
-	const idShort = $derived(seg[2] ? seg[2].slice(0, 8) + "…" + seg[2].slice(-6) : "—");
 
 	// price direction (vs the previous poll) for a subtle ▲/▼ tint
 	let dir = $state(0);
@@ -179,7 +178,7 @@
 			<button class="copy" onclick={copyId} title="copy the full market id">{copied ? "✓ copied" : "⧉ copy"}</button>
 		</div>
 		<div class="addr">
-			<code class="stream"><span class="seg a">{seg[0] ?? "—"}</span><span class="sep">::</span><span class="seg b">{seg[1] ?? "—"}</span><span class="sep">::</span><span class="seg c" title={seg[2] ?? ""}>{idShort}</span></code>
+			<code class="stream"><span class="seg a">{seg[0] ?? "—"}</span><span class="sep">::</span><span class="seg b">{seg[1] ?? "—"}</span><span class="sep">::</span><span class="seg c">{seg[2] ?? "—"}</span></code>
 			<div class="legend">
 				<span class="lg a">channel</span>
 				<span class="lg b">method</span>
@@ -346,12 +345,14 @@
 	.addr { display: flex; flex-direction: column; gap: 0.5rem; }
 	/* one continuous bordered bar — the channel name IS one string; the pieces are colored, flush
 	   highlights joined by neutral :: separators, not separate boxes. */
-	.stream { display: inline-flex; align-items: stretch; flex-wrap: wrap; width: fit-content; max-width: 100%; font-family: var(--mono); font-size: 0.9rem; font-weight: 600; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; }
-	.stream .seg { display: inline-flex; align-items: center; padding: 0.5rem 0.55rem; }
+	/* the FULL channel address as one wrapping color-coded stream — the long coordinate (a 64-hex
+	   feed id) flows across lines with its highlight following each fragment (box-decoration-break). */
+	.stream { display: block; font-family: var(--mono); font-size: 0.82rem; font-weight: 600; line-height: 2; word-break: break-all; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-2); padding: 0.5rem 0.6rem; }
+	.stream .seg { padding: 0.16rem 0.34rem; border-radius: 4px; -webkit-box-decoration-break: clone; box-decoration-break: clone; }
 	.stream .seg.a { color: var(--text); background: var(--panel-3); }
 	.stream .seg.b { color: var(--green); background: var(--green-soft); }
-	.stream .seg.c { color: var(--accent); background: var(--accent-soft); word-break: break-all; }
-	.stream .sep { display: inline-flex; align-items: center; color: var(--faint); background: var(--bg-2); padding: 0.5rem 0.1rem; }
+	.stream .seg.c { color: var(--accent); background: var(--accent-soft); }
+	.stream .sep { color: var(--faint); padding: 0 0.15rem; }
 	.legend { display: flex; gap: 1rem; flex-wrap: wrap; }
 	.legend .lg { display: inline-flex; align-items: center; gap: 0.32rem; font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--faint); }
 	.legend .lg::before { content: ""; width: 9px; height: 9px; border-radius: 2px; flex: none; }
