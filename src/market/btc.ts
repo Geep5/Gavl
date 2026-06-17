@@ -22,7 +22,6 @@ import type { Op } from "./ops.ts";
 import { isOp } from "./ops.ts";
 import { finalizedOrdering, orderingFor } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
-import { bridgePubHex } from "./oracle.ts";
 import { verifyPythUpdate } from "./pyth.ts";
 import { verifySignedQuorum } from "./signed-feed.ts";
 import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
@@ -34,12 +33,6 @@ import type { MarketBook, Offer } from "./intent.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "../custody/attestation.ts";
 import { fromHex } from "../det/canonical.ts";
-
-// ── consensus constants (every node must agree) ──────────────────
-
-/** The BTC bridge attestor (committee) key. Only it may mint gBTC from a verified
- *  deposit or settle a withdrawal. v0 single signer; production = threshold committee. */
-export const BRIDGE_ATTESTOR = bridgePubHex(process.env.GAVL_BRIDGE_SEED);
 
 /**
  * The channel's market price. A CHANNEL IS A MARKET: the channel name encodes the instrument's Pyth

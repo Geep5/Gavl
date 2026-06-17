@@ -17,7 +17,9 @@ import { Producer } from "./consensus/producer.ts";
 import { StandinSpaceProver, StandinSpaceVerifier } from "./consensus/space.ts";
 import { finalizedView, gbtcOf } from "./market/btc.ts";
 import { Account } from "./market/account.ts";
-import { bridgeKeyPair } from "./market/oracle.ts";
+import { generateFundKeyDKG, thresholdSign, quorumOf } from "./custody/threshold.ts";
+import { depositAttestationDigest } from "./custody/attestation.ts";
+import { toHex } from "./det/canonical.ts";
 import { Writer } from "./chain/writer.ts";
 import { defaultParams } from "./config.ts";
 
@@ -46,7 +48,8 @@ const tb = new SwarmTransport(nodeB, { bootstrap: testnet.bootstrap });
 let clock = 0;
 const now = () => ++clock;
 const alice = new Account({ node: nodeA, params: PARAMS, k: K, now });
-const attestor = new Account({ node: nodeA, params: PARAMS, k: K, now, keypair: bridgeKeyPair() }); // bridge attestor
+const custodian = new Account({ node: nodeA, params: PARAMS, k: K, now }); // announces the fund key + relays the signed mint
+const fund = generateFundKeyDKG(2, 3); // a 2-of-3 committee fund key (this demo holds all shares)
 
 // Node A farms anchors; node B follows the chain purely via gossip. (The real
 // chiavdf eval blocks the event loop via spawnSync, so running two in-process
@@ -65,11 +68,14 @@ try {
 	await tb.join(NETWORK);
 	console.log("• two nodes connected over the DHT\n");
 
-	// The bridge attestor (on node A) mints alice 3000 gBTC from a verified deposit.
-	// The signed write gossips to node B.
-	await attestor.attestDeposit("demo-dep:0", alice.pubHex, 3000n);
+	// The committee mints alice 3000 gBTC: announce the group key on-chain, then post a deposit
+	// carrying a 2-of-3 threshold signature over the deposit digest. Both writes gossip to node B,
+	// whose fold verifies the quorum against the announced key (no single attestor key exists).
+	await custodian.announceFund(toHex(fund.groupPubKey), 0);
+	const mintSig = toHex(thresholdSign(depositAttestationDigest({ depositId: "demo-dep:0", depositor: alice.pubHex, amount: 3000n }), fund.pub, quorumOf(fund, 2)));
+	await custodian.attestDeposit("demo-dep:0", alice.pubHex, 3000n, mintSig);
 	await waitFor(() => gbtcOf(nodeB.view(), alice.pubHex) === 3000n);
-	console.log(`• alice credited 3000 gBTC (bridge deposit gossiped to node B)\n`);
+	console.log(`• alice credited 3000 gBTC (committee-signed deposit gossiped to node B)\n`);
 
 	console.log(`• node A farms anchors (real ${PARAMS.vdf.name} cooldown); node B follows via gossip…`);
 	const farming = prodA.run({ until: () => stop, paceMs: 120 });

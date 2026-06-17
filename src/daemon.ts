@@ -27,11 +27,11 @@ import type { Anchor } from "./consensus/anchor.ts";
 import type { Heads } from "./ledger/ledger.ts";
 import { longPayout, verifyOffer } from "./market/intent.ts";
 import type { Offer, Side } from "./market/intent.ts";
-import { bridgeKeyPair } from "./market/oracle.ts";
-import { fundKeyFromSeed } from "./custody/threshold.ts";
+import { generateFundKeyDKG, thresholdSign, quorumOf } from "./custody/threshold.ts";
 import type { FundKey } from "./custody/threshold.ts";
 import { DkgCoordinator } from "./custody/dkg-coordinator.ts";
 import { saveShare, loadShare } from "./custody/share-store.ts";
+import { toJsonSafe, fromJsonSafe } from "./custody/u8json.ts";
 import type { StoredShare } from "./custody/share-store.ts";
 import { fundAddress as deriveFundAddress } from "./custody/bitcoin.ts";
 import { depositAddress } from "./custody/deposit.ts";
@@ -77,7 +77,7 @@ import { KeepAllPolicy, MinePolicy } from "./store/policy.ts";
 import type { PersistPolicy } from "./store/policy.ts";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 
 export type SpaceMode = "standin" | "chiapos";
@@ -116,11 +116,12 @@ export interface DaemonOptions {
 		policy?: PersistPolicy;
 	};
 	/**
-	 * Threshold-custody mode. "seed" (default) = single-operator testnet fund from
-	 * GAVL_FUND_SEED. "committee" = autonomous epoch-driven custody: the fund key is
-	 * DKG'd across a PoST-weighted committee sampled from the anchor chain and reshared
-	 * to a fresh committee each epoch, no node ever holding it whole. Needs farming on
-	 * (the node's stable producer key is its committee id).
+	 * Threshold-custody mode. "seed" (default) = single-operator: a 2-of-3 fund key generated +
+	 * persisted LOCALLY (no public seed), this node holding all shares, announced on-chain and used
+	 * to threshold-sign its own mints/settles. "committee" = autonomous epoch-driven custody: the
+	 * fund key is DKG'd across a PoST-weighted committee sampled from the anchor chain and reshared
+	 * to a fresh committee each epoch, no node ever holding it whole. Needs farming on (the node's
+	 * stable producer key is its committee id). Either way the on-chain group key is the only authority.
 	 */
 	custody?: {
 		mode?: "seed" | "committee";
@@ -848,7 +849,7 @@ export class Daemon {
 	} {
 		const cs = this.committeeShare();
 		const committee = this.committeeMode();
-		const onchain = committee ? this.view().custody.fundKey : null;
+		const onchain = this.view().custody.fundKey; // the announced group key (solo or committee)
 		const id = committee ? this.producerId() : null;
 		return {
 			mode: committee ? "committee" : "seed",
@@ -953,6 +954,8 @@ export class Daemon {
 			this.producer = new Producer({ node: this.node, keypair: farmer, prover, params: this.params, appRootFor: (prev) => this.appRootForParent(prev) });
 			this.farming = true;
 			if (this.committeeMode()) this.startCommitteeCustody();
+			else void this.announceSoloFund(); // solo: publish the local fund key so the fold authorizes its mints
+
 			// Adaptive: farm hard while there are unfinalized writes to bury, then drop
 			// to a slow heartbeat when idle — work tracks activity instead of running
 			// flat-out. busyPaceMs keeps the event loop (HTTP, gossip) responsive.
@@ -1099,11 +1102,48 @@ export class Daemon {
 
 	// ── real-BTC bridge (testnet) ────────────────────────────────────
 
-	/** The bridge attestor account (mints from verified deposits, settles withdrawals). */
-	private bridgeAcct?: Account;
-	private attestor(): Account {
-		if (!this.bridgeAcct) this.bridgeAcct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: bridgeKeyPair(process.env.GAVL_BRIDGE_SEED) });
-		return this.bridgeAcct;
+	/** Solo (single-operator) custody fund key — a 2-of-3 generated + persisted LOCALLY (no public
+	 *  seed), with this node holding all shares. Stable across reboots: the fund ADDRESS derives from
+	 *  it, so losing it would lock the BTC. The committee path (GAVL_CUSTODY=committee) generates the
+	 *  key across independent nodes instead, no node holding it whole — but either way the on-chain
+	 *  group key + threshold sigs are the ONLY mint/settle authority (no single key, no public default). */
+	private soloFundCache?: FundKey;
+	private soloFundPath(): string {
+		return join(this.dataDir, "custody", "solo-fund.json");
+	}
+	private soloFund(): FundKey {
+		if (this.soloFundCache) return this.soloFundCache;
+		const path = this.soloFundPath();
+		try {
+			this.soloFundCache = fromJsonSafe(JSON.parse(readFileSync(path, "utf8"))) as FundKey;
+		} catch {
+			const fk = generateFundKeyDKG(2, 3); // single operator → this node holds all shares
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(path, JSON.stringify(toJsonSafe(fk)), { mode: 0o600 });
+			this.soloFundCache = fk;
+		}
+		return this.soloFundCache;
+	}
+
+	/** A threshold signature over a custody attestation digest. Committee mode runs the distributed
+	 *  ceremony (no node holds the key); solo mode signs locally with the shares this node holds. The
+	 *  fold verifies it against the on-chain group key — there is no single-key path. */
+	private async attestDigest(digest: Uint8Array): Promise<string | null> {
+		if (this.committeeMode()) return this.committeeAttest(digest);
+		const fk = this.soloFund();
+		const quorum = Object.fromEntries(Object.entries(fk.shares).slice(0, fk.min));
+		return toHex(thresholdSign(digest, fk.pub, quorum));
+	}
+
+	/** Announce the solo fund's group key on-chain (once) so the fold accepts its threshold-signed
+	 *  mints/settles. Committee mode announces via the genesis DKG instead. */
+	private async announceSoloFund(): Promise<void> {
+		if (this.committeeMode() || this.view().custody.fundKey) return;
+		try {
+			await this.custodyAccount().announceFund(toHex(this.soloFund().groupPubKey), 0);
+		} catch {
+			/* best effort; a claim re-announces if needed */
+		}
 	}
 
 	/** Whether autonomous committee custody is enabled (vs single-operator seed fund). */
@@ -1114,9 +1154,8 @@ export class Daemon {
 	/** The threshold-custody fund key. In committee mode the group key is the ON-CHAIN
 	 *  published one (so any node — even one holding no share — derives the right
 	 *  address); if this node holds the matching share, pub/min are exposed for
-	 *  co-signing. Else TESTNET single-operator from GAVL_FUND_SEED. The FundKey never
-	 *  carries gathered shares — spending always goes through the distributed ceremony. */
-	private fundKeyCache?: FundKey;
+	 *  co-signing. Else the locally-generated, persisted solo fund key (this node holds all
+	 *  shares). Spending always goes through a threshold ceremony — never a single key. */
 	private fundKey(): FundKey {
 		const cs = this.committeeShare();
 		if (this.committeeMode()) {
@@ -1127,12 +1166,11 @@ export class Daemon {
 				return { groupPubKey, pub: {} as FundKey["pub"], shares: {}, min: 0, max: 0 }; // address-only (no share here)
 			}
 			if (cs) return { groupPubKey: cs.groupPubKey, pub: cs.pub, shares: {}, min: cs.min, max: cs.participants.length }; // genesis announce not seen yet
-			// pre-genesis: fall through to the bootstrap seed fund so the node still has an address
+			// pre-genesis: fall through to the local solo key for a bootstrap address (no funds yet)
 		} else if (cs) {
 			return { groupPubKey: cs.groupPubKey, pub: cs.pub, shares: {}, min: cs.min, max: cs.participants.length };
 		}
-		if (!this.fundKeyCache) this.fundKeyCache = fundKeyFromSeed(2, 3, process.env.GAVL_FUND_SEED ?? "gavl-testnet-fund-v1");
-		return this.fundKeyCache;
+		return this.soloFund(); // single-operator: the locally-generated, persisted, announced key
 	}
 
 	/** Path to THIS node's persisted committee share (secret, node-local). */
@@ -1337,7 +1375,10 @@ export class Daemon {
 			if (this.committeeMode() && this.view().custody.fundKey) {
 				await this.custodyAccount().claim(depositId, depositor); // post the trigger; the committee mints
 			} else {
-				await this.attestor().attestDeposit(depositId, depositor, d.amount); // seed: direct mint
+				// solo: threshold-sign the mint locally with the held key, then post the signed deposit
+				await this.announceSoloFund();
+				const sig = await this.attestDigest(depositAttestationDigest({ depositId, depositor, amount: d.amount }));
+				if (sig) await this.custodyAccount().attestDeposit(depositId, depositor, d.amount, sig);
 			}
 			total += d.amount;
 		}
@@ -1354,8 +1395,8 @@ export class Daemon {
 		return this.seedProcessWithdrawals(feeSats);
 	}
 
-	/** Seed/testnet single-operator path: sign ALL pending with the seed key, broadcast,
-	 *  settle immediately (no committee, no confirmation wait). */
+	/** Solo single-operator path: threshold-sign ALL pending with the locally-held fund key,
+	 *  broadcast, and settle immediately (no committee ceremony, no confirmation wait). */
 	private async seedProcessWithdrawals(feeSats: bigint): Promise<string | null> {
 		const pending = this.view().bridge.pending;
 		if (pending.length === 0) return null;
@@ -1365,7 +1406,10 @@ export class Daemon {
 		const fk = this.fundKey();
 		const quorum = Object.fromEntries(Object.entries(fk.shares).slice(0, fk.min));
 		const txid = await esplora.broadcast(signWithdrawalTx(built.mkUnsigned(), fk, quorum).hex);
-		for (const w of pending) await this.attestor().settleWithdrawal(w.id);
+		for (const w of pending) {
+			const sig = await this.attestDigest(settleAttestationDigest({ withdrawalId: w.id }));
+			if (sig) await this.custodyAccount().settleWithdrawal(w.id, sig);
+		}
 		return txid;
 	}
 

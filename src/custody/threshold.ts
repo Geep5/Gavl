@@ -21,7 +21,6 @@
  */
 
 import { schnorr_FROST as FROST } from "@noble/curves/secp256k1.js";
-import { sha256, concatBytes, u32be } from "../det/canonical.ts";
 
 /** A holder's secret share — lives ONLY on that holder's node in production. */
 export type Share = ReturnType<typeof FROST.trustedDealer>["secretShares"][string];
@@ -48,34 +47,6 @@ export interface FundKey {
 export function generateFundKey(min: number, max: number, rng?: (len: number) => Uint8Array): FundKey {
 	const deal = rng ? FROST.trustedDealer({ min, max }, undefined, undefined, rng) : FROST.trustedDealer({ min, max });
 	return { groupPubKey: deal.public.commitments[0], pub: deal.public, shares: deal.secretShares, min, max };
-}
-
-/** A deterministic byte stream from a seed (sha256 counter mode) — for reproducible keys. */
-function seededRng(seed: Uint8Array): (len: number) => Uint8Array {
-	let counter = 0;
-	let buf = new Uint8Array(0);
-	return (len: number) => {
-		const out = new Uint8Array(len);
-		let off = 0;
-		while (off < len) {
-			if (buf.length === 0) buf = sha256(concatBytes(seed, u32be(counter++)));
-			const take = Math.min(buf.length, len - off);
-			out.set(buf.subarray(0, take), off);
-			buf = buf.subarray(take);
-			off += take;
-		}
-		return out;
-	};
-}
-
-/**
- * A DETERMINISTIC fund key from a seed string — same seed → same key/address every
- * boot, no persistence needed. For TESTNET single-operator use (the node generating
- * it holds all shares). Production is distributed DKG (generateFundKeyDKG) across
- * independent nodes; never use a shared/known seed on mainnet.
- */
-export function fundKeyFromSeed(min: number, max: number, seed: string): FundKey {
-	return generateFundKey(min, max, seededRng(sha256(seed)));
 }
 
 /**

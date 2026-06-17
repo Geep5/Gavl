@@ -30,21 +30,8 @@ export function oraclePubHex(seedOverrideHex?: string): string {
 	return toHex(oracleKeyPair(seedOverrideHex).publicKey);
 }
 
-/** Fixed dev seed for the BTC BRIDGE ATTESTOR — the committee key that signs deposit
- *  attestations + withdrawal settlements. v0 single signer; production is a threshold
- *  committee. Override with GAVL_BRIDGE_SEED. */
-const DEFAULT_BRIDGE_SEED = "gavl-bridge-attestor-v1";
-
-/** The bridge attestor's keypair (holding it = able to mint gBTC / settle withdrawals). */
-export function bridgeKeyPair(seedOverrideHex?: string): KeyPair {
-	const seed = seedOverrideHex && /^[0-9a-f]{64}$/i.test(seedOverrideHex) ? hexToBytes(seedOverrideHex) : sha256(DEFAULT_BRIDGE_SEED);
-	return keyPairFromSeed(seed);
-}
-
-/** The bridge attestor's public key (hex) — the BRIDGE_ATTESTOR consensus constant. */
-export function bridgePubHex(seedOverrideHex?: string): string {
-	return toHex(bridgeKeyPair(seedOverrideHex).publicKey);
-}
+// The BTC bridge attestor's public default key was removed: custody is threshold-only now (a
+// DKG'd group key, announced on-chain), so there is no single mint/settle key to derive here.
 
 function hexToBytes(h: string): Uint8Array {
 	return new Uint8Array(Buffer.from(h, "hex"));
