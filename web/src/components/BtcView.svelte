@@ -52,7 +52,6 @@
 	const topic = $derived((c?.topic ?? "").toLowerCase());
 	const coordIsId = $derived(/^[0-9a-f]{64}$/.test((seg[2] ?? "").toLowerCase()));
 	const topicMatchesCoord = $derived(coordIsId && topic === (seg[2] ?? "").toLowerCase());
-	const topicShort = $derived(topic ? topic.slice(0, 8) + "…" + topic.slice(-6) : "—");
 
 	// price direction (vs the previous poll) for a subtle ▲/▼ tint
 	let dir = $state(0);
@@ -193,7 +192,7 @@
 			{#if topic}
 				<div class="topic">
 					<span class="tk">dht topic</span>
-					<code class="tv">{topicShort}</code>
+					<code class="tv">{topic}</code>
 					{#if coordIsId}
 						{#if topicMatchesCoord}<span class="tnote ok">✓ = coordinate</span>
 						{:else}<span class="tnote warn">⚠ derived hash — restart on the latest for the id-topic</span>{/if}
@@ -377,7 +376,7 @@
 	.legend .lg.c::before { background: var(--accent); }
 	.topic { display: flex; align-items: baseline; gap: 0.45rem; flex-wrap: wrap; }
 	.topic .tk { font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--faint); }
-	.topic .tv { font-family: var(--mono); font-size: 0.68rem; color: var(--muted); }
+	.topic .tv { font-family: var(--mono); font-size: 0.68rem; color: var(--muted); word-break: break-all; min-width: 0; }
 	.topic .tnote { font-size: 0.62rem; }
 	.topic .tnote.ok { color: var(--green); }
 	.topic .tnote.warn { color: var(--accent); }
