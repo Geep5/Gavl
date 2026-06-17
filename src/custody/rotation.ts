@@ -7,8 +7,10 @@
  * every node agrees) and runs whichever ceremony the transition calls for:
  *
  *   - GENESIS  (no fund key published yet, self in the committee): a distributed DKG
- *     mints the fund key across the committee, then PUBLISHES it on-chain. Establishes
- *     the group key / Taproot address ONCE, for the life of the fund.
+ *     mints the fund key across a SMALL committee (genesisSize), then PUBLISHES it on-chain.
+ *     Establishes the group key / Taproot address ONCE, for the life of the fund. DKG is
+ *     n-of-n (any dropout aborts), so genesis runs among a small set that's likely all-online;
+ *     the first rotation then GROWS the committee to the full `size`.
  *   - ROTATION (a fund exists, the committee changed since epoch E-1): a distributed
  *     reshare hands the SAME group key to the new committee. The previous committee's
  *     quorum (deterministic) provides shares; the new committee receives them; the
@@ -24,11 +26,10 @@
  * complete this epoch (members offline) is retried on a later boundary — the loop
  * never wedges. One attempt per epoch; non-reentrant.
  *
- * SCOPE: happy churn (a quorum of epoch E-1's committee stays online to hand off).
- * Recovering the fund after an entire committee's quorum is lost at once (re-DKG /
- * social recovery — which WOULD move the address) is future work, flagged not handled.
- * Reshare has no quorum failover yet (signing does), so a down old-quorum member means
- * retry next epoch.
+ * SCOPE: happy churn (a quorum of epoch E-1's committee stays online to hand off; reshare rolls
+ * to the next old-quorum on a dropout). Recovering the fund after an ENTIRE committee's quorum is
+ * lost at once (re-DKG / social recovery — which WOULD move the address) is the terminal failure,
+ * flagged not handled (consistent with the no-backstop durability stance).
  */
 
 import { DkgCoordinator } from "./dkg-coordinator.ts";
@@ -44,8 +45,16 @@ export interface RotationConfig {
 	node: GavlNode;
 	selfId: string; // this node's stable producer pubkey hex (its committee id)
 	epochLength: number; // anchors per epoch
-	size: number; // desired committee size (clamped to eligible count)
+	size: number; // target committee size (clamped to eligible count)
 	timeoutMs: number; // per-ceremony budget
+	/** GENESIS committee size — small so the n-of-n DKG actually completes (any dropout aborts it).
+	 *  Defaults to `minCommittee`. After genesis, the next reshare grows the committee to `size`.
+	 *  Because `committeeForEpoch(E, n)` samples sequentially, the genesis-n set is a prefix of the
+	 *  full-`size` set, so the growth reshare is mostly additive. No-op when ≥ `size`. */
+	genesisSize?: number;
+	/** The on-chain genesis epoch (`view.custody.epoch`), or null if no fund yet. Lets every node
+	 *  agree which epoch used the small genesis committee, so the size schedule is deterministic. */
+	fundEpoch?: () => number | null;
 	/** Minimum committee size to activate committee custody (default 3). Below this,
 	 *  threshold custody is meaningless, so the loop waits for more farmers. */
 	minCommittee?: number;
@@ -108,13 +117,24 @@ export class CommitteeRotation {
 		}
 	}
 
-	private epochCommittee(finalized: AnchorView[], epoch: number): EpochCommittee | null {
-		return committeeForEpoch(finalized, epoch, { epochLength: this.c.epochLength, size: this.c.size, windowAnchors: this.c.windowAnchors, bonds: this.c.bonds?.() });
+	private epochCommittee(finalized: AnchorView[], epoch: number, size = this.c.size): EpochCommittee | null {
+		return committeeForEpoch(finalized, epoch, { epochLength: this.c.epochLength, size, windowAnchors: this.c.windowAnchors, bonds: this.c.bonds?.() });
+	}
+
+	/** Committee size for `epoch`: the small genesis set AT the genesis epoch, the full target size
+	 *  afterward. Deterministic across nodes — `fundEpoch()` (the on-chain genesis epoch) is shared
+	 *  state, so genesis and every later rotation compute the same size (hence the same committee). */
+	private sizeFor(epoch: number): number {
+		const genesisSize = this.c.genesisSize ?? this.c.minCommittee ?? 3;
+		if (genesisSize >= this.c.size) return this.c.size; // growth disabled (genesis already full-size)
+		const ge = this.c.fundEpoch?.() ?? null;
+		if (ge === null) return genesisSize; // no fund yet → this epoch is a genesis attempt (small)
+		return epoch === ge ? genesisSize : this.c.size; // the genesis epoch stays small; grown after
 	}
 
 	private async actOnEpoch(finalized: AnchorView[], epoch: number): Promise<void> {
 		const minCommittee = this.c.minCommittee ?? 3;
-		const next = this.epochCommittee(finalized, epoch);
+		const next = this.epochCommittee(finalized, epoch, this.sizeFor(epoch)); // small at genesis, grown after
 		if (!next || next.committee.length < minCommittee) return; // not enough eligible farmers yet
 
 		const inNew = next.committee.includes(this.c.selfId);
@@ -140,9 +160,10 @@ export class CommitteeRotation {
 	}
 
 	private async rotate(finalized: AnchorView[], next: EpochCommittee, epoch: number, key: Uint8Array, inNew: boolean): Promise<void> {
-		// The previous committee is epoch E-1's — a SHARED fact, so every node computes
-		// the same old quorum (not from local share state, which a stale node would get wrong).
-		const prev = this.epochCommittee(finalized, epoch - 1);
+		// The previous committee is epoch E-1's — a SHARED fact, so every node computes the same old
+		// quorum (not from local share state, which a stale node would get wrong). sizeFor(E-1) gives
+		// the genesis size if E-1 was the genesis epoch, so prev == the set that actually holds the key.
+		const prev = this.epochCommittee(finalized, epoch - 1, this.sizeFor(epoch - 1));
 		const minCommittee = this.c.minCommittee ?? 3;
 		if (!prev || prev.committee.length < minCommittee) {
 			this.log(`epoch ${epoch}: no usable previous committee — standing by`);

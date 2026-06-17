@@ -127,8 +127,11 @@ export interface DaemonOptions {
 		mode?: "seed" | "committee";
 		/** Anchors per custody epoch (default 16). */
 		epochLength?: number;
-		/** Desired committee size, clamped to eligible producers (default 5). */
+		/** Target committee size, clamped to eligible producers (default 5). */
 		size?: number;
+		/** Genesis committee size — small so the n-of-n DKG completes; grown to `size` by the first
+		 *  reshare (default: minCommittee). */
+		genesisSize?: number;
 		/** Min eligible producers before committee custody activates (default 3). */
 		minCommittee?: number;
 		/** Per-ceremony timeout in ms (default 30s). */
@@ -978,6 +981,7 @@ export class Daemon {
 			selfId: this.producerId(),
 			epochLength: this.custodyOpts.epochLength ?? 16,
 			size: this.custodyOpts.size ?? 5,
+			genesisSize: this.custodyOpts.genesisSize ?? this.custodyOpts.minCommittee ?? 3, // small n-of-n genesis, grown after
 			minCommittee: this.custodyOpts.minCommittee ?? 3,
 			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
 			windowAnchors: this.custodyOpts.windowAnchors,
@@ -986,6 +990,10 @@ export class Daemon {
 			groupKey: () => {
 				const hex = this.view().custody.fundKey;
 				return hex ? fromHex(hex) : null;
+			},
+			fundEpoch: () => {
+				const e = this.view().custody.epoch;
+				return e >= 0 ? e : null; // -1 until genesis publishes; then the genesis epoch
 			},
 			publishFund: (key, epoch) => void this.custodyAccount().announceFund(toHex(key), epoch).catch(() => {}),
 			loadShare: () => this.committeeShare(),
