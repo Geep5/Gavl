@@ -166,7 +166,7 @@
 	<div class="hero-top">
 		<div class="instrument">
 			<span class="pair">{base}<span class="quote">/ {quote}</span></span>
-			<span class="status"><span class="dot live"></span> live · no operator</span>
+			<span class="status"><span class="dot live"></span> live</span>
 		</div>
 		<div class="px-wrap">
 			{#if priceNum != null}
