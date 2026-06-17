@@ -179,14 +179,19 @@ threshold Schnorr (Taproot-compatible), proven against Bitcoin's own BIP340 veri
   it against the ledger's reserves, flagging any shortfall (the solvency check a custodial
   bridge must run).
 
-**Committee custody** is implemented as an **opt-in mode** (`GAVL_CUSTODY=committee`):
-VDF-seeded stake-weighted committee sampling, distributed DKG, threshold signing, and
-proactive resharing all run over the live mesh, rotating the share-holders each epoch
-*without moving the fund address*; **bonding** makes a committee seat cost stake and
-**slashing** makes ceremony equivocation cost the bond
+**Committee custody is the DEFAULT** — the decentralized, mainnet posture. VDF-seeded
+stake-weighted committee sampling, distributed DKG, threshold signing, and proactive
+resharing all run over the live mesh, rotating the share-holders each epoch *without moving
+the fund address*; **bonding** makes a committee seat cost stake and **slashing** makes
+ceremony equivocation cost the bond
 (`custody/{committee,epoch,rotation,*-coordinator,ceremony-auth,attestation,bridge,slashing}.ts`).
-It is unit-tested over the in-process transport but **not yet validated live across
-independent machines**, so the default stays single-operator seed custody (above).
+The genesis DKG has been validated **live across three independent machines** — all agreeing
+on one fund key, no node ever holding it whole. A committee needs **≥3 independent farmers** to
+form: a lone node holds no key and **can't mint — by design it waits for peers** rather than
+falling back to a single signer. For single-node testnet dev, `GAVL_CUSTODY=solo` is an explicit
+escape hatch (one locally-generated key, this node only). A **mainnet safety-lock** then refuses
+solo custody — and in-memory storage — outright when `GAVL_BTC_NET=mainnet`: real BTC must be held
+by an M-of-N committee on durable disk, never one key in RAM.
 
 > **Deferred — auto-slashing.** The slashing *op + fraud-proof verifier* exist
 > (`custody/slashing.ts`), but nothing yet **auto-detects** an equivocation — two conflicting

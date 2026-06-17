@@ -12,6 +12,7 @@
 	const members = $derived(cu?.committee ?? null); // this node's known committee (once it holds a share)
 	const n = $derived(members?.length ?? (committee ? null : 1)); // committee size N
 	const m = $derived(cu?.threshold ?? (committee ? null : 1)); // signing threshold M
+	const need = $derived(cu?.minCommittee ?? 3); // farmers needed to bootstrap genesis custody
 
 	// N seats; the one that's "you" is highlighted if this node holds a share. We DON'T claim which M
 	// sign — any M of N can, so all seats are equal members and the caption states the rule.
@@ -26,11 +27,11 @@
 	<div class="head">
 		<span class="title">Custody of the Bitcoin</span>
 		<span class="chip" class:ok={established} class:warn={committee && !established}>
-			{#if !cu}—{:else if committee}{established ? `${m}-of-${n} committee` : "forming committee…"}{:else}single key{/if}
+			{#if !cu}—{:else if committee}{established ? `${m}-of-${n} committee` : `waiting · needs ${need}`}{:else}solo · testnet{/if}
 		</span>
 	</div>
 
-	{#if committee}
+	{#if committee && established}
 		<p class="lead">
 			<strong>No one node holds the key.</strong> The fund's Bitcoin key is split across the committee by a
 			distributed ceremony — moving BTC needs <strong>{m ?? "a quorum"} of {n ?? "them"}</strong> to co-sign,
@@ -49,13 +50,26 @@
 		<dl class="grid">
 			<div><dt>epoch</dt><dd>{cu?.epoch >= 0 ? cu.epoch : "—"}</dd></div>
 			<div><dt>this node</dt><dd class:hold={cu?.holdsShare}>{cu?.holdsShare ? "holds a share" : "watching"}</dd></div>
-			<div><dt>fund key</dt><dd class="mono">{established ? short(cu.fundKeyOnChain) : "pending DKG"}</dd></div>
+			<div><dt>fund key</dt><dd class="mono">{short(cu.fundKeyOnChain)}</dd></div>
+		</dl>
+	{:else if committee}
+		<p class="lead">
+			<strong>Waiting for the committee to form.</strong> Custody is by an M-of-N committee, and it takes
+			<strong>≥{need} independent farmers</strong> to run the genesis ceremony. Until then this node
+			<strong>holds no key and can't mint</strong> — by design it waits for peers rather than falling back to a
+			single signer. Bring more nodes online and the committee will DKG a shared fund key on its own.
+		</p>
+		<dl class="grid">
+			<div><dt>needs</dt><dd>≥{need} farmers</dd></div>
+			<div><dt>this node</dt><dd>waiting for peers</dd></div>
+			<div><dt>fund key</dt><dd class="mono">pending DKG</dd></div>
 		</dl>
 	{:else}
 		<p class="lead">
-			<strong>One operator holds the key</strong> (this node) — a single-signer testnet fund, its key generated
-			locally (not a shared default). For real, trustless custody, run <code class="mono">committee</code> mode so
-			the key is split across independent nodes — <strong>M-of-N, no one holds it whole.</strong>
+			<strong>Solo custody — testnet only.</strong> This node has explicitly opted out of the committee
+			(<code class="mono">GAVL_CUSTODY=solo</code>): one locally-generated key, held whole by this single node. The
+			default is <code class="mono">committee</code> mode — M-of-N, no one holds it whole — and
+			<strong>mainnet refuses solo entirely.</strong>
 		</p>
 		<dl class="grid">
 			<div><dt>fund key</dt><dd class="mono">{established ? short(cu.fundKeyOnChain) : "—"}</dd></div>

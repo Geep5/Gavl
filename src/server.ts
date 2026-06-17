@@ -52,12 +52,22 @@ const NETWORK = process.env.GAVL_NETWORK ?? defaultMarketChannel();
 const MESH = process.env.GAVL_MESH !== "0";
 const FARM = process.env.GAVL_FARM !== "0";
 
-// Threshold-custody mode. GAVL_CUSTODY=committee turns on the autonomous epoch-driven
-// committee (DKG at genesis, reshare each epoch, no node holding the key); default
-// "seed" is the single-operator testnet fund. GAVL_DATA_DIR isolates a node's wallet +
-// custody secrets — REQUIRED to run several nodes on one machine (give each its own).
-const CUSTODY = process.env.GAVL_CUSTODY === "committee" ? "committee" : "seed";
+// Threshold-custody mode. COMMITTEE is the DEFAULT — the decentralized, mainnet-ready posture: a
+// DKG at genesis, reshare each epoch, and NO node ever holds the key. A node won't custody until
+// ≥minCommittee farmers form the committee, so a LONE node has no fund (it WAITS for peers) rather
+// than falling back to a single key. GAVL_CUSTODY=solo is an explicit single-operator escape hatch
+// for testnet/dev only — REFUSED on mainnet below (real BTC must never sit under one key).
+// GAVL_DATA_DIR isolates a node's wallet + custody secrets — REQUIRED to run several nodes on one box.
+const CUSTODY = process.env.GAVL_CUSTODY === "solo" || process.env.GAVL_CUSTODY === "seed" ? "seed" : "committee";
+const BTC_NET = process.env.GAVL_BTC_NET === "mainnet" ? "mainnet" : process.env.GAVL_BTC_NET === "signet" ? "signet" : "testnet";
 const DATA_DIR = process.env.GAVL_DATA_DIR; // undefined → ~/.gavl
+
+// Mainnet safety-lock: real BTC must never be held under a single key, and must never live only in
+// RAM. Refuse to boot with either risky config on mainnet (testnet/signet are free to do as they like).
+if (BTC_NET === "mainnet") {
+	if (CUSTODY === "seed") throw new Error("mainnet refuses SOLO custody — real BTC must be held by an M-of-N committee, not one key. Drop GAVL_CUSTODY=solo (committee is the default) and bring up ≥3 independent nodes.");
+	if (PERSIST === "off") throw new Error("mainnet refuses in-memory storage (GAVL_PERSIST=off) — a restart would erase who owns which BTC. Use GAVL_PERSIST=all on durable disk.");
+}
 
 const daemon = new Daemon({
 	network: NETWORK,
@@ -379,7 +389,12 @@ createServer((req, res) => {
 	console.log(`  → mesh ${c.mesh ? "joined" : "off"}, ${c.peers} peer(s), farming ${c.farming ? "live" : "off"}`);
 	if (CUSTODY === "committee") {
 		const cu = daemon.custodyStatus();
-		console.log(`  custody: committee mode — id ${cu.committeeId?.slice(0, 16)}… ; fund ${cu.fundAddress ?? "(pending genesis)"}`);
+		if (cu.fundKeyOnChain)
+			console.log(`  custody: committee mode — fund ${cu.fundAddress} (key ${cu.fundKeyOnChain.slice(0, 12)}…; this node ${cu.holdsShare ? "holds a share" : "is watching"})`);
+		else
+			console.log(`  custody: committee mode — WAITING for ≥${cu.minCommittee} farmers to run genesis DKG. No fund key yet, so minting is disabled until the committee forms — a lone node waits for peers, it does NOT fall back to a single key.`);
+	} else {
+		console.log(`  custody: SOLO mode (GAVL_CUSTODY=solo) — a single-operator testnet key this node holds whole. Committee is the default; mainnet refuses solo.`);
 	}
 });
 

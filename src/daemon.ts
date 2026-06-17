@@ -846,6 +846,7 @@ export class Daemon {
 		holdsShare: boolean;
 		committee: string[] | null;
 		threshold: number | null;
+		minCommittee: number;
 		subSwarmTopics: string[];
 		bonded: boolean;
 		myBond: string;
@@ -863,6 +864,7 @@ export class Daemon {
 			holdsShare: !!cs,
 			committee: cs?.participants ?? null,
 			threshold: cs?.min ?? null,
+			minCommittee: this.custodyOpts.minCommittee ?? 3, // farmers needed to bootstrap genesis custody
 			subSwarmTopics: this.transport?.committeeTopicNames() ?? [],
 			bonded: !!this.custodyOpts.bonded, // stake-weighted selection on?
 			myBond: (id ? this.view().bridge.bonds.get(id) ?? 0n : 0n).toString(),
