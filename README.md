@@ -23,8 +23,10 @@ Each channel is its own sandboxed economy. Collateral is **gBTC** — a 1:1 clai
 in a **threshold-custody fund** that only a quorum can spend (no single party ever holds the key).
 
 > **Status:** the matched market (consensus + intents + per-channel pricing) is complete and runs live,
-> including cross-node intent gossip. The real-BTC bridge runs end-to-end on **testnet**.
-> Mainnet is gated on an audit and four named items — see
+> including cross-node intent gossip. The real-BTC bridge runs end-to-end on **testnet** across an
+> M-of-N committee — custody is **committee-only** (no single-key path on any network), so the minimum
+> deployment is a **3-node** network. Two of the four mainnet gates are now closed (distributed DKG;
+> non-public keys); it's still gated on an **independent audit** and **real independent stakers** — see
 > [Trust model & status](#trust-model--status). Don't put real mainnet BTC in it yet.
 
 ---
@@ -161,9 +163,11 @@ gBTC is a 1:1 claim on Bitcoin in a fund **no single party can spend** — secur
 threshold Schnorr (Taproot-compatible), proven against Bitcoin's own BIP340 verifier.
 
 - **Threshold signing** (`threshold.ts`) — a quorum (min-of-max) produces one valid
-  signature for the fund's single key, without anyone reconstructing it.
-- **DKG** (`threshold.ts`) — distributed key generation: the key is born as shares; no one
-  ever sees it whole, even at setup.
+  signature for the fund's group key, without anyone reconstructing it.
+- **DKG** (`dkg-session.ts`, `dkg-coordinator.ts`) — each node runs its own session and only ever
+  holds its OWN share plus the shares addressed to it; the live group key is born distributed across
+  independent nodes, none ever holding it whole (validated across 3 machines). (`threshold.ts`'s
+  in-process DKG is for tests only.)
 - **Taproot binding** (`bitcoin.ts`) — the fund key → a real `bc1p…` / `tb1p…` address; a
   quorum's withdrawal signature is BIP340-valid (verified against the BIP341 test vector).
 - **Withdrawal txs** (`btctx.ts`) — build the real BIP-341 sighash from the fund's UTXOs,
@@ -180,10 +184,10 @@ threshold Schnorr (Taproot-compatible), proven against Bitcoin's own BIP340 veri
   bridge must run).
 
 **Committee custody is the ONLY mode** — there is no solo/single-key path on any network. VDF-seeded
-stake-weighted committee sampling, distributed DKG, threshold signing, and proactive
-resharing all run over the live mesh, rotating the share-holders each epoch *without moving
-the fund address*; **bonding** makes a committee seat cost stake and **slashing** makes
-ceremony equivocation cost the bond
+committee sampling (PoST-weighted by default; **stake-weighted** when `GAVL_CUSTODY_BONDED=1`),
+distributed DKG, threshold signing, and proactive resharing all run over the live mesh, rotating the
+share-holders each epoch *without moving the fund address*; **bonding** makes a committee seat cost
+stake and **slashing** makes ceremony equivocation cost the bond
 (`custody/{committee,epoch,rotation,*-coordinator,ceremony-auth,attestation,bridge,slashing}.ts`).
 The genesis DKG has been validated **live across three independent machines** — all agreeing
 on one fund key, no node ever holding it whole. A committee needs **≥3 independent farmers** to
@@ -193,14 +197,16 @@ real deployment a complete 3-node network, so testing matches production. A **ma
 additionally refuses in-memory storage (`GAVL_PERSIST=off`) when `GAVL_BTC_NET=mainnet`: real BTC
 must be held by an M-of-N committee on durable disk, never in RAM.
 
-> **Deferred — auto-slashing.** The slashing *op + fraud-proof verifier* exist
-> (`custody/slashing.ts`), but nothing yet **auto-detects** an equivocation — two conflicting
-> signed ceremony messages from the same member — and **auto-submits** the proof. It's the
-> lowest-leverage custody hardening (bonding, not slashing, is what makes capturing the
-> committee expensive), so it's parked: worth adding a watcher that spots conflicting
-> messages on the wire and files the slash when committee custody goes live. Until then,
-> slashing only fires if someone submits a proof by hand. See `docs/scaling-equal-nodes.md`
-> for where custody sits in the bigger picture.
+> **Auto-slashing — implemented.** Every node taps the inbound ceremony traffic on its
+> sub-swarm (`node.onCeremonyMessage`) and feeds it to an `EquivocationWatcher`
+> (`custody/equivocation-watcher.ts`); when a member emits two conflicting signed messages for
+> one slot, the daemon auto-submits a `custody.slash` with the two messages as the fraud proof,
+> and the fold (`custody/slashing.ts` `equivocationCulprit`) burns the culprit's bond to the
+> submitter as a bounty. The watcher does NOT flag legitimate round-2 shares (distinct shares
+> to distinct recipients) and fires once per slot. Covered by `test/custody-auto-slash.test.ts`.
+> The remaining gap is economic, not code: slashing only bites with **real independent bonded
+> stakers** — among one operator's own nodes it's a node slashing itself. See
+> `docs/scaling-equal-nodes.md` for where custody sits in the bigger picture.
 
 ---
 
@@ -249,6 +255,14 @@ hyperdht topic whose name *is* the network identity.
 > arbitrary size limit anywhere. At ~10k active traders that's a phone-class footprint (tens of
 > MB); it stays commodity-hardware-friendly into the millions.
 
+> **Durability — no central backstop.** The protocol is the only guarantor: state survives as long
+> as **≥1 node keeps a durable copy**, and any peer re-syncs from any other. So real nodes run with
+> `GAVL_PERSIST=all` (durable disk) — in-memory (`GAVL_PERSIST=off`) is **dev-only**, and mainnet
+> refuses it. The trade-off is deliberate and decentralization-first: if *every* copy is permanently
+> destroyed, the custodied BTC is **stranded** (still visible on-chain, but the secret committee
+> shares are gone with the nodes) — the accepted cost of having no privileged rescuer.
+> [`docs/durability-and-decentralization.md`](docs/durability-and-decentralization.md).
+
 ---
 
 ## Layout
@@ -289,7 +303,7 @@ local-only) **and** the web UI in one command, cross-platform — no env vars to
 Other scripts:
 
 ```bash
-npm test                 # full suite (~220 tests): consensus, checkpoints, genesis-free adoption, matched market, demurrage, liquidity backstop, intent gossip, per-channel pricing, custody, bridge
+npm test                 # full suite (~238 tests): consensus, checkpoints, genesis-free adoption, matched market, demurrage, liquidity backstop, intent gossip, per-channel pricing, custody + committee DKG, bonding/slashing + auto-slash, bridge
 npm run demo             # PoST cooldown chain — watch space→cooldown
 npm run demo:consensus   # two nodes farm + gossip anchors, finalize the same state over a real mesh
 npm run daemon           # daemon only (real chiavdf VDF — needs the .venv; see below)
@@ -310,9 +324,14 @@ identities (the account picker, bottom-left) or run a second node on the same ch
 broadcast an intent on one, **take** the opposite side on the other → a matched contract
 opens, both sides escrow, and it settles at the channel's mark when either side closes.
 
-**Testnet round-trip:** open the UI → **Wallet & custody** → send testnet BTC to *your*
+**Testnet round-trip:** open the UI → **Fund your test wallet** → send testnet BTC to *your*
 deposit address → paste the txid to claim → mint gBTC → broadcast/take an intent → close →
 withdraw → process payouts (broadcasts a real testnet BTC tx).
+
+> **Custody needs ≥3 nodes.** Because custody is committee-only, a lone node has **no deposit
+> address** until ≥3 farmers complete the genesis DKG — the UI shows *"custody is still forming"*
+> until then. Run three daemons on the same channel (each with its own `GAVL_DATA_DIR`) to mint and
+> withdraw. The market itself — intents, matching, demurrage, the liquidity pot — works on one node.
 
 ---
 
@@ -339,8 +358,10 @@ What's **trusted** (and surfaced honestly in the UI):
 1. **Independent audit.** — *open; the largest remaining blocker.*
 2. **Real distributed DKG** across independent nodes (not in-process). — *DONE: genesis DKG
    validated live across three independent machines, all agreeing on one fund key.*
-3. **Bonding + slashing** so the honest-majority assumption is economically enforced. — *built;
-   needs real independent stakers (auto-slashing watcher still deferred).*
+3. **Bonding + slashing** so the honest-majority assumption is economically enforced. — *code
+   complete, incl. the auto-slashing equivocation watcher (`test/custody-auto-slash.test.ts`);
+   the gap is economic — it only bites with real independent bonded stakers, not one operator's
+   own nodes.*
 4. **Non-public keys.** — *DONE: the public dev-seed attestor/fund keys were deleted; minting is
    gated on the on-chain DKG'd group key with no single-key fallback.*
 
@@ -367,5 +388,10 @@ What's **trusted** (and surfaced honestly in the UI):
 - **Real-BTC bridge (testnet)** ✅ FROST threshold signing · DKG · Taproot address +
   BIP340-valid spends · withdrawal tx build/sign/broadcast · deposit watcher · bridge
   ledger · proof of reserves
-- **Mainnet** ⛔ gated on the four items above (audit, distributed DKG, bonding/slashing,
-  non-public keys)
+- **Threshold custody (committee)** ✅ **committee-only** — no single-key path on any network ·
+  VDF-sampled committee, per-epoch reshare **without moving the address** · live **3-machine genesis
+  DKG** · bonding + (opt-in) stake-weighted selection · slashing + **auto-slashing** equivocation
+  watcher · mainnet safety-lock (refuses in-memory) · a lone node holds no key and waits for ≥3 peers
+- **Mainnet** ⛔ two gates closed (distributed DKG · non-public keys); still gated on an
+  **independent audit** and **real independent bonded stakers** — bonding/slashing is code-complete
+  but only bites when the stakers aren't all one operator
