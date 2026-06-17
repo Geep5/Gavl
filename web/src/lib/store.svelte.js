@@ -11,6 +11,7 @@ export const store = $state({
 	gbtc: {}, // { pubkey: amount } gBTC balances (1:1 claim on BTC in the custody fund)
 	market: null, // { price, oracles, myGbtc, reserves, gbtcOutstanding, depositAddress, tape, myContracts, ... }
 	consensus: null, // { enabled, vdf, mesh, network, peers, farming, tip, finalizedHeight, secPerAnchor, secPerAnchorMeasured }
+	custody: null, // { mode, epoch, fundKeyOnChain, fundAddress, holdsShare, committee, threshold, committeeId, bonded, myBond }
 });
 
 // Whether the current store.error came from refresh() (a connection problem) —
@@ -26,6 +27,7 @@ export async function refresh() {
 		store.gbtc = s.gbtc ?? {};
 		store.market = s.market ?? null;
 		store.consensus = s.consensus ?? null;
+		store.custody = s.custody ?? null;
 		if (errorFromRefresh) {
 			store.error = null;
 			errorFromRefresh = false;

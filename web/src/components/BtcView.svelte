@@ -4,6 +4,7 @@
 	import { store, act, refresh, myGbtc, short } from "../lib/store.svelte.js";
 	import { api } from "../lib/api.js";
 	import DecentralizationBar from "./DecentralizationBar.svelte";
+	import CustodyPanel from "./CustodyPanel.svelte";
 
 	const m = $derived(store.market);
 	const c = $derived(store.consensus);
@@ -261,6 +262,7 @@
 			<p><span class="ok">✓</span> <strong>The price is verified, not reported.</strong> The mark is a {mechName} price signed by a quorum and checked on every node; anyone can relay it and no single party can forge it.</p>
 			<p><span class="ok">✓</span> <strong>Real counterparties, real Bitcoin.</strong> Longs and shorts are matched peer-to-peer (no pool, zero-sum, fully collateralized), and gBTC is a 1:1 claim on BTC in threshold custody.</p>
 			<DecentralizationBar />
+			<CustodyPanel />
 		</div>
 	</details>
 {/if}
