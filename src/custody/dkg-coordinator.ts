@@ -48,6 +48,8 @@ export class DkgCoordinator {
 	private sentRound2 = false;
 	private settled = false;
 	private timer: ReturnType<typeof setTimeout> | null = null;
+	private round1Timer: ReturnType<typeof setInterval> | null = null;
+	private round1Msg: DkgWire | null = null;
 	private resolve!: (r: DkgResult) => void;
 	private reject!: (e: Error) => void;
 	private readonly node: GavlNode;
@@ -80,7 +82,17 @@ export class DkgCoordinator {
 			// Round 1: broadcast my public commitment.
 			const pkg = this.session.round1();
 			this.r1.set(this.selfFid, pkg);
-			this.node.dkgBroadcast(this.stamp({ d: "round1", session: this.opts.session, from: this.opts.selfId, pkg: enc(pkg) }));
+			this.round1Msg = this.stamp({ d: "round1", session: this.opts.session, from: this.opts.selfId, pkg: enc(pkg) });
+			this.node.dkgBroadcast(this.round1Msg);
+			// Re-broadcast round1 until we've collected everyone's (i.e. until round2 goes out). Members
+			// start the ceremony at slightly different moments (finality jitter), so a single broadcast can
+			// reach a peer before ITS coordinator is on this session — it drops the message. Re-broadcasting
+			// closes that start-skew race without a separate buffering layer; receivers treat it idempotently.
+			const everyMs = this.opts.timeoutMs ? Math.max(250, Math.floor(this.opts.timeoutMs / 8)) : 700;
+			this.round1Timer = setInterval(() => {
+				if (this.settled || this.sentRound2) return this.stopRebroadcast();
+				if (this.round1Msg) this.node.dkgBroadcast(this.round1Msg);
+			}, everyMs);
 			this.maybeRound2();
 		});
 	}
@@ -97,9 +109,15 @@ export class DkgCoordinator {
 		return out;
 	}
 
+	private stopRebroadcast(): void {
+		if (this.round1Timer) clearInterval(this.round1Timer);
+		this.round1Timer = null;
+	}
+
 	private fail(): void {
 		if (this.settled) return;
 		this.settled = true;
+		this.stopRebroadcast();
 		this.reject(new CeremonyTimeout("dkg", this.missing()));
 	}
 
@@ -133,6 +151,7 @@ export class DkgCoordinator {
 	private maybeRound2(): void {
 		if (this.sentRound2 || this.r1.size < this.max) return; // wait for everyone's round 1
 		this.sentRound2 = true;
+		this.stopRebroadcast(); // have everyone's round1 → stop re-broadcasting ours
 		const shares = this.session.round2(this.peerPackages() as never);
 		for (const recipientFid of Object.keys(shares)) {
 			const pid = this.idOfFid.get(recipientFid);
@@ -147,6 +166,7 @@ export class DkgCoordinator {
 		if (this.settled || !this.sentRound2 || this.sharesForMe.size < this.max - 1) return; // wait for all shares
 		const { groupPubKey } = this.session.round3(this.peerPackages() as never, [...this.sharesForMe.values()] as never);
 		this.settled = true;
+		this.stopRebroadcast();
 		if (this.timer) clearTimeout(this.timer);
 		this.resolve({ share: this.session.share(), pub: this.session.pub(), groupPubKey });
 	}
