@@ -19,7 +19,7 @@ export const api = {
 	deposit: (amount) => req("/deposit", "POST", { amount }), // dev: mint test gBTC (bridge attestor)
 	claimDeposit: (txid) => req("/deposit/claim", "POST", { txid }), // REAL: verify a BTC txid → mint
 	transfer: (to, amount) => req("/transfer", "POST", { to, amount }),
-	withdraw: (amount, btcAddress) => req("/withdraw", "POST", { amount, btcAddress }),
+	withdraw: (amount, btcAddress, fee) => req("/withdraw", "POST", { amount, btcAddress, fee }),
 	processWithdrawals: () => req("/withdrawals/process", "POST", {}),
 	// matched market (real counterparty, no pool)
 	broadcastIntent: (side, size, leverage) => req("/intent/broadcast", "POST", { side, size, leverage }),

@@ -342,10 +342,12 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 		}
 		case "bridge.withdraw": {
 			// Burn gBTC → a pending BTC withdrawal. The BTC leaves only on bridge.settle
-			// (after the threshold-signed payout tx confirms).
+			// (after the threshold-signed payout tx confirms). `fee` (the withdrawer's chosen
+			// miner fee) comes out of their own payout; requestWithdrawal enforces the floor.
 			const amt = parseAmount(op.amount);
-			if (amt === null || typeof op.btcAddress !== "string") return;
-			requestWithdrawal(view.bridge, { id: w.id, owner: w.writer, amount: amt, btcAddress: op.btcAddress });
+			const fee = parseAmount(op.fee);
+			if (amt === null || fee === null || typeof op.btcAddress !== "string") return;
+			requestWithdrawal(view.bridge, { id: w.id, owner: w.writer, amount: amt, btcAddress: op.btcAddress, fee });
 			return;
 		}
 		case "bridge.claim": {

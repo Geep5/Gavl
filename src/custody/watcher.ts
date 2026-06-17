@@ -15,8 +15,10 @@
 import type { Esplora, EsploraTx, EsploraUtxo } from "./esplora.ts";
 import type { FundUtxo } from "./btctx.ts";
 
-/** Minimum confirmations before a deposit is credited (consensus-relevant policy). */
-export const MIN_CONFIRMATIONS = 1;
+/** Minimum confirmations before a deposit is credited — and before the fund's own UTXOs are
+ *  spent / a payout is settled (consensus-relevant policy). 2 buys basic reorg safety for real
+ *  BTC: a 1-conf deposit can still be reorged away after gBTC is minted against it. */
+export const MIN_CONFIRMATIONS = 2;
 
 export interface VerifiedDeposit {
 	txid: string;

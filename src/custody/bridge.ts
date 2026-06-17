@@ -38,6 +38,7 @@ export interface PendingWithdrawal {
 	owner: string;
 	amount: bigint; // sats of gBTC burned, owed as BTC
 	btcAddress: string; // where to send the BTC
+	fee: bigint; // miner fee (sats) the withdrawer chose — deducted from their payout (they get amount − fee)
 }
 
 export interface BridgeState {
@@ -250,8 +251,20 @@ export function transferGbtc(s: BridgeState, from: string, to: string, amount: b
  * payout tx confirms. No-op (returns false) if the owner can't cover it or the id
  * was already used.
  */
+/** Minimum miner fee (sats) a withdrawer may choose — a relay-safe floor so a withdrawal can't be
+ *  posted with a fee so low it never confirms (which would clog the pending set). Consensus-relevant. */
+export const MIN_WITHDRAW_FEE = 500n;
+/** Default miner fee when a withdrawer doesn't choose one. */
+export const DEFAULT_WITHDRAW_FEE = 1_000n;
+/** A BTC payout below this many sats is dust (unspendable) — `amount − fee` must clear it. */
+export const WITHDRAW_DUST = 546n;
+
 export function requestWithdrawal(s: BridgeState, w: PendingWithdrawal): boolean {
 	if (w.amount <= 0n || gbtcOf(s, w.owner) < w.amount) return false;
+	// The withdrawer's own fee comes out of their payout (they receive amount − fee); enforce a
+	// relay-safe floor and that the net payout clears dust. The fund's reserves still drop by exactly
+	// `amount`, so 1:1 backing is preserved (the fee is BTC the withdrawer forgoes, not the fund's).
+	if (w.fee < MIN_WITHDRAW_FEE || w.amount - w.fee < WITHDRAW_DUST) return false;
 	if (s.pending.some((p) => p.id === w.id)) return false;
 	addG(s, w.owner, -w.amount); // burn gBTC
 	s.pending.push({ ...w }); // now owed as BTC (still backed by reserves)

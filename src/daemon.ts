@@ -1349,7 +1349,7 @@ export class Daemon {
 	 * rebuild thunk (finalizing a PSBT consumes it) + the txid-to-be, or null if there
 	 * isn't enough confirmed BTC yet.
 	 */
-	private async buildPayout(targets: { id: string; btcAddress: string; amount: bigint }[], feeSats: bigint): Promise<{ mkUnsigned: () => ReturnType<typeof buildWithdrawalTx> } | null> {
+	private async buildPayout(targets: { id: string; btcAddress: string; amount: bigint; fee: bigint }[]): Promise<{ mkUnsigned: () => ReturnType<typeof buildWithdrawalTx> } | null> {
 		const fk = this.fundKey();
 		const fundAddr = this.fundAddress();
 		if (!fk || !fundAddr) return null; // no committee fund yet — nothing to sign against
@@ -1357,10 +1357,12 @@ export class Daemon {
 		const tip = await esplora.tipHeight();
 		const inputs = (await Promise.all(this.fundAddresses().map(async ({ address, owner }) => utxosToInputs(await esplora.utxos(address), MIN_CONFIRMATIONS, tip).map((u) => ({ ...u, owner }))))).flat();
 		const inSum = inputs.reduce((a, u) => a + u.amount, 0n);
-		const payouts = targets.map((w) => ({ address: w.btcAddress, amount: w.amount }));
-		const outSum = payouts.reduce((a, p) => a + p.amount, 0n);
-		if (inputs.length === 0 || inSum < outSum + feeSats) return null;
-		const change = inSum - outSum - feeSats;
+		// Each withdrawer receives amount − their OWN fee; the summed fees ARE the tx's miner fee, so
+		// the fund's reserves drop by exactly `gross` (Σamount = the burned gBTC) — 1:1 backing holds.
+		const payouts = targets.map((w) => ({ address: w.btcAddress, amount: w.amount - w.fee }));
+		const gross = targets.reduce((a, w) => a + w.amount, 0n);
+		if (inputs.length === 0 || inSum < gross) return null; // not enough confirmed BTC to cover it
+		const change = inSum - gross; // miner fee (= Σfee) is the gap between gross and the user payouts
 		if (change > 0n) payouts.push({ address: fundAddr, amount: change });
 		// VETO: the tx may pay ONLY the requested withdrawal addresses + change to the fund.
 		const requested = new Set(targets.map((w) => w.btcAddress));
@@ -1404,7 +1406,7 @@ export class Daemon {
 		if (!cs) return null;
 		const unsent = unsentWithdrawals(this.finalView().bridge);
 		if (unsent.length === 0) return null;
-		const built = await this.buildPayout(unsent, 1_000n);
+		const built = await this.buildPayout(unsent); // each withdrawal carries its own miner fee
 		if (!built) return null;
 		const signed = await signWithdrawalWithFailover(built.mkUnsigned, {
 			node: this.node,

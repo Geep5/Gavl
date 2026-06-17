@@ -16,8 +16,10 @@ export type Op =
 	| { kind: "bridge.deposit"; depositId: string; depositor: string; amount: string; sig?: string }
 	/** Send gBTC to another account. */
 	| { kind: "gbtc.transfer"; to: string; amount: string }
-	/** Burn gBTC to redeem BTC → a pending withdrawal paid to `btcAddress`. */
-	| { kind: "bridge.withdraw"; amount: string; btcAddress: string }
+	/** Burn gBTC to redeem BTC → a pending withdrawal paid to `btcAddress`. `fee` (sats) is the
+	 *  miner fee the WITHDRAWER chooses; it's deducted from their own payout (they receive
+	 *  `amount − fee`), so the fund's reserves drop by exactly `amount`. Must be ≥ MIN_WITHDRAW_FEE. */
+	| { kind: "bridge.withdraw"; amount: string; btcAddress: string; fee: string }
 	/** Request that a verified BTC deposit be minted — the on-chain TRIGGER that tells
 	 *  every committee member to check `depositId` on-chain and co-sign the mint. No
 	 *  authority needed: it only credits the per-user-address owner, and a bogus claim

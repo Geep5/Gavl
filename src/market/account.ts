@@ -12,6 +12,7 @@ import type { KeyPair } from "../det/ed25519.ts";
 import type { GavlNode } from "../sync/node.ts";
 import { computeView, finalizedView, gbtcOf } from "./btc.ts";
 import type { View } from "./btc.ts";
+import { DEFAULT_WITHDRAW_FEE } from "../custody/bridge.ts";
 import type { Op } from "./ops.ts";
 import { signOffer } from "./intent.ts";
 import type { Offer, OfferCore, Side } from "./intent.ts";
@@ -71,9 +72,10 @@ export class Account {
 		return this.produce({ kind: "gbtc.transfer", to, amount: amountStr(amount) });
 	}
 
-	/** Burn gBTC to redeem BTC to `btcAddress` → a pending withdrawal. */
-	withdraw(amount: bigint | number | string, btcAddress: string): Promise<Write> {
-		return this.produce({ kind: "bridge.withdraw", amount: amountStr(amount), btcAddress });
+	/** Burn gBTC to redeem BTC to `btcAddress` → a pending withdrawal. `fee` (sats) is the miner
+	 *  fee, deducted from the payout (you receive `amount − fee`); must be ≥ MIN_WITHDRAW_FEE. */
+	withdraw(amount: bigint | number | string, btcAddress: string, fee: bigint | number | string = DEFAULT_WITHDRAW_FEE): Promise<Write> {
+		return this.produce({ kind: "bridge.withdraw", amount: amountStr(amount), btcAddress, fee: amountStr(fee) });
 	}
 
 	/** Request that a verified BTC deposit be minted — the on-chain trigger every

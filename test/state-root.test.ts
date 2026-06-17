@@ -38,8 +38,8 @@ function makeView(rev = false): View {
 	bridge.mintedTotal = 400n;
 	bridge.paidOut = 43n;
 	bridge.pending = [
-		{ id: "burn1", owner: "aa", amount: 12n, btcAddress: "bc1qaa" },
-		{ id: "burn2", owner: "bb", amount: 31n, btcAddress: "bc1qbb" },
+		{ id: "burn1", owner: "aa", amount: 12n, btcAddress: "bc1qaa", fee: 500n },
+		{ id: "burn2", owner: "bb", amount: 31n, btcAddress: "bc1qbb", fee: 700n },
 	]; // pending is FIFO — order is itself state, NOT reversed
 
 	const book = emptyBook();

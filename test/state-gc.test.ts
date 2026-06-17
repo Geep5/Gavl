@@ -40,8 +40,8 @@ test("an unminted deposit claim is retired only after the reclaim grace, and can
 
 test("a withdrawal's in-flight marker is retired once it settles", () => {
 	const s = emptyBridge();
-	mintFromDeposit(s, { depositId: "d", depositor: "a", amount: 1000n });
-	requestWithdrawal(s, { id: "w1", owner: "a", amount: 500n, btcAddress: "bc1qx" });
+	mintFromDeposit(s, { depositId: "d", depositor: "a", amount: 100_000n });
+	requestWithdrawal(s, { id: "w1", owner: "a", amount: 50_000n, btcAddress: "bc1qx", fee: 1000n });
 	recordBroadcast(s, "w1", "txid123");
 	assert.equal(s.broadcasts.size, 1);
 	completeWithdrawal(s, "w1");

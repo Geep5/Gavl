@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { emptyBridge, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, withdrawalPayouts, gbtcOf, totalGbtc, pendingTotal, conserved, backingBps } from "../src/custody/bridge.ts";
+import { emptyBridge, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, withdrawalPayouts, gbtcOf, totalGbtc, pendingTotal, conserved, backingBps, MIN_WITHDRAW_FEE, WITHDRAW_DUST } from "../src/custody/bridge.ts";
 import { generateFundKeyDKG, quorumOf } from "../src/custody/threshold.ts";
 import { fundAddress } from "../src/custody/bitcoin.ts";
 import { buildWithdrawalTx, signWithdrawalTx, verifyWithdrawalSigs } from "../src/custody/btctx.ts";
@@ -30,19 +30,19 @@ test("deposit mints gBTC 1:1 and is idempotent", () => {
 test("burn → pending withdrawal: gBTC destroyed, reserves still back it", () => {
 	const b = emptyBridge();
 	mintFromDeposit(b, { depositId: "d1", depositor: "bob", amount: 300_000n });
-	assert.equal(requestWithdrawal(b, { id: "w1", owner: "bob", amount: 100_000n, btcAddress: RECIPIENT }), true);
+	assert.equal(requestWithdrawal(b, { id: "w1", owner: "bob", amount: 100_000n, btcAddress: RECIPIENT, fee: 1000n }), true);
 	assert.equal(gbtcOf(b, "bob"), 200_000n, "gBTC burned");
 	assert.equal(pendingTotal(b), 100_000n, "owed as a pending BTC payout");
 	assert.equal(b.reserves, 300_000n, "BTC still in the fund until the payout confirms");
 	assert.ok(conserved(b), "reserves == gBTC + pending");
 	// can't burn more than you hold
-	assert.equal(requestWithdrawal(b, { id: "w2", owner: "bob", amount: 999_999n, btcAddress: RECIPIENT }), false);
+	assert.equal(requestWithdrawal(b, { id: "w2", owner: "bob", amount: 999_999n, btcAddress: RECIPIENT, fee: 1000n }), false);
 });
 
 test("complete withdrawal: BTC leaves the fund, invariant preserved", () => {
 	const b = emptyBridge();
 	mintFromDeposit(b, { depositId: "d1", depositor: "carol", amount: 250_000n });
-	requestWithdrawal(b, { id: "w1", owner: "carol", amount: 250_000n, btcAddress: RECIPIENT });
+	requestWithdrawal(b, { id: "w1", owner: "carol", amount: 250_000n, btcAddress: RECIPIENT, fee: 1000n });
 	assert.equal(completeWithdrawal(b, "w1"), true);
 	assert.equal(b.reserves, 0n, "BTC left the fund");
 	assert.equal(pendingTotal(b), 0n);
@@ -51,14 +51,31 @@ test("complete withdrawal: BTC leaves the fund, invariant preserved", () => {
 	assert.ok(conserved(b));
 });
 
+test("withdrawal fee: floor + dust enforced; the fee is the withdrawer's, not the fund's", () => {
+	const b = emptyBridge();
+	mintFromDeposit(b, { depositId: "f:0", depositor: "u", amount: 100_000n });
+	// fee below the relay floor → rejected, and the gBTC is NOT burned
+	assert.equal(requestWithdrawal(b, { id: "lo", owner: "u", amount: 50_000n, btcAddress: RECIPIENT, fee: MIN_WITHDRAW_FEE - 1n }), false);
+	assert.equal(gbtcOf(b, "u"), 100_000n, "a rejected withdrawal burns nothing");
+	// amount − fee would be dust → rejected (the payout must be spendable)
+	assert.equal(requestWithdrawal(b, { id: "dust", owner: "u", amount: WITHDRAW_DUST + 100n, btcAddress: RECIPIENT, fee: 600n }), false);
+	// valid → accepted. The LEDGER burns/owes the FULL amount; the fee only comes off the BTC payout
+	// later (buildPayout pays amount − fee), so reserves still back it 1:1 and conservation holds.
+	assert.equal(requestWithdrawal(b, { id: "ok", owner: "u", amount: 50_000n, btcAddress: RECIPIENT, fee: 2_000n }), true);
+	assert.equal(pendingTotal(b), 50_000n, "pending owes the full burned amount, not amount − fee");
+	assert.equal(b.pending[0].fee, 2_000n, "the chosen fee is recorded for the payout tx");
+	assert.equal(b.reserves, 100_000n);
+	assert.ok(conserved(b), "reserves == gBTC + pending — the fee never touches the ledger");
+});
+
 test("CONSERVATION: 1:1 backing holds across a full deposit→trade→withdraw run", () => {
 	const b = emptyBridge();
 	const steps = [
 		() => mintFromDeposit(b, { depositId: "d1", depositor: "a", amount: 400_000n }),
 		() => mintFromDeposit(b, { depositId: "d2", depositor: "x", amount: 600_000n }),
 		() => transferGbtc(b, "a", "y", 150_000n), // gBTC trades hands
-		() => requestWithdrawal(b, { id: "w1", owner: "y", amount: 150_000n, btcAddress: RECIPIENT }),
-		() => requestWithdrawal(b, { id: "w2", owner: "x", amount: 600_000n, btcAddress: RECIPIENT }),
+		() => requestWithdrawal(b, { id: "w1", owner: "y", amount: 150_000n, btcAddress: RECIPIENT, fee: 1000n }),
+		() => requestWithdrawal(b, { id: "w2", owner: "x", amount: 600_000n, btcAddress: RECIPIENT, fee: 1000n }),
 		() => completeWithdrawal(b, "w1"),
 		() => mintFromDeposit(b, { depositId: "d3", depositor: "a", amount: 50_000n }),
 		() => completeWithdrawal(b, "w2"),
@@ -80,8 +97,8 @@ test("FULL LIFECYCLE: burned gBTC → a real threshold-signed BTC payout tx", ()
 	mintFromDeposit(b, { depositId: "ab".repeat(32) + ":0", depositor: "alice", amount: 700_000n });
 	mintFromDeposit(b, { depositId: "cd".repeat(32) + ":1", depositor: "bob", amount: 300_000n });
 	// both redeem
-	requestWithdrawal(b, { id: "w-alice", owner: "alice", amount: 700_000n, btcAddress: RECIPIENT });
-	requestWithdrawal(b, { id: "w-bob", owner: "bob", amount: 300_000n, btcAddress: RECIPIENT });
+	requestWithdrawal(b, { id: "w-alice", owner: "alice", amount: 700_000n, btcAddress: RECIPIENT, fee: 1000n });
+	requestWithdrawal(b, { id: "w-bob", owner: "bob", amount: 300_000n, btcAddress: RECIPIENT, fee: 1000n });
 
 	// settle: the fund's UTXO (1,000,000 sats) pays the two withdrawals minus fee
 	const payouts = withdrawalPayouts(b); // [{RECIPIENT, 700k}, {RECIPIENT, 300k}]
