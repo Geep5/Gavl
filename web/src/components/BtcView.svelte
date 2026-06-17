@@ -186,7 +186,6 @@
 			<span class="sep">::</span>
 			<div class="segblock"><code class="seg c" title={seg[2] ?? ""}>{idShort}</code><span class="slabel">{idLabel}</span></div>
 		</div>
-		<p class="midcap">This string <strong>is</strong> the market — it hashes to the network address every peer independently agrees on. There's no server: same name → same market{#if mkt?.iAmRelaying}, and this node is relaying the verified price{/if}.</p>
 	</div>
 </section>
 
@@ -352,8 +351,6 @@
 	.seg.c { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, var(--border)); background: var(--accent-soft); }
 	.slabel { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--faint); padding-left: 0.1rem; }
 	.sep { font-family: var(--mono); color: var(--faint); font-size: 0.95rem; padding-top: 0.42rem; }
-	.midcap { margin: 0.85rem 0 0; font-size: 0.78rem; line-height: 1.55; color: var(--muted); }
-	.midcap strong { color: var(--text); font-style: italic; }
 
 	/* ── cards ── */
 	.card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.1rem 1.25rem; margin-bottom: 1rem; }
