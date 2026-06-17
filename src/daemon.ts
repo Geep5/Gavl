@@ -27,15 +27,13 @@ import type { Anchor } from "./consensus/anchor.ts";
 import type { Heads } from "./ledger/ledger.ts";
 import { longPayout, verifyOffer } from "./market/intent.ts";
 import type { Offer, Side } from "./market/intent.ts";
-import { generateFundKeyDKG, thresholdSign, quorumOf } from "./custody/threshold.ts";
 import type { FundKey } from "./custody/threshold.ts";
 import { DkgCoordinator } from "./custody/dkg-coordinator.ts";
 import { saveShare, loadShare } from "./custody/share-store.ts";
-import { toJsonSafe, fromJsonSafe } from "./custody/u8json.ts";
 import type { StoredShare } from "./custody/share-store.ts";
 import { fundAddress as deriveFundAddress } from "./custody/bitcoin.ts";
 import { depositAddress } from "./custody/deposit.ts";
-import { buildWithdrawalTx, signWithdrawalTx } from "./custody/btctx.ts";
+import { buildWithdrawalTx } from "./custody/btctx.ts";
 import { signWithdrawalWithFailover } from "./custody/withdraw-ceremony.ts";
 import { SignCoordinator } from "./custody/sign-coordinator.ts";
 import { CommitteeRotation } from "./custody/rotation.ts";
@@ -77,7 +75,7 @@ import { KeepAllPolicy, MinePolicy } from "./store/policy.ts";
 import type { PersistPolicy } from "./store/policy.ts";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 
 export type SpaceMode = "standin" | "chiapos";
@@ -116,15 +114,13 @@ export interface DaemonOptions {
 		policy?: PersistPolicy;
 	};
 	/**
-	 * Threshold-custody mode. "seed" (default) = single-operator: a 2-of-3 fund key generated +
-	 * persisted LOCALLY (no public seed), this node holding all shares, announced on-chain and used
-	 * to threshold-sign its own mints/settles. "committee" = autonomous epoch-driven custody: the
+	 * Threshold-custody config. There is ONLY one mode: an autonomous epoch-driven committee. The
 	 * fund key is DKG'd across a PoST-weighted committee sampled from the anchor chain and reshared
 	 * to a fresh committee each epoch, no node ever holding it whole. Needs farming on (the node's
-	 * stable producer key is its committee id). Either way the on-chain group key is the only authority.
+	 * stable producer key is its committee id). A lone node (< minCommittee farmers) holds NO key and
+	 * cannot mint — it waits for peers. There is no single-key/solo fallback, on any network.
 	 */
 	custody?: {
-		mode?: "seed" | "committee";
 		/** Anchors per custody epoch (default 16). */
 		epochLength?: number;
 		/** Target committee size, clamped to eligible producers (default 5). */
@@ -380,7 +376,7 @@ export class Daemon {
 	 * committee mode + a live transport.
 	 */
 	private maintainCommitteeTopics(): void {
-		if (!this.committeeMode() || !this.transport) return;
+		if (!this.transport) return;
 		const anchors = this.node.anchors;
 		const tip = anchors?.tip();
 		if (!anchors || !tip) return;
@@ -838,7 +834,7 @@ export class Daemon {
 	/** Custody status for the UI/operator: the mode, the autonomous loop's epoch, the
 	 *  on-chain fund key/address, and whether THIS node currently holds a committee share. */
 	custodyStatus(): {
-		mode: "seed" | "committee";
+		mode: "committee";
 		epoch: number;
 		fundKeyOnChain: string | null;
 		fundAddress: string | null;
@@ -852,14 +848,13 @@ export class Daemon {
 		myBond: string;
 	} {
 		const cs = this.committeeShare();
-		const committee = this.committeeMode();
-		const onchain = this.view().custody.fundKey; // the announced group key (solo or committee)
-		const id = committee ? this.producerId() : null;
+		const onchain = this.view().custody.fundKey; // the announced committee group key (null until genesis DKG completes)
+		const id = this.producerId();
 		return {
-			mode: committee ? "committee" : "seed",
+			mode: "committee",
 			epoch: this.rotation?.epoch ?? -1,
 			fundKeyOnChain: onchain,
-			fundAddress: committee ? (onchain ? this.fundAddress() : null) : this.fundAddress(),
+			fundAddress: this.fundAddress(), // null pre-genesis (no key yet)
 			committeeId: id,
 			holdsShare: !!cs,
 			committee: cs?.participants ?? null,
@@ -867,7 +862,7 @@ export class Daemon {
 			minCommittee: this.custodyOpts.minCommittee ?? 3, // farmers needed to bootstrap genesis custody
 			subSwarmTopics: this.transport?.committeeTopicNames() ?? [],
 			bonded: !!this.custodyOpts.bonded, // stake-weighted selection on?
-			myBond: (id ? this.view().bridge.bonds.get(id) ?? 0n : 0n).toString(),
+			myBond: (this.view().bridge.bonds.get(id) ?? 0n).toString(),
 		};
 	}
 
@@ -946,7 +941,7 @@ export class Daemon {
 		if (opts.farm) {
 			// Stable producer identity (persisted) so this node is the SAME committee
 			// candidate across reboots — its anchor-producer pubkey IS its committee id.
-			const farmer = this.committeeMode() ? this.producerKey() : generateKeyPair();
+			const farmer = this.producerKey(); // stable producer identity = this node's committee id
 			let prover: SpaceProver;
 			if (this.spaceMode === "chiapos") {
 				// Real disk cost: plot the farmer's chiapos plot (slow the first time, then cached).
@@ -958,8 +953,7 @@ export class Daemon {
 			}
 			this.producer = new Producer({ node: this.node, keypair: farmer, prover, params: this.params, appRootFor: (prev) => this.appRootForParent(prev) });
 			this.farming = true;
-			if (this.committeeMode()) this.startCommitteeCustody();
-			else void this.announceSoloFund(); // solo: publish the local fund key so the fold authorizes its mints
+			this.startCommitteeCustody(); // the only custody path: form/join the M-of-N committee
 
 			// Adaptive: farm hard while there are unfinalized writes to bury, then drop
 			// to a slow heartbeat when idle — work tracks activity instead of running
@@ -1114,75 +1108,21 @@ export class Daemon {
 
 	// ── real-BTC bridge (testnet) ────────────────────────────────────
 
-	/** Solo (single-operator) custody fund key — a 2-of-3 generated + persisted LOCALLY (no public
-	 *  seed), with this node holding all shares. Stable across reboots: the fund ADDRESS derives from
-	 *  it, so losing it would lock the BTC. The committee path (GAVL_CUSTODY=committee) generates the
-	 *  key across independent nodes instead, no node holding it whole — but either way the on-chain
-	 *  group key + threshold sigs are the ONLY mint/settle authority (no single key, no public default). */
-	private soloFundCache?: FundKey;
-	private soloFundPath(): string {
-		return join(this.dataDir, "custody", "solo-fund.json");
-	}
-	private soloFund(): FundKey {
-		if (this.soloFundCache) return this.soloFundCache;
-		const path = this.soloFundPath();
-		try {
-			this.soloFundCache = fromJsonSafe(JSON.parse(readFileSync(path, "utf8"))) as FundKey;
-		} catch {
-			const fk = generateFundKeyDKG(2, 3); // single operator → this node holds all shares
-			mkdirSync(dirname(path), { recursive: true });
-			writeFileSync(path, JSON.stringify(toJsonSafe(fk)), { mode: 0o600 });
-			this.soloFundCache = fk;
-		}
-		return this.soloFundCache;
-	}
-
-	/** A threshold signature over a custody attestation digest. Committee mode runs the distributed
-	 *  ceremony (no node holds the key); solo mode signs locally with the shares this node holds. The
-	 *  fold verifies it against the on-chain group key — there is no single-key path. */
-	private async attestDigest(digest: Uint8Array): Promise<string | null> {
-		if (this.committeeMode()) return this.committeeAttest(digest);
-		const fk = this.soloFund();
-		const quorum = Object.fromEntries(Object.entries(fk.shares).slice(0, fk.min));
-		return toHex(thresholdSign(digest, fk.pub, quorum));
-	}
-
-	/** Announce the solo fund's group key on-chain (once) so the fold accepts its threshold-signed
-	 *  mints/settles. Committee mode announces via the genesis DKG instead. */
-	private async announceSoloFund(): Promise<void> {
-		if (this.committeeMode() || this.view().custody.fundKey) return;
-		try {
-			await this.custodyAccount().announceFund(toHex(this.soloFund().groupPubKey), 0);
-		} catch {
-			/* best effort; a claim re-announces if needed */
-		}
-	}
-
-	/** Whether autonomous committee custody is enabled (vs single-operator seed fund). */
-	private committeeMode(): boolean {
-		return this.custodyOpts.mode === "committee";
-	}
-
-	/** The threshold-custody fund key. In committee mode the group key is the ON-CHAIN
-	 *  published one (so any node — even one holding no share — derives the right
-	 *  address); if this node holds the matching share, pub/min are exposed for
-	 *  co-signing. Else the locally-generated, persisted solo fund key (this node holds all
-	 *  shares). Spending always goes through a threshold ceremony — never a single key. */
-	private fundKey(): FundKey {
+	/** The threshold-custody fund key — ALWAYS the committee's; there is no single-key/solo path on
+	 *  any network. The group key is the ON-CHAIN published one (so any node, even one holding no
+	 *  share, derives the right address); if this node holds the matching share, pub/min are exposed
+	 *  for co-signing. Returns NULL pre-genesis: until the committee runs its DKG there is no fund
+	 *  key, no address, and nothing can be minted — a lone node simply waits for peers. */
+	private fundKey(): FundKey | null {
+		const onchain = this.view().custody.fundKey;
 		const cs = this.committeeShare();
-		if (this.committeeMode()) {
-			const onchain = this.view().custody.fundKey;
-			if (onchain) {
-				const groupPubKey = fromHex(onchain);
-				if (cs && toHex(cs.groupPubKey) === onchain) return { groupPubKey, pub: cs.pub, shares: {}, min: cs.min, max: cs.participants.length };
-				return { groupPubKey, pub: {} as FundKey["pub"], shares: {}, min: 0, max: 0 }; // address-only (no share here)
-			}
-			if (cs) return { groupPubKey: cs.groupPubKey, pub: cs.pub, shares: {}, min: cs.min, max: cs.participants.length }; // genesis announce not seen yet
-			// pre-genesis: fall through to the local solo key for a bootstrap address (no funds yet)
-		} else if (cs) {
-			return { groupPubKey: cs.groupPubKey, pub: cs.pub, shares: {}, min: cs.min, max: cs.participants.length };
+		if (onchain) {
+			const groupPubKey = fromHex(onchain);
+			if (cs && toHex(cs.groupPubKey) === onchain) return { groupPubKey, pub: cs.pub, shares: {}, min: cs.min, max: cs.participants.length };
+			return { groupPubKey, pub: {} as FundKey["pub"], shares: {}, min: 0, max: 0 }; // address-only (no share here)
 		}
-		return this.soloFund(); // single-operator: the locally-generated, persisted, announced key
+		if (cs) return { groupPubKey: cs.groupPubKey, pub: cs.pub, shares: {}, min: cs.min, max: cs.participants.length }; // hold a share; genesis announce not seen yet
+		return null; // pre-genesis: no committee fund exists yet
 	}
 
 	/** Path to THIS node's persisted committee share (secret, node-local). */
@@ -1315,22 +1255,30 @@ export class Daemon {
 		return this.esplora().net;
 	}
 	/** The base fund address (change + legacy + consolidation). Per-user deposits go to
-	 *  `depositAddressFor` instead — see the front-running fix. */
-	fundAddress(): string {
-		return deriveFundAddress(this.fundKey(), this.btcNetwork());
+	 *  `depositAddressFor` instead — see the front-running fix. NULL pre-genesis (no committee
+	 *  fund key yet), so deposits/withdrawals are impossible until the committee forms. */
+	fundAddress(): string | null {
+		const fk = this.fundKey();
+		return fk ? deriveFundAddress(fk, this.btcNetwork()) : null;
 	}
 
 	/** A user's OWN Bitcoin deposit address — derived from (fund key, their pubkey), so a
-	 *  deposit here is cryptographically bound to them and can't be claimed by anyone else. */
-	depositAddressFor(pubHex: string): string {
-		return depositAddress(this.fundKey().groupPubKey, pubHex, this.btcNetwork());
+	 *  deposit here is cryptographically bound to them and can't be claimed by anyone else.
+	 *  NULL pre-genesis (no fund key) — there's nowhere to deposit until the committee forms. */
+	depositAddressFor(pubHex: string): string | null {
+		const fk = this.fundKey();
+		return fk ? depositAddress(fk.groupPubKey, pubHex, this.btcNetwork()) : null;
 	}
 
 	/** Every address the fund holds BTC at: the base, plus each depositor's per-user
 	 *  address (`owner` = the depositor, telling the signer which tweak to use). */
 	private fundAddresses(): { address: string; owner?: string }[] {
-		const list: { address: string; owner?: string }[] = [{ address: this.fundAddress() }];
-		for (const d of this.view().bridge.depositors) list.push({ address: this.depositAddressFor(d), owner: d });
+		const base = this.fundAddress();
+		const list: { address: string; owner?: string }[] = base ? [{ address: base }] : []; // empty pre-genesis
+		for (const d of this.view().bridge.depositors) {
+			const addr = this.depositAddressFor(d);
+			if (addr) list.push({ address: addr, owner: d });
+		}
 		return list;
 	}
 
@@ -1364,65 +1312,34 @@ export class Daemon {
 	}
 
 	/**
-	 * Begin claiming a real BTC deposit `txid` for `depositor` (verified to have paid
-	 * THEIR per-user address). In committee mode this just posts the on-chain `bridge.claim`
-	 * TRIGGER — the committee then independently re-verifies + co-signs the mint (so no
-	 * single key mints). In seed mode the single attestor mints directly. Returns the sats
-	 * found (the gBTC appears once minted).
+	 * Begin claiming a real BTC deposit `txid` for `depositor` (verified to have paid THEIR
+	 * per-user address). This only posts the on-chain `bridge.claim` TRIGGER — the committee
+	 * then independently re-verifies + co-signs the mint, so no single key ever mints. No-op
+	 * (returns 0) pre-genesis: with no committee fund there's no deposit address and nothing
+	 * to claim. Returns the sats found (the gBTC appears once the committee mints).
 	 */
 	async claimDeposit(txid: string, depositor: string): Promise<bigint> {
-		// FRONT-RUN FIX: verify the deposit paid the CLAIMER's OWN per-user address.
-		let deps = await checkDeposit(this.esplora(), this.depositAddressFor(depositor), txid, MIN_CONFIRMATIONS);
-		// SEED / single-operator fallback: per-user deposit addresses are the COMMITTEE-mode
-		// front-running guard. In single-operator seed mode there's one operator (you), so a
-		// deposit that paid the shared FUND address is also yours to claim — otherwise BTC sent
-		// straight to the fund address would be stranded. Committee mode keeps the strict
-		// per-user binding (no fallback).
-		if (deps.length === 0 && !this.committeeMode()) {
-			deps = await checkDeposit(this.esplora(), this.fundAddress(), txid, MIN_CONFIRMATIONS);
-		}
+		// FRONT-RUN FIX: verify the deposit paid the CLAIMER's OWN per-user address. The strict
+		// per-user binding is the committee front-running guard — there is no fund-address fallback.
+		const addr = this.depositAddressFor(depositor);
+		if (!addr || !this.view().custody.fundKey) return 0n; // no committee fund yet — nothing to claim against
+		const deps = await checkDeposit(this.esplora(), addr, txid, MIN_CONFIRMATIONS);
 		let total = 0n;
 		for (const d of deps) {
 			const depositId = `${d.txid}:${d.vout}`;
-			if (this.committeeMode() && this.view().custody.fundKey) {
-				await this.custodyAccount().claim(depositId, depositor); // post the trigger; the committee mints
-			} else {
-				// solo: threshold-sign the mint locally with the held key, then post the signed deposit
-				await this.announceSoloFund();
-				const sig = await this.attestDigest(depositAttestationDigest({ depositId, depositor, amount: d.amount }));
-				if (sig) await this.custodyAccount().attestDeposit(depositId, depositor, d.amount, sig);
-			}
+			await this.custodyAccount().claim(depositId, depositor); // post the trigger; the committee re-verifies + co-signs the mint
 			total += d.amount;
 		}
 		return total;
 	}
 
 	/**
-	 * Settle pending withdrawals. Committee mode → co-sign the unsent ones (the finality
-	 * loop also does this autonomously); seed mode → the single operator signs + broadcasts
-	 * + settles inline. Returns the broadcast txid (committee: of the unsent batch), or null.
+	 * Settle pending withdrawals by co-signing the unsent ones (the finality loop also does this
+	 * autonomously). Returns the broadcast txid of the batch, or null (incl. pre-genesis: no fund).
 	 */
-	async processWithdrawals(feeSats = 1_000n): Promise<string | null> {
-		if (this.committeeMode() && this.view().custody.fundKey) return this.coSignWithdrawals();
-		return this.seedProcessWithdrawals(feeSats);
-	}
-
-	/** Solo single-operator path: threshold-sign ALL pending with the locally-held fund key,
-	 *  broadcast, and settle immediately (no committee ceremony, no confirmation wait). */
-	private async seedProcessWithdrawals(feeSats: bigint): Promise<string | null> {
-		const pending = this.view().bridge.pending;
-		if (pending.length === 0) return null;
-		const esplora = this.esplora();
-		const built = await this.buildPayout(pending, feeSats);
-		if (!built) return null;
-		const fk = this.fundKey();
-		const quorum = Object.fromEntries(Object.entries(fk.shares).slice(0, fk.min));
-		const txid = await esplora.broadcast(signWithdrawalTx(built.mkUnsigned(), fk, quorum).hex);
-		for (const w of pending) {
-			const sig = await this.attestDigest(settleAttestationDigest({ withdrawalId: w.id }));
-			if (sig) await this.custodyAccount().settleWithdrawal(w.id, sig);
-		}
-		return txid;
+	async processWithdrawals(): Promise<string | null> {
+		if (!this.view().custody.fundKey) return null; // no committee fund yet
+		return this.coSignWithdrawals();
 	}
 
 	/**
@@ -1433,6 +1350,9 @@ export class Daemon {
 	 * isn't enough confirmed BTC yet.
 	 */
 	private async buildPayout(targets: { id: string; btcAddress: string; amount: bigint }[], feeSats: bigint): Promise<{ mkUnsigned: () => ReturnType<typeof buildWithdrawalTx> } | null> {
+		const fk = this.fundKey();
+		const fundAddr = this.fundAddress();
+		if (!fk || !fundAddr) return null; // no committee fund yet — nothing to sign against
 		const esplora = this.esplora();
 		const tip = await esplora.tipHeight();
 		const inputs = (await Promise.all(this.fundAddresses().map(async ({ address, owner }) => utxosToInputs(await esplora.utxos(address), MIN_CONFIRMATIONS, tip).map((u) => ({ ...u, owner }))))).flat();
@@ -1440,7 +1360,6 @@ export class Daemon {
 		const payouts = targets.map((w) => ({ address: w.btcAddress, amount: w.amount }));
 		const outSum = payouts.reduce((a, p) => a + p.amount, 0n);
 		if (inputs.length === 0 || inSum < outSum + feeSats) return null;
-		const fundAddr = this.fundAddress();
 		const change = inSum - outSum - feeSats;
 		if (change > 0n) payouts.push({ address: fundAddr, amount: change });
 		// VETO: the tx may pay ONLY the requested withdrawal addresses + change to the fund.
@@ -1448,7 +1367,7 @@ export class Daemon {
 		for (const p of payouts) if (p.address !== fundAddr && !requested.has(p.address)) throw new Error(`withdrawal policy: refusing to pay ${p.address}`);
 		inputs.sort((a, b) => (a.txid === b.txid ? a.index - b.index : a.txid < b.txid ? -1 : 1));
 		payouts.sort((a, b) => (a.address === b.address ? Number(a.amount - b.amount) : a.address < b.address ? -1 : 1));
-		return { mkUnsigned: () => buildWithdrawalTx(this.fundKey(), { inputs, outputs: payouts, network: this.btcNetwork() }) };
+		return { mkUnsigned: () => buildWithdrawalTx(fk, { inputs, outputs: payouts, network: this.btcNetwork() }) };
 	}
 
 	// ── autonomous committee co-signing (finality-driven; the trigger) ───────
@@ -1459,11 +1378,11 @@ export class Daemon {
 	 * FINALIZED state and co-signs it — withdrawals to sign, deposits to mint, payouts to
 	 * settle — with NO leader: every member reads the same finalized state, runs the same
 	 * deterministic ceremony per item, and idempotent effects make duplicates safe. This
-	 * is what makes the committee autonomous across many nodes. No-op unless committee mode
-	 * + this node holds a share + a fund exists. Non-reentrant.
+	 * is what makes the committee autonomous across many nodes. No-op unless this node holds
+	 * a share + a fund exists. Non-reentrant.
 	 */
 	private maybeAuthorizePending(): void {
-		if (this.authorizing || !this.committeeMode() || !this.committeeShare() || !this.view().custody.fundKey) return;
+		if (this.authorizing || !this.committeeShare() || !this.view().custody.fundKey) return;
 		this.authorizing = true;
 		void (async () => {
 			try {
@@ -1516,7 +1435,9 @@ export class Daemon {
 			if (colon < 0) continue;
 			const txid = depositId.slice(0, colon);
 			const vout = Number(depositId.slice(colon + 1));
-			const deps = await checkDeposit(esplora, this.depositAddressFor(depositor), txid, MIN_CONFIRMATIONS);
+			const addr = this.depositAddressFor(depositor);
+			if (!addr) continue; // no fund key — can't derive the per-user address
+			const deps = await checkDeposit(esplora, addr, txid, MIN_CONFIRMATIONS);
 			const d = deps.find((x) => x.vout === vout);
 			if (!d) continue; // not verified (yet) — retried next tick
 			const sig = await this.committeeAttest(depositAttestationDigest({ depositId, depositor, amount: d.amount }));

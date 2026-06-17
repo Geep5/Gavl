@@ -179,7 +179,7 @@ threshold Schnorr (Taproot-compatible), proven against Bitcoin's own BIP340 veri
   it against the ledger's reserves, flagging any shortfall (the solvency check a custodial
   bridge must run).
 
-**Committee custody is the DEFAULT** — the decentralized, mainnet posture. VDF-seeded
+**Committee custody is the ONLY mode** — there is no solo/single-key path on any network. VDF-seeded
 stake-weighted committee sampling, distributed DKG, threshold signing, and proactive
 resharing all run over the live mesh, rotating the share-holders each epoch *without moving
 the fund address*; **bonding** makes a committee seat cost stake and **slashing** makes
@@ -187,11 +187,11 @@ ceremony equivocation cost the bond
 (`custody/{committee,epoch,rotation,*-coordinator,ceremony-auth,attestation,bridge,slashing}.ts`).
 The genesis DKG has been validated **live across three independent machines** — all agreeing
 on one fund key, no node ever holding it whole. A committee needs **≥3 independent farmers** to
-form: a lone node holds no key and **can't mint — by design it waits for peers** rather than
-falling back to a single signer. For single-node testnet dev, `GAVL_CUSTODY=solo` is an explicit
-escape hatch (one locally-generated key, this node only). A **mainnet safety-lock** then refuses
-solo custody — and in-memory storage — outright when `GAVL_BTC_NET=mainnet`: real BTC must be held
-by an M-of-N committee on durable disk, never one key in RAM.
+form: until then a node holds **no fund key, has no deposit address, and can't mint** — it simply
+**waits for peers** (there is no single-signer fallback to drop back to). This makes the minimum
+real deployment a complete 3-node network, so testing matches production. A **mainnet safety-lock**
+additionally refuses in-memory storage (`GAVL_PERSIST=off`) when `GAVL_BTC_NET=mainnet`: real BTC
+must be held by an M-of-N committee on durable disk, never in RAM.
 
 > **Deferred — auto-slashing.** The slashing *op + fraud-proof verifier* exist
 > (`custody/slashing.ts`), but nothing yet **auto-detects** an equivocation — two conflicting
@@ -328,17 +328,21 @@ What's **trusted** (and surfaced honestly in the UI):
   attested by the **Wormhole guardian set** (a fixed public committee) and verified on-chain, so
   there's no reporter to trust — you trust the guardian set (a weak-subjectivity pin), and a
   malicious market is sandboxed to its own channel.
-- **The bridge, on testnet** — currently **single-operator**: the daemon holds all the
-  fund's key shares (deterministic dev seed) and is the deposit attestor. Real BTC custody
-  is never zero-trust; this pushes trust as thin as it goes, but it isn't there yet.
+- **The bridge** — gBTC is backed by BTC in an **M-of-N committee fund**: the key is DKG'd across
+  independent farmers (no node ever holds it whole), and there is **no single-operator/dev-seed
+  path** — a node with too few peers simply has no fund and waits. What's still trusted: the
+  committee's honest-majority assumption (bonding raises its capture cost) and a single Esplora
+  chain view per node (multi-source is future work).
 
-**Before any mainnet satoshi, four gates must close:**
+**Before any mainnet satoshi, four gates — two now closed:**
 
-1. **Independent audit.**
-2. **Real distributed DKG** across independent nodes (not in-process).
-3. **Bonding + slashing** so the honest-majority assumption is economically enforced.
-4. **Non-public keys** — the attestor / fund keys currently derive from public dev seeds (fine for
-   testnet, instant theft on mainnet).
+1. **Independent audit.** — *open; the largest remaining blocker.*
+2. **Real distributed DKG** across independent nodes (not in-process). — *DONE: genesis DKG
+   validated live across three independent machines, all agreeing on one fund key.*
+3. **Bonding + slashing** so the honest-majority assumption is economically enforced. — *built;
+   needs real independent stakers (auto-slashing watcher still deferred).*
+4. **Non-public keys.** — *DONE: the public dev-seed attestor/fund keys were deleted; minting is
+   gated on the on-chain DKG'd group key with no single-key fallback.*
 
 ## Roadmap
 

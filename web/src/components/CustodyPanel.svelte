@@ -1,24 +1,23 @@
 <script>
 	// A live readout of how the BTC is CUSTODIED — the other half of decentralization. The
-	// DecentralizationBar shows the consensus chain; this shows the KEY. The headline: with a
-	// committee, NO single node holds the key — an M-of-N quorum must co-sign to move BTC, and the
-	// committee re-shuffles every epoch, so trust isn't pinned to anyone. Solo mode is shown honestly
-	// as a single-operator key. All values come from the daemon's real custody state.
+	// DecentralizationBar shows the consensus chain; this shows the KEY. The headline: NO single node
+	// holds the key — an M-of-N quorum must co-sign to move BTC, and the committee re-shuffles every
+	// epoch, so trust isn't pinned to anyone. There is no solo/single-key mode at all: a node with too
+	// few peers simply WAITS. All values come from the daemon's real custody state.
 	import { store, short } from "../lib/store.svelte.js";
 
 	const cu = $derived(store.custody);
-	const committee = $derived(cu?.mode === "committee");
 	const established = $derived(!!cu?.fundKeyOnChain);
 	const members = $derived(cu?.committee ?? null); // this node's known committee (once it holds a share)
-	const n = $derived(members?.length ?? (committee ? null : 1)); // committee size N
-	const m = $derived(cu?.threshold ?? (committee ? null : 1)); // signing threshold M
+	const n = $derived(members?.length ?? null); // committee size N
+	const m = $derived(cu?.threshold ?? null); // signing threshold M
 	const need = $derived(cu?.minCommittee ?? 3); // farmers needed to bootstrap genesis custody
 
 	// N seats; the one that's "you" is highlighted if this node holds a share. We DON'T claim which M
 	// sign — any M of N can, so all seats are equal members and the caption states the rule.
 	const seats = $derived.by(() => {
 		if (!n) return [];
-		const mineIdx = committee && cu?.holdsShare ? n - 1 : -1;
+		const mineIdx = cu?.holdsShare ? n - 1 : -1;
 		return Array.from({ length: n }, (_, i) => ({ mine: i === mineIdx }));
 	});
 </script>
@@ -26,12 +25,12 @@
 <section class="cust">
 	<div class="head">
 		<span class="title">Custody of the Bitcoin</span>
-		<span class="chip" class:ok={established} class:warn={committee && !established}>
-			{#if !cu}—{:else if committee}{established ? `${m}-of-${n} committee` : `waiting · needs ${need}`}{:else}solo · testnet{/if}
+		<span class="chip" class:ok={established} class:warn={!established}>
+			{#if !cu}—{:else if established}{m && n ? `${m}-of-${n} committee` : "committee"}{:else}waiting · needs {need}{/if}
 		</span>
 	</div>
 
-	{#if committee && established}
+	{#if established}
 		<p class="lead">
 			<strong>No one node holds the key.</strong> The fund's Bitcoin key is split across the committee by a
 			distributed ceremony — moving BTC needs <strong>{m ?? "a quorum"} of {n ?? "them"}</strong> to co-sign,
@@ -52,28 +51,17 @@
 			<div><dt>this node</dt><dd class:hold={cu?.holdsShare}>{cu?.holdsShare ? "holds a share" : "watching"}</dd></div>
 			<div><dt>fund key</dt><dd class="mono">{short(cu.fundKeyOnChain)}</dd></div>
 		</dl>
-	{:else if committee}
+	{:else}
 		<p class="lead">
 			<strong>Waiting for the committee to form.</strong> Custody is by an M-of-N committee, and it takes
 			<strong>≥{need} independent farmers</strong> to run the genesis ceremony. Until then this node
-			<strong>holds no key and can't mint</strong> — by design it waits for peers rather than falling back to a
-			single signer. Bring more nodes online and the committee will DKG a shared fund key on its own.
+			<strong>holds no key and can't mint</strong> — there is no single-key fallback; it waits for peers.
+			Bring more nodes online and the committee will DKG a shared fund key on its own.
 		</p>
 		<dl class="grid">
 			<div><dt>needs</dt><dd>≥{need} farmers</dd></div>
 			<div><dt>this node</dt><dd>waiting for peers</dd></div>
 			<div><dt>fund key</dt><dd class="mono">pending DKG</dd></div>
-		</dl>
-	{:else}
-		<p class="lead">
-			<strong>Solo custody — testnet only.</strong> This node has explicitly opted out of the committee
-			(<code class="mono">GAVL_CUSTODY=solo</code>): one locally-generated key, held whole by this single node. The
-			default is <code class="mono">committee</code> mode — M-of-N, no one holds it whole — and
-			<strong>mainnet refuses solo entirely.</strong>
-		</p>
-		<dl class="grid">
-			<div><dt>fund key</dt><dd class="mono">{established ? short(cu.fundKeyOnChain) : "—"}</dd></div>
-			<div><dt>address</dt><dd class="mono">{cu?.fundAddress ? short(cu.fundAddress) : "—"}</dd></div>
 		</dl>
 	{/if}
 </section>

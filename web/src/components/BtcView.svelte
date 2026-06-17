@@ -14,6 +14,10 @@
 	const bal = $derived(Number(myGbtc()));
 	const tape = $derived(m?.tape ?? []);
 	const contracts = $derived(m?.myContracts ?? []);
+	// Custody must FORM before there's anywhere to deposit: the committee runs a genesis DKG to mint a
+	// fund key, and until then `depositAddress` is null. A lone/early node sits here, waiting for peers.
+	const fundReady = $derived(!!m?.depositAddress);
+	const needN = $derived(store.custody?.minCommittee ?? 3);
 
 	// instrument label → base / quote (BTC-USD → BTC / USD)
 	const label = $derived(mkt?.label ?? "BTC-USD");
@@ -234,20 +238,29 @@
 		</summary>
 		<div class="fbody">
 			<p class="note">gBTC is a <strong>1:1 claim on real Bitcoin</strong> held by a threshold quorum — no one holds the key. Send testnet BTC to your personal deposit address, then claim it by txid.</p>
-			<div class="sub">your deposit address ({m.btcNetwork})</div>
-			<div class="addr-box mono">{m.depositAddress}</div>
-			<div class="line">
-				<input placeholder="deposit txid (after you send BTC)" bind:value={depTx} />
-				<button class="ghost" onclick={claim} disabled={!depTx.trim()}>Claim</button>
-			</div>
-			{#if claimMsg}<div class="muted tiny msg">{claimMsg}</div>{/if}
-			<div class="sub">withdraw</div>
-			<div class="line">
-				<input placeholder="gBTC" bind:value={wAmt} inputmode="numeric" style="flex:0 0 7rem" />
-				<input placeholder="your BTC address (tb1…)" bind:value={wAddr} />
-				<button class="ghost" onclick={withdraw} disabled={!wAmt || !wAddr}>Withdraw</button>
-			</div>
-			{#if m.pendingCount > 0}<button class="ghost full" onclick={processPayouts}>Process {m.pendingCount} pending payout{m.pendingCount === 1 ? "" : "s"} → broadcast BTC</button>{/if}
+			{#if fundReady}
+				<div class="sub">your deposit address ({m.btcNetwork})</div>
+				<div class="addr-box mono">{m.depositAddress}</div>
+				<div class="line">
+					<input placeholder="deposit txid (after you send BTC)" bind:value={depTx} />
+					<button class="ghost" onclick={claim} disabled={!depTx.trim()}>Claim</button>
+				</div>
+				{#if claimMsg}<div class="muted tiny msg">{claimMsg}</div>{/if}
+				<div class="sub">withdraw</div>
+				<div class="line">
+					<input placeholder="gBTC" bind:value={wAmt} inputmode="numeric" style="flex:0 0 7rem" />
+					<input placeholder="your BTC address (tb1…)" bind:value={wAddr} />
+					<button class="ghost" onclick={withdraw} disabled={!wAmt || !wAddr}>Withdraw</button>
+				</div>
+				{#if m.pendingCount > 0}<button class="ghost full" onclick={processPayouts}>Process {m.pendingCount} pending payout{m.pendingCount === 1 ? "" : "s"} → broadcast BTC</button>{/if}
+			{:else}
+				<div class="forming">
+					<strong>Custody is still forming.</strong> There's no fund to deposit into yet — a committee of
+					<strong>≥{needN} independent nodes</strong> must complete its genesis DKG to mint the shared fund key first
+					(no node holds it whole). Bring more nodes online; once the committee forms, your deposit address appears
+					here. See <em>Custody of the Bitcoin</em> under “How this works” below.
+				</div>
+			{/if}
 		</div>
 	</details>
 
@@ -366,6 +379,8 @@
 	.fbody p { margin: 0 0 0.6rem; font-size: 0.8rem; line-height: 1.55; color: var(--muted); }
 	.fbody p strong { color: var(--text); }
 	.note { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 0.6rem 0.75rem; }
+	.forming { background: var(--panel-2); border: 1px dashed var(--accent-dim); border-radius: 10px; padding: 0.7rem 0.8rem; font-size: 0.78rem; line-height: 1.55; color: var(--muted); }
+	.forming strong { color: var(--text); }
 	.sub { font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--faint); margin: 0.7rem 0 0.35rem; }
 	.addr-box { background: var(--bg-2); border: 1px solid var(--border); border-radius: 9px; padding: 0.55rem 0.65rem; word-break: break-all; font-size: 0.76rem; }
 	.line { display: flex; gap: 0.5rem; margin-top: 0.4rem; }
