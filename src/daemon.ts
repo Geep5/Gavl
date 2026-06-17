@@ -1626,22 +1626,49 @@ function channelSlug(name: string): string {
 	return safe || "default";
 }
 
-/** A market channel's name IS its definition (and hashes to the DHT topic). Two QUORUM-SIGNED kinds
- *  — the price is signed by an M-of-N set and relayed by anyone; the fold verifies the quorum, never
- *  the relayer, and no single signer can forge:
- *    `label::pyth::<feedId>`     — a Wormhole-attested Pyth feed (13-of-19 guardian-set trust anchor).
- *    `label::signed::<setHash>`  — your own Ed25519 signer set, committed by `signerSetHash`.
- *  A name that doesn't match is a plain channel: no market, transfers only. */
+/**
+ * A channel is a decentralized COORDINATION ADDRESS — one human/agent-readable string that IS the
+ * channel's definition and hashes (sha256) to its DHT topic. Three `::`-separated roles:
+ *
+ *     <name> :: <method> :: <coordinate>
+ *
+ *   • name        — the channel's identity / handle (e.g. `BTC-USD`).
+ *   • method      — HOW peers coordinate: an OPEN namespace of coordination methods. Each shipped
+ *                   method is a quorum-signed price anchor (the fold verifies the quorum, anyone
+ *                   relays, no single signer can forge). Adding one is a `CHANNEL_METHODS` entry —
+ *                   no parser change, nothing positional beyond the 3-role split.
+ *   • coordinate  — the method's argument: the pointer it needs (a Pyth feed id, a signer-set hash…).
+ *
+ * Shipped methods: `pyth` (a Wormhole-attested feed, 13-of-19 guardian trust anchor) and `signed`
+ * (your own Ed25519 M-of-N set, committed by `signerSetHash`). A string that isn't a valid
+ * `<name>::<method>::<coordinate>` is a plain channel: no market, transfers only.
+ */
+export type ChannelAddr = { name: string; method: string; coordinate: string };
 export type ChannelMarket = { label: string } & MarketDef;
-export function parseChannel(name: string): ChannelMarket | null {
+
+/** The coordination-method registry: validate a method's coordinate + map it to the market definition
+ *  the fold/relay understand. EXTEND the namespace by adding an entry here — the address format and
+ *  the 3-role split are unchanged, so nothing downstream relies on "part 3 happens to be hex". */
+const CHANNEL_METHODS: Record<string, { ok: (coordinate: string) => boolean; def: (coordinate: string) => MarketDef }> = {
+	pyth: { ok: (c) => /^[0-9a-f]{64}$/i.test(c), def: (c) => ({ kind: "pyth", feedId: c.toLowerCase() }) },
+	signed: { ok: (c) => /^[0-9a-f]{64}$/i.test(c), def: (c) => ({ kind: "signed", signerSet: c.toLowerCase() }) },
+};
+
+/** Split a channel string into its three coordination roles (method lower-cased), or null if it
+ *  isn't a `<name>::<method>::<coordinate>` address. Generic — knows nothing about specific methods. */
+export function parseChannelAddr(name: string): ChannelAddr | null {
 	const parts = name.split("::");
-	if (parts.length === 3 && parts[1].toLowerCase() === "pyth" && /^[0-9a-f]{64}$/i.test(parts[2])) {
-		return { label: parts[0], kind: "pyth", feedId: parts[2].toLowerCase() };
-	}
-	if (parts.length === 3 && parts[1].toLowerCase() === "signed" && /^[0-9a-f]{64}$/i.test(parts[2])) {
-		return { label: parts[0], kind: "signed", signerSet: parts[2].toLowerCase() };
-	}
-	return null;
+	if (parts.length !== 3 || parts.some((p) => p.length === 0)) return null;
+	return { name: parts[0], method: parts[1].toLowerCase(), coordinate: parts[2] };
+}
+
+/** Resolve a channel string to its market definition via the method registry, or null (not a market). */
+export function parseChannel(name: string): ChannelMarket | null {
+	const addr = parseChannelAddr(name);
+	if (!addr) return null;
+	const method = CHANNEL_METHODS[addr.method];
+	if (!method || !method.ok(addr.coordinate)) return null;
+	return { label: addr.name, ...method.def(addr.coordinate) };
 }
 
 /** Pyth BTC/USD feed id — the instrument the shipped default market prices. */

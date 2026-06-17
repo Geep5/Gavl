@@ -43,11 +43,10 @@
 	const base = $derived(label.split("-")[0] ?? "BTC");
 	const quote = $derived(label.split("-")[1] ?? "USD");
 
-	// decode the channel name into labeled segments: instrument :: mechanism :: feed/set id
+	// a channel is a coordination address: <name> :: <method> :: <coordinate>
 	const channel = $derived(mkt?.channel ?? c?.network ?? "");
 	const seg = $derived(channel.split("::"));
 	const mechName = $derived(seg[1] === "signed" ? "signed quorum" : "Pyth");
-	const idLabel = $derived(seg[1] === "signed" ? "signer-set hash" : "Pyth feed id");
 	const idShort = $derived(seg[2] ? seg[2].slice(0, 8) + "…" + seg[2].slice(-6) : "—");
 
 	// price direction (vs the previous poll) for a subtle ▲/▼ tint
@@ -182,9 +181,9 @@
 		<div class="addr">
 			<code class="stream"><span class="seg a">{seg[0] ?? "—"}</span><span class="sep">::</span><span class="seg b">{seg[1] ?? "—"}</span><span class="sep">::</span><span class="seg c" title={seg[2] ?? ""}>{idShort}</span></code>
 			<div class="legend">
-				<span class="lg a">instrument</span>
-				<span class="lg b">priced by</span>
-				<span class="lg c">{idLabel}</span>
+				<span class="lg a">channel</span>
+				<span class="lg b">method</span>
+				<span class="lg c">coordinate</span>
 			</div>
 		</div>
 	</div>
