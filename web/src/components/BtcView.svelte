@@ -180,11 +180,12 @@
 			<button class="copy" onclick={copyId} title="copy the full market id">{copied ? "✓ copied" : "⧉ copy"}</button>
 		</div>
 		<div class="addr">
-			<div class="segblock"><code class="seg a">{seg[0] ?? "—"}</code><span class="slabel">instrument</span></div>
-			<span class="sep">::</span>
-			<div class="segblock"><code class="seg b">{seg[1] ?? "—"}</code><span class="slabel">priced by</span></div>
-			<span class="sep">::</span>
-			<div class="segblock"><code class="seg c" title={seg[2] ?? ""}>{idShort}</code><span class="slabel">{idLabel}</span></div>
+			<code class="stream"><span class="seg a">{seg[0] ?? "—"}</span><span class="sep">::</span><span class="seg b">{seg[1] ?? "—"}</span><span class="sep">::</span><span class="seg c" title={seg[2] ?? ""}>{idShort}</span></code>
+			<div class="legend">
+				<span class="lg a">instrument</span>
+				<span class="lg b">priced by</span>
+				<span class="lg c">{idLabel}</span>
+			</div>
 		</div>
 	</div>
 </section>
@@ -343,14 +344,21 @@
 	.mid-label { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--faint); }
 	.copy { background: var(--panel-3); color: var(--muted); border: 1px solid var(--border); border-radius: 7px; padding: 0.18rem 0.5rem; font-size: 0.7rem; font-weight: 600; }
 	.copy:hover { color: var(--text); border-color: var(--border-bright); filter: none; }
-	.addr { display: flex; align-items: flex-start; gap: 0.5rem; flex-wrap: wrap; }
-	.segblock { display: flex; flex-direction: column; gap: 0.28rem; }
-	.seg { font-family: var(--mono); font-size: 0.92rem; font-weight: 600; padding: 0.34rem 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-2); }
-	.seg.a { color: var(--text); }
-	.seg.b { color: var(--green); border-color: color-mix(in srgb, var(--green) 35%, var(--border)); background: var(--green-soft); }
-	.seg.c { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, var(--border)); background: var(--accent-soft); }
-	.slabel { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--faint); padding-left: 0.1rem; }
-	.sep { font-family: var(--mono); color: var(--faint); font-size: 0.95rem; padding-top: 0.42rem; }
+	.addr { display: flex; flex-direction: column; gap: 0.5rem; }
+	/* one continuous bordered bar — the channel name IS one string; the pieces are colored, flush
+	   highlights joined by neutral :: separators, not separate boxes. */
+	.stream { display: inline-flex; align-items: stretch; flex-wrap: wrap; width: fit-content; max-width: 100%; font-family: var(--mono); font-size: 0.9rem; font-weight: 600; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; }
+	.stream .seg { display: inline-flex; align-items: center; padding: 0.5rem 0.55rem; }
+	.stream .seg.a { color: var(--text); background: var(--panel-3); }
+	.stream .seg.b { color: var(--green); background: var(--green-soft); }
+	.stream .seg.c { color: var(--accent); background: var(--accent-soft); word-break: break-all; }
+	.stream .sep { display: inline-flex; align-items: center; color: var(--faint); background: var(--bg-2); padding: 0.5rem 0.1rem; }
+	.legend { display: flex; gap: 1rem; flex-wrap: wrap; }
+	.legend .lg { display: inline-flex; align-items: center; gap: 0.32rem; font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--faint); }
+	.legend .lg::before { content: ""; width: 9px; height: 9px; border-radius: 2px; flex: none; }
+	.legend .lg.a::before { background: var(--panel-3); border: 1px solid var(--border); }
+	.legend .lg.b::before { background: var(--green); }
+	.legend .lg.c::before { background: var(--accent); }
 
 	/* ── cards ── */
 	.card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.1rem 1.25rem; margin-bottom: 1rem; }
