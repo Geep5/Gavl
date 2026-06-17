@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="Gavl" width="300" />
+</p>
+
 # Gavl
 
 A decentralized **peer-to-peer Bitcoin bull/bear market** on a **Proof-of-Space-Time
