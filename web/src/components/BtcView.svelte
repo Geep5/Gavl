@@ -104,12 +104,13 @@
 			if (bal <= 0) fundsOpen = true; // first load with an empty wallet → invite funding
 		}
 	});
-	let wAmt = $state(""), wAddr = $state(""), wFee = $state(""), depTx = $state(""), claimMsg = $state("");
+	let wAmt = $state(""), wAddr = $state(""), depTx = $state(""), claimMsg = $state("");
 	async function withdraw() {
 		if (!wAmt || !wAddr) return;
-		// fee (sats) is optional — blank lets the daemon use its default; it's deducted from YOUR payout
-		const ok = await act(() => api.withdraw(wAmt, wAddr, wFee.trim() || undefined));
-		if (ok) { wAmt = ""; wFee = ""; }
+		// the UI always uses the daemon's default miner fee — a custom fee is an under-the-hood
+		// (direct API) capability only, so a normal user can't foot-gun their payout with a bad fee.
+		const ok = await act(() => api.withdraw(wAmt, wAddr));
+		if (ok) wAmt = "";
 	}
 	async function claim() {
 		if (!depTx.trim()) return;
@@ -249,14 +250,10 @@
 				{#if claimMsg}<div class="muted tiny msg">{claimMsg}</div>{/if}
 				<div class="sub">withdraw</div>
 				<div class="line">
-					<input placeholder="gBTC" bind:value={wAmt} inputmode="numeric" style="flex:0 0 6rem" />
+					<input placeholder="gBTC" bind:value={wAmt} inputmode="numeric" style="flex:0 0 7rem" />
 					<input placeholder="your BTC address (tb1…)" bind:value={wAddr} />
 					<button class="ghost" onclick={withdraw} disabled={!wAmt || !wAddr}>Withdraw</button>
 				</div>
-				<div class="line">
-					<input placeholder="miner fee (sats, optional)" bind:value={wFee} inputmode="numeric" />
-				</div>
-				<div class="muted tiny">The fee is deducted from your payout — you receive <strong>amount − fee</strong>. Blank uses the default.</div>
 				{#if m.pendingCount > 0}<button class="ghost full" onclick={processPayouts}>Process {m.pendingCount} pending payout{m.pendingCount === 1 ? "" : "s"} → broadcast BTC</button>{/if}
 			{:else}
 				<div class="forming">

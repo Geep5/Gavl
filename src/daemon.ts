@@ -46,8 +46,9 @@ import { committeeTopic, quorumForRound } from "./custody/committee.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "./custody/attestation.ts";
 import { isCeremonyTimeout } from "./custody/ceremony.ts";
 import { Esplora } from "./custody/esplora.ts";
-import { checkDeposit, utxosToInputs, confirmations, MIN_CONFIRMATIONS } from "./custody/watcher.ts";
-import { pendingClaims, unsentWithdrawals, inFlightWithdrawals, slashable } from "./custody/bridge.ts";
+import { checkDeposit, utxosToInputs, confirmations, MIN_CONFIRMATIONS, txPaysWithdrawal } from "./custody/watcher.ts";
+import { pendingClaims, inFlightWithdrawals, slashable } from "./custody/bridge.ts";
+import type { PendingWithdrawal } from "./custody/bridge.ts";
 import { fetchPythUpdate, fetchSignedUpdate, HERMES_URL } from "./market/pricefeed.ts";
 import { verifyPythUpdate } from "./market/pyth.ts";
 import { verifySignedQuorum } from "./market/signed-feed.ts";
@@ -1404,7 +1405,20 @@ export class Daemon {
 	private async coSignWithdrawals(): Promise<string | null> {
 		const cs = this.committeeShare();
 		if (!cs) return null;
-		const unsent = unsentWithdrawals(this.finalView().bridge);
+		const bridge = this.finalView().bridge;
+		const esplora = this.esplora();
+		// A withdrawal needs (re)signing UNLESS a real payout tx that actually pays it is already out
+		// there. The bridge.broadcast note is an unauthenticated hint, so verify it on-chain — a bogus
+		// note (or one an attacker overwrote) doesn't really pay, so we re-sign rather than stall.
+		const unsent: PendingWithdrawal[] = [];
+		for (const w of bridge.pending) {
+			const noted = bridge.broadcasts.get(w.id);
+			if (noted) {
+				const tx = await esplora.getTx(noted).catch(() => null);
+				if (tx && txPaysWithdrawal(tx, w.btcAddress, w.amount - w.fee)) continue; // a real payout exists
+			}
+			unsent.push(w);
+		}
 		if (unsent.length === 0) return null;
 		const built = await this.buildPayout(unsent); // each withdrawal carries its own miner fee
 		if (!built) return null;
@@ -1421,8 +1435,12 @@ export class Daemon {
 			auth: this.ceremonyAuth(),
 		});
 		if (!signed) return null; // quorum not reached this round — retried next finality tick
-		await this.esplora().broadcast(signed.hex);
-		for (const w of unsent) await this.custodyAccount().announceBroadcast(w.id, signed.txid); // mark in flight
+		try {
+			await esplora.broadcast(signed.hex);
+		} catch {
+			/* already in mempool (a re-sign of the deterministic tx) — fine; still re-assert the note */
+		}
+		for (const w of unsent) await this.custodyAccount().announceBroadcast(w.id, signed.txid); // (re)assert the real payout txid
 		return signed.txid;
 	}
 
@@ -1457,6 +1475,10 @@ export class Daemon {
 		for (const { withdrawal, txid } of inFlight) {
 			const tx = await esplora.getTx(txid);
 			if (!tx || confirmations(tx, tip) < MIN_CONFIRMATIONS) continue; // not confirmed yet
+			// AUTHENTICATE the note: only settle (drop reserves) if the confirmed tx ACTUALLY pays this
+			// withdrawal. Otherwise a bogus bridge.broadcast pointing at any confirmed tx could drop
+			// reserves with the withdrawer never paid — a robbery. A non-paying txid is ignored.
+			if (!txPaysWithdrawal(tx, withdrawal.btcAddress, withdrawal.amount - withdrawal.fee)) continue;
 			const sig = await this.committeeAttest(settleAttestationDigest({ withdrawalId: withdrawal.id }));
 			if (sig) await this.custodyAccount().settleWithdrawal(withdrawal.id, sig);
 		}

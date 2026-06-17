@@ -59,6 +59,14 @@ export async function checkDeposit(esplora: Esplora, fundAddress: string, txid: 
 	return verifyDeposit(tx, fundAddress, await esplora.tipHeight(), minConf);
 }
 
+/** Does `tx` actually pay this withdrawal — an output to `btcAddress` of exactly `amount` sats
+ *  (the deterministic payout = burned amount − the withdrawer's fee)? Used to AUTHENTICATE a
+ *  `bridge.broadcast` note: the note is just a hint, so the committee never settles (drops reserves)
+ *  or stops re-signing on a txid that doesn't really pay — a bogus/unrelated txid is ignored. */
+export function txPaysWithdrawal(tx: EsploraTx, btcAddress: string, amount: bigint): boolean {
+	return tx.vout.some((o) => o.scriptpubkey_address === btcAddress && BigInt(o.value) === amount);
+}
+
 /** Map confirmed fund UTXOs (from Esplora) into btctx withdrawal inputs. */
 export function utxosToInputs(utxos: EsploraUtxo[], minConf: number, tipHeight: number): FundUtxo[] {
 	return utxos

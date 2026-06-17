@@ -296,9 +296,14 @@ export function pruneStaleClaims(s: BridgeState, nowHeight: number): void {
 	for (const [depositId, c] of s.claims) if (nowHeight - c.height > CLAIM_RECLAIM_GRACE) s.claims.delete(depositId);
 }
 
-/** Record a withdrawal's payout txid → marks it in flight (stop re-signing). */
+/** Record a withdrawal's payout txid → a HINT that a payout was broadcast (so the committee can
+ *  stop re-signing). Last-write-wins: the note is unauthenticated (anyone can post one — it costs
+ *  PoST like any write), so it can't be trusted on its own. The committee VERIFIES the txid actually
+ *  pays the withdrawal on-chain before settling or before skipping a re-sign (see daemon), and
+ *  re-asserts the real txid each tick — so a bogus note can delay (at ongoing PoST cost to the
+ *  griefer) but can never settle a withdrawal that wasn't paid, nor permanently stall one. */
 export function recordBroadcast(s: BridgeState, withdrawalId: string, txid: string): void {
-	if (!s.broadcasts.has(withdrawalId)) s.broadcasts.set(withdrawalId, txid);
+	s.broadcasts.set(withdrawalId, txid);
 }
 
 /** Outstanding deposit-mint requests: a claim whose depositId hasn't been minted yet.

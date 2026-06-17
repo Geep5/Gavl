@@ -80,7 +80,9 @@ test("a broadcast note moves a withdrawal from unsent → in-flight", async () =
 		"now in flight, watching that txid for confirmation",
 	);
 
-	// a second note doesn't change the recorded txid (first wins)
+	// a later note OVERWRITES the recorded txid (last-write-wins). The note is an unauthenticated
+	// hint, so the committee re-asserts the REAL payout txid each tick and verifies it on-chain
+	// before settling — a stale/bogus note can't pin a withdrawal to the wrong txid.
 	await acct().announceBroadcast(burn.id, "cd".repeat(32));
-	assert.equal(inFlightWithdrawals(bridge(node))[0].txid, "ab".repeat(32), "broadcast is idempotent");
+	assert.equal(inFlightWithdrawals(bridge(node))[0].txid, "cd".repeat(32), "last write wins — committee re-asserts the real txid");
 });

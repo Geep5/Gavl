@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { verifyDeposit, confirmations, utxosToInputs, fundBalance } from "../src/custody/watcher.ts";
+import { verifyDeposit, confirmations, utxosToInputs, fundBalance, txPaysWithdrawal } from "../src/custody/watcher.ts";
 import { Esplora } from "../src/custody/esplora.ts";
 import { emptyBridge, mintFromDeposit, gbtcOf, conserved } from "../src/custody/bridge.ts";
 
@@ -44,6 +44,21 @@ test("verifyDeposit: nothing credited until confirmed deep enough (reorg safety)
 	const shallow = tx([{ scriptpubkey_address: FUND, value: 100_000 }], true, 100);
 	assert.deepEqual(verifyDeposit(shallow, FUND, 100, 6), [], "1 conf but need 6 → not yet");
 	assert.equal(verifyDeposit(shallow, FUND, 105, 6).length, 1, "6 confs → credited");
+});
+
+test("txPaysWithdrawal: only a real output to the address for the exact net amount counts", () => {
+	const RECIP = "tb1quserwithdrawaddrxxxxxxxxxxxxxxxxxxxxxxxxx";
+	// the committee's payout: change back to the fund + the recipient's net (amount 50_000 − fee 2_000)
+	const real = tx([
+		{ scriptpubkey_address: "tb1qchangebacktothefund", value: 9_000 },
+		{ scriptpubkey_address: RECIP, value: 48_000 },
+	]);
+	assert.equal(txPaysWithdrawal(real, RECIP, 48_000n), true, "an output pays the recipient the exact net amount");
+	assert.equal(txPaysWithdrawal(real, RECIP, 50_000n), false, "wrong amount (gross, not net) → not a match");
+	assert.equal(txPaysWithdrawal(real, "tb1qsomeoneelse", 48_000n), false, "wrong address → not a match");
+	// the robbery vector: a confirmed but UNRELATED txid must never authenticate a settle
+	const unrelated = tx([{ scriptpubkey_address: "tb1qrandomwhale", value: 1_000_000 }]);
+	assert.equal(txPaysWithdrawal(unrelated, RECIP, 48_000n), false, "a bogus broadcast note pointing at any confirmed tx can't settle");
 });
 
 test("verified deposit → gBTC mint (1:1, idempotent, conserved)", () => {
