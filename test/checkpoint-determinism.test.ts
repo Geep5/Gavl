@@ -20,8 +20,7 @@ import { viewRoot } from "../src/market/state.ts";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
-import { bridgeKeyPair } from "../src/market/oracle.ts";
-import { PARAMS, K, priceBase } from "./helpers.ts";
+import { PARAMS, K, priceBase, withGbtc } from "./helpers.ts";
 
 function stateWithOpenContract(mark: bigint): View {
 	const bridge = emptyBridge();
@@ -58,14 +57,16 @@ test("an expired contract's settle ignores the oracle mark entirely (the fork-sa
 });
 
 // ── cross-boundary fold equivalence: demurrage (→ pot) + an expiring contract ──
-let depN = 0;
 async function market() {
 	const node = new GavlNode(new Ledger(PARAMS));
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
-	const attestor = mk(bridgeKeyPair());
-	const fund = (a: Account, amt: bigint) => attestor.attestDeposit("dep" + depN++ + ":0", a.pubHex, amt);
+	// gBTC seeded into the fold base (withGbtc) — minting is committee-gated, but this test is about
+	// cross-checkpoint fold equivalence, not mint authorization. The balances must be byte-identical in
+	// every base the producer/verifier folds from, so the test threads them through a shared base().
+	const balances: Record<string, bigint> = {};
+	const fund = (a: Account, amt: bigint) => (balances[a.pubHex] = (balances[a.pubHex] ?? 0n) + amt);
 	const A = mk(); // idle whale → its decay flows to the pot
 	const B = mk();
 	const C = mk();
@@ -74,21 +75,23 @@ async function market() {
 	await fund(C, 50_000n);
 	const offer = B.makeOffer({ makerSide: "long", size: "50000", leverage: "2", expiryHeight: 9_999_999, nonce: "z" });
 	await C.matchOpen(offer, 50_000n);
-	return { node };
+	return { node, balances };
 }
 
 test("folding to the same target from two different checkpoint heights agrees (demurrage + expiry)", async () => {
-	const { node } = await market();
+	const { node, balances } = await market();
 	const writes = node.ledger.allWrites();
 	const born = new Map(writes.map((w) => [w.id, 0] as [string, number])); // all credits at height 0
 	const grace = DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY;
 	const T = 43_300; // past the demurrage grace AND the contract's time-lock (born 0 → expiry 43200)
+	// The seeded gBTC must be byte-identical in every base the fold resumes from (producer vs verifier).
+	const base = () => withGbtc(priceBase(61_000n), balances);
 
-	const full = computeView(writes, { bornAt: born, nowHeight: T, base: priceBase(61_000n) });
+	const full = computeView(writes, { bornAt: born, nowHeight: T, base: base() });
 	// checkpoint BEFORE the contract expires (still open in the base)
-	const resumeEarly = computeView([], { base: computeView(writes, { bornAt: born, nowHeight: grace + 5 * DEMURRAGE_DAY, base: priceBase(61_000n) }), nowHeight: T });
+	const resumeEarly = computeView([], { base: computeView(writes, { bornAt: born, nowHeight: grace + 5 * DEMURRAGE_DAY, base: base() }), nowHeight: T });
 	// checkpoint AFTER it expires (already unwound in the base)
-	const resumeLate = computeView([], { base: computeView(writes, { bornAt: born, nowHeight: 43_250, base: priceBase(61_000n) }), nowHeight: T });
+	const resumeLate = computeView([], { base: computeView(writes, { bornAt: born, nowHeight: 43_250, base: base() }), nowHeight: T });
 
 	assert.equal(viewRoot(resumeEarly), viewRoot(full), "early-checkpoint resume diverged from the full fold");
 	assert.equal(viewRoot(resumeLate), viewRoot(full), "late-checkpoint resume diverged from the full fold");

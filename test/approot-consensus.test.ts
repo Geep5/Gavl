@@ -19,45 +19,48 @@ import type { Anchor } from "../src/consensus/anchor.ts";
 import { AnchorChain } from "../src/consensus/chain.ts";
 import type { Heads } from "../src/ledger/ledger.ts";
 import { computeView, viewAtAnchor } from "../src/market/btc.ts";
+import type { View } from "../src/market/btc.ts";
 import { viewRoot } from "../src/market/state.ts";
-import { bridgeKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver } from "./helpers.ts";
+import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
 
 const EMPTY_ROOT = viewRoot(computeView([]));
 
-let depN = 0;
 async function fixture() {
 	const node = new GavlNode(new Ledger(PARAMS));
 	let t = 0;
 	const now = () => ++t;
 	const A = new Account({ node, params: PARAMS, k: K, now });
 	const B = new Account({ node, params: PARAMS, k: K, now });
-	const attestor = new Account({ node, params: PARAMS, k: K, now, keypair: bridgeKeyPair() });
-	await attestor.attestDeposit("dep" + depN++ + ":0", A.pubHex, 5000n);
+	// A is funded by seeding gBTC into the fold base (the committee mint is exercised elsewhere);
+	// the same base must be used everywhere appRoot is computed, so it's threaded into expectedAppRoot.
+	const balances = { [A.pubHex]: 5000n };
 	await A.transfer(B.pubHex, 1500n);
 	await A.transfer(B.pubHex, 500n);
-	return { node };
+	return { node, balances };
 }
 
-/** appRoot an anchor must commit: the state its PARENT certified (empty at genesis). */
-function expectedAppRoot(writes: any[], chain: AnchorChain, prev: Anchor | null): string {
-	return prev ? viewRoot(viewAtAnchor(writes, chain, prev.id)) : EMPTY_ROOT;
+/** appRoot an anchor must commit: the state its PARENT certified (empty at genesis). The funding
+ *  base (seeded gBTC) is folded under each anchor's writes — producer and verifier pass the SAME
+ *  base so the recomputed root matches. */
+function expectedAppRoot(writes: any[], chain: AnchorChain, prev: Anchor | null, base: View): string {
+	return prev ? viewRoot(viewAtAnchor(writes, chain, prev.id, base)) : EMPTY_ROOT;
 }
 
 test("anchors with correct appRoot are accepted; the committed state is non-empty after activity", async () => {
-	const { node } = await fixture();
+	const { node, balances } = await fixture();
 	const writes = node.ledger.allWrites();
 	const H = node.ledger.heads();
 	const kp = generateKeyPair();
 	const prover = standinProver(kp);
+	const base = () => withGbtc(computeView([]), balances); // a fresh seeded fold base per call
 
 	const chain = new AnchorChain(PARAMS, STANDIN_VERIFIER, {
-		verifyState: (anchor, heads) => expectedAppRoot(writes, chain, anchor.prev ? chain.get(anchor.prev) ?? null : null) === anchor.appRoot,
+		verifyState: (anchor, heads) => expectedAppRoot(writes, chain, anchor.prev ? chain.get(anchor.prev) ?? null : null, base()) === anchor.appRoot,
 	});
 
 	const mine = async (prev: Anchor | null, prevHeads: Heads, heads: Heads) =>
-		(await mineAnchor({ prev, prevHeads, producer: kp, prover, heads, params: PARAMS, appRoot: expectedAppRoot(writes, chain, prev) }))!;
+		(await mineAnchor({ prev, prevHeads, producer: kp, prover, heads, params: PARAMS, appRoot: expectedAppRoot(writes, chain, prev, base()) }))!;
 
 	const g = await mine(null, {}, {});
 	assert.equal(g.appRoot, EMPTY_ROOT, "genesis commits the empty-state root");
@@ -72,19 +75,21 @@ test("anchors with correct appRoot are accepted; the committed state is non-empt
 });
 
 test("an anchor with a wrong appRoot is rejected and never enters the chain", async () => {
-	const { node } = await fixture();
+	const { node, balances } = await fixture();
 	const writes = node.ledger.allWrites();
 	const H = node.ledger.heads();
 	const kp = generateKeyPair();
 	const prover = standinProver(kp);
+	const base = () => withGbtc(computeView([]), balances); // a fresh seeded fold base per call
 
 	const chain = new AnchorChain(PARAMS, STANDIN_VERIFIER, {
-		verifyState: (anchor) => expectedAppRoot(writes, chain, anchor.prev ? chain.get(anchor.prev) ?? null : null) === anchor.appRoot,
+		verifyState: (anchor) => expectedAppRoot(writes, chain, anchor.prev ? chain.get(anchor.prev) ?? null : null, base()) === anchor.appRoot,
 	});
 
 	const g = (await mineAnchor({ prev: null, prevHeads: {}, producer: kp, prover, heads: {}, params: PARAMS, appRoot: EMPTY_ROOT }))!;
 	await chain.add(g);
-	const a1 = (await mineAnchor({ prev: g, prevHeads: {}, producer: kp, prover, heads: H, params: PARAMS, appRoot: EMPTY_ROOT }))!;
+	// a1 commits the state g certified (g's heads + the seeded funding base) — the correct root.
+	const a1 = (await mineAnchor({ prev: g, prevHeads: {}, producer: kp, prover, heads: H, params: PARAMS, appRoot: expectedAppRoot(writes, chain, g, base()) }))!;
 	await chain.add(a1);
 
 	// a2 mined with a BOGUS appRoot (claims a different state than a1 actually certified).

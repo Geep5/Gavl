@@ -16,25 +16,25 @@ import { Account } from "../src/market/account.ts";
 import { computeView, gbtcOf, marketConserved } from "../src/market/btc.ts";
 import type { View } from "../src/market/btc.ts";
 import { CONTRACT_MAX_LIFE } from "../src/market/intent.ts";
-import { bridgeKeyPair } from "../src/market/oracle.ts";
-import { PARAMS, K, priceBase, repriced } from "./helpers.ts";
+import { PARAMS, K, priceBase, repriced, withGbtc } from "./helpers.ts";
 
-let depN = 0;
 function setup() {
 	const node = new GavlNode(new Ledger(PARAMS));
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
-	const attestor = new Account({ node, params: PARAMS, k: K, now, keypair: bridgeKeyPair() });
-	const fund = (a: Account, amt: bigint) => attestor.attestDeposit("dep" + depN++ + ":0", a.pubHex, amt);
-	return { node, mk, fund };
+	// Seed balances into the fold base (withGbtc) — minting is committee-gated now, but these tests
+	// are about the time-lock/settlement, not mint authorization, so they just need gBTC to exist.
+	const balances: Record<string, bigint> = {};
+	const fund = (a: Account, amt: bigint) => (balances[a.pubHex] = (balances[a.pubHex] ?? 0n) + amt);
+	return { node, mk, fund, balances };
 }
 /** Fold with explicit heights; the mark is seeded into the fold base (a price enters consensus only
  *  via an attested Pyth update). */
 const viewAt = (node: GavlNode, bornAt: Map<string, number>, nowHeight: number, base: View) => computeView(node.ledger.allWrites(), { bornAt, nowHeight, base });
 
 test("a position auto-unwinds at entry once its time-lock elapses (no PnL — base-independent)", async () => {
-	const { node, mk, fund } = setup();
+	const { node, mk, fund, balances } = setup();
 	const A = mk(); // LONG (maker)
 	const B = mk(); // SHORT (taker)
 	await fund(A, 5000n);
@@ -45,7 +45,7 @@ test("a position auto-unwinds at entry once its time-lock elapses (no PnL — ba
 	const born = new Map([[matchId, 5]]); // contract born at height 5 → expiry = 5 + CONTRACT_MAX_LIFE
 
 	// Still open well before the cap (entry mark = 61000).
-	const open = viewAt(node, born, 5, priceBase(61000n));
+	const open = viewAt(node, born, 5, withGbtc(priceBase(61000n), balances));
 	assert.equal(open.book.contracts.size, 1, "open before the time-lock");
 	assert.equal(open.book.contracts.get(matchId)!.expiryHeight, 5 + CONTRACT_MAX_LIFE, "expiry = born + max life");
 	assert.ok(marketConserved(open));
@@ -62,7 +62,7 @@ test("a position auto-unwinds at entry once its time-lock elapses (no PnL — ba
 });
 
 test("early close still works and pre-empts the time-lock", async () => {
-	const { node, mk, fund } = setup();
+	const { node, mk, fund, balances } = setup();
 	const A = mk();
 	const B = mk();
 	await fund(A, 5000n);
@@ -74,7 +74,7 @@ test("early close still works and pre-empts the time-lock", async () => {
 	const settleW = await mk().settle(matchId); // closed EARLY (well before expiry); flat mark → stakes back
 	born.set(settleW.id, 8);
 
-	const v = viewAt(node, born, 8, priceBase(61000n)); // far below the time-lock
+	const v = viewAt(node, born, 8, withGbtc(priceBase(61000n), balances)); // far below the time-lock
 	assert.equal(v.book.contracts.size, 0, "closed early, not by the cap");
 	assert.equal(gbtcOf(v, A.pubHex), 5000n, "flat price → A whole");
 	assert.equal(gbtcOf(v, B.pubHex), 5000n, "flat price → B whole");

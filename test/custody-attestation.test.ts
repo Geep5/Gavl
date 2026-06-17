@@ -1,10 +1,9 @@
 /**
  * Committee-authorized bridge attestations (gate #4) — minting gBTC and settling
- * withdrawals no longer trust a single attestor key. Once a committee fund key is
- * published on-chain, a `bridge.deposit` / `bridge.settle` is authorized ONLY by a
- * threshold signature from that group key over the attestation digest, verified by the
- * fold against the on-chain key. Before any committee fund exists, the legacy single
- * attestor still works (seed/testnet).
+ * withdrawals NEVER trust a single key. A `bridge.deposit` / `bridge.settle` is authorized
+ * ONLY by a threshold signature from the on-chain-announced group key over the attestation
+ * digest, verified by the fold against that committed key. There is NO single-key fallback:
+ * before a committee fund key is announced, minting is impossible (Option A — no fund, no mint).
  *
  *   node --test test/custody-attestation.test.ts
  */
@@ -15,8 +14,7 @@ import assert from "node:assert/strict";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
-import { computeView, gbtcOf, BRIDGE_ATTESTOR } from "../src/market/btc.ts";
-import { bridgeKeyPair } from "../src/market/oracle.ts";
+import { computeView, gbtcOf } from "../src/market/btc.ts";
 import { generateFundKeyDKG, thresholdSign, quorumOf } from "../src/custody/threshold.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "../src/custody/attestation.ts";
 import { toHex } from "../src/det/canonical.ts";
@@ -26,7 +24,7 @@ function setup() {
 	const node = new GavlNode(new Ledger(PARAMS));
 	let t = 0;
 	const now = () => ++t;
-	const acct = (kp?: ReturnType<typeof bridgeKeyPair>) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
+	const acct = () => new Account({ node, params: PARAMS, k: K, now }); // fresh identity each call
 	return { node, acct };
 }
 const view = (node: GavlNode) => computeView(node.ledger.allWrites());
@@ -46,9 +44,9 @@ test("committee-signed deposit mints; unsigned or forged ones are rejected once 
 	await acct().attestDeposit(dep.depositId, dep.depositor, dep.amount, goodSig);
 	assert.equal(gbtcOf(view(node), dep.depositor), 5000n, "committee threshold sig authorizes the mint");
 
-	// an UNSIGNED deposit (even from the legacy attestor key) is now rejected
-	await acct(bridgeKeyPair()).attestDeposit("cc:0", dep.depositor, 9999n);
-	assert.equal(gbtcOf(view(node), dep.depositor), 5000n, "no committee sig → no mint (single attestor can't mint anymore)");
+	// an UNSIGNED deposit (from any account) is rejected — there's no single-key fallback
+	await acct().attestDeposit("cc:0", dep.depositor, 9999n);
+	assert.equal(gbtcOf(view(node), dep.depositor), 5000n, "no committee sig → no mint");
 
 	// a FORGED sig (a DIFFERENT key signs the digest) is rejected
 	const wrong = generateFundKeyDKG(2, 3);
@@ -69,15 +67,16 @@ test("a committee sig is bound to its content — can't be replayed for a differ
 	assert.equal(gbtcOf(view(node), "abcd"), 1000n, "the signed amount mints");
 });
 
-test("seed mode (no committee fund) keeps the legacy single attestor", async () => {
+test("no committee fund published → minting is impossible (no single-key fallback)", async () => {
 	const { node, acct } = setup();
-	const attestor = acct(bridgeKeyPair());
-	assert.equal(attestor.pubHex, BRIDGE_ATTESTOR, "holds the legacy bridge key");
-	await attestor.attestDeposit("ff:0", "deadbeef", 4200n); // no sig, no committee fund
-	assert.equal(gbtcOf(view(node), "deadbeef"), 4200n, "legacy attestor mints when no committee fund is published");
-	// a stranger still can't
-	await acct().attestDeposit("ff:1", "deadbeef", 5000n);
-	assert.equal(gbtcOf(view(node), "deadbeef"), 4200n, "non-attestor, non-committee → rejected");
+	// no announceFund → view.custody.fundKey is null → a market can't mint claims on BTC yet
+	await acct().attestDeposit("ff:0", "deadbeef", 4200n); // unsigned, no committee fund
+	assert.equal(gbtcOf(view(node), "deadbeef"), 0n, "no committee fund → no mint (the single-attestor fallback is gone)");
+	// even a perfectly valid threshold sig can't mint — there's no on-chain key to verify it against
+	const orphan = generateFundKeyDKG(2, 3);
+	const sig = toHex(thresholdSign(depositAttestationDigest({ depositId: "ff:1", depositor: "deadbeef", amount: 5000n }), orphan.pub, quorumOf(orphan, 2)));
+	await acct().attestDeposit("ff:1", "deadbeef", 5000n, sig);
+	assert.equal(gbtcOf(view(node), "deadbeef"), 0n, "a sig with no announced fund key to check against → still no mint");
 });
 
 test("committee-signed settle closes a pending withdrawal", async () => {

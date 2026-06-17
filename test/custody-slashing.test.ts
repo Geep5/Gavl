@@ -14,12 +14,18 @@ import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
 import { computeView, gbtcOf, marketConserved } from "../src/market/btc.ts";
-import { bridgeKeyPair } from "../src/market/oracle.ts";
 import { makeCeremonyAuth } from "../src/custody/ceremony-auth.ts";
 import { equivocationCulprit } from "../src/custody/slashing.ts";
 import { generateKeyPair, keyPairFromSeed } from "../src/det/ed25519.ts";
 import { toHex } from "../src/det/canonical.ts";
-import { PARAMS, K } from "./helpers.ts";
+import { PARAMS, K, TestFund } from "./helpers.ts";
+
+/** Committee-mint helper: announce one fund key, then mint quorum-signed deposits against it. */
+async function funder(node: GavlNode, now: () => number) {
+	const tf = new TestFund();
+	await tf.announce(new Account({ node, params: PARAMS, k: K, now }));
+	return (who: string, amount: bigint) => tf.fund(new Account({ node, params: PARAMS, k: K, now }), who, amount);
+}
 
 test("equivocationCulprit: two conflicting signed messages for one slot prove a fault", () => {
 	const kp = generateKeyPair();
@@ -47,11 +53,11 @@ test("custody.slash burns the culprit's bond to the slasher; an invalid proof is
 	const now = () => ++t;
 	const kp = keyPairFromSeed(new Uint8Array(32).fill(9)); // culprit's known key (signs ceremony msgs)
 	const culprit = new Account({ node, params: PARAMS, k: K, now, keypair: kp });
-	const attestor = new Account({ node, params: PARAMS, k: K, now, keypair: bridgeKeyPair() });
 	const slasher = new Account({ node, params: PARAMS, k: K, now });
 	const view = () => computeView(node.ledger.allWrites());
+	const fund = await funder(node, now);
 
-	await attestor.attestDeposit("d:0", culprit.pubHex, 5000n); // fund + bond the culprit
+	await fund(culprit.pubHex, 5000n); // fund + bond the culprit
 	await culprit.bond(5000n);
 	assert.equal(view().bridge.bonds.get(culprit.pubHex), 5000n);
 
@@ -66,7 +72,7 @@ test("custody.slash burns the culprit's bond to the slasher; an invalid proof is
 	assert.ok(marketConserved(view()), "conservation holds — the bond moved, wasn't destroyed");
 
 	// an invalid proof (the same message twice) does nothing to a fresh bond
-	await attestor.attestDeposit("d:1", culprit.pubHex, 3000n);
+	await fund(culprit.pubHex, 3000n);
 	await culprit.bond(3000n);
 	await slasher.slash(a, a);
 	assert.equal(view().bridge.bonds.get(culprit.pubHex), 3000n, "an invalid proof is a no-op");
@@ -78,11 +84,11 @@ test("unbonding is still slashable — a caught equivocator can't dodge by unbon
 	const now = () => ++t;
 	const kp = keyPairFromSeed(new Uint8Array(32).fill(7));
 	const culprit = new Account({ node, params: PARAMS, k: K, now, keypair: kp });
-	const attestor = new Account({ node, params: PARAMS, k: K, now, keypair: bridgeKeyPair() });
 	const slasher = new Account({ node, params: PARAMS, k: K, now });
 	const view = () => computeView(node.ledger.allWrites());
+	const fund = await funder(node, now);
 
-	await attestor.attestDeposit("d:0", culprit.pubHex, 4000n);
+	await fund(culprit.pubHex, 4000n);
 	await culprit.bond(4000n);
 	await culprit.unbond(4000n); // try to exit...
 	assert.equal(view().bridge.unbonding.get(culprit.pubHex)?.amount, 4000n, "in the unbonding queue");

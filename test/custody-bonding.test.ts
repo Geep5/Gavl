@@ -13,25 +13,36 @@ import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
 import { computeView, gbtcOf, marketConserved } from "../src/market/btc.ts";
-import { bridgeKeyPair } from "../src/market/oracle.ts";
 import { bondedTotal, UNBOND_DELAY } from "../src/custody/bridge.ts";
 import { committeeForEpoch } from "../src/custody/epoch.ts";
 import type { AnchorView } from "../src/custody/epoch.ts";
-import { PARAMS, K } from "./helpers.ts";
+import { PARAMS, K, TestFund } from "./helpers.ts";
 
 function setup() {
 	const node = new GavlNode(new Ledger(PARAMS));
 	let t = 0;
 	const now = () => ++t;
-	const acct = (kp?: ReturnType<typeof bridgeKeyPair>) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
-	return { node, acct };
+	const acct = () => new Account({ node, params: PARAMS, k: K, now }); // fresh identity each call
+	// Committee-mint gBTC to `who` (announce ONE fund key, then quorum-signed deposits against it) —
+	// the real authorized path now that the single-attestor fallback is gone. First-write-wins, so the
+	// key is announced once and reused; every deposit's threshold sig verifies against that one key.
+	const tf = new TestFund();
+	let announced = false;
+	const fund = async (who: string, amount: bigint) => {
+		if (!announced) {
+			announced = true;
+			await tf.announce(acct());
+		}
+		await tf.fund(acct(), who, amount);
+	};
+	return { node, acct, fund };
 }
 const view = (node: GavlNode) => computeView(node.ledger.allWrites());
 
 test("bond locks free gBTC (still backed, unwithdrawable); over-bond rejected", async () => {
-	const { node, acct } = setup();
+	const { node, acct, fund } = setup();
 	const me = acct();
-	await acct(bridgeKeyPair()).attestDeposit("d:0", me.pubHex, 10_000n); // seed-mint 10k to me
+	await fund(me.pubHex, 10_000n); // committee-mint 10k to me
 	assert.equal(gbtcOf(view(node), me.pubHex), 10_000n);
 
 	await me.bond(6000n);
@@ -51,9 +62,9 @@ test("bond locks free gBTC (still backed, unwithdrawable); over-bond rejected", 
 });
 
 test("unbond is delayed: still locked + slashable until it matures, then spendable", async () => {
-	const { node, acct } = setup();
+	const { node, acct, fund } = setup();
 	const me = acct();
-	await acct(bridgeKeyPair()).attestDeposit("d:0", me.pubHex, 10_000n);
+	await fund(me.pubHex, 10_000n); // committee-mint 10k to me
 	await me.bond(6000n); // free 4k, bonded 6k
 	const ub = await me.unbond(2000n);
 

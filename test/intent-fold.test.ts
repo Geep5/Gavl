@@ -14,25 +14,25 @@ import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
 import { computeView, gbtcOf, marketConserved } from "../src/market/btc.ts";
-import { bridgeKeyPair } from "../src/market/oracle.ts";
-import { PARAMS, K, priceBase, repriced } from "./helpers.ts";
+import { PARAMS, K, priceBase, repriced, withGbtc } from "./helpers.ts";
 
-let depN = 0;
 function setup() {
 	const node = new GavlNode(new Ledger(PARAMS));
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
-	const attestor = new Account({ node, params: PARAMS, k: K, now, keypair: bridgeKeyPair() });
-	const fund = (acct, amount) => attestor.attestDeposit("dep" + depN++ + ":0", acct.pubHex, amount);
-	return { node, mk, fund };
+	// Balances are seeded into the fold base (withGbtc): minting is committee-gated now, but these
+	// tests are about matching/settlement, not mint authorization — they just need gBTC to exist.
+	const balances: Record<string, bigint> = {};
+	const fund = (acct, amount) => (balances[acct.pubHex] = (balances[acct.pubHex] ?? 0n) + amount);
+	return { node, mk, fund, balances };
 }
 /** Fold the whole ledger with explicit per-write heights so we can drive the clock. The mark is
  *  seeded into the fold base (a price enters consensus only via an attested Pyth update). */
 const viewAt = (node, bornAt, nowHeight, base) => computeView(node.ledger.allWrites(), { bornAt, nowHeight, base });
 
 test("a gossiped offer is taken on-chain, escrows both sides, and settles at the oracle mark", async () => {
-	const { node, mk, fund } = setup();
+	const { node, mk, fund, balances } = setup();
 	const A = mk(); // maker, will be LONG
 	const B = mk(); // taker, takes the SHORT side
 
@@ -48,7 +48,7 @@ test("a gossiped offer is taken on-chain, escrows both sides, and settles at the
 
 	// fold with the match certified at height 5 (within the offer window), mark = 61000
 	const born = new Map([[matchId, 5]]);
-	const open = viewAt(node, born, 5, priceBase(61000n));
+	const open = viewAt(node, born, 5, withGbtc(priceBase(61000n), balances));
 	assert.equal(open.book.contracts.size, 1, "one open contract");
 	const c = open.book.contracts.get(matchId);
 	assert.equal(c.long, A.pubHex);
@@ -71,7 +71,7 @@ test("a gossiped offer is taken on-chain, escrows both sides, and settles at the
 });
 
 test("a maker who spent the collateral (ghost) just fails to match — reserves untouched", async () => {
-	const { node, mk, fund } = setup();
+	const { node, mk, fund, balances } = setup();
 	const A = mk(); // maker
 	const B = mk(); // taker
 	const C = mk(); // A sends its funds away before B can match (the "ghost")
@@ -83,7 +83,7 @@ test("a maker who spent the collateral (ghost) just fails to match — reserves 
 	await A.transfer(C.pubHex, 1000n); // A ghosts — moves the collateral it offered
 	const matchId = await B.matchOpen(offer, 1000n);
 
-	const v = viewAt(node, new Map([[matchId, 5]]), 5, priceBase(61000n));
+	const v = viewAt(node, new Map([[matchId, 5]]), 5, withGbtc(priceBase(61000n), balances));
 	assert.equal(v.book.contracts.size, 0, "no contract — the maker couldn't cover");
 	assert.equal(gbtcOf(v, B.pubHex), 1000n, "taker's funds untouched");
 	assert.equal(gbtcOf(v, C.pubHex), 1000n, "A's funds went to C");

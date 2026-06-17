@@ -15,8 +15,7 @@ import { rm } from "node:fs/promises";
 
 import { Daemon } from "../src/daemon.ts";
 import { Account } from "../src/market/account.ts";
-import { bridgeKeyPair } from "../src/market/oracle.ts";
-import { PARAMS, K } from "./helpers.ts";
+import { PARAMS, K, TestFund } from "./helpers.ts";
 
 let n = 0;
 const freshDir = () => join(tmpdir(), `gavl-cover-${process.pid}-${n++}`);
@@ -37,10 +36,14 @@ test("a gossiped offer is kept only if its maker can back it", async () => {
 		const d = new Daemon({ walletDir: dir, params: PARAMS });
 		let t = 0;
 		const now = () => ++t;
-		const attestor = new Account({ node: d.node, params: PARAMS, k: K, now, keypair: bridgeKeyPair() });
 		const maker = new Account({ node: d.node, params: PARAMS, k: K, now }); // will be funded
 		const ghost = new Account({ node: d.node, params: PARAMS, k: K, now }); // never funded
-		await attestor.attestDeposit("dep0:0", maker.pubHex, 5000n);
+		// The cover-check folds the daemon's own ledger, so the maker needs a REAL on-chain credit
+		// (not a fold-base seed). Mint it via the committee threshold — the only authorized mint path
+		// now that the single-attestor fallback is gone — with the group key announced first.
+		const tf = new TestFund();
+		await tf.announce(maker);
+		await tf.fund(maker, maker.pubHex, 5000n);
 
 		const backed = maker.makeOffer({ makerSide: "long", size: "1000", leverage: "2", expiryHeight: 9_999_999, nonce: "ok" });
 		const unbacked = ghost.makeOffer({ makerSide: "long", size: "1000", leverage: "2", expiryHeight: 9_999_999, nonce: "ghost" });

@@ -22,11 +22,9 @@ import { computeView, viewAtAnchor } from "../src/market/btc.ts";
 import { serializeView, deserializeView, viewRoot } from "../src/market/state.ts";
 import type { View } from "../src/market/btc.ts";
 import type { StoredSnapshot } from "../src/store/store.ts";
-import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
+import { oracleKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver } from "./helpers.ts";
-
-let depN = 0;
+import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
 
 test("a fresh peer bootstraps from a pruned peer's checkpoint and converges without pre-checkpoint history", async () => {
 	// ── Build peer A: writes + an anchor chain that buries them to finality ──
@@ -35,15 +33,20 @@ test("a fresh peer bootstraps from a pruned peer's checkpoint and converges with
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node: A, params: PARAMS, k: K, now, keypair: kp });
 	const oracle = mk(oracleKeyPair());
-	const attestor = mk(bridgeKeyPair());
-	const fund = (a: Account, amt: bigint) => attestor.attestDeposit("dep" + depN++ + ":0", a.pubHex, amt);
+	// gBTC seeded into the fold base (withGbtc) — minting is committee-gated now, but this test is about
+	// trustless checkpoint bootstrap, not mint authorization. Every fold (the anchors' appRoot, A's full
+	// view, the snapshot state, and B's reconstruction) resumes from the same base() so the seeded
+	// balances are byte-identical everywhere — which is exactly what the bootstrap equivalence needs.
+	const balances: Record<string, bigint> = {};
+	const fund = (a: Account, amt: bigint) => (balances[a.pubHex] = (balances[a.pubHex] ?? 0n) + amt);
+	const base = (): View => withGbtc(computeView([]), balances);
 
 	const m = generateKeyPair();
 	const prover = standinProver(m);
 	const mineOn = async (node: GavlNode) => {
 		const prev = node.anchorTip();
 		const all = node.ledger.allWrites();
-		const appRoot = prev ? viewRoot(viewAtAnchor(all, node.anchors!, prev.id)) : viewRoot(computeView([]));
+		const appRoot = prev ? viewRoot(viewAtAnchor(all, node.anchors!, prev.id, base())) : viewRoot(base());
 		const a = (await mineAnchor({ prev, prevHeads: prev ? node.anchors!.headsAt(prev.id) : {}, producer: m, prover, heads: node.ledger.heads(), params: PARAMS, appRoot }))!;
 		await node.submitAnchor(a);
 		return a;
@@ -62,13 +65,13 @@ test("a fresh peer bootstraps from a pruned peer's checkpoint and converges with
 	await mineOn(A); // a2 (so a1 is now finalized and has a child)
 	await mineOn(A); // a3
 
-	const fullView = computeView(A.ledger.allWrites());
+	const fullView = computeView(A.ledger.allWrites(), { base: base() });
 	const fullRoot = A.ledger.stateRoot();
 
 	// ── A takes a checkpoint at a finalized anchor and PRUNES to it ──
 	const ckptAnchor = A.anchors!.finalized(2)!; // a1 (2 deep from a3) — has children a2,a3
 	const ckptHeads = A.anchors!.headsAt(ckptAnchor.id);
-	const ckptState = viewAtAnchor(A.ledger.allWrites(), A.anchors!, ckptAnchor.id);
+	const ckptState = viewAtAnchor(A.ledger.allWrites(), A.anchors!, ckptAnchor.id, base());
 	const snapshot: StoredSnapshot = { anchorId: ckptAnchor.id, height: ckptAnchor.height, heads: ckptHeads, state: serializeView(ckptState) };
 	const preCount = A.ledger.allWrites().length;
 	A.ledger.pruneBelow(ckptHeads); // A now holds ONLY post-checkpoint writes

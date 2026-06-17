@@ -17,19 +17,17 @@ import assert from "node:assert/strict";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
-import { bridgeKeyPair } from "../src/market/oracle.ts";
 import { PARAMS, K } from "./helpers.ts";
 
-let depN = 0;
-/** Produce a real write stream from one node; return the writes in seq order per writer. */
+/** Produce a real write stream from one node; return the writes in seq order per writer. This test
+ *  exercises the write DAG (heads/stateRoot/seq/prune), not the gBTC fold — no view is computed — so
+ *  the transfers don't need funded balances; they exist only as a chain of writes to prune/resume. */
 async function makeStream() {
 	const node = new GavlNode(new Ledger(PARAMS));
 	let t = 0;
 	const now = () => ++t;
 	const A = new Account({ node, params: PARAMS, k: K, now });
 	const B = new Account({ node, params: PARAMS, k: K, now });
-	const attestor = new Account({ node, params: PARAMS, k: K, now, keypair: bridgeKeyPair() });
-	await attestor.attestDeposit("dep" + depN++ + ":0", A.pubHex, 10000n);
 	for (let i = 0; i < 6; i++) await A.transfer(B.pubHex, 100n); // A: seq 0..5
 	return { writes: node.ledger.allWrites(), A: A.pubHex };
 }

@@ -20,11 +20,8 @@ import { AnchorChain } from "../src/consensus/chain.ts";
 import type { Heads } from "../src/ledger/ledger.ts";
 import { viewAtAnchor, marketConserved } from "../src/market/btc.ts";
 import { viewRoot } from "../src/market/state.ts";
-import { bridgeKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver, priceBase } from "./helpers.ts";
-
-let depN = 0;
+import { PARAMS, K, STANDIN_VERIFIER, standinProver, priceBase, withGbtc } from "./helpers.ts";
 
 test("a checkpoint-pruned node folds forward to the same state + appRoot as a full node", async () => {
 	const node = new GavlNode(new Ledger(PARAMS));
@@ -32,8 +29,11 @@ test("a checkpoint-pruned node folds forward to the same state + appRoot as a fu
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
-	const attestor = mk(bridgeKeyPair());
-	const fund = (a: Account, amt: bigint) => attestor.attestDeposit("dep" + depN++ + ":0", a.pubHex, amt);
+	// gBTC seeded into the shared fold base (withGbtc) — minting is committee-gated now, but this test
+	// is about full-vs-pruned fold equivalence, not mint authorization. Both folds resume from the same
+	// priced() base, so the seeded balances are byte-identical on both sides.
+	const balances: Record<string, bigint> = {};
+	const fund = (a: Account, amt: bigint) => (balances[a.pubHex] = (balances[a.pubHex] ?? 0n) + amt);
 
 	const kp = generateKeyPair();
 	const prover = standinProver(kp);
@@ -52,7 +52,8 @@ test("a checkpoint-pruned node folds forward to the same state + appRoot as a fu
 
 	// The market mark lives in the fold base (a price enters consensus only via an attested Pyth
 	// update; both the full and pruned folds start from the same agreed base, which is the point).
-	const priced = () => priceBase(61000n);
+	// The seeded gBTC rides in the same base, so full and pruned fold from byte-identical state.
+	const priced = () => withGbtc(priceBase(61000n), balances);
 
 	// ── activity round 1, then an anchor ──
 	await fund(A, 5000n);

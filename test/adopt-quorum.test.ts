@@ -22,11 +22,9 @@ import { computeView, viewAtAnchor } from "../src/market/btc.ts";
 import { serializeView, deserializeView, viewRoot } from "../src/market/state.ts";
 import type { View } from "../src/market/btc.ts";
 import type { StoredSnapshot } from "../src/store/store.ts";
-import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
+import { oracleKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver } from "./helpers.ts";
-
-let depN = 0;
+import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
 
 /** Build a server: writes + an anchor chain, then prune BOTH to a checkpoint (genesis gone).
  *  Returns the pruned node, the checkpoint snapshot, and the full pre-prune view for comparison. */
@@ -36,22 +34,26 @@ async function buildServer(): Promise<{ snapshot: StoredSnapshot; full: { writes
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node: S, params: PARAMS, k: K, now, keypair: kp });
 	const oracle = mk(oracleKeyPair());
-	const attestor = mk(bridgeKeyPair());
-	const fund = (a: Account, amt: bigint) => attestor.attestDeposit("dep" + depN++ + ":0", a.pubHex, amt);
+	// gBTC is committee-gated now, so balances live in the fold base (withGbtc), not in a sig-less
+	// deposit write. This test is about adoption/appRoot, not mint authorization — it just needs the
+	// gBTC to EXIST in the SAME base the appRoot, snapshot state, and B's reconstruction all fold from.
+	const balances: Record<string, bigint> = {};
+	const fund = (a: Account, amt: bigint) => (balances[a.pubHex] = (balances[a.pubHex] ?? 0n) + amt);
+	const base = () => withGbtc(computeView([]), balances); // a FRESH base each call (withGbtc mutates it)
 	const m = generateKeyPair();
 	const prover = standinProver(m);
 	const mineOn = async (): Promise<void> => {
 		const prev = S.anchorTip();
 		const all = S.ledger.allWrites();
-		const appRoot = prev ? viewRoot(viewAtAnchor(all, S.anchors!, prev.id)) : viewRoot(computeView([]));
+		const appRoot = prev ? viewRoot(viewAtAnchor(all, S.anchors!, prev.id, base())) : viewRoot(computeView([], { base: base() }));
 		const a = (await mineAnchor({ prev, prevHeads: prev ? S.anchors!.headsAt(prev.id) : {}, producer: m, prover, heads: S.ledger.heads(), params: PARAMS, appRoot }))!;
 		await S.submitAnchor(a);
 	};
 	const acctA = mk();
 	const acctB = mk();
 	await oracle.noop(); // a write from the oracle account (price now enters only via attested Pyth updates)
-	await fund(acctA, 5000n);
-	await fund(acctB, 5000n);
+	fund(acctA, 5000n);
+	fund(acctB, 5000n);
 	await acctA.transfer(acctB.pubHex, 700n);
 	await mineOn();
 	await mineOn();
@@ -59,10 +61,10 @@ async function buildServer(): Promise<{ snapshot: StoredSnapshot; full: { writes
 	await mineOn();
 	await mineOn();
 
-	const full = { writes: S.ledger.allWrites(), anchors: S.anchors!.chainTo(), root: S.ledger.stateRoot(), view: computeView(S.ledger.allWrites()) };
+	const full = { writes: S.ledger.allWrites(), anchors: S.anchors!.chainTo(), root: S.ledger.stateRoot(), view: computeView(S.ledger.allWrites(), { base: base() }) };
 	const ckpt = S.anchors!.finalized(2)!;
 	const heads = S.anchors!.headsAt(ckpt.id);
-	const snapshot: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(viewAtAnchor(full.writes, S.anchors!, ckpt.id)) };
+	const snapshot: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(viewAtAnchor(full.writes, S.anchors!, ckpt.id, base())) };
 	return { snapshot, full };
 }
 

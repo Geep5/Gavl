@@ -9,6 +9,12 @@ import type { SpaceProver } from "../src/consensus/space.ts";
 import type { KeyPair } from "../src/det/ed25519.ts";
 import { computeView, cloneView } from "../src/market/btc.ts";
 import type { View } from "../src/market/btc.ts";
+import { mintFromDeposit } from "../src/custody/bridge.ts";
+import { generateFundKeyDKG, thresholdSign, quorumOf } from "../src/custody/threshold.ts";
+import type { FundKey } from "../src/custody/threshold.ts";
+import { depositAttestationDigest } from "../src/custody/attestation.ts";
+import { toHex } from "../src/det/canonical.ts";
+import type { Account } from "../src/market/account.ts";
 
 /** A fold base carrying a market price — the test stand-in for a relayed Pyth update. Every market is
  *  now a Pyth market: the only way a price enters consensus is a Wormhole-guardian-attested update,
@@ -27,6 +33,40 @@ export function repriced(view: View, price: bigint, seq = view.market.seq + 1, a
 	const v = cloneView(view);
 	v.market = { price, expo: 0, seq, at };
 	return v;
+}
+
+/** Seed gBTC balances directly into a fold base. Minting is committee-gated now (a threshold sig
+ *  over the group key — see TestFund), but economic/consensus tests only need balances to EXIST,
+ *  not to exercise the mint authorization, so we put them straight in the resume base (1:1 backed,
+ *  so `marketConserved` holds). Use TestFund when the test is actually about mint authorization. */
+export function withGbtc(base: View, balances: Record<string, bigint>): View {
+	let i = 0;
+	for (const [pub, amt] of Object.entries(balances)) mintFromDeposit(base.bridge, { depositId: "seed:" + i++, depositor: pub, amount: amt }, 0);
+	return base;
+}
+
+/** A test committee fund: a DKG'd group key you announce on-chain, then mint against with a
+ *  threshold signature — the real authorization path now that the single-attestor fallback is gone.
+ *  `announce()` must fold BEFORE any `fund()` deposit (it carries the earliest ts when produced first). */
+export class TestFund {
+	readonly key: FundKey;
+	private n = 0;
+	constructor(min = 2, max = 3) {
+		this.key = generateFundKeyDKG(min, max);
+	}
+	get groupKeyHex(): string {
+		return toHex(this.key.groupPubKey);
+	}
+	/** Announce the group key on-chain via `announcer` (any account; first-write-wins). */
+	announce(announcer: Account, epoch = 1) {
+		return announcer.announceFund(this.groupKeyHex, epoch);
+	}
+	/** A quorum-signed `bridge.deposit` minting `amount` to `depositor`, relayed by `via` (any node).
+	 *  `depositId` defaults to a fresh outpoint; pass one to satisfy a specific claim. */
+	fund(via: Account, depositor: string, amount: bigint, depositId = "tf" + this.n++ + ":0") {
+		const sig = toHex(thresholdSign(depositAttestationDigest({ depositId, depositor, amount }), this.key.pub, quorumOf(this.key, this.key.min)));
+		return via.attestDeposit(depositId, depositor, amount, sig);
+	}
 }
 
 /** Low difficulty so multi-write, multi-node tests stay quick. */

@@ -16,21 +16,30 @@ import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
 import { computeView } from "../src/market/btc.ts";
-import { bridgeKeyPair } from "../src/market/oracle.ts";
 import { pendingClaims, unsentWithdrawals, inFlightWithdrawals } from "../src/custody/bridge.ts";
-import { PARAMS, K } from "./helpers.ts";
+import { PARAMS, K, TestFund } from "./helpers.ts";
 
 function setup() {
 	const node = new GavlNode(new Ledger(PARAMS));
 	let t = 0;
 	const now = () => ++t;
-	const acct = (kp?: ReturnType<typeof bridgeKeyPair>) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
-	return { node, acct };
+	const acct = () => new Account({ node, params: PARAMS, k: K, now }); // fresh identity each call
+	// Committee-mint helper: announce one fund key, then mint quorum-signed deposits against it.
+	const tf = new TestFund();
+	let announced = false;
+	const fund = async (depositor: string, amount: bigint, depositId?: string) => {
+		if (!announced) {
+			announced = true;
+			await tf.announce(acct());
+		}
+		await tf.fund(acct(), depositor, amount, depositId);
+	};
+	return { node, acct, fund };
 }
 const bridge = (node: GavlNode) => computeView(node.ledger.allWrites()).bridge;
 
 test("a claim is an outstanding mint request until its deposit is minted", async () => {
-	const { node, acct } = setup();
+	const { node, acct, fund } = setup();
 	await acct().claim("txA:0", "alicepub");
 	await acct().claim("txB:1", "bobpub");
 	assert.deepEqual(
@@ -41,8 +50,8 @@ test("a claim is an outstanding mint request until its deposit is minted", async
 		],
 		"both claims are pending",
 	);
-	// the (seed) attestor mints txA:0 → that claim is satisfied
-	await acct(bridgeKeyPair()).attestDeposit("txA:0", "alicepub", 5000n);
+	// the committee mints txA:0 → that claim is satisfied
+	await fund("alicepub", 5000n, "txA:0");
 	assert.deepEqual(pendingClaims(bridge(node)), [{ depositId: "txB:1", depositor: "bobpub" }], "minted claim drops; the other remains");
 	// a duplicate claim doesn't double-count
 	await acct().claim("txB:1", "bobpub");
@@ -50,10 +59,9 @@ test("a claim is an outstanding mint request until its deposit is minted", async
 });
 
 test("a broadcast note moves a withdrawal from unsent → in-flight", async () => {
-	const { node, acct } = setup();
-	const attestor = acct(bridgeKeyPair());
+	const { node, acct, fund } = setup();
 	const user = acct();
-	await attestor.attestDeposit("dep:0", user.pubHex, 10_000n); // seed-mode mint to fund the user
+	await fund(user.pubHex, 10_000n, "dep:0"); // committee-mint to fund the user
 	const burn = await user.withdraw(4000n, "tb1quserwithdrawaddrxxxxxxxxxxxxxxxxxxx");
 
 	assert.deepEqual(

@@ -22,11 +22,9 @@ import { computeView, viewAtAnchor } from "../src/market/btc.ts";
 import { serializeView, deserializeView, viewRoot } from "../src/market/state.ts";
 import type { View } from "../src/market/btc.ts";
 import type { StoredSnapshot } from "../src/store/store.ts";
-import { oracleKeyPair, bridgeKeyPair } from "../src/market/oracle.ts";
+import { oracleKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver } from "./helpers.ts";
-
-let depN = 0;
+import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
 
 test("a fresh peer bootstraps genesis-free by adopting a pruned peer's checkpoint as a trusted floor", async () => {
 	// ── Build peer A: writes + an anchor chain that buries them to finality ──
@@ -35,15 +33,19 @@ test("a fresh peer bootstraps genesis-free by adopting a pruned peer's checkpoin
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node: A, params: PARAMS, k: K, now, keypair: kp });
 	const oracle = mk(oracleKeyPair());
-	const attestor = mk(bridgeKeyPair());
-	const fund = (a: Account, amt: bigint) => attestor.attestDeposit("dep" + depN++ + ":0", a.pubHex, amt);
+	// gBTC is committee-gated now, so balances live in the fold base (withGbtc), not a sig-less deposit
+	// write. This test is about genesis-free adoption, not mint authorization: the gBTC just has to
+	// EXIST in the SAME base that A's appRoot, the checkpoint state, and B's reconstruction fold from.
+	const balances: Record<string, bigint> = {};
+	const fund = (a: Account, amt: bigint) => (balances[a.pubHex] = (balances[a.pubHex] ?? 0n) + amt);
+	const base = () => withGbtc(computeView([]), balances); // a FRESH base each call (withGbtc mutates it)
 
 	const m = generateKeyPair();
 	const prover = standinProver(m);
 	const mineOn = async (node: GavlNode): Promise<Anchor> => {
 		const prev = node.anchorTip();
 		const all = node.ledger.allWrites();
-		const appRoot = prev ? viewRoot(viewAtAnchor(all, node.anchors!, prev.id)) : viewRoot(computeView([]));
+		const appRoot = prev ? viewRoot(viewAtAnchor(all, node.anchors!, prev.id, base())) : viewRoot(computeView([], { base: base() }));
 		const a = (await mineAnchor({ prev, prevHeads: prev ? node.anchors!.headsAt(prev.id) : {}, producer: m, prover, heads: node.ledger.heads(), params: PARAMS, appRoot }))!;
 		await node.submitAnchor(a);
 		return a;
@@ -52,8 +54,8 @@ test("a fresh peer bootstraps genesis-free by adopting a pruned peer's checkpoin
 	const acctA = mk();
 	const acctB = mk();
 	await oracle.noop(); // a write from the oracle account (price now enters only via attested Pyth updates)
-	await fund(acctA, 5000n);
-	await fund(acctB, 5000n);
+	fund(acctA, 5000n);
+	fund(acctB, 5000n);
 	await acctA.transfer(acctB.pubHex, 700n);
 	await mineOn(A);
 	await mineOn(A);
@@ -62,13 +64,13 @@ test("a fresh peer bootstraps genesis-free by adopting a pruned peer's checkpoin
 	await mineOn(A);
 	await mineOn(A);
 
-	const fullView = computeView(A.ledger.allWrites());
+	const fullView = computeView(A.ledger.allWrites(), { base: base() });
 	const fullRoot = A.ledger.stateRoot();
 
 	// ── A checkpoints at a finalized anchor and PRUNES BOTH ledger AND anchor chain to it ──
 	const ckptAnchor = A.anchors!.finalized(2)!; // has children (so its appRoot is committed)
 	const ckptHeads = A.anchors!.headsAt(ckptAnchor.id);
-	const ckptState = viewAtAnchor(A.ledger.allWrites(), A.anchors!, ckptAnchor.id);
+	const ckptState = viewAtAnchor(A.ledger.allWrites(), A.anchors!, ckptAnchor.id, base());
 	const snapshot: StoredSnapshot = { anchorId: ckptAnchor.id, height: ckptAnchor.height, heads: ckptHeads, state: serializeView(ckptState) };
 	A.ledger.pruneBelow(ckptHeads);
 	A.anchors!.prune(ckptAnchor.height); // ← the new part: A no longer holds genesis, only [ckpt..tip]

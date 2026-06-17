@@ -127,20 +127,20 @@ function cmpWrite(a: Write, b: Write): number {
  * (committee custody), authority is a BIP340 THRESHOLD signature by that group key over
  * the attestation digest — so a quorum of the committee, each having independently
  * verified the on-chain fact, must have agreed; no single key can mint or settle. The
- * write's author is irrelevant then (anyone may relay a committee-signed attestation).
- * Before any committee fund exists (seed/testnet mode), it falls back to the single
- * legacy attestor key.
+ * write's author is irrelevant (anyone may relay a committee-signed attestation). There is
+ * NO single-key fallback: with no announced fund key, minting/settling is impossible — a
+ * market can't issue claims on BTC before the custody that holds the BTC exists.
  */
-function attestationAuthorized(view: View, w: Write, digest: Uint8Array, sig: string | undefined): boolean {
-	if (view.custody.fundKey) {
-		if (typeof sig !== "string") return false;
-		try {
-			return verifyThreshold(fromHex(sig), digest, fromHex(view.custody.fundKey));
-		} catch {
-			return false; // malformed sig/key → unauthorized
-		}
+function attestationAuthorized(view: View, _w: Write, digest: Uint8Array, sig: string | undefined): boolean {
+	// No fund, no mint: a market can't issue claims on BTC before the custody that holds the BTC
+	// exists. The ONLY authority is a threshold signature by the on-chain-announced group key — there
+	// is no single-key fallback (Option A: no public default attestor, no pre-genesis mint window).
+	if (!view.custody.fundKey || typeof sig !== "string") return false;
+	try {
+		return verifyThreshold(fromHex(sig), digest, fromHex(view.custody.fundKey));
+	} catch {
+		return false; // malformed sig/key → unauthorized
 	}
-	return w.writer === BRIDGE_ATTESTOR; // legacy single attestor (no committee fund yet)
 }
 
 export interface ViewOptions {
@@ -332,9 +332,9 @@ export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: st
 function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, market?: MarketDef): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
-			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized by the committee
-			// threshold (a group-key sig over the deposit digest) once a committee fund
-			// exists, else the legacy single attestor key. Idempotent by deposit outpoint.
+			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized ONLY by the committee
+			// threshold (a group-key sig over the deposit digest) — no fund key, no mint.
+			// Idempotent by deposit outpoint.
 			const amt = parseAmount(op.amount);
 			if (amt === null || typeof op.depositId !== "string" || typeof op.depositor !== "string") return;
 			if (!attestationAuthorized(view, w, depositAttestationDigest({ depositId: op.depositId, depositor: op.depositor, amount: amt }), op.sig)) return;
@@ -371,8 +371,7 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 		}
 		case "bridge.settle": {
 			// Mark a withdrawal's BTC payout confirmed → reserves drop. Committee
-			// threshold (group-key sig over the settle digest) once a fund exists, else
-			// the legacy attestor key.
+			// threshold (group-key sig over the settle digest) only — no fund key, no settle.
 			if (typeof op.withdrawalId !== "string") return;
 			if (!attestationAuthorized(view, w, settleAttestationDigest({ withdrawalId: op.withdrawalId }), op.sig)) return;
 			completeWithdrawal(view.bridge, op.withdrawalId);
