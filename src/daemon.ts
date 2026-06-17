@@ -987,6 +987,8 @@ export class Daemon {
 			windowAnchors: this.custodyOpts.windowAnchors,
 			bonds: this.custodyOpts.bonded ? () => this.finalView().bridge.bonds : undefined, // stake-weighted selection
 			auth: this.ceremonyAuth(),
+			ceremonySeed: () => this.producerKey().privateKey, // deterministic DKG material across retries
+
 			groupKey: () => {
 				const hex = this.view().custody.fundKey;
 				return hex ? fromHex(hex) : null;

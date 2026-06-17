@@ -54,10 +54,14 @@ export class DkgSession {
 		this.id = typeof idOrIndex === "number" ? FROST.Identifier.fromNumber(idOrIndex) : idOrIndex;
 	}
 
-	/** Round 1: sample our polynomial, stash the secret, return the public package to BROADCAST. */
-	round1(): Round1Message {
+	/** Round 1: sample our polynomial, stash the secret, return the public package to BROADCAST.
+	 *  `rng` (optional) makes the polynomial DETERMINISTIC — seed it from this node's secret + the
+	 *  ceremony id and every retry regenerates identical material, so a peer that mixes round1 from
+	 *  one attempt with round2 from another still validates (safe: this is one-time key-gen, not
+	 *  signing — there's no nonce-reuse hazard). Omit for fresh randomness. */
+	round1(rng?: (len: number) => Uint8Array): Round1Message {
 		if (this.step !== 0) throw new Error("dkg: round1 already done");
-		const { public: pub, secret } = FROST.DKG.round1(this.id, this.signers);
+		const { public: pub, secret } = FROST.DKG.round1(this.id, this.signers, undefined, rng as Parameters<typeof FROST.DKG.round1>[3]);
 		this.r1secret = secret;
 		this.step = 1;
 		return pub;

@@ -29,6 +29,25 @@ import type { DkgWire } from "../sync/messages.ts";
 import { toJsonSafe as enc, fromJsonSafe as dec } from "./u8json.ts";
 import { CeremonyTimeout } from "./ceremony.ts";
 import type { CeremonyAuth } from "./ceremony-auth.ts";
+import { sha256, concatBytes, u32be } from "../det/canonical.ts";
+
+/** A deterministic byte stream from a seed (sha256 counter mode) — for reproducible DKG material. */
+function seededRng(seed: Uint8Array): (len: number) => Uint8Array {
+	let counter = 0;
+	let buf: Uint8Array = new Uint8Array(0);
+	return (len: number) => {
+		const out = new Uint8Array(len);
+		let off = 0;
+		while (off < len) {
+			if (buf.length === 0) buf = sha256(concatBytes(seed, u32be(counter++)));
+			const take = Math.min(buf.length, len - off);
+			out.set(buf.subarray(0, take), off);
+			buf = buf.subarray(take);
+			off += take;
+		}
+		return out;
+	};
+}
 
 export interface DkgResult {
 	share: Share; // THIS node's threshold share — stays local
@@ -48,14 +67,15 @@ export class DkgCoordinator {
 	private sentRound2 = false;
 	private settled = false;
 	private timer: ReturnType<typeof setTimeout> | null = null;
-	private round1Timer: ReturnType<typeof setInterval> | null = null;
+	private resendTimer: ReturnType<typeof setInterval> | null = null;
 	private round1Msg: DkgWire | null = null;
+	private round2Msgs: { conn: Connection; msg: DkgWire }[] = [];
 	private resolve!: (r: DkgResult) => void;
 	private reject!: (e: Error) => void;
 	private readonly node: GavlNode;
-	private readonly opts: { session: string; selfId: string; participants: string[]; min: number; timeoutMs?: number; auth?: CeremonyAuth };
+	private readonly opts: { session: string; selfId: string; participants: string[]; min: number; timeoutMs?: number; auth?: CeremonyAuth; seed?: Uint8Array };
 
-	constructor(node: GavlNode, opts: { session: string; selfId: string; participants: string[]; min: number; timeoutMs?: number; auth?: CeremonyAuth }) {
+	constructor(node: GavlNode, opts: { session: string; selfId: string; participants: string[]; min: number; timeoutMs?: number; auth?: CeremonyAuth; seed?: Uint8Array }) {
 		this.node = node;
 		this.opts = opts;
 		this.max = opts.participants.length;
@@ -80,18 +100,26 @@ export class DkgCoordinator {
 			this.reject = rej;
 			if (this.opts.timeoutMs !== undefined) this.timer = setTimeout(() => this.fail(), this.opts.timeoutMs);
 			// Round 1: broadcast my public commitment.
-			const pkg = this.session.round1();
+			// Deterministic material per (node seed, session): every retry of this session regenerates the
+			// SAME polynomial, so a peer that collected our round1 from an earlier attempt + round2 from a
+			// later one still validates (FROST round3 checks shares against commitments). No seed → random.
+			const rng = this.opts.seed ? seededRng(sha256(concatBytes(this.opts.seed, new TextEncoder().encode(this.opts.session)))) : undefined;
+			const pkg = this.session.round1(rng);
 			this.r1.set(this.selfFid, pkg);
-			this.round1Msg = this.stamp({ d: "round1", session: this.opts.session, from: this.opts.selfId, pkg: enc(pkg) });
+			this.round1Msg = this.stamp<DkgWire>({ d: "round1", session: this.opts.session, from: this.opts.selfId, pkg: enc(pkg) });
 			this.node.dkgBroadcast(this.round1Msg);
-			// Re-broadcast round1 until we've collected everyone's (i.e. until round2 goes out). Members
-			// start the ceremony at slightly different moments (finality jitter), so a single broadcast can
-			// reach a peer before ITS coordinator is on this session — it drops the message. Re-broadcasting
-			// closes that start-skew race without a separate buffering layer; receivers treat it idempotently.
-			const everyMs = this.opts.timeoutMs ? Math.max(250, Math.floor(this.opts.timeoutMs / 8)) : 700;
-			this.round1Timer = setInterval(() => {
-				if (this.settled || this.sentRound2) return this.stopRebroadcast();
-				if (this.round1Msg) this.node.dkgBroadcast(this.round1Msg);
+			// Resend loop until the ceremony settles: members start at slightly different moments (finality
+			// jitter) and messages can arrive before a peer's coordinator is ready, so a single send is
+			// lossy. While collecting round1, re-broadcast ours; once we've sent round2 (secret shares,
+			// point-to-point), keep re-sending those until round3 fires. All sends are idempotent.
+			const everyMs = this.opts.timeoutMs ? Math.max(250, Math.floor(this.opts.timeoutMs / 12)) : 600;
+			this.resendTimer = setInterval(() => {
+				if (this.settled) return this.stopRebroadcast();
+				if (!this.sentRound2) {
+					if (this.round1Msg) this.node.dkgBroadcast(this.round1Msg);
+				} else {
+					for (const { conn, msg } of this.round2Msgs) this.node.dkgReply(conn, msg);
+				}
 			}, everyMs);
 			this.maybeRound2();
 		});
@@ -110,8 +138,8 @@ export class DkgCoordinator {
 	}
 
 	private stopRebroadcast(): void {
-		if (this.round1Timer) clearInterval(this.round1Timer);
-		this.round1Timer = null;
+		if (this.resendTimer) clearInterval(this.resendTimer);
+		this.resendTimer = null;
 	}
 
 	private fail(): void {
@@ -151,13 +179,17 @@ export class DkgCoordinator {
 	private maybeRound2(): void {
 		if (this.sentRound2 || this.r1.size < this.max) return; // wait for everyone's round 1
 		this.sentRound2 = true;
-		this.stopRebroadcast(); // have everyone's round1 → stop re-broadcasting ours
+		// (the resend loop now switches from round1 to round2; it stops only on settle)
 		const shares = this.session.round2(this.peerPackages() as never);
 		for (const recipientFid of Object.keys(shares)) {
 			const pid = this.idOfFid.get(recipientFid);
 			const conn = pid ? this.connOf.get(pid) : undefined;
-			// Point-to-point over the recipient's own connection — never broadcast.
-			if (pid && conn) this.node.dkgReply(conn, this.stamp({ d: "round2", session: this.opts.session, from: this.opts.selfId, to: pid, share: enc(shares[recipientFid]) }));
+			// Point-to-point over the recipient's own connection — never broadcast (the share is secret).
+			if (pid && conn) {
+				const msg = this.stamp<DkgWire>({ d: "round2", session: this.opts.session, from: this.opts.selfId, to: pid, share: enc(shares[recipientFid]) });
+				this.round2Msgs.push({ conn, msg }); // resent until round3 fires
+				this.node.dkgReply(conn, msg);
+			}
 		}
 		this.maybeRound3();
 	}

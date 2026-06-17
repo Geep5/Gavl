@@ -65,6 +65,9 @@ export interface RotationConfig {
 	bonds?: () => Map<string, bigint>;
 	/** Authenticates ceremony messages (signs as this node's committee id, verifies peers'). */
 	auth?: CeremonyAuth;
+	/** This node's stable SECRET (e.g. its producer private key) — seeds DETERMINISTIC DKG material
+	 *  so genesis retries regenerate identical commitments/shares (survives unsynchronized retries). */
+	ceremonySeed?: () => Uint8Array;
 	/** The network-known fund group key (on-chain published), or null if no fund yet. */
 	groupKey: () => Uint8Array | null;
 	/** Publish the freshly-DKG'd fund key on-chain (so every node + client learns it). */
@@ -134,20 +137,38 @@ export class CommitteeRotation {
 
 	private async actOnEpoch(finalized: AnchorView[], epoch: number): Promise<void> {
 		const minCommittee = this.c.minCommittee ?? 3;
-		const next = this.epochCommittee(finalized, epoch, this.sizeFor(epoch)); // small at genesis, grown after
-		if (!next || next.committee.length < minCommittee) return; // not enough eligible farmers yet
-
-		const inNew = next.committee.includes(this.c.selfId);
 		const key = this.c.groupKey();
 
-		if (!key) return inNew ? this.genesis(next, epoch) : undefined; // no fund → DKG it (if we're in)
-		return this.rotate(finalized, next, epoch, key, inNew);
+		if (!key) {
+			// GENESIS: run for the FIRST genesis-able epoch, NOT the latest. The latest epoch drifts
+			// across nodes (finality jitter), so a per-latest-epoch session id would never match between
+			// them — they'd each broadcast round1 on a different `custody-epoch-N` and time out forever.
+			// The first eligible epoch is a stable, chain-derived value every node + every retry agrees on,
+			// so the session id matches and the ceremony can actually complete.
+			const g = this.firstGenesisEpoch(finalized, epoch, minCommittee);
+			if (g && g.committee.includes(this.c.selfId)) return this.genesis(g, g.epoch);
+			return;
+		}
+
+		const next = this.epochCommittee(finalized, epoch, this.sizeFor(epoch)); // grown to full size after genesis
+		if (!next || next.committee.length < minCommittee) return; // not enough eligible farmers yet
+		return this.rotate(finalized, next, epoch, key, next.committee.includes(this.c.selfId));
+	}
+
+	/** The first selectable epoch whose committee meets `minCommittee` — the stable genesis target
+	 *  (deterministic from the finalized chain, so every node picks the same one). */
+	private firstGenesisEpoch(finalized: AnchorView[], maxEpoch: number, minCommittee: number): EpochCommittee | null {
+		for (let e = 1; e <= maxEpoch; e++) {
+			const c = this.epochCommittee(finalized, e, this.sizeFor(e));
+			if (c && c.committee.length >= minCommittee) return c;
+		}
+		return null;
 	}
 
 	private async genesis(next: EpochCommittee, epoch: number): Promise<void> {
 		if (this.c.loadShare()) return; // already hold a share (key publish just hasn't propagated)
 		this.log(`epoch ${epoch}: genesis DKG among ${next.committee.length} (min ${next.min})`);
-		const coord = new DkgCoordinator(this.c.node, { session: `custody-epoch-${epoch}`, selfId: this.c.selfId, participants: next.committee, min: next.min, timeoutMs: this.c.timeoutMs, auth: this.c.auth });
+		const coord = new DkgCoordinator(this.c.node, { session: `custody-epoch-${epoch}`, selfId: this.c.selfId, participants: next.committee, min: next.min, timeoutMs: this.c.timeoutMs, auth: this.c.auth, seed: this.c.ceremonySeed?.() });
 		try {
 			const r = await coord.start();
 			this.c.saveShare({ ...r, session: `custody-epoch-${epoch}`, selfId: this.c.selfId, participants: next.committee, min: next.min, epoch });
