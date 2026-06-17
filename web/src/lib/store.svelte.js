@@ -9,7 +9,7 @@ export const store = $state({
 	accounts: [],
 	active: null,
 	gbtc: {}, // { pubkey: amount } gBTC balances (1:1 claim on BTC in the custody fund)
-	market: null, // { price, oracles, myGbtc, reserves, gbtcOutstanding, depositAddress, tape, myContracts, ... }
+	market: null, // { price, oracles, myGbtc, idleDecay, reserves, gbtcOutstanding, depositAddress, tape, myContracts, ... }
 	consensus: null, // { enabled, vdf, mesh, network, peers, farming, tip, finalizedHeight, secPerAnchor, secPerAnchorMeasured }
 	custody: null, // { mode, epoch, fundKeyOnChain, fundAddress, holdsShare, committee, threshold, minCommittee, committeeId, bonded, myBond }
 });

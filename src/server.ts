@@ -21,7 +21,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
 import { mark, gbtcOf, MAX_LEVERAGE, parseAmount, leverageOk } from "./market/btc.ts";
 import { escrowedInContracts } from "./market/intent.ts";
-import { totalGbtc, pendingTotal, backingBps as bridgeBackingBps } from "./custody/bridge.ts";
+import { totalGbtc, pendingTotal, backingBps as bridgeBackingBps, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS } from "./custody/bridge.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
@@ -117,6 +117,11 @@ function serializeState() {
 
 	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)
 	const onChainR = rsv != null ? rsv.sats : null;
+	// Idle-decay (demurrage) countdown for the active account: its idle clock starts at the last
+	// credit (`since`); decay begins at +grace and the balance is fully reclaimed by +cutoff. The UI
+	// turns these heights into a live countdown via the current tip + secPerAnchor. Null if no clock.
+	const cf = view.bridge.chargeFrom.get(me);
+	const idleDecay = cf ? { decayAtHeight: cf.since + DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY, cutoffHeight: cf.since + DEMURRAGE_CUTOFF_DAYS * DEMURRAGE_DAY } : null;
 	const market = {
 		oracle: def?.kind ?? "pyth", // mechanism: the channel name encodes the price source; updates are source-signed
 		marketInfo,
@@ -125,6 +130,8 @@ function serializeState() {
 		maxLeverage: Number(MAX_LEVERAGE),
 		// collateral = gBTC, a 1:1 claim on BTC in the custody fund
 		myGbtc: gbtcOf(view, me).toString(),
+		idleDecay, // { decayAtHeight, cutoffHeight } | null — demurrage countdown for your idle gBTC
+
 		reserves: view.bridge.reserves.toString(), // BTC sats in the fund
 		gbtcOutstanding: (totalGbtc(view.bridge) + escrowedInContracts(view.book)).toString(),
 		pending: pendingTotal(view.bridge).toString(), // burned, awaiting BTC payout

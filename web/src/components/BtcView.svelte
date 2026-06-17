@@ -19,6 +19,25 @@
 	const fundReady = $derived(!!m?.depositAddress);
 	const needN = $derived(store.custody?.minCommittee ?? 3);
 
+	// Idle-decay (demurrage) countdown: gBTC left idle decays into the liquidity pot. The daemon gives
+	// the heights it starts (+grace) and is fully reclaimed (+cutoff); we turn anchors-remaining into a
+	// live time using the chain's seconds-per-anchor. Any credit (deposit, a trade payout) resets it.
+	function fmtDur(sec) {
+		sec = Math.max(0, Math.round(sec));
+		const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), mn = Math.floor((sec % 3600) / 60);
+		if (d > 0) return h > 0 ? `${d}d ${h}h` : `${d}d`;
+		if (h > 0) return mn > 0 ? `${h}h ${mn}m` : `${h}h`;
+		return mn > 0 ? `${mn}m` : `${sec}s`;
+	}
+	const decay = $derived.by(() => {
+		const id = m?.idleDecay, h = c?.tip?.height, spa = c?.secPerAnchor;
+		if (!id || bal <= 0 || h == null || !spa) return null;
+		const toDecay = (id.decayAtHeight - h) * spa, toCutoff = (id.cutoffHeight - h) * spa;
+		if (toDecay > 0) return { decaying: false, text: `Idle balance starts decaying in ${fmtDur(toDecay)} (−20%/day after) unless you use or move it.` };
+		if (toCutoff > 0) return { decaying: true, text: `Decaying now — −20%/day, fully reclaimed to the liquidity pot in ${fmtDur(toCutoff)}. Move it to reset the clock.` };
+		return { decaying: true, text: `This idle balance is being reclaimed to the liquidity pot.` };
+	});
+
 	// instrument label → base / quote (BTC-USD → BTC / USD)
 	const label = $derived(mkt?.label ?? "BTC-USD");
 	const base = $derived(label.split("-")[0] ?? "BTC");
@@ -197,7 +216,8 @@
 		{:else}Broadcast {side === "long" ? "Long" : "Short"}<span class="cta-sub"> · {leverage}×, waits for a taker</span>
 		{/if}
 	</button>
-	{#if bal <= 0}<div class="hint">No gBTC yet — <button class="linkish" onclick={() => (fundsOpen = true)}>add test funds</button> to trade.</div>{/if}
+	{#if bal <= 0}<div class="hint">No gBTC yet — <button class="linkish" onclick={() => (fundsOpen = true)}>add test funds</button> to trade.</div>
+	{:else if decay}<div class="hint decay" class:warn={decay.decaying}>⏳ {decay.text}</div>{/if}
 </section>
 
 <!-- ── live intents ──────────────────────────────────────────────────────────── -->
@@ -358,6 +378,8 @@
 	.cta.bear { background: var(--red); color: #fff; }
 	.cta-sub { font-size: 0.72rem; font-weight: 600; opacity: 0.82; }
 	.hint { font-size: 0.76rem; color: var(--muted); margin-top: 0.6rem; text-align: center; }
+	.hint.decay { font-size: 0.72rem; line-height: 1.5; background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px; padding: 0.45rem 0.65rem; }
+	.hint.decay.warn { color: var(--accent); border-color: var(--accent-dim); background: var(--accent-soft); }
 	.linkish { background: none; border: none; color: var(--accent); padding: 0; cursor: pointer; font-size: inherit; text-decoration: underline; }
 	.empty { font-size: 0.8rem; color: var(--muted); line-height: 1.55; }
 	.empty strong { color: var(--text); }
