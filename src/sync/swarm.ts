@@ -122,7 +122,8 @@ export class SwarmTransport {
 		return this.swarm.keyPair.publicKey.toString("hex");
 	}
 
-	/** sha256(networkName) (hex) — the DHT topic every Gavl peer rendezvouses on. */
+	/** The 32-byte DHT topic (hex) every Gavl peer rendezvouses on — the value passed to `join`
+	 *  (for a market channel, its price-source id directly; otherwise sha256 of the name). */
 	get topicHexValue(): string | null {
 		return this.topicHex;
 	}
@@ -132,9 +133,11 @@ export class SwarmTransport {
 		return [...this.peerKeys.keys()];
 	}
 
-	/** Join a named network and wait until announced + connected to the swarm. */
-	async join(networkName: string): Promise<void> {
-		const topic = Buffer.from(sha256(networkName));
+	/** Join a network and wait until announced + connected. `topic32` is the exact 32-byte DHT topic
+	 *  to rendezvous on (the caller decides the name→topic mapping — e.g. a market's id directly);
+	 *  if omitted, falls back to sha256(name). */
+	async join(networkName: string, topic32?: Uint8Array): Promise<void> {
+		const topic = Buffer.from(topic32 ?? sha256(networkName));
 		this.topicHex = topic.toString("hex");
 		const discovery = this.swarm.join(topic, { server: true, client: true });
 		await discovery.flushed();

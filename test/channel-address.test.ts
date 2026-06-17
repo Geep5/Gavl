@@ -9,7 +9,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseChannel, parseChannelAddr, defaultMarketChannel } from "../src/daemon.ts";
+import { parseChannel, parseChannelAddr, channelTopic, defaultMarketChannel } from "../src/daemon.ts";
+import { sha256, toHex } from "../src/det/canonical.ts";
 
 const FEED = "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
 
@@ -32,4 +33,13 @@ test("parseChannel: resolves a method's coordinate to a market definition (regis
 
 test("the shipped default channel is a valid pyth coordination address", () => {
 	assert.deepEqual(parseChannel(defaultMarketChannel()), { label: "BTC-USD", kind: "pyth", feedId: FEED });
+});
+
+test("channelTopic: a market's id IS the 32-byte topic (used directly, no hash)", () => {
+	// the default BTC-USD pyth channel rendezvouses at the feed id itself — not a hash of the name
+	assert.equal(toHex(channelTopic(defaultMarketChannel())), FEED);
+	// same id ⇒ same topic regardless of the human label (case-insensitive on the id)
+	assert.equal(toHex(channelTopic(`BTC-USD::pyth::${FEED}`)), toHex(channelTopic(`Bitcoin::pyth::${FEED.toUpperCase()}`)));
+	// a plain / non-market channel (no 32-byte id) falls back to hashing its full name
+	assert.equal(toHex(channelTopic("just-a-room")), toHex(sha256("just-a-room")));
 });

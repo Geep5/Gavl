@@ -909,7 +909,7 @@ export class Daemon {
 			// Custom bootstrap nodes (the DHT entry/"DNS" layer) are added alongside
 			// Holepunch's defaults; undefined → defaults only.
 			this.transport = new SwarmTransport(this.node, { bootstrap: this.bootstrap.forSwarm(), keyPair: this.swarmKeyPair() });
-			const joined = this.transport.join(this.network); // resolved channel, not a param
+			const joined = this.transport.join(this.network, channelTopic(this.network)); // a market's id IS its topic
 			await Promise.race([joined, new Promise((r) => setTimeout(r, 8000))]);
 			// Re-dial pinned peers directly (independent of DHT discovery) — eclipse resistance.
 			for (const key of this.knownPeers.list()) {
@@ -1669,6 +1669,17 @@ export function parseChannel(name: string): ChannelMarket | null {
 	const method = CHANNEL_METHODS[addr.method];
 	if (!method || !method.ok(addr.coordinate)) return null;
 	return { label: addr.name, ...method.def(addr.coordinate) };
+}
+
+/** The 32-byte DHT topic a channel rendezvouses on. A market address's `id` (its 32-byte-hex
+ *  coordinate) IS the topic — used DIRECTLY, no hash — so a perp market's rendezvous is literally its
+ *  price-source id (a Pyth feed id / a signer-set hash). The `name` is a label and `source` tells the
+ *  fold how to verify; neither needs to be in the topic. Anything else (a plain transfers channel, or
+ *  a non-32-byte id) hashes its full name to 32 bytes. Same id ⇒ same topic, regardless of label. */
+export function channelTopic(name: string): Uint8Array {
+	const addr = parseChannelAddr(name);
+	if (addr && /^[0-9a-f]{64}$/i.test(addr.coordinate)) return fromHex(addr.coordinate.toLowerCase());
+	return sha256(name);
 }
 
 /** Pyth BTC/USD feed id — the instrument the shipped default market prices. */
