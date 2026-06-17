@@ -193,10 +193,7 @@
 				<div class="topic">
 					<span class="tk">dht topic</span>
 					<code class="tv">{topic}</code>
-					{#if coordIsId}
-						{#if topicMatchesCoord}<span class="tnote ok">✓ = coordinate</span>
-						{:else}<span class="tnote warn">⚠ derived hash — restart on the latest for the id-topic</span>{/if}
-					{/if}
+					{#if topicMatchesCoord}<span class="tnote ok">✓ = coordinate</span>{/if}
 				</div>
 			{/if}
 		</div>
@@ -379,7 +376,6 @@
 	.topic .tv { font-family: var(--mono); font-size: 0.68rem; color: var(--muted); word-break: break-all; min-width: 0; }
 	.topic .tnote { font-size: 0.62rem; }
 	.topic .tnote.ok { color: var(--green); }
-	.topic .tnote.warn { color: var(--accent); }
 
 	/* ── cards ── */
 	.card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.1rem 1.25rem; margin-bottom: 1rem; }
