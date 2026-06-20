@@ -115,11 +115,15 @@ export class DkgCoordinator {
 			const everyMs = this.opts.timeoutMs ? Math.max(250, Math.floor(this.opts.timeoutMs / 12)) : 600;
 			this.resendTimer = setInterval(() => {
 				if (this.settled) return this.stopRebroadcast();
-				if (!this.sentRound2) {
-					if (this.round1Msg) this.node.dkgBroadcast(this.round1Msg);
-				} else {
-					for (const { conn, msg } of this.round2Msgs) this.node.dkgReply(conn, msg);
-				}
+				// ALWAYS re-broadcast round1 — for the whole ceremony, not just until we send round2.
+				// Broadcasts are direct-peer-only (no multi-hop), and members connect at slightly
+				// different moments (finality jitter, sub-swarm discovery). A peer that connects AFTER
+				// we've already sent round2 must still receive our round1, or it never learns we're a
+				// participant, never sends us a round2 share, and we straggle without a share. (The old
+				// code stopped re-broadcasting round1 at that point, stranding late joiners.)
+				if (this.round1Msg) this.node.dkgBroadcast(this.round1Msg);
+				// Once our secret shares are out, keep re-sending them point-to-point until round3 fires.
+				if (this.sentRound2) for (const { conn, msg } of this.round2Msgs) this.node.dkgReply(conn, msg);
 			}, everyMs);
 			this.maybeRound2();
 		});
