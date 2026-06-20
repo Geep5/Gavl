@@ -159,6 +159,21 @@
 	const height = $derived(c?.tip?.height ?? null);
 	const finalized = $derived(c?.finalizedHeight ?? null);
 	const peers = $derived(c?.peers ?? 0);
+	// anchor production: is THIS node actually minting anchors (the committee signal), and how many
+	// distinct producers are on the chain. A farming node that isn't producing is the ceremony stall.
+	const iProduce = $derived(!!c?.iProduce);
+	const producers = $derived(c?.producers ?? 0);
+	const myAnchors = $derived(c?.myAnchors ?? 0);
+	// flash the anvil each time this node's anchor count ticks up — a live "it just minted one" pulse.
+	let anchorFlash = $state(false);
+	let seenAnchors = 0;
+	$effect(() => {
+		if (myAnchors > seenAnchors) {
+			seenAnchors = myAnchors;
+			anchorFlash = true;
+			setTimeout(() => (anchorFlash = false), 700);
+		}
+	});
 </script>
 
 <!-- ── market identity: the channel name, decoded into a verifiable address ───── -->
@@ -333,6 +348,15 @@
 	<span class="sb-item">{peers} peer{peers === 1 ? "" : "s"}</span>
 	<span class="sb-sep">·</span>
 	<span class="sb-item muted">proof-of-space-time{#if c?.farming} · farming{/if}</span>
+	{#if c?.farming}
+		<span class="sb-sep">·</span>
+		{#if iProduce}<span class="sb-item produce"><span class="anvil" class:flash={anchorFlash}>⚒</span> minting · {myAnchors}</span>
+		{:else}<span class="sb-item warn">⚠ not minting anchors</span>{/if}
+	{/if}
+	{#if producers > 0}
+		<span class="sb-sep">·</span>
+		<span class="sb-item tnum" class:produce={producers >= needN}>{producers}/{needN} producers</span>
+	{/if}
 </footer>
 
 <style>
@@ -450,6 +474,11 @@
 	/* ── slim status bar ── */
 	.status-bar { display: flex; align-items: center; justify-content: center; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.4rem; font-size: 0.72rem; color: var(--muted); }
 	.sb-item { display: inline-flex; align-items: center; gap: 0.38rem; }
+	.sb-item.produce { color: var(--green); }
+	.sb-item.warn { color: var(--accent); }
+	.anvil { display: inline-block; }
+	.anvil.flash { animation: anvilFlash 0.7s ease-out; }
+	@keyframes anvilFlash { 0% { transform: scale(1.6) rotate(-12deg); filter: brightness(1.9); } 60% { transform: scale(1.1); } 100% { transform: scale(1) rotate(0); filter: brightness(1); } }
 	.sb-sep { color: var(--faint); }
 
 	@media (max-width: 560px) {

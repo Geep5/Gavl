@@ -151,6 +151,14 @@ export interface ConsensusStatus {
 	farming: boolean;
 	tip: { height: number; weight: string; id: string } | null;
 	finalizedHeight: number | null;
+	/** Distinct ANCHOR PRODUCERS in the recent chain — the committee is sampled from these, so this is
+	 *  the number that must reach minCommittee for genesis (NOT the op-writer count). */
+	producers: number;
+	/** Whether THIS node is currently producing anchors (its producer key signed a recent anchor). A
+	 *  farming node that shows false is connected but not actually producing — the usual ceremony stall. */
+	iProduce: boolean;
+	/** How many of the recent anchors THIS node produced (a live "am I farming" counter). */
+	myAnchors: number;
 	/** Seconds per anchor used for time estimates — measured cadence if live, else the target rate. */
 	secPerAnchor: number;
 	/** True if secPerAnchor is a live measurement; false if it's the target fallback (cold/idle). */
@@ -882,6 +890,11 @@ export class Daemon {
 		const tip = this.node.anchorTip();
 		const finalized = this.node.anchors?.finalized(this.finalityDepth) ?? null;
 		const measured = this.measuredSecPerAnchor();
+		// Distinct anchor PRODUCERS in the recent (pruned) chain — the real committee signal, vs the
+		// op-writer count. Also whether THIS node is among them (it's actually producing, not just connected).
+		const recent = this.node.anchors?.chainTo(tip) ?? [];
+		const myId = this.producerId();
+		const producerSet = new Set(recent.map((a) => a.producer));
 		return {
 			enabled: !!this.node.anchors,
 			vdf: this.params.vdf.name,
@@ -892,6 +905,9 @@ export class Daemon {
 			farming: this.farming,
 			tip: tip ? { height: tip.height, weight: tip.weight, id: tip.id } : null,
 			finalizedHeight: finalized ? finalized.height : null,
+			producers: producerSet.size,
+			iProduce: producerSet.has(myId),
+			myAnchors: recent.reduce((n, a) => n + (a.producer === myId ? 1 : 0), 0),
 			secPerAnchor: measured ?? this.targetSecPerAnchor,
 			secPerAnchorMeasured: measured != null,
 			nodeKey: this.transport ? this.transport.nodeKeyHex : null,
