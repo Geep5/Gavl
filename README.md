@@ -332,10 +332,43 @@ opens, both sides escrow, and it settles at the channel's mark when either side 
 deposit address → paste the txid to claim → mint gBTC → broadcast/take an intent → close →
 withdraw → process payouts (broadcasts a real testnet BTC tx).
 
-> **Custody needs ≥3 nodes.** Because custody is committee-only, a lone node has **no deposit
-> address** until ≥3 farmers complete the genesis DKG — the UI shows *"custody is still forming"*
-> until then. Run three daemons on the same channel (each with its own `GAVL_DATA_DIR`) to mint and
-> withdraw. The market itself — intents, matching, demurrage, the liquidity pot — works on one node.
+**Run a committee (the genesis DKG).** Custody is committee-only, so to mint or withdraw you need
+**≥3 nodes that are actually FARMING.** The committee is sampled from *anchor producers* — a node that
+is merely *connected* does not count. Until the committee forms, a lone node has no deposit address and
+the UI shows *"custody is still forming."*
+
+**On every machine, run it the same way:**
+
+```bash
+npm install
+npm run dev          # hash VDF + farming + web UI, on the default BTC-USD channel
+```
+
+Do **not** use `npm run daemon` for this — that defaults to the real `chiavdf` VDF, which needs the
+Python venv; without it, **farming hangs**: the node connects to the mesh but never produces an anchor,
+so it never joins the committee (this is the #1 cause of "3 nodes but the DKG won't fire"). `npm run dev`
+uses the fast `hash` VDF and farms out of the box. Leave `GAVL_NETWORK` **unset** so all nodes share the
+default channel (its DHT topic is the feed id). To run more than one node on one machine, give each its
+own `GAVL_DATA_DIR` **and** `GAVL_PORT`.
+
+**Check each node is producing, not just connected:**
+
+```bash
+curl -s localhost:6440/api/state | jq '.consensus | {farming, vdf, tip, peers, topic}'
+```
+
+Want: `farming: true`, `vdf: "hash-vdf-v0"`, `tip` climbing, `peers` ≥ 2, and `topic` equal to the feed
+id (the UI shows a green **`✓ = coordinate`** under the market id when a node is on the right topic — a
+mismatch means it's on older code / a different channel).
+
+**The one number that matters** is in the daemon log: `checkpoint: height N … K writer(s)`. `K` is how
+many nodes are *producing anchors* — it must reach your node count. **If `K` stays at `1`, the others are
+connected but not farming** (fix their VDF/farming as above). When ≥3 are producing, the genesis DKG runs
+automatically: `fundKeyOnChain` populates, the members show `holdsShare: true`, and the Custody panel
+flips to *"M-of-N committee."*
+
+> The market itself — intents, matching, demurrage, the liquidity pot — works on a single node; only
+> custody (deposit/mint/withdraw) needs the committee.
 
 ---
 
