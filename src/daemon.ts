@@ -971,17 +971,44 @@ export class Daemon {
 			this.producer = new Producer({ node: this.node, keypair: farmer, prover, params: this.params, appRootFor: (prev) => this.appRootForParent(prev) });
 			this.farming = true;
 			this.startCommitteeCustody(); // the only custody path: form/join the M-of-N committee
-
-			// Adaptive: farm hard while there are unfinalized writes to bury, then drop
-			// to a slow heartbeat when idle — work tracks activity instead of running
-			// flat-out. busyPaceMs keeps the event loop (HTTP, gossip) responsive.
-			void this.producer.runAdaptive({
-				until: () => !this.farming,
-				finalityDepth: this.finalityDepth,
-				busyPaceMs: 250,
-				heartbeatMs: this.heartbeatMs,
-			});
+			void this.lobbyThenFarm(); // join the channel as a LOBBY first — adopt an existing chain or start with a quorum, never fork a solo genesis
 		}
+	}
+
+	/**
+	 * The LOBBY gate — the channel is a lobby; the chain FORMS ONCE, with a quorum, instead of every
+	 * node minting its own genesis and reconciling forks by longest-chain (which partitioned on any
+	 * churn). A farming node does NOT mint genesis on boot. It joins the channel and WAITS until either:
+	 *   • it has ADOPTED an existing chain (anchorTip != null) — a late/restarting node joins the live
+	 *     network rather than forking a competing chain; or
+	 *   • ≥ minCommittee farmers are present AND this node is the deterministic SEEDER (the lowest
+	 *     node-key among the present farmers) — it mints genesis; every other node waits and adopts that
+	 *     one chain. So exactly one genesis is ever seeded — there are no competing chains to choose.
+	 * A sub-quorum (< minCommittee) node simply waits — no solo chain. This matches the committee's own
+	 * ≥minCommittee requirement and the security the genesis ceremony depends on. (Mesh off → local-only
+	 * dev, farm immediately; for a single-node chain set GAVL_CUSTODY_MIN=1.)
+	 */
+	private async lobbyThenFarm(): Promise<void> {
+		const need = this.custodyOpts.minCommittee ?? 3;
+		if (this.transport) {
+			while (this.farming && !this.node.anchorTip()) {
+				const myKey = this.transport.nodeKeyHex;
+				const roster = [myKey, ...this.transport.connectedPeerKeys()].sort();
+				if (roster.length >= need && roster[0] === myKey) break; // quorum present + I'm the seeder → form the one chain
+				await new Promise((r) => setTimeout(r, 1000)); // else wait — adopt the seeder's/existing chain when it appears
+			}
+		}
+		if (!this.farming) return;
+		const adopted = this.node.anchorTip();
+		console.log(adopted ? `  consensus: joined the channel's chain (height ${adopted.height})` : `  consensus: seeding the chain — quorum of ${need} reached, this node is the seeder`);
+		// Adaptive: farm hard while there are unfinalized writes to bury, then drop to a slow heartbeat
+		// when idle — work tracks activity. busyPaceMs keeps the event loop (HTTP, gossip) responsive.
+		void this.producer!.runAdaptive({
+			until: () => !this.farming,
+			finalityDepth: this.finalityDepth,
+			busyPaceMs: 250,
+			heartbeatMs: this.heartbeatMs,
+		});
 	}
 
 	/** Stand up the autonomous custody loop: it watches finality (via node.onTip →

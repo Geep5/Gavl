@@ -350,7 +350,8 @@
 	<span class="sb-item muted">proof-of-space-time{#if c?.farming} · farming{/if}</span>
 	{#if c?.farming}
 		<span class="sb-sep">·</span>
-		{#if iProduce}<span class="sb-item produce"><span class="anvil" class:flash={anchorFlash}>⚒</span> minting · {myAnchors}</span>
+		{#if height == null}<span class="sb-item">⏳ lobby — {(peers ?? 0) + 1}/{needN} farmers to form the chain</span>
+		{:else if iProduce}<span class="sb-item produce"><span class="anvil" class:flash={anchorFlash}>⚒</span> minting · {myAnchors}</span>
 		{:else}<span class="sb-item warn">⚠ not minting anchors</span>{/if}
 	{/if}
 	{#if producers > 0}
