@@ -17,8 +17,12 @@
  * A node may be in BOTH committees (overlap is good for liveness). Wraps the proven
  * Shamir math (reshare/shamir) bridged to FROST encoding.
  *
- * SCOPE: happy-path over a connected old-quorum + new committee. The participating
- * old quorum is the deterministic sorted-first-`oldMin`; timeouts/dropouts are next.
+ * SCOPE: an old-quorum + new committee that may connect at ANY time — hello/sub/vshare are
+ * re-broadcast until the ceremony settles, so a late-joining member is never stranded (the same
+ * late-join fix the genesis DKG carries). Timeouts/dropouts roll to the next old quorum via
+ * reshareWithFailover. Before committing, the assembled shares are checked to still reconstruct the
+ * FIXED group key — a mixed-generation handoff (a laggard in the old quorum) is rejected, never
+ * silently saved against a key it no longer matches.
  */
 
 import { schnorr_FROST as FROST, secp256k1 } from "@noble/curves/secp256k1.js";
@@ -34,6 +38,7 @@ import type { ReshareWire } from "../sync/messages.ts";
 
 const Fn = FROST.utils.Fn;
 const Pt = secp256k1.Point;
+const hex = (b: Uint8Array): string => Buffer.from(b).toString("hex");
 
 export interface ReshareResult {
 	share: Share | null; // THIS node's NEW share if it's in the new committee, else null
@@ -51,6 +56,10 @@ export class ReshareCoordinator {
 	private myVShareSent = false;
 	private settled = false;
 	private timer: ReturnType<typeof setTimeout> | null = null;
+	private resendTimer: ReturnType<typeof setInterval> | null = null;
+	private helloMsg: ReshareWire | null = null; // re-broadcast so late joiners learn our connection
+	private subMsgs: { conn: Connection; msg: ReshareWire }[] = []; // our sub-shares, resent until settle
+	private vshareMsg: ReshareWire | null = null; // our verifying share, resent until settle
 	private resolve!: (r: ReshareResult) => void;
 	private reject!: (e: Error) => void;
 
@@ -78,7 +87,21 @@ export class ReshareCoordinator {
 			this.reject = rej;
 			if (this.o.timeoutMs !== undefined) this.timer = setTimeout(() => this.fail(), this.o.timeoutMs);
 			// Announce so peers learn our connection (old members route sub-shares by it).
-			this.node.reshareBroadcast(this.stamp({ r: "hello", session: this.o.session, from: this.o.selfId }));
+			this.helloMsg = this.stamp<ReshareWire>({ r: "hello", session: this.o.session, from: this.o.selfId });
+			this.node.reshareBroadcast(this.helloMsg);
+			// Resend loop until the ceremony settles. Members start at slightly different moments (finality
+			// jitter) and connect over sub-swarm discovery, so a single send is lossy. ALWAYS re-broadcast
+			// hello — an OLD member that connects to a NEW member only AFTER its one-shot hello would never
+			// learn that member's connection, never route it a sub-share, and strand it without a new share
+			// (the same late-join gap the genesis DKG had). Re-send sub-shares + our verifying share too;
+			// every send is idempotent.
+			const everyMs = this.o.timeoutMs ? Math.max(250, Math.floor(this.o.timeoutMs / 12)) : 600;
+			this.resendTimer = setInterval(() => {
+				if (this.settled) return this.stopRebroadcast();
+				if (this.helloMsg) this.node.reshareBroadcast(this.helloMsg);
+				for (const { conn, msg } of this.subMsgs) this.node.reshareReply(conn, msg);
+				if (this.vshareMsg) this.node.reshareBroadcast(this.vshareMsg);
+			}, everyMs);
 			this.maybeSendSubs();
 		});
 	}
@@ -92,9 +115,15 @@ export class ReshareCoordinator {
 		return [...out];
 	}
 
+	private stopRebroadcast(): void {
+		if (this.resendTimer) clearInterval(this.resendTimer);
+		this.resendTimer = null;
+	}
+
 	private fail(): void {
 		if (this.settled) return;
 		this.settled = true;
+		this.stopRebroadcast();
 		this.reject(new CeremonyTimeout("reshare", this.missing()));
 	}
 
@@ -137,7 +166,11 @@ export class ReshareCoordinator {
 				this.subsForMe.set(this.o.selfId, y); // my own contribution to my own share
 			} else {
 				const conn = this.connOf.get(recipientId);
-				if (conn) this.node.reshareReply(conn, this.stamp({ r: "sub", session: this.o.session, from: this.o.selfId, to: recipientId, share: enc(Fn.toBytes(y)) }));
+				if (conn) {
+					const msg = this.stamp<ReshareWire>({ r: "sub", session: this.o.session, from: this.o.selfId, to: recipientId, share: enc(Fn.toBytes(y)) });
+					this.subMsgs.push({ conn, msg }); // resent point-to-point until the ceremony settles
+					this.node.reshareReply(conn, msg);
+				}
 			}
 		});
 		this.maybeCombine();
@@ -153,23 +186,52 @@ export class ReshareCoordinator {
 		this.myNewY = y;
 		const vshare = Pt.BASE.multiply(y).toBytes(true); // g^newShare
 		this.vshares.set(this.o.selfId, vshare);
-		this.node.reshareBroadcast(this.stamp({ r: "vshare", session: this.o.session, from: this.o.selfId, v: enc(vshare) }));
+		this.vshareMsg = this.stamp<ReshareWire>({ r: "vshare", session: this.o.session, from: this.o.selfId, v: enc(vshare) });
+		this.node.reshareBroadcast(this.vshareMsg);
 		this.maybeFinish();
 	}
 	private myNewY: bigint | null = null;
 
 	private maybeFinish(): void {
 		if (this.settled || this.vshares.size < this.o.newCommittee.length) return;
-		// every new member's verifying share is in → assemble the new public package,
-		// keyed by FROST identifier (fid(pid)) so it drops straight into the signing
-		// ceremony, which derives the same identifiers.
+		// Every new member's verifying share is in. Before committing, verify the refreshed shares still
+		// reconstruct the FIXED group key. A mixed-generation old quorum (a laggard that missed a refresh)
+		// or a faulty handoff yields shares that don't match the group key — saving them would silently
+		// break signing. Reject so the failover rolls to a different old quorum; healthy nodes keep their
+		// current share until a quorum hands off cleanly.
+		if (!this.reconstructsGroupKey()) {
+			this.settled = true;
+			this.stopRebroadcast();
+			if (this.timer) clearTimeout(this.timer);
+			this.reject(new CeremonyTimeout("reshare", [])); // bad handoff (not a missing member) → failover rotates the old quorum
+			return;
+		}
+		// assemble the new public package, keyed by FROST identifier (fid(pid)) so it drops straight into
+		// the signing ceremony, which derives the same identifiers.
 		const verifyingShares: Record<string, Uint8Array> = {};
 		for (const [pid, v] of this.vshares) verifyingShares[fid(pid)] = v;
 		const pub: PublicPackage = { signers: { min: this.o.newMin, max: this.o.newCommittee.length }, commitments: [this.o.groupPubKey], verifyingShares } as PublicPackage;
 		const share: Share | null = this.isNew() && this.myNewY !== null ? { identifier: fid(this.o.selfId), signingShare: Fn.toBytes(this.myNewY) } : null;
 		this.settled = true;
+		this.stopRebroadcast();
 		if (this.timer) clearTimeout(this.timer);
 		this.resolve({ share, pub, groupPubKey: this.o.groupPubKey });
+	}
+
+	/** The refreshed verifying shares (g^s'_j) must interpolate at 0 to the group key (g^secret) — i.e.
+	 *  every new share lies on ONE polynomial whose constant term is the unchanged secret. False if any
+	 *  contribution came from a different generation/polynomial (the threshold sig would then never verify). */
+	private reconstructsGroupKey(): boolean {
+		const xs = this.o.newCommittee.map(fidScalar);
+		let acc: ReturnType<typeof Pt.fromHex> | null = null;
+		for (let i = 0; i < this.o.newCommittee.length; i++) {
+			const v = this.vshares.get(this.o.newCommittee[i]);
+			if (!v) return false; // a vshare missing (shouldn't happen — maybeFinish gates on all present)
+			const lambda = lagrangeAtZero(xs[i], xs, SECP256K1_N);
+			const term = Pt.fromHex(hex(v)).multiply(lambda);
+			acc = acc ? acc.add(term) : term;
+		}
+		return !!acc && Buffer.compare(acc.toBytes(true), this.o.groupPubKey) === 0;
 	}
 }
 

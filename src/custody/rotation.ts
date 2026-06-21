@@ -190,7 +190,11 @@ export class CommitteeRotation {
 			this.log(`epoch ${epoch}: no usable previous committee — standing by`);
 			return;
 		}
-		if (sameSet(prev.committee, next.committee)) return; // membership unchanged across the boundary
+		// PROACTIVE resharing (Herzberg PSS): reshare EVERY epoch, even when membership is unchanged. A
+		// refresh re-randomizes the shares (same group key, same Taproot address) so an attacker slowly
+		// harvesting old shares across epochs can never reach a threshold — last epoch's shares are dead.
+		// A membership change reshares to the new set; an unchanged set refreshes in place.
+		const refresh = sameSet(prev.committee, next.committee);
 
 		const stored = this.c.loadShare();
 		// We can hand off iff we hold a CURRENT share for exactly the previous committee
@@ -201,7 +205,7 @@ export class CommitteeRotation {
 			return;
 		}
 
-		this.log(`epoch ${epoch}: reshare ${prev.committee.length}→${next.committee.length} (new min ${next.min})`);
+		this.log(refresh ? `epoch ${epoch}: proactive reshare — refresh ${next.committee.length} shares, same members (min ${next.min})` : `epoch ${epoch}: reshare ${prev.committee.length}→${next.committee.length} (new min ${next.min})`);
 		// OLD-quorum failover: if a selected old member is offline, roll to the next quorum
 		// (in lockstep on every participant) instead of stalling until next epoch.
 		const r = await reshareWithFailover({
@@ -223,7 +227,7 @@ export class CommitteeRotation {
 		}
 		if (inNew && r.share) {
 			this.c.saveShare({ share: r.share, pub: r.pub, groupPubKey: r.groupPubKey, session: `custody-epoch-${epoch}`, selfId: this.c.selfId, participants: next.committee, min: next.min, epoch });
-			this.log(`epoch ${epoch}: rotated in (same address)`);
+			this.log(refresh ? `epoch ${epoch}: share refreshed (same address)` : `epoch ${epoch}: rotated in (same address)`);
 		} else {
 			this.c.clearShare(); // rotated out — discard the now-dead share
 			this.log(`epoch ${epoch}: rotated out — share discarded`);
