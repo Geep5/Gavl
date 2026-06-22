@@ -77,9 +77,8 @@ in tests.
 4. **Close** early any time at the current mark — directional PnL, capped at the stake. A
    position you never close **auto-settles at its time-lock** (a hard ~1-month cap), so nothing
    sits open forever.
-5. **Withdraw** — burn gBTC → a quorum threshold-signs and broadcasts a real Bitcoin tx. (Because
-   the whole ledger lives in RAM, balances can't sit untouched forever; gBTC left idle too long
-   **decays into the liquidity pot**, where it's put to work backing trades instead of squatting.)
+5. **Withdraw** — burn gBTC → a quorum threshold-signs and broadcasts a real Bitcoin tx. (Leave gBTC
+   idle too long and it **decays into the liquidity pot** instead — see the matched engine below.)
 
 ### The matched engine (`src/market/intent.ts`, `src/market/btc.ts`)
 
@@ -103,7 +102,7 @@ No pool, no order book to babysit — just signed intents and matched bilateral 
   side — winning trades drain idle capital out to traders, losing trades refill it. It can never
   be drawn insolvent: a trade may only stake against pot capital that has *finalized* (a
   network-agreed, deterministic budget), which provably keeps the free pot ≥ 0. It funds only
-  what it holds and never mints, so reserves still can't be drained.
+  what it holds and never mints.
 - **Partial fills + cross-node.** One offer fills across many takers (tracked by nonce);
   intents propagate epidemically, so a peer on another machine sees your tape and can take it.
 - **Time-locked.** Either side may close early at the mark, but every contract has a hard
@@ -170,8 +169,7 @@ threshold Schnorr (Taproot-compatible), proven against Bitcoin's own BIP340 veri
   signature for the fund's group key, without anyone reconstructing it.
 - **DKG** (`dkg-session.ts`, `dkg-coordinator.ts`) — each node runs its own session and only ever
   holds its OWN share plus the shares addressed to it; the live group key is born distributed across
-  independent nodes, none ever holding it whole (validated across 3 machines). (`threshold.ts`'s
-  in-process DKG is for tests only.)
+  independent nodes, none ever holding it whole. (`threshold.ts`'s in-process DKG is for tests only.)
 - **Taproot binding** (`bitcoin.ts`) — the fund key → a real `bc1p…` / `tb1p…` address; a
   quorum's withdrawal signature is BIP340-valid (verified against the BIP341 test vector).
 - **Withdrawal txs** (`btctx.ts`) — build the real BIP-341 sighash from the fund's UTXOs,
@@ -193,8 +191,8 @@ distributed DKG, threshold signing, and proactive resharing all run over the liv
 share-holders each epoch *without moving the fund address*; **bonding** makes a committee seat cost
 stake and **slashing** makes ceremony equivocation cost the bond
 (`custody/{committee,epoch,rotation,*-coordinator,ceremony-auth,attestation,bridge,slashing}.ts`).
-The genesis DKG has been validated **live across three independent machines** — all agreeing
-on one fund key, no node ever holding it whole. A committee needs **≥3 independent farmers** to
+The genesis DKG has been validated **live across three independent machines**, all agreeing
+on one fund key. A committee needs **≥3 independent farmers** to
 form: until then a node holds **no fund key, has no deposit address, and can't mint** — it simply
 **waits for peers** (there is no single-signer fallback to drop back to). This makes the minimum
 real deployment a complete 3-node network, so testing matches production. A **mainnet safety-lock**
@@ -392,15 +390,12 @@ threshold signing (no one holds the fund key).
 
 What's **trusted** (and surfaced honestly in the UI):
 
-- **The market price** — each market channel names a **Pyth feed** in its name. Every price is
-  attested by the **Wormhole guardian set** (a fixed public committee) and verified on-chain, so
-  there's no reporter to trust — you trust the guardian set (a weak-subjectivity pin), and a
-  malicious market is sandboxed to its own channel.
-- **The bridge** — gBTC is backed by BTC in an **M-of-N committee fund**: the key is DKG'd across
-  independent farmers (no node ever holds it whole), and there is **no single-operator/dev-seed
-  path** — a node with too few peers simply has no fund and waits. What's still trusted: the
-  committee's honest-majority assumption (bonding raises its capture cost) and a single Esplora
-  chain view per node (multi-source is future work).
+- **The market price** — you trust the channel's signer committee: the **Wormhole guardian set** (for a
+  Pyth feed) or your own committed Ed25519 set. Either is a fixed public committee — a weak-subjectivity
+  pin, not a reporter — and a malicious market is sandboxed to its own channel.
+- **The bridge** — the committee's **honest-majority assumption** (bonding raises its capture cost) and a
+  **single Esplora chain view per node** (multi-source is future work). The fund key is DKG'd across
+  independent farmers with no single-operator path; a node with too few peers simply has no fund and waits.
 
 **Before any mainnet satoshi, four gates — two now closed:**
 
