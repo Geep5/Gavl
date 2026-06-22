@@ -201,8 +201,8 @@
 				</label>
 			</div>
 			<div class="expo">{exposure ? `≈ ${exposure} ${base} · ${fmt(notional)} gBTC notional` : "Enter an amount to size the trade."}</div>
-			<button class="cta {side}" onclick={place} disabled={busy || !amount || priceNum == null}>
-				{#if priceNum == null}WAITING FOR PRICE…{:else if busy}…{:else if fillable > 0}GO {side === "long" ? "LONG" : "SHORT"} · MATCHES {fmt(matchNow)}{:else}BROADCAST {side === "long" ? "LONG" : "SHORT"} · {leverage}×{/if}
+			<button class="cta {side}" onclick={place} disabled={busy || priceNum == null}>
+				{#if priceNum == null}WAITING FOR PRICE…{:else if busy}…{:else if !amount}GO {side === "long" ? "LONG" : "SHORT"}{:else if fillable > 0}GO {side === "long" ? "LONG" : "SHORT"} · MATCHES {fmt(matchNow)}{:else}BROADCAST {side === "long" ? "LONG" : "SHORT"} · {leverage}×{/if}
 			</button>
 			<div class="cta-sub">{#if !amount}Sweeps resting peer intents first, then broadcasts the remainder.{:else if fillable > 0}A real counterparty is resting on the tape — this opens a matched contract now.{:else}Nothing to match — your signed intent floods the mesh and waits for a taker.{/if}</div>
 			{#if bal <= 0}<div class="hint">No gBTC yet — fund your wallet in ARTICLE 03 to trade.</div>
