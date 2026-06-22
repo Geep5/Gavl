@@ -122,6 +122,11 @@ function serializeState() {
 	// turns these heights into a live countdown via the current tip + secPerAnchor. Null if no clock.
 	const cf = view.bridge.chargeFrom.get(me);
 	const idleDecay = cf ? { decayAtHeight: cf.since + DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY, cutoffHeight: cf.since + DEMURRAGE_CUTOFF_DAYS * DEMURRAGE_DAY } : null;
+	// Conservation buckets (reserves == free + bonded + escrow + pending + pot) for the UI breakdown.
+	// `free` is the remainder, so the five always sum to reserves regardless of how the ledger rounds.
+	const escrowV = escrowedInContracts(view.book);
+	const bondedV = [...view.bridge.bonds.values()].reduce((a, b) => a + b, 0n);
+	const freeV = view.bridge.reserves - bondedV - escrowV - pendingTotal(view.bridge) - view.bridge.pot;
 	const market = {
 		oracle: def?.kind ?? "pyth", // mechanism: the channel name encodes the price source; updates are source-signed
 		marketInfo,
@@ -152,6 +157,10 @@ function serializeState() {
 		// ── the liquidity backstop (idle-decay pot as counterparty of last resort) ──
 		pot: view.bridge.pot.toString(), // free idle-decay capital backing the pot
 		backstopAvailable: daemon.backstopAvailable(view).toString(), // gBTC the pot can stake right now
+		// conservation breakdown (free + bonded + escrow + pending + pot == reserves)
+		free: freeV.toString(),
+		bonded: bondedV.toString(),
+		escrow: escrowV.toString(),
 	};
 
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));
