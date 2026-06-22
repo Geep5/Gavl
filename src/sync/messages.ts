@@ -12,6 +12,7 @@ import type { Anchor } from "../consensus/anchor.ts";
 import type { Offer } from "../market/intent.ts";
 import type { StoredSnapshot } from "../store/store.ts";
 import type { EncKeyAnnounce } from "../custody/enckey.ts";
+import type { Deal } from "../custody/pvss.ts";
 
 export type SyncMessage =
 	// ── write sync ───────────────────────────────────────────────
@@ -51,7 +52,11 @@ export type SyncMessage =
 	| { t: "reshare"; m: ReshareWire }
 	/** A member's self-signed encryption-key announcement (verifiable encrypted resharing, phase 1).
 	 *  Broadcast + re-broadcast so peers learn which X25519 key to seal a reshare sub-share to. */
-	| { t: "enckey"; a: EncKeyAnnounce };
+	| { t: "enckey"; a: EncKeyAnnounce }
+	/** A SHADOW reshare contribution deal (verifiable encrypted resharing, phase 2 shadow run). Old
+	 *  members broadcast these alongside the live ceremony so the blob path can be assembled + verified
+	 *  live WITHOUT being trusted — pure validation, never consumed for an actual share. */
+	| { t: "shadowdeal"; epoch: number; deal: Deal };
 
 /**
  * DKG ceremony payloads. `pkg`/`share` are FROST structures pre-encoded JSON-safe

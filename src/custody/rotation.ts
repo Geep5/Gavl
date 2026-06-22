@@ -34,6 +34,7 @@
 
 import { DkgCoordinator } from "./dkg-coordinator.ts";
 import { reshareWithFailover } from "./reshare-coordinator.ts";
+import { quorumForRound } from "./committee.ts";
 import { committeeForEpoch, epochOf } from "./epoch.ts";
 import type { AnchorView, EpochCommittee } from "./epoch.ts";
 import { isCeremonyTimeout } from "./ceremony.ts";
@@ -76,6 +77,10 @@ export interface RotationConfig {
 	saveShare: (s: StoredShare) => void;
 	clearShare: () => void;
 	log?: (msg: string) => void;
+	/** SHADOW run (verifiable encrypted resharing, phase 2): called when a reshare fires, alongside the
+	 *  live ceremony, to validate the blob path live WITHOUT trusting it. Validation-only — the handler
+	 *  never writes a share. Passed the data a node needs to build/verify/combine a blob for this reshare. */
+	onReshareShadow?: (p: { epoch: number; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupKey: Uint8Array; myOldShare?: StoredShare["share"]; oldPub?: StoredShare["pub"]; inNew: boolean }) => void;
 }
 
 const sameSet = (a: string[], b: string[]): boolean => a.length === b.length && [...a].sort().join(",") === [...b].sort().join(",");
@@ -204,6 +209,10 @@ export class CommitteeRotation {
 			this.log(`epoch ${epoch}: rotation we're not part of — standing by`);
 			return;
 		}
+
+		// SHADOW run (validation-only): kick off the blob-path reshare alongside the live ceremony below.
+		// It builds + verifies a PVSS blob and logs the result; it NEVER writes a share (see shadow-reshare).
+		this.c.onReshareShadow?.({ epoch, oldQuorum: quorumForRound(prev.committee, prev.min, 0), newCommittee: next.committee, newMin: next.min, groupKey: key, myOldShare: holdsPrev && stored ? stored.share : undefined, oldPub: holdsPrev && stored ? stored.pub : undefined, inNew });
 
 		this.log(refresh ? `epoch ${epoch}: proactive reshare — refresh ${next.committee.length} shares, same members (min ${next.min})` : `epoch ${epoch}: reshare ${prev.committee.length}→${next.committee.length} (new min ${next.min})`);
 		// OLD-quorum failover: if a selected old member is offline, roll to the next quorum

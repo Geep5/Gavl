@@ -18,6 +18,7 @@
 
 import type { SyncMessage, DkgWire, SignWire, ReshareWire } from "./messages.ts";
 import type { EncKeyAnnounce } from "../custody/enckey.ts";
+import type { Deal } from "../custody/pvss.ts";
 import type { Offer } from "../market/intent.ts";
 import type { StoredSnapshot } from "../store/store.ts";
 import type { Write } from "../chain/writer.ts";
@@ -257,6 +258,10 @@ export class GavlNode {
 				this.onEncKey?.(m.a); // self-authenticating (the binding is signed); the registry verifies it
 				return;
 			}
+			case "shadowdeal": {
+				this.onShadowDeal?.(m.epoch, m.deal); // validation-only; the deal's commitments are self-checking
+				return;
+			}
 		}
 	}
 
@@ -308,6 +313,14 @@ export class GavlNode {
 	/** Broadcast this node's encryption-key announcement (self-signed; safe to flood + re-broadcast). */
 	encKeyBroadcast(a: EncKeyAnnounce): void {
 		this.broadcast({ t: "enckey", a });
+	}
+
+	// ── shadow reshare transport (verifiable encrypted resharing, phase 2 shadow run) ──
+	/** Registered by the shadow coordinator; receives peers' shadow contribution deals. */
+	onShadowDeal?: (epoch: number, deal: Deal) => void;
+	/** Broadcast a shadow contribution deal (validation-only; safe to flood + re-broadcast). */
+	shadowDealBroadcast(epoch: number, deal: Deal): void {
+		this.broadcast({ t: "shadowdeal", epoch, deal });
 	}
 
 	/** Cap on buffered orphan anchors (transient bootstrap state) — far above any real suffix. */

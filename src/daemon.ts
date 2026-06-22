@@ -39,11 +39,13 @@ import { SignCoordinator } from "./custody/sign-coordinator.ts";
 import { CommitteeRotation } from "./custody/rotation.ts";
 import { EquivocationWatcher } from "./custody/equivocation-watcher.ts";
 import { makeCeremonyAuth } from "./custody/ceremony-auth.ts";
-import { announceEncKey, EncKeyRegistry } from "./custody/enckey.ts";
+import { announceEncKey, deriveEncKey, EncKeyRegistry } from "./custody/enckey.ts";
+import { ShadowReshareCoordinator } from "./custody/shadow-reshare.ts";
+import { schnorr_FROST as FROST } from "@noble/curves/secp256k1.js";
 import type { CeremonyAuth } from "./custody/ceremony-auth.ts";
 import { committeeEpochsFor, epochOf } from "./custody/epoch.ts";
 import type { AnchorView } from "./custody/epoch.ts";
-import { committeeTopic, quorumForRound } from "./custody/committee.ts";
+import { committeeTopic, fid, quorumForRound } from "./custody/committee.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "./custody/attestation.ts";
 import { isCeremonyTimeout } from "./custody/ceremony.ts";
 import { Esplora } from "./custody/esplora.ts";
@@ -1051,6 +1053,7 @@ export class Daemon {
 				}
 			},
 			log: (m) => console.log(m),
+			onReshareShadow: (p) => this.runShadowReshare(p), // validation-only blob-path run, alongside the live ceremony
 		});
 
 		// Auto-slashing: watch every ceremony message this node sees; when a committee
@@ -1071,11 +1074,38 @@ export class Daemon {
 		const myAnnounce = announceEncKey(this.producerKey().privateKey, this.producerId());
 		this.encKeys.learn(myAnnounce);
 		this.node.onEncKey = (a) => void this.encKeys.learn(a);
+		this.node.onShadowDeal = (e, d) => this.shadowCoord?.onDeal(e, d); // route shadow deals to the current run
 		this.node.encKeyBroadcast(myAnnounce);
 		clearInterval(this.encKeyTimer);
 		this.encKeyTimer = setInterval(() => this.node.encKeyBroadcast(myAnnounce), 15_000);
 
 		console.log(`  custody: committee mode (epochLength ${this.custodyOpts.epochLength ?? 16}, size ${this.custodyOpts.size ?? 5}); id ${this.producerId().slice(0, 16)}…`);
+	}
+
+	/** SHADOW reshare (verifiable encrypted resharing, phase 2): build + publicly verify a PVSS blob
+	 *  ALONGSIDE the live ceremony and LOG the outcome — validation only, never writes a share. Driven by
+	 *  the rotation when a reshare fires. A sustained "blob ✓ · combine ✓" across a soak is the cutover
+	 *  signal; a "✗" means the blob path disagrees with the trusted path. */
+	private runShadowReshare(p: { epoch: number; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupKey: Uint8Array; myOldShare?: { signingShare: Uint8Array }; oldPub?: { verifyingShares: Record<string, Uint8Array> }; inNew: boolean }): void {
+		const coord = new ShadowReshareCoordinator({
+			node: this.node,
+			epoch: p.epoch,
+			selfId: this.producerId(),
+			oldQuorum: p.oldQuorum,
+			newCommittee: p.newCommittee,
+			newMin: p.newMin,
+			groupKey: p.groupKey,
+			myOldShare: p.myOldShare ? FROST.utils.Fn.fromBytes(p.myOldShare.signingShare) : undefined,
+			oldVerifyingShareOf: p.oldPub ? (id) => p.oldPub!.verifyingShares[fid(id)] : undefined,
+			myEncKey: p.inNew ? deriveEncKey(this.producerKey().privateKey) : undefined,
+			encKeyOf: (id) => this.encKeys.get(id),
+			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
+		});
+		this.shadowCoord = coord;
+		void coord.start().then((r) => {
+			const mark = (b: boolean | null) => (b === null ? "—" : b ? "✓" : "✗ MISMATCH");
+			console.log(`[custody] shadow reshare epoch ${r.epoch}: deals ${r.dealsSeen}/${p.oldQuorum.length}${r.complete ? "" : " incomplete"} · blob ${mark(r.blobVerifies)} · combine ${mark(r.combineOk)}${r.note ? ` · ${r.note}` : ""}`);
+		});
 	}
 
 	/**
@@ -1350,8 +1380,10 @@ export class Daemon {
 	private reserveTimer?: ReturnType<typeof setInterval>;
 	private encKeyTimer?: ReturnType<typeof setInterval>;
 	/** Peers' verified X25519 encryption keys (verifiable encrypted resharing, phase 1). Populated by the
-	 *  enc-key announce gossip; not yet consumed (the reshare wiring is a later phase). */
+	 *  enc-key announce gossip; consumed only by the SHADOW reshare run (validation-only). */
 	private readonly encKeys = new EncKeyRegistry();
+	/** The current epoch's shadow reshare coordinator (validation-only; never writes a share). */
+	private shadowCoord?: ShadowReshareCoordinator;
 	async refreshOnChainReserves(): Promise<void> {
 		try {
 			const esplora = this.esplora();
