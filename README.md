@@ -212,6 +212,17 @@ must be held by an M-of-N committee on durable disk, never in RAM.
 > stakers** — among one operator's own nodes it's a node slashing itself. See
 > `docs/scaling-equal-nodes.md` for where custody sits in the bigger picture.
 
+> **Verifiable encrypted resharing (the "share blob") — opt-in, in soak.** The per-epoch reshare can run
+> as a durable, publicly-verifiable artifact instead of a live point-to-point ceremony: each old member
+> posts a **signed** contribution *deal* (Feldman commitments + a sub-share sealed to each new member's
+> X25519 key), anyone verifies the reshare preserved the fund key **with no secret revealed**, and a
+> member recovers its share by reading the blob — so a member that was offline at ceremony time isn't
+> stranded. It ships **dormant**: by default it runs only in **shadow** alongside the trusted live
+> ceremony, logging `shadow reshare epoch N: … blob ✓ · combine ✓` so you can watch it prove itself at
+> zero risk. Set `GAVL_PVSS_RESHARE=1` to make it the real reshare, with the live ceremony as an automatic
+> fallback on any failure. `custody/{pvss,enckey,reshare-blob,shadow-reshare}.ts`; design in
+> [`docs/pvss-reshare.md`](docs/pvss-reshare.md). Don't enable it on mainnet until it's soak-validated.
+
 ---
 
 ## Consensus (`src/consensus`)
@@ -280,7 +291,7 @@ src/
   sync/          hyperswarm/hyperdht mesh, gossip, peer/bootstrap management
   store/         durable hypercore write store + state snapshots/checkpoints + selective persist policy
   market/        the matched market: intents + bilateral contracts (intent.ts), btc fold, ops, account, price feeds
-  custody/       real-BTC bridge: threshold (FROST) · DKG · Taproot · per-identity deposits · tx · ledger · watcher · esplora
+  custody/       real-BTC bridge: threshold (FROST) · DKG · Taproot · per-identity deposits · tx · ledger · watcher · esplora · verifiable encrypted resharing (pvss/reshare-blob/shadow-reshare)
   daemon.ts      boots ledger + node + store + consensus + Pyth price relay + bridge + intent book
   server.ts      localhost JSON API for the web UI
 web/             Svelte SPA — the intent tape + bull/bear trading UI
@@ -317,7 +328,8 @@ npm run web:dev          # web UI only (expects a daemon on :6440)
 Tuning env vars (set inline on macOS/Linux; on Windows use `set VAR=…` or `$env:VAR=…`, or
 just edit the `daemon:dev` script): `GAVL_VDF=hash|chia` · `GAVL_ORACLE_PUBLISH=1` (this node relays
 the channel's Pyth feed; anyone may) · `GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_PERSIST=all|mine|off` ·
-`GAVL_MESH=0` (disable the mesh — runs local-only; on by default) · `GAVL_NETWORK=<channel>`. A
+`GAVL_MESH=0` (disable the mesh — runs local-only; on by default) · `GAVL_NETWORK=<channel>` ·
+`GAVL_PVSS_RESHARE=1` (opt-in: the verifiable blob-path reshare; default off, shadow-validated first). A
 **market** channel is named `label::pyth::feedId` (that name is the market's public definition);
 a plain name is a transfers-only channel with no price.
 The real chiavdf VDF (`GAVL_VDF=chia`, the daemon's default) needs a Python venv with
@@ -428,7 +440,8 @@ What's **trusted** (and surfaced honestly in the UI):
 - **Threshold custody (committee)** ✅ **committee-only** — no single-key path on any network ·
   VDF-sampled committee, per-epoch reshare **without moving the address** · live **3-machine genesis
   DKG** · bonding + (opt-in) stake-weighted selection · slashing + **auto-slashing** equivocation
-  watcher · mainnet safety-lock (refuses in-memory) · a lone node holds no key and waits for ≥3 peers
+  watcher · mainnet safety-lock (refuses in-memory) · a lone node holds no key and waits for ≥3 peers ·
+  **verifiable encrypted resharing** (the durable "share blob" — opt-in `GAVL_PVSS_RESHARE`, in soak)
 - **Mainnet** ⛔ two gates closed (distributed DKG · non-public keys); still gated on an
   **independent audit** and **real independent bonded stakers** — bonding/slashing is code-complete
   but only bites when the stakers aren't all one operator
