@@ -8,11 +8,15 @@
  * pure layer over `pvss` (the crypto) + `enckey` (who to seal to); it does no networking.
  */
 
+import { schnorr_FROST as FROST } from "@noble/curves/secp256k1.js";
 import { type Deal, dealVerifiable, verifyContribution, groupKeyOf, newVerifyingShare, openShare } from "./pvss.ts";
 import { lagrangeAtZero, mod, SECP256K1_N } from "./shamir.ts";
-import { fidScalar } from "./committee.ts";
+import { fid, fidScalar } from "./committee.ts";
+import type { Share, PublicPackage } from "./threshold.ts";
 import type * as x25519 from "../det/x25519.ts";
 import { toHex } from "../det/canonical.ts";
+
+const Fn = FROST.utils.Fn;
 
 export interface ReshareBlob {
 	epoch: number; // the epoch this reshare lands at
@@ -72,4 +76,22 @@ export function newVerifyingShares(blob: ReshareBlob): Record<string, string> {
 	const out: Record<string, string> = {};
 	for (const id of blob.newCommittee) out[id] = toHex(newVerifyingShare(blob.deals, id));
 	return out;
+}
+
+/**
+ * NEW member: turn a (verified) blob into a usable FROST reshare result — my signing share, the new public
+ * package (commitments = the unchanged group key + verifying shares derived from the blob), and the group
+ * key. Shape matches the live reshare's result, so the rotation can save it interchangeably. THROWS if a
+ * deal sealed me a bad share (run verifyBlob first for the public checks; this is the member-side check).
+ */
+export function assembleReshare(blob: ReshareBlob, myId: string, myKey: x25519.KeyPair): { share: Share; pub: PublicPackage; groupPubKey: Uint8Array } {
+	const signingShare = Fn.toBytes(combineShare(blob, myId, myKey));
+	const verifyingShares: Record<string, Uint8Array> = {};
+	for (const id of blob.newCommittee) verifyingShares[fid(id)] = newVerifyingShare(blob.deals, id);
+	const groupPubKey = groupKeyOf(blob.deals); // the key the deals reconstruct (== blob.groupKey for a verified blob)
+	return {
+		share: { identifier: fid(myId), signingShare } as Share,
+		pub: { signers: { min: blob.newMin, max: blob.newCommittee.length }, commitments: [groupPubKey], verifyingShares } as PublicPackage,
+		groupPubKey,
+	};
 }

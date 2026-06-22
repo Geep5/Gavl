@@ -14,10 +14,11 @@ import assert from "node:assert/strict";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import * as ed from "../src/det/ed25519.ts";
 import { deriveEncKey, announceEncKey, EncKeyRegistry } from "../src/custody/enckey.ts";
-import { buildContribution, verifyBlob, combineShare, newVerifyingShares, type ReshareBlob } from "../src/custody/reshare-blob.ts";
+import { buildContribution, verifyBlob, combineShare, newVerifyingShares, assembleReshare, type ReshareBlob } from "../src/custody/reshare-blob.ts";
+import { thresholdSign, verify } from "../src/custody/threshold.ts";
 import { mod, randScalar, SECP256K1_N as N, lagrangeAtZero } from "../src/custody/shamir.ts";
-import { fidScalar } from "../src/custody/committee.ts";
-import { toHex } from "../src/det/canonical.ts";
+import { fid, fidScalar } from "../src/custody/committee.ts";
+import { sha256, fromHex, toHex } from "../src/det/canonical.ts";
 
 const G = secp256k1.Point.BASE;
 const gx = (k: bigint): string => toHex(G.multiply(k).toBytes(true));
@@ -90,4 +91,17 @@ test("combineShare throws when a deal sealed a recipient a bad share (→ compla
 	const tampered = structuredClone(blob);
 	tampered.deals[0].commitments[1] = gx(randScalar()); // breaks the Feldman check for every recipient of deal 0
 	assert.throws(() => combineShare(tampered, nextIds[0], deriveEncKey(next[0].privateKey)), /Feldman/, "recipient catches the cheat");
+});
+
+test("assembleReshare yields FROST shares that threshold-sign for the ORIGINAL fund key", () => {
+	const { blob, next, nextIds } = fixture();
+	// two new members each turn the blob into a usable signing share + the shared package
+	const a = assembleReshare(blob, nextIds[0], deriveEncKey(next[0].privateKey));
+	const b = assembleReshare(blob, nextIds[1], deriveEncKey(next[1].privateKey));
+	assert.equal(toHex(a.groupPubKey), blob.groupKey, "the assembled package keeps the fund key");
+
+	// the 2-of-3 co-signs a message with their blob-derived shares; the threshold verifier accepts it
+	const msg = sha256("withdraw after a blob reshare");
+	const sig = thresholdSign(msg, a.pub, { [fid(nextIds[0])]: a.share, [fid(nextIds[1])]: b.share });
+	assert.equal(verify(sig, msg, fromHex(blob.groupKey)), true, "the blob-derived committee signs for the SAME fund key");
 });
