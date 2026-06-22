@@ -42,6 +42,7 @@ export interface Deal {
 	from: string; // the dealer's committee id
 	commitments: string[]; // Feldman C_k = G^{a_k}, compressed secp256k1 (hex); C_0 = G^{secret}
 	shares: Record<string, EncShare>; // recipient id → its sealed sub-share
+	sig?: string; // ceremony-auth signature over the deal by `from` — authenticates the dealer; a forged deal is dropped
 }
 
 // ── ECIES: seal/open a 32-byte scalar to an X25519 key ──────────────────────────────────────────────

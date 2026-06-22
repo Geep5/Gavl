@@ -15,8 +15,9 @@ import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { MemoryNetwork } from "../src/sync/memory.ts";
 import { ShadowReshareCoordinator } from "../src/custody/shadow-reshare.ts";
-import { assembleReshare } from "../src/custody/reshare-blob.ts";
+import { assembleReshare, buildContribution } from "../src/custody/reshare-blob.ts";
 import { deriveEncKey } from "../src/custody/enckey.ts";
+import { makeCeremonyAuth } from "../src/custody/ceremony-auth.ts";
 import * as ed from "../src/det/ed25519.ts";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { mod, randScalar, SECP256K1_N as N } from "../src/custody/shamir.ts";
@@ -93,4 +94,37 @@ test("shadow run: old quorum's deals assemble into a blob that verifies + new me
 	assert.ok(dBlob, "the coordinator exposes the assembled blob for the cutover to consume");
 	const consumed = assembleReshare(dBlob, newCommittee[0], deriveEncKey(next.D.privateKey));
 	assert.equal(toHex(consumed.groupPubKey), toHex(groupKey), "the consumed share is for the SAME fund key");
+});
+
+test("with ceremony auth, an unsigned (forged) deal is dropped", async () => {
+	const A = ed.generateKeyPair(); // the honest dealer's identity
+	const D = ed.generateKeyPair(); // a new member that collects
+	const idA = toHex(A.publicKey);
+	const idD = toHex(D.publicKey);
+	const secret = randScalar(); // 1-of-1: A's share IS the secret
+	const encD = deriveEncKey(D.privateKey).publicKey;
+	const encOf = (_id: string) => encD; // the only new member is D
+
+	const { nodes } = fullMesh([idD]);
+	const coord = new ShadowReshareCoordinator({
+		node: nodes[idD],
+		epoch: 9,
+		selfId: idD,
+		oldQuorum: [idA],
+		newCommittee: [idD],
+		newMin: 1,
+		groupKey: G.multiply(secret).toBytes(true),
+		myEncKey: deriveEncKey(D.privateKey),
+		encKeyOf: encOf,
+		timeoutMs: 600,
+		auth: makeCeremonyAuth(D.privateKey), // ok() is pure → verifies any dealer's signature
+	});
+	const done = coord.start();
+
+	// an UNSIGNED deal claiming to be from A — the auth must drop it (no signature to check against `from`)
+	coord.onDeal(9, buildContribution(idA, secret, [idA], [idD], 1, encOf));
+
+	const r = await done;
+	assert.equal(r.dealsSeen, 0, "the unsigned deal was rejected");
+	assert.equal(r.complete, false, "so the quorum never completed");
 });

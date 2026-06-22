@@ -17,6 +17,7 @@
 
 import { buildContribution, verifyBlob, combineShare, type ReshareBlob } from "./reshare-blob.ts";
 import type { Deal } from "./pvss.ts";
+import type { CeremonyAuth } from "./ceremony-auth.ts";
 import type * as x25519 from "../det/x25519.ts";
 import { toHex } from "../det/canonical.ts";
 import type { GavlNode } from "../sync/node.ts";
@@ -45,6 +46,7 @@ export interface ShadowOpts {
 	myEncKey?: x25519.KeyPair; // my derived encryption key, if I'm in the new committee (to combine + check)
 	encKeyOf: (id: string) => Uint8Array | undefined; // the registry: a member id → its X25519 key
 	timeoutMs?: number;
+	auth?: CeremonyAuth; // signs my deal + verifies peers' deals — authenticates the dealer, forgeries dropped
 }
 
 export class ShadowReshareCoordinator {
@@ -70,7 +72,8 @@ export class ShadowReshareCoordinator {
 			// already has every new member's encryption key (else the enc-key gossip hasn't propagated yet).
 			if (o.myOldShare != null && o.oldQuorum.includes(o.selfId) && o.newCommittee.every((id) => o.encKeyOf(id))) {
 				try {
-					this.myDeal = buildContribution(o.selfId, o.myOldShare, o.oldQuorum, o.newCommittee, o.newMin, (id) => o.encKeyOf(id)!);
+					const built = buildContribution(o.selfId, o.myOldShare, o.oldQuorum, o.newCommittee, o.newMin, (id) => o.encKeyOf(id)!);
+					this.myDeal = o.auth ? o.auth.stamp(built) : built; // sign as this node's committee id (forgeries dropped on receipt)
 					this.built = true;
 					this.deals.set(o.selfId, this.myDeal);
 					o.node.shadowDealBroadcast(o.epoch, this.myDeal);
@@ -91,6 +94,7 @@ export class ShadowReshareCoordinator {
 	/** Routed here by the daemon for every inbound shadow deal. Ignores other epochs / non-quorum dealers. */
 	onDeal(epoch: number, deal: Deal): void {
 		if (this.settled || epoch !== this.o.epoch) return;
+		if (this.o.auth && !this.o.auth.ok(deal)) return; // unsigned / forged deal (sig doesn't match `from`) → drop
 		if (this.o.oldQuorum.includes(deal.from)) this.deals.set(deal.from, deal);
 		this.maybeFinish();
 	}

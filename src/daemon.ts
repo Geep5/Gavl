@@ -1103,6 +1103,7 @@ export class Daemon {
 			myEncKey: p.inNew ? deriveEncKey(this.producerKey().privateKey) : undefined,
 			encKeyOf: (id) => this.encKeys.get(id),
 			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
+			auth: this.ceremonyAuth(),
 		});
 		this.shadowCoord = coord;
 		void coord.start().then((r) => {
@@ -1130,6 +1131,7 @@ export class Daemon {
 			myEncKey: p.inNew ? deriveEncKey(this.producerKey().privateKey) : undefined,
 			encKeyOf: (id) => this.encKeys.get(id),
 			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
+			auth: this.ceremonyAuth(),
 		});
 		this.shadowCoord = coord;
 		const r = await coord.start();
