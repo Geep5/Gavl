@@ -11,6 +11,7 @@ import type { Heads } from "../ledger/ledger.ts";
 import type { Anchor } from "../consensus/anchor.ts";
 import type { Offer } from "../market/intent.ts";
 import type { StoredSnapshot } from "../store/store.ts";
+import type { EncKeyAnnounce } from "../custody/enckey.ts";
 
 export type SyncMessage =
 	// ── write sync ───────────────────────────────────────────────
@@ -47,7 +48,10 @@ export type SyncMessage =
 	/** A signing ceremony message, routed to the node's registered signing coordinator. */
 	| { t: "sign"; m: SignWire }
 	/** A reshare ceremony message, routed to the node's registered reshare coordinator. */
-	| { t: "reshare"; m: ReshareWire };
+	| { t: "reshare"; m: ReshareWire }
+	/** A member's self-signed encryption-key announcement (verifiable encrypted resharing, phase 1).
+	 *  Broadcast + re-broadcast so peers learn which X25519 key to seal a reshare sub-share to. */
+	| { t: "enckey"; a: EncKeyAnnounce };
 
 /**
  * DKG ceremony payloads. `pkg`/`share` are FROST structures pre-encoded JSON-safe

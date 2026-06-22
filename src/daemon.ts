@@ -39,6 +39,7 @@ import { SignCoordinator } from "./custody/sign-coordinator.ts";
 import { CommitteeRotation } from "./custody/rotation.ts";
 import { EquivocationWatcher } from "./custody/equivocation-watcher.ts";
 import { makeCeremonyAuth } from "./custody/ceremony-auth.ts";
+import { announceEncKey, EncKeyRegistry } from "./custody/enckey.ts";
 import type { CeremonyAuth } from "./custody/ceremony-auth.ts";
 import { committeeEpochsFor, epochOf } from "./custody/epoch.ts";
 import type { AnchorView } from "./custody/epoch.ts";
@@ -855,6 +856,7 @@ export class Daemon {
 		subSwarmTopics: string[];
 		bonded: boolean;
 		myBond: string;
+		encKeysKnown: number;
 	} {
 		const cs = this.committeeShare();
 		const onchain = this.view().custody.fundKey; // the announced committee group key (null until genesis DKG completes)
@@ -872,6 +874,7 @@ export class Daemon {
 			subSwarmTopics: this.transport?.committeeTopicNames() ?? [],
 			bonded: !!this.custodyOpts.bonded, // stake-weighted selection on?
 			myBond: (this.view().bridge.bonds.get(id) ?? 0n).toString(),
+			encKeysKnown: this.encKeys.size(), // verified peer encryption keys (phase-1 announce liveness)
 		};
 	}
 
@@ -1059,6 +1062,18 @@ export class Daemon {
 			void this.custodyAccount().slash(a, b).catch(() => {});
 		});
 		this.node.onCeremonyMessage = (m) => this.equivWatcher!.observe(m);
+
+		// Verifiable encrypted resharing (phase 1): announce this node's X25519 encryption key (bound to
+		// its committee id) so peers can seal a future reshare sub-share to it, and learn peers' keys via
+		// the registry (binding-verified). Self-register so we can also seal to ourselves; re-announce on a
+		// loop so a late-joining peer catches it. Nothing consumes the registry yet — the reshare wiring is
+		// a later phase — so this only adds announce traffic, it changes no existing custody behavior.
+		const myAnnounce = announceEncKey(this.producerKey().privateKey, this.producerId());
+		this.encKeys.learn(myAnnounce);
+		this.node.onEncKey = (a) => void this.encKeys.learn(a);
+		this.node.encKeyBroadcast(myAnnounce);
+		clearInterval(this.encKeyTimer);
+		this.encKeyTimer = setInterval(() => this.node.encKeyBroadcast(myAnnounce), 15_000);
 
 		console.log(`  custody: committee mode (epochLength ${this.custodyOpts.epochLength ?? 16}, size ${this.custodyOpts.size ?? 5}); id ${this.producerId().slice(0, 16)}…`);
 	}
@@ -1333,6 +1348,10 @@ export class Daemon {
 	 */
 	private onChainReserves: { sats: bigint; at: number } | null = null;
 	private reserveTimer?: ReturnType<typeof setInterval>;
+	private encKeyTimer?: ReturnType<typeof setInterval>;
+	/** Peers' verified X25519 encryption keys (verifiable encrypted resharing, phase 1). Populated by the
+	 *  enc-key announce gossip; not yet consumed (the reshare wiring is a later phase). */
+	private readonly encKeys = new EncKeyRegistry();
 	async refreshOnChainReserves(): Promise<void> {
 		try {
 			const esplora = this.esplora();
@@ -1620,6 +1639,7 @@ export class Daemon {
 		// 1. Tear down the current channel's consensus + storage. Stop the oracle loop and
 		//    farming FIRST so neither posts a write into the store while it's closing.
 		this.farming = false;
+		clearInterval(this.encKeyTimer);
 		this.oracleGen++; // the running oracle publisher loop exits on its next tick
 		this.producer?.stop();
 		this.producer = undefined;
@@ -1656,6 +1676,7 @@ export class Daemon {
 
 	async stop(): Promise<void> {
 		this.farming = false;
+		clearInterval(this.encKeyTimer);
 		this.producer?.stop();
 		if (this.transport) await this.transport.destroy().catch(() => {});
 		if (this.store) await this.store.close().catch(() => {});

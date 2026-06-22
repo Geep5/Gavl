@@ -17,6 +17,7 @@
  */
 
 import type { SyncMessage, DkgWire, SignWire, ReshareWire } from "./messages.ts";
+import type { EncKeyAnnounce } from "../custody/enckey.ts";
 import type { Offer } from "../market/intent.ts";
 import type { StoredSnapshot } from "../store/store.ts";
 import type { Write } from "../chain/writer.ts";
@@ -252,6 +253,10 @@ export class GavlNode {
 				this.onReshare?.(conn, m.m); // sub-shares are point-to-point → needs the conn
 				return;
 			}
+			case "enckey": {
+				this.onEncKey?.(m.a); // self-authenticating (the binding is signed); the registry verifies it
+				return;
+			}
 		}
 	}
 
@@ -295,6 +300,14 @@ export class GavlNode {
 	/** Send a reshare message to ONE peer over its connection (secret sub-share). */
 	reshareReply(conn: Connection, m: ReshareWire): void {
 		conn.send({ t: "reshare", m });
+	}
+
+	// ── encryption-key announce transport (verifiable encrypted resharing, phase 1) ──
+	/** Registered by the daemon; receives peers' encryption-key announcements (verified by the registry). */
+	onEncKey?: (a: EncKeyAnnounce) => void;
+	/** Broadcast this node's encryption-key announcement (self-signed; safe to flood + re-broadcast). */
+	encKeyBroadcast(a: EncKeyAnnounce): void {
+		this.broadcast({ t: "enckey", a });
 	}
 
 	/** Cap on buffered orphan anchors (transient bootstrap state) — far above any real suffix. */

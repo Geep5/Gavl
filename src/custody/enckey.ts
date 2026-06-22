@@ -86,4 +86,9 @@ export class EncKeyRegistry {
 	missing(ids: string[]): string[] {
 		return ids.filter((id) => !this.keys.has(id));
 	}
+
+	/** How many verified peer keys we hold — a liveness hook (has the announce gossip reached us?). */
+	size(): number {
+		return this.keys.size;
+	}
 }
