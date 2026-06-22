@@ -81,6 +81,11 @@ export interface RotationConfig {
 	 *  live ceremony, to validate the blob path live WITHOUT trusting it. Validation-only — the handler
 	 *  never writes a share. Passed the data a node needs to build/verify/combine a blob for this reshare. */
 	onReshareShadow?: (p: { epoch: number; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupKey: Uint8Array; myOldShare?: StoredShare["share"]; oldPub?: StoredShare["pub"]; inNew: boolean }) => void;
+	/** CUTOVER (verifiable encrypted resharing, phase 4): when set (GAVL_PVSS_RESHARE on), rotate() tries
+	 *  the durable blob path FIRST — resolving to a saved-ready reshare result, "rotated-out" if this node
+	 *  leaves the committee, or null to FALL BACK to the live ceremony. The daemon's handler runs every
+	 *  trust gate (group key preserved, contributions verified, share combines) before returning a result. */
+	reshareViaBlob?: (p: { epoch: number; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupKey: Uint8Array; myOldShare?: StoredShare["share"]; oldPub?: StoredShare["pub"]; inNew: boolean }) => Promise<{ share: StoredShare["share"]; pub: StoredShare["pub"]; groupPubKey: Uint8Array } | "rotated-out" | null>;
 }
 
 const sameSet = (a: string[], b: string[]): boolean => a.length === b.length && [...a].sort().join(",") === [...b].sort().join(",");
@@ -210,9 +215,28 @@ export class CommitteeRotation {
 			return;
 		}
 
-		// SHADOW run (validation-only): kick off the blob-path reshare alongside the live ceremony below.
-		// It builds + verifies a PVSS blob and logs the result; it NEVER writes a share (see shadow-reshare).
-		this.c.onReshareShadow?.({ epoch, oldQuorum: quorumForRound(prev.committee, prev.min, 0), newCommittee: next.committee, newMin: next.min, groupKey: key, myOldShare: holdsPrev && stored ? stored.share : undefined, oldPub: holdsPrev && stored ? stored.pub : undefined, inNew });
+		// Blob-path reshare params — shared by the validation-only SHADOW run (flag off) and the real
+		// CUTOVER (flag on, GAVL_PVSS_RESHARE); identical shape.
+		const blobParams = { epoch, oldQuorum: quorumForRound(prev.committee, prev.min, 0), newCommittee: next.committee, newMin: next.min, groupKey: key, myOldShare: holdsPrev && stored ? stored.share : undefined, oldPub: holdsPrev && stored ? stored.pub : undefined, inNew };
+		if (this.c.reshareViaBlob) {
+			// CUTOVER: the blob path IS the reshare; on ANY failure (incomplete / unverified / combine throw)
+			// fall back to the trusted live ceremony below.
+			const viaBlob = await this.c.reshareViaBlob(blobParams);
+			if (viaBlob === "rotated-out") {
+				this.c.clearShare();
+				this.log(`epoch ${epoch}: rotated out via blob path — share discarded`);
+				return;
+			}
+			if (viaBlob) {
+				this.c.saveShare({ share: viaBlob.share, pub: viaBlob.pub, groupPubKey: viaBlob.groupPubKey, session: `custody-epoch-${epoch}`, selfId: this.c.selfId, participants: next.committee, min: next.min, epoch });
+				this.log(`epoch ${epoch}: ${refresh ? "share refreshed" : "rotated in"} via blob path (same address)`);
+				return;
+			}
+			this.log(`epoch ${epoch}: blob path unavailable — falling back to the live ceremony`);
+		} else {
+			// SHADOW (flag off): validate the blob path alongside the trusted live ceremony, never trusted.
+			this.c.onReshareShadow?.(blobParams);
+		}
 
 		this.log(refresh ? `epoch ${epoch}: proactive reshare — refresh ${next.committee.length} shares, same members (min ${next.min})` : `epoch ${epoch}: reshare ${prev.committee.length}→${next.committee.length} (new min ${next.min})`);
 		// OLD-quorum failover: if a selected old member is offline, roll to the next quorum

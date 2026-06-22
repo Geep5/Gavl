@@ -28,6 +28,7 @@ export interface ShadowResult {
 	complete: boolean; // assembled the full old quorum?
 	blobVerifies: boolean | null; // old members: public verify (honest contributions + fund key preserved)
 	combineOk: boolean | null; // new members: I combined a VALID share (Feldman passed for every deal to me)
+	blob?: ReshareBlob; // the assembled blob, when complete — the cutover handler consumes it (else validation-only)
 	note: string;
 }
 
@@ -113,8 +114,8 @@ export class ShadowReshareCoordinator {
 		let combineOk: boolean | null = null;
 		let note = complete ? "" : `incomplete: ${this.deals.size}/${o.oldQuorum.length} deals`;
 
-		if (complete) {
-			const blob: ReshareBlob = { epoch: o.epoch, oldQuorum: o.oldQuorum, newCommittee: o.newCommittee, newMin: o.newMin, groupKey: toHex(o.groupKey), deals: [...this.deals.values()] };
+		const blob: ReshareBlob | undefined = complete ? { epoch: o.epoch, oldQuorum: o.oldQuorum, newCommittee: o.newCommittee, newMin: o.newMin, groupKey: toHex(o.groupKey), deals: [...this.deals.values()] } : undefined;
+		if (blob) {
 			if (o.oldVerifyingShareOf) blobVerifies = verifyBlob(blob, o.oldVerifyingShareOf);
 			// A new member combines its share; success means every deal's Feldman check passed, so the share
 			// is valid + consistent with the publicly-derived verifying share. (No live comparison — see header.)
@@ -128,6 +129,6 @@ export class ShadowReshareCoordinator {
 				}
 			}
 		}
-		this.resolve({ epoch: o.epoch, built: this.built, dealsSeen: this.deals.size, complete, blobVerifies, combineOk, note });
+		this.resolve({ epoch: o.epoch, built: this.built, dealsSeen: this.deals.size, complete, blobVerifies, combineOk, blob, note });
 	}
 }

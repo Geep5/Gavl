@@ -41,6 +41,8 @@ import { EquivocationWatcher } from "./custody/equivocation-watcher.ts";
 import { makeCeremonyAuth } from "./custody/ceremony-auth.ts";
 import { announceEncKey, deriveEncKey, EncKeyRegistry } from "./custody/enckey.ts";
 import { ShadowReshareCoordinator } from "./custody/shadow-reshare.ts";
+import { assembleReshare } from "./custody/reshare-blob.ts";
+import { groupKeyOf } from "./custody/pvss.ts";
 import { schnorr_FROST as FROST } from "@noble/curves/secp256k1.js";
 import type { CeremonyAuth } from "./custody/ceremony-auth.ts";
 import { committeeEpochsFor, epochOf } from "./custody/epoch.ts";
@@ -1054,6 +1056,7 @@ export class Daemon {
 			},
 			log: (m) => console.log(m),
 			onReshareShadow: (p) => this.runShadowReshare(p), // validation-only blob-path run, alongside the live ceremony
+			reshareViaBlob: process.env.GAVL_PVSS_RESHARE ? (p) => this.reshareViaBlob(p) : undefined, // CUTOVER (opt-in): the blob path IS the reshare, with the live ceremony as fallback
 		});
 
 		// Auto-slashing: watch every ceremony message this node sees; when a committee
@@ -1106,6 +1109,48 @@ export class Daemon {
 			const mark = (b: boolean | null) => (b === null ? "—" : b ? "✓" : "✗ MISMATCH");
 			console.log(`[custody] shadow reshare epoch ${r.epoch}: deals ${r.dealsSeen}/${p.oldQuorum.length}${r.complete ? "" : " incomplete"} · blob ${mark(r.blobVerifies)} · combine ${mark(r.combineOk)}${r.note ? ` · ${r.note}` : ""}`);
 		});
+	}
+
+	/** CUTOVER (verifiable encrypted resharing, phase 4, opt-in GAVL_PVSS_RESHARE): try to reshare via the
+	 *  durable blob path. Runs every TRUST GATE — the group key is preserved, contributions verify (if I'm
+	 *  an old member), and my share combines — then returns a saved-ready reshare result, "rotated-out" if I
+	 *  leave the committee, or null to FALL BACK to the live ceremony. It never returns a share it could not
+	 *  fully validate, so a flagged-on node is never worse off than the trusted ceremony. */
+	private async reshareViaBlob(p: { epoch: number; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupKey: Uint8Array; myOldShare?: { signingShare: Uint8Array }; oldPub?: { verifyingShares: Record<string, Uint8Array> }; inNew: boolean }) {
+		const coord = new ShadowReshareCoordinator({
+			node: this.node,
+			epoch: p.epoch,
+			selfId: this.producerId(),
+			oldQuorum: p.oldQuorum,
+			newCommittee: p.newCommittee,
+			newMin: p.newMin,
+			groupKey: p.groupKey,
+			myOldShare: p.myOldShare ? FROST.utils.Fn.fromBytes(p.myOldShare.signingShare) : undefined,
+			oldVerifyingShareOf: p.oldPub ? (id) => p.oldPub!.verifyingShares[fid(id)] : undefined,
+			myEncKey: p.inNew ? deriveEncKey(this.producerKey().privateKey) : undefined,
+			encKeyOf: (id) => this.encKeys.get(id),
+			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
+		});
+		this.shadowCoord = coord;
+		const r = await coord.start();
+		const fail = (why: string): null => {
+			console.log(`[custody] blob reshare epoch ${p.epoch}: ${why} — falling back to the live ceremony`);
+			return null;
+		};
+		if (!r.blob) return fail(`incomplete (${r.dealsSeen}/${p.oldQuorum.length} deals)`);
+		if (Buffer.compare(groupKeyOf(r.blob.deals), p.groupKey) !== 0) return fail("the reshare would change the fund key");
+		if (r.blobVerifies === false) return fail("a contribution failed public verification");
+		if (!p.inNew) {
+			console.log(`[custody] blob reshare epoch ${p.epoch}: rotated out (not in the new committee)`);
+			return "rotated-out" as const;
+		}
+		try {
+			const res = assembleReshare(r.blob, this.producerId(), deriveEncKey(this.producerKey().privateKey));
+			console.log(`[custody] blob reshare epoch ${p.epoch}: rotated in via the blob (contributions ${r.blobVerifies === null ? "self-checked" : "verified"})`);
+			return res;
+		} catch (e) {
+			return fail(`my share did not combine (${(e as Error).message})`);
+		}
 	}
 
 	/**

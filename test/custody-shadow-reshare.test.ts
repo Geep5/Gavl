@@ -15,6 +15,7 @@ import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { MemoryNetwork } from "../src/sync/memory.ts";
 import { ShadowReshareCoordinator } from "../src/custody/shadow-reshare.ts";
+import { assembleReshare } from "../src/custody/reshare-blob.ts";
 import { deriveEncKey } from "../src/custody/enckey.ts";
 import * as ed from "../src/det/ed25519.ts";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
@@ -85,4 +86,11 @@ test("shadow run: old quorum's deals assemble into a blob that verifies + new me
 	}
 	// new members recover a valid share from the blob (Feldman passes for every deal)
 	for (const id of newCommittee) assert.equal(byId[id].combineOk, true, `new member ${id.slice(0, 8)} combined a valid share`);
+
+	// the CUTOVER consumes the coordinator's assembled blob: a new member turns it into a usable FROST
+	// reshare result for the SAME fund key (this is exactly what the daemon's reshareViaBlob saves).
+	const dBlob = byId[newCommittee[0]].blob;
+	assert.ok(dBlob, "the coordinator exposes the assembled blob for the cutover to consume");
+	const consumed = assembleReshare(dBlob, newCommittee[0], deriveEncKey(next.D.privateKey));
+	assert.equal(toHex(consumed.groupPubKey), toHex(groupKey), "the consumed share is for the SAME fund key");
 });
