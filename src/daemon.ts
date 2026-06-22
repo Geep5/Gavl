@@ -861,6 +861,7 @@ export class Daemon {
 		bonded: boolean;
 		myBond: string;
 		encKeysKnown: number;
+		lastReshare?: { epoch: number; ok: boolean; detail: string };
 	} {
 		const cs = this.committeeShare();
 		const onchain = this.view().custody.fundKey; // the announced committee group key (null until genesis DKG completes)
@@ -879,6 +880,7 @@ export class Daemon {
 			bonded: !!this.custodyOpts.bonded, // stake-weighted selection on?
 			myBond: (this.view().bridge.bonds.get(id) ?? 0n).toString(),
 			encKeysKnown: this.encKeys.size(), // verified peer encryption keys (phase-1 announce liveness)
+			lastReshare: this.lastReshare, // latest per-epoch reshare outcome (for the UI indicator)
 		};
 	}
 
@@ -1109,6 +1111,8 @@ export class Daemon {
 		void coord.start().then((r) => {
 			const mark = (b: boolean | null) => (b === null ? "—" : b ? "✓" : "✗ MISMATCH");
 			console.log(`[custody] shadow reshare epoch ${r.epoch}: deals ${r.dealsSeen}/${p.oldQuorum.length}${r.complete ? "" : " incomplete"} · blob ${mark(r.blobVerifies)} · combine ${mark(r.combineOk)}${r.note ? ` · ${r.note}` : ""}`);
+			const detail = r.complete ? `shadow · blob ${mark(r.blobVerifies)} · combine ${mark(r.combineOk)}` : `shadow · forming (${r.dealsSeen}/${p.oldQuorum.length} deals)`;
+			this.lastReshare = { epoch: r.epoch, ok: r.complete && r.blobVerifies !== false && r.combineOk !== false, detail };
 		});
 	}
 
@@ -1137,6 +1141,7 @@ export class Daemon {
 		const r = await coord.start();
 		const fail = (why: string): null => {
 			console.log(`[custody] blob reshare epoch ${p.epoch}: ${why} — falling back to the live ceremony`);
+			this.lastReshare = { epoch: p.epoch, ok: false, detail: `blob · ${why} — fell back to ceremony` };
 			return null;
 		};
 		if (!r.blob) return fail(`incomplete (${r.dealsSeen}/${p.oldQuorum.length} deals)`);
@@ -1144,11 +1149,13 @@ export class Daemon {
 		if (r.blobVerifies === false) return fail("a contribution failed public verification");
 		if (!p.inNew) {
 			console.log(`[custody] blob reshare epoch ${p.epoch}: rotated out (not in the new committee)`);
+			this.lastReshare = { epoch: p.epoch, ok: true, detail: "blob · rotated out" };
 			return "rotated-out" as const;
 		}
 		try {
 			const res = assembleReshare(r.blob, this.producerId(), deriveEncKey(this.producerKey().privateKey));
 			console.log(`[custody] blob reshare epoch ${p.epoch}: rotated in via the blob (contributions ${r.blobVerifies === null ? "self-checked" : "verified"})`);
+			this.lastReshare = { epoch: p.epoch, ok: true, detail: "blob · rotated in (same address)" };
 			return res;
 		} catch (e) {
 			return fail(`my share did not combine (${(e as Error).message})`);
@@ -1431,6 +1438,8 @@ export class Daemon {
 	private readonly encKeys = new EncKeyRegistry();
 	/** The current epoch's shadow reshare coordinator (validation-only; never writes a share). */
 	private shadowCoord?: ShadowReshareCoordinator;
+	/** The latest reshare outcome — surfaced in custodyStatus for the UI's reshare indicator. */
+	private lastReshare?: { epoch: number; ok: boolean; detail: string };
 	async refreshOnChainReserves(): Promise<void> {
 		try {
 			const esplora = this.esplora();

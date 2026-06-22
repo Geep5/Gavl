@@ -20,6 +20,10 @@
 		const mineIdx = cu?.holdsShare ? n - 1 : -1;
 		return Array.from({ length: n }, (_, i) => ({ mine: i === mineIdx }));
 	});
+
+	// The per-epoch reshare made observable — turns "re-shuffles every epoch" into live evidence. During
+	// the soak it reflects the shadow blob validation; once GAVL_PVSS_RESHARE is on, the blob-path result.
+	const reshare = $derived(cu?.lastReshare);
 </script>
 
 <section class="cust">
@@ -48,6 +52,9 @@
 
 		<dl class="grid">
 			<div><dt>epoch</dt><dd>{cu?.epoch >= 0 ? cu.epoch : "—"}</dd></div>
+			{#if reshare}
+				<div><dt>reshare</dt><dd class="rsh" class:ok={reshare.ok} title={reshare.detail}>↻ {reshare.ok ? "✓" : "⚠"}</dd></div>
+			{/if}
 			<div><dt>this node</dt><dd class:hold={cu?.holdsShare}>{cu?.holdsShare ? "holds a share" : "watching"}</dd></div>
 			<div><dt>fund key</dt><dd class="mono">{short(cu.fundKeyOnChain)}</dd></div>
 		</dl>
@@ -89,4 +96,6 @@
 	dd { margin: 0; font-size: 0.78rem; color: var(--text); }
 	dd.hold { color: var(--green); }
 	.mono { font-family: var(--mono); font-size: 0.72rem; }
+	.rsh { font-family: var(--mono); font-size: 0.74rem; color: var(--accent); cursor: help; }
+	.rsh.ok { color: var(--green); }
 </style>
