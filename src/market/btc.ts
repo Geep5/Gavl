@@ -24,7 +24,7 @@ import { finalizedOrdering, orderingFor } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import { verifyPythUpdate } from "./pyth.ts";
 import { verifySignedQuorum } from "./signed-feed.ts";
-import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, mintCeiling, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
+import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, mintCeiling, withdrawCap, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
 import { emptyBook, escrowedInContracts, applyMatch, applyMatchPot, applySettle, pruneExpiredOffers, settleExpired } from "./intent.ts";
@@ -247,6 +247,7 @@ export function cloneView(v: View): View {
 			chargeFrom: cp(b.chargeFrom),
 			pot: b.pot,
 			potEscrowTaken: b.potEscrowTaken,
+			withdrawnTotal: b.withdrawnTotal,
 		},
 		market: { ...v.market },
 		custody: { fundKey: v.custody.fundKey, epoch: v.custody.epoch },
@@ -277,12 +278,16 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	// — since CHECKPOINT_EVERY == epochLength — advances exactly one epoch at a time). No base yet
 	// (pre-first-checkpoint / genesis) → bond 0 → just the bootstrap floor.
 	const custodyCeiling = mintCeiling(opts.base ? bondedTotal(opts.base.bridge) : 0n);
+	// Vector B outflow budget (absolute, mirrors backstopBudget): from the SAME checkpoint base, the
+	// epoch may withdraw up to withdrawCap(finalized reserves); `available` per write = this minus the
+	// live withdrawnTotal. No base yet (pre-first-checkpoint / full-from-genesis) → undefined → uncapped.
+	const withdrawBudget = opts.base ? opts.base.bridge.withdrawnTotal + withdrawCap(opts.base.bridge.reserves) : undefined;
 	for (const w of [...writes].sort(cmp)) {
 		const op = w.payload as Op | null;
 		// Effects timed by height (unbond maturity) use the write's STABLE certifying
 		// height (bornAt) so they don't drift as the global nowHeight advances; others
 		// use nowHeight (the current anchor clock).
-		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, custodyCeiling, opts.market);
+		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, custodyCeiling, withdrawBudget, opts.market);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
 	settleExpired(view.bridge, view.book, nowHeight); // time-locked directional swaps unwind at entry (base-independent)
@@ -327,7 +332,7 @@ export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: st
 	return computeView(included, { order, nowHeight, bornAt, base, market });
 }
 
-function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, custodyCeiling = 0n, market?: MarketDef): void {
+function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, custodyCeiling = 0n, withdrawBudget?: bigint, market?: MarketDef): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized ONLY by the committee
@@ -352,7 +357,9 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			const amt = parseAmount(op.amount);
 			const fee = parseAmount(op.fee);
 			if (amt === null || fee === null || typeof op.btcAddress !== "string") return;
-			requestWithdrawal(view.bridge, { id: w.id, owner: w.writer, amount: amt, btcAddress: op.btcAddress, fee });
+			// Vector B: gate against this epoch's remaining outflow allowance (undefined → uncapped).
+			const available = withdrawBudget === undefined ? undefined : withdrawBudget - view.bridge.withdrawnTotal;
+			requestWithdrawal(view.bridge, { id: w.id, owner: w.writer, amount: amt, btcAddress: op.btcAddress, fee }, available);
 			return;
 		}
 		case "bridge.claim": {

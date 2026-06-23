@@ -87,6 +87,12 @@ export interface BridgeState {
 	 *  once they finalize too. Both finalized figures are agreed by every node, and this counter is
 	 *  write-driven, so the budget is deterministic — and it provably keeps the free pot ≥ 0. */
 	potEscrowTaken: bigint;
+	/** Lifetime gBTC burned for withdrawal (monotonic; += at each requestWithdrawal). Vector B's
+	 *  outflow circuit breaker measures per-epoch outflow as this minus the FINALIZED base's value,
+	 *  capping how fast custodied BTC can leave — a captured (or buggy) committee can't drain the
+	 *  whole fund in one epoch. Write-driven + read off the checkpoint base ⇒ deterministic, exactly
+	 *  like potEscrowTaken. */
+	withdrawnTotal: bigint;
 }
 
 /** Anchors a bond must wait after unbonding before it's spendable — long enough for a
@@ -110,6 +116,20 @@ export function mintCeiling(finalizedBond: bigint): bigint {
 	return tied > TVL_BOOTSTRAP_FLOOR ? tied : TVL_BOOTSTRAP_FLOOR;
 }
 
+// ── per-epoch withdrawal outflow cap (Vector B circuit breaker) — consensus-critical ──
+/** Max percent of FINALIZED reserves that may be withdrawn per epoch. A captured (or buggy)
+ *  committee can drain at most this much before the network can react; honest over-cap withdrawals
+ *  simply fail and retry next epoch (no queue). The economic dual of the mint ceiling. */
+export const MAX_WITHDRAW_PCT_PER_EPOCH = 10n;
+/** Below this, the per-epoch allowance is lifted to this floor so a small fund stays fully
+ *  withdrawable in one epoch (mirrors TVL_BOOTSTRAP_FLOOR). */
+export const WITHDRAW_CAP_FLOOR = TVL_BOOTSTRAP_FLOOR;
+/** The per-epoch withdrawal allowance for a given FINALIZED reserves figure. */
+export function withdrawCap(finalizedReserves: bigint): bigint {
+	const pct = (finalizedReserves * MAX_WITHDRAW_PCT_PER_EPOCH) / 100n;
+	return pct > WITHDRAW_CAP_FLOOR ? pct : WITHDRAW_CAP_FLOOR;
+}
+
 // ── demurrage (idle-balance decay) — consensus-critical, every node must agree ──
 /** Anchors per demurrage "day". */
 export const DEMURRAGE_DAY = 1440;
@@ -129,7 +149,7 @@ export function demurrageChargeFrom(creditHeight: number): number {
 }
 
 export function emptyBridge(): BridgeState {
-	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), unbonding: new Map(), mintedTotal: 0n, paidOut: 0n, chargeFrom: new Map(), pot: 0n, potEscrowTaken: 0n };
+	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), unbonding: new Map(), mintedTotal: 0n, paidOut: 0n, chargeFrom: new Map(), pot: 0n, potEscrowTaken: 0n, withdrawnTotal: 0n };
 }
 
 export function gbtcOf(s: BridgeState, pubkey: string): bigint {
@@ -187,6 +207,12 @@ export function bond(s: BridgeState, pubkey: string, amount: bigint): boolean {
 export function requestUnbond(s: BridgeState, pubkey: string, amount: bigint, nowHeight: number): boolean {
 	const cur = s.bonds.get(pubkey) ?? 0n;
 	if (amount <= 0n || cur < amount) return false;
+	// Vector A — stake securing live custodied BTC can't leave. Once this unbond releases, the
+	// remaining total bond drops by `amount`; refuse if that would push custodied BTC past what it
+	// can back (custodied ≤ TVL_PER_BOND × bond, with the bootstrap floor). The mirror of the mint
+	// ceiling: as deposits can't outrun the bond, withdrawals of the bond can't outrun the deposits.
+	// The fund must shrink (BTC withdrawn) or be re-bonded first; the requester just retries later.
+	if (s.reserves > mintCeiling(bondedTotal(s) - amount)) return false;
 	const rest = cur - amount;
 	if (rest === 0n) s.bonds.delete(pubkey);
 	else s.bonds.set(pubkey, rest);
@@ -278,8 +304,14 @@ export const DEFAULT_WITHDRAW_FEE = 1_000n;
  *  withdrawal can't produce a valid output. A BUILDABILITY bound, NOT a fee-policy cap. */
 export const WITHDRAW_DUST = 546n;
 
-export function requestWithdrawal(s: BridgeState, w: PendingWithdrawal): boolean {
+export function requestWithdrawal(s: BridgeState, w: PendingWithdrawal, available?: bigint): boolean {
 	if (w.amount <= 0n || gbtcOf(s, w.owner) < w.amount) return false;
+	// Vector B — per-epoch outflow circuit breaker. `available` is this epoch's remaining allowance
+	// (deterministic: withdrawCap(finalized reserves) minus what's already left since the checkpoint
+	// base). Over it, the withdrawal simply FAILS — no queue; the owner retries next epoch once the
+	// budget refreshes. Undefined → uncapped (legacy/direct callers, tests). Checked before the burn
+	// so a rejected withdrawal is a clean no-op.
+	if (available !== undefined && w.amount > available) return false;
 	// The withdrawer's own fee comes out of their payout (they receive amount − fee). The PROTOCOL
 	// does NOT cap the fee — under the hood you can broadcast whatever you want; the sane upper bound
 	// is a UI guardrail only. It only rejects a fee that can't yield a VALID tx: negative (would
@@ -289,6 +321,7 @@ export function requestWithdrawal(s: BridgeState, w: PendingWithdrawal): boolean
 	if (s.pending.some((p) => p.id === w.id)) return false;
 	addG(s, w.owner, -w.amount); // burn gBTC
 	s.pending.push({ ...w }); // now owed as BTC (still backed by reserves)
+	s.withdrawnTotal += w.amount; // count toward this epoch's outflow budget (monotonic, like potEscrowTaken)
 	return true;
 }
 

@@ -4,7 +4,9 @@
  * fast as the slashable stake backing it FINALISES. The fold reads the bond from the checkpoint base,
  * which advances one epoch at a time (CHECKPOINT_EVERY == epochLength), so the ceiling scales per
  * epoch. A deposit over the ceiling isn't lost: it stays an unminted claim and mints on a later fold
- * once the next epoch's bond lifts the ceiling. Withdrawals are never gated (they only reduce TVL).
+ * once the next epoch's bond lifts the ceiling. This file also covers the two symmetric outflow
+ * gates: Vector A (stake backing live custodied BTC can't be unbonded) and Vector B (custodied BTC
+ * can leave at most a bounded fraction per epoch — over-cap withdrawals fail and retry next epoch).
  *
  *   node --test test/custody-ceiling.test.ts
  */
@@ -12,7 +14,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { emptyBridge, mintFromDeposit, mintCeiling, bond, conserved, gbtcOf as bridgeGbtcOf, TVL_PER_BOND, TVL_BOOTSTRAP_FLOOR } from "../src/custody/bridge.ts";
+import { emptyBridge, mintFromDeposit, mintCeiling, bond, conserved, gbtcOf as bridgeGbtcOf, requestUnbond, bondedTotal, requestWithdrawal, withdrawCap, MAX_WITHDRAW_PCT_PER_EPOCH, WITHDRAW_CAP_FLOOR, TVL_PER_BOND, TVL_BOOTSTRAP_FLOOR } from "../src/custody/bridge.ts";
 import { computeView, gbtcOf, marketConserved } from "../src/market/btc.ts";
 import { withGbtc } from "./helpers.ts";
 import { generateFundKeyDKG, thresholdSign, quorumOf } from "../src/custody/threshold.ts";
@@ -127,4 +129,72 @@ test("through the fold: determinism — the ceiling is identical whoever folds (
 	const v2 = computeView([w], { base: baseWithFund(fund, 0n), bornAt, nowHeight: 1 });
 	assert.equal(gbtcOf(v1, dep), 0n, "5 BTC deposit deferred under the 1 BTC bootstrap floor");
 	assert.equal(gbtcOf(v2, dep), gbtcOf(v1, dep), "every node computes the same ceiling outcome");
+});
+
+test("Vector A: stake backing custodied BTC can't be unbonded (mirror of the mint ceiling)", () => {
+	// 10 BTC custodied, 2 BTC bonded → ceiling 20 BTC ≥ 10, fund is secured. Held 1:1.
+	const s = emptyBridge();
+	s.reserves = 10n * BTC;
+	s.bonds.set("p", 2n * BTC);
+	s.gbtc.set("holder", 8n * BTC); // depositors hold the unbonded gBTC
+	assert.ok(conserved(s), "setup is 1:1 backed");
+
+	// Unbonding 1.5 BTC would leave 0.5 BTC bond → ceiling 5 BTC < 10 reserves → refused.
+	assert.equal(requestUnbond(s, "p", (15n * BTC) / 10n, 0), false, "an unbond that would under-secure the fund is refused");
+	assert.equal(s.bonds.get("p"), 2n * BTC, "bond untouched on refusal");
+	assert.equal(bondedTotal(s), 2n * BTC, "no weight moved to unbonding");
+
+	// Unbonding 1 BTC leaves 1 BTC bond → ceiling exactly 10 BTC == reserves → allowed.
+	assert.equal(requestUnbond(s, "p", 1n * BTC, 0), true, "an unbond that keeps reserves ≤ ceiling is allowed");
+	assert.equal(s.bonds.get("p"), 1n * BTC, "active bond reduced");
+});
+
+test("Vector A: below the bootstrap floor, unbond is never gated", () => {
+	const s = emptyBridge();
+	s.reserves = BTC / 2n; // 0.5 BTC < 1 BTC floor
+	s.bonds.set("p", (4n * BTC) / 10n);
+	s.gbtc.set("holder", BTC / 10n); // 0.5 = 0.4 bonded + 0.1 free
+	assert.ok(conserved(s), "setup is 1:1 backed");
+	assert.equal(requestUnbond(s, "p", (4n * BTC) / 10n, 0), true, "small fund (≤ floor) → unbond ungated");
+});
+
+// ── Vector B: per-epoch withdrawal OUTFLOW cap (the circuit breaker) ──
+
+test("withdrawCap: bootstrap floor below, then a percent of reserves above it", () => {
+	assert.equal(withdrawCap(0n), WITHDRAW_CAP_FLOOR, "no reserves → just the floor");
+	assert.equal(withdrawCap(100n * BTC), (100n * BTC * MAX_WITHDRAW_PCT_PER_EPOCH) / 100n, "large fund → percent of reserves");
+});
+
+test("Vector B (unit): an over-budget withdrawal fails cleanly (no burn) and the counter only moves on success", () => {
+	const s = emptyBridge();
+	s.reserves = 10n * BTC;
+	s.gbtc.set("o", 10n * BTC);
+	const over = { id: "w5", owner: "o", amount: 5n * BTC, btcAddress: "tb1q", fee: 1000n };
+	assert.equal(requestWithdrawal(s, over, 3n * BTC), false, "amount over the remaining budget → refused");
+	assert.equal(bridgeGbtcOf(s, "o"), 10n * BTC, "no gBTC burned on refusal");
+	assert.equal(s.withdrawnTotal, 0n, "outflow counter untouched");
+	const ok = { id: "w3", owner: "o", amount: 3n * BTC, btcAddress: "tb1q", fee: 1000n };
+	assert.equal(requestWithdrawal(s, ok, 3n * BTC), true, "amount within budget → succeeds");
+	assert.equal(s.withdrawnTotal, 3n * BTC, "counter advances by exactly the amount");
+});
+
+test("Vector B (fold): outflow is capped per epoch; the over-cap withdrawal defers and retries next epoch", async () => {
+	const a = relayer();
+	const base = withGbtc(computeView([]), { [a.pubHex]: 100n * BTC }); // reserves 100 BTC, a holds 100 BTC
+	// withdrawCap(100 BTC) = max(10% × 100, 1 BTC) = 10 BTC per epoch.
+	const w1 = await a.withdraw(8n * BTC, "tb1qaaa"); // ts 1 → sorts first
+	const w2 = await a.withdraw(5n * BTC, "tb1qbbb"); // 8 + 5 = 13 > 10 cap
+
+	// Epoch N: w1 (8) fits; w2 (5) would breach the 10 BTC cap → deferred, not burned, not queued.
+	const vN = computeView([w1, w2], { base, nowHeight: 1 });
+	assert.equal(gbtcOf(vN, a.pubHex), 92n * BTC, "only the within-cap withdrawal burned");
+	assert.equal(vN.bridge.withdrawnTotal, 8n * BTC, "outflow counter reflects just w1");
+	assert.equal(vN.bridge.pending.length, 1, "one pending payout; the over-cap one didn't queue");
+	assert.ok(marketConserved(vN), "1:1 backing holds with a withdrawal deferred");
+
+	// Epoch N+1: the checkpoint base now carries w1's outflow, so the cap refreshes → w2 fits on retry.
+	const vN1 = computeView([w2], { base: vN, nowHeight: 1 });
+	assert.equal(gbtcOf(vN1, a.pubHex), 87n * BTC, "deferred withdrawal succeeds next epoch");
+	assert.equal(vN1.bridge.withdrawnTotal, 13n * BTC, "counter advances once it goes through");
+	assert.ok(marketConserved(vN1));
 });

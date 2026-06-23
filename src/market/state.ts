@@ -43,6 +43,7 @@ export interface CanonBridge {
 	chargeFrom: Entry<{ since: number; charged: number }>[]; // pubkey → demurrage idle clock, sorted
 	pot: string; // the liquidity pot (idle-decay bucket), free/unescrowed
 	potEscrowTaken: string; // lifetime pot capital staked as backstop (budget counter)
+	withdrawnTotal: string; // lifetime gBTC burned for withdrawal (Vector B outflow budget counter)
 }
 
 export type CanonMarket = { price: string | null; expo: number; seq: number; at: number };
@@ -92,6 +93,7 @@ function serializeBridge(b: BridgeState): CanonBridge {
 		chargeFrom: mapEntries(b.chargeFrom, (e) => ({ since: e.since, charged: e.charged })),
 		pot: b.pot.toString(),
 		potEscrowTaken: b.potEscrowTaken.toString(),
+		withdrawnTotal: b.withdrawnTotal.toString(),
 	};
 }
 
@@ -134,6 +136,7 @@ function deserializeBridge(b: CanonBridge): BridgeState {
 	for (const [k, e] of b.chargeFrom) s.chargeFrom.set(k, { since: e.since, charged: e.charged });
 	s.pot = BigInt(b.pot);
 	s.potEscrowTaken = BigInt(b.potEscrowTaken);
+	s.withdrawnTotal = BigInt(b.withdrawnTotal ?? "0"); // ?? 0 → tolerate pre-Vector-B snapshots
 	return s;
 }
 
