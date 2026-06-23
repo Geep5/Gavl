@@ -151,7 +151,9 @@ export interface DaemonOptions {
 		/** Gate #2: cap on how many percent the total eligible committee weight may grow per epoch.
 		 *  A sudden influx of freshly-bonded stake is admitted oldest-first up to this much above last
 		 *  epoch's total, so the committee can't be captured faster than the network can react (e.g. 5
-		 *  → ≤5%/epoch). Consensus-critical. Undefined → uncapped (current behavior). */
+		 *  → ≤5%/epoch). Consensus-critical. Defaults to DEFAULT_MAX_GROWTH_PCT (5) when `bonded` is
+		 *  on; override with any positive value (a large one effectively uncaps). Ignored when
+		 *  `bonded` is off (the cap is only meaningful for stake weight). */
 		maxGrowthPct?: number;
 	};
 }
@@ -222,6 +224,13 @@ const OFFER_TTL_ANCHORS = Number(process.env.GAVL_OFFER_TTL ?? "2880");
  *  windows (the only backward walks that reach below the checkpoint); the daemon takes the
  *  max with those windows. Bounds the anchor chain to a constant suffix instead of forever. */
 const ANCHOR_KEEP_MARGIN = Number(process.env.GAVL_ANCHOR_MARGIN ?? "256");
+
+/** Default per-epoch committee-weight growth cap (gate #2) applied whenever stake-weighted custody
+ *  (`bonded`) is on: the total eligible weight may rise ≤5%/epoch, so a sudden bonded-stake influx
+ *  can't seize a threshold before the network reacts. Consensus-critical — both committee-derivation
+ *  call sites must resolve to the SAME value, so they share this constant. Set `custody.maxGrowthPct`
+ *  to override. */
+const DEFAULT_MAX_GROWTH_PCT = 5;
 
 export class Daemon {
 	readonly node: GavlNode;
@@ -415,7 +424,7 @@ export class Daemon {
 			windowAnchors: this.custodyOpts.windowAnchors,
 			bonds: this.custodyOpts.bonded ? this.finalView().bridge.bonds : undefined,
 			minBond: this.custodyOpts.minBond,
-			maxGrowthPct: this.custodyOpts.maxGrowthPct,
+			maxGrowthPct: this.custodyOpts.bonded ? (this.custodyOpts.maxGrowthPct ?? DEFAULT_MAX_GROWTH_PCT) : undefined, // gate #2: default-on under stake weighting
 		});
 		void this.transport.setCommitteeTopics(mine.map((e) => committeeTopic(this.network, e)));
 	}
@@ -1058,7 +1067,7 @@ export class Daemon {
 			windowAnchors: this.custodyOpts.windowAnchors,
 			bonds: this.custodyOpts.bonded ? () => this.finalView().bridge.bonds : undefined, // stake-weighted selection
 			minBond: this.custodyOpts.minBond, // gate #4: per-seat bond floor
-			maxGrowthPct: this.custodyOpts.maxGrowthPct, // gate #2: per-epoch growth cap
+			maxGrowthPct: this.custodyOpts.bonded ? (this.custodyOpts.maxGrowthPct ?? DEFAULT_MAX_GROWTH_PCT) : undefined, // gate #2: default-on under stake weighting
 			auth: this.ceremonyAuth(),
 			ceremonySeed: () => this.producerKey().privateKey, // deterministic DKG material across retries
 
