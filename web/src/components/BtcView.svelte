@@ -1,7 +1,8 @@
 <script>
-	// The single BTC market as a "protocol newspaper": THE MARKET (price + decoded identity),
-	// TAKE A SIDE (trade + tape + positions), FUND (deposit/withdraw), NO HOUSE (consensus,
-	// custody, conservation). All wired to the real daemon — the design's mock data is replaced.
+	// The new UI — a clean mobile-width Gavl app (header · live price · trade · positions ·
+	// add-funds · network), ported verbatim from the design mockup and wired to the real
+	// daemon. The mockup has no fee control, so a Maker-Fee section is improvised below the
+	// amount/leverage row in the same visual language.
 	import { store, act, refresh, myGbtc, short } from "../lib/store.svelte.js";
 	import { api } from "../lib/api.js";
 
@@ -17,34 +18,15 @@
 	const needN = $derived(cu?.minCommittee ?? 3);
 	const fmt = (v) => (v == null ? "—" : Number(v).toLocaleString());
 
-	// idle-decay (demurrage) countdown
-	function fmtDur(sec) {
-		sec = Math.max(0, Math.round(sec));
-		const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), mn = Math.floor((sec % 3600) / 60);
-		if (d > 0) return h > 0 ? `${d}d ${h}h` : `${d}d`;
-		if (h > 0) return mn > 0 ? `${h}h ${mn}m` : `${h}h`;
-		return mn > 0 ? `${mn}m` : `${sec}s`;
-	}
-	const decay = $derived.by(() => {
-		const id = m?.idleDecay, h = c?.tip?.height, spa = c?.secPerAnchor;
-		if (!id || bal <= 0 || h == null || !spa) return null;
-		const toDecay = (id.decayAtHeight - h) * spa, toCutoff = (id.cutoffHeight - h) * spa;
-		if (toDecay > 0) return { decaying: false, text: `Idle balance starts decaying in ${fmtDur(toDecay)} (−20%/day after) unless you use or move it.` };
-		if (toCutoff > 0) return { decaying: true, text: `Decaying now — −20%/day, fully reclaimed to the pot in ${fmtDur(toCutoff)}. Move it to reset the clock.` };
-		return { decaying: true, text: `This idle balance is being reclaimed to the liquidity pot.` };
-	});
-
 	// instrument + decoded market identity (the channel IS the market)
 	const label = $derived(mkt?.label ?? "BTC-USD");
 	const base = $derived(label.split("-")[0] ?? "BTC");
 	const quote = $derived(label.split("-")[1] ?? "USD");
 	const channel = $derived(mkt?.channel ?? c?.network ?? "");
 	const seg = $derived(channel.split("::"));
-	const method = $derived(seg[1] ?? "—");
 	const topic = $derived((c?.topic ?? "").toLowerCase());
 	const coordIsId = $derived(/^[0-9a-f]{64}$/.test((seg[2] ?? "").toLowerCase()));
 	const topicMatchesCoord = $derived(coordIsId && topic === (seg[2] ?? "").toLowerCase());
-	const priceNote = $derived(method === "signed" ? "SIGNED QUORUM · VERIFIED ON EVERY NODE. NO REPORTER TO TRUST." : "PYTH FEED · 13-OF-19 WORMHOLE GUARDIANS · VERIFIED ON EVERY NODE. NO REPORTER TO TRUST.");
 
 	// price direction tint
 	let dir = $state(0);
@@ -54,46 +36,79 @@
 		if (priceNum != null) last = priceNum;
 	});
 
-	let copied = $state(false);
-	async function copyId() {
-		let ok = false;
-		try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(channel); ok = true; } } catch { ok = false; }
-		if (!ok) {
-			try {
-				const ta = document.createElement("textarea");
-				ta.value = channel; ta.setAttribute("readonly", ""); ta.style.position = "fixed"; ta.style.top = "-9999px";
-				document.body.appendChild(ta); ta.select(); ok = document.execCommand("copy"); document.body.removeChild(ta);
-			} catch { ok = false; }
-		}
-		if (ok) { copied = true; setTimeout(() => (copied = false), 1400); }
+	// ── copy-to-clipboard (multiple targets) ──
+	let copiedId = $state(null);
+	let copyTimer;
+	function copy(id, text) {
+		return async () => {
+			let ok = false;
+			try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); ok = true; } } catch { ok = false; }
+			if (!ok) {
+				try {
+					const ta = document.createElement("textarea");
+					ta.value = text; ta.setAttribute("readonly", ""); ta.style.position = "fixed"; ta.style.top = "-9999px";
+					document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
+				} catch { /* ignore */ }
+			}
+			copiedId = id; clearTimeout(copyTimer); copyTimer = setTimeout(() => (copiedId = null), 1300);
+		};
+	}
+	const cpLbl = (id) => (copiedId === id ? "✓" : "⧉");
+
+	// ── account switch (kept subtle, in the identity card) ──
+	async function switchAccount(e) {
+		const pubHex = e.target.value;
+		if (pubHex && pubHex !== store.active) await act(() => api.setActive(pubHex));
 	}
 
 	// ── trade ──
 	let side = $state("long");
 	let amount = $state("");
 	let leverage = $state("2");
-	// Maker fee, in basis points — serves both roles: when this order RESTS as a maker, it's the fee you
-	// EARN; when it TAKES a resting intent, it's the most you'll pay (so you only take offers ≤ this).
-	// Pre-filled to the protocol default; the pot subsidises peer fees up to it, so at the default a
-	// taker pays nothing. Editable — set whatever; the market finds the level.
+	// Maker fee, in basis points — when this order RESTS it's the fee you EARN; when it TAKES a
+	// resting intent it's the most you'll pay. The pot subsidises the first 10 bps, so at the
+	// default a taker pays nothing. Editable; the market finds the level.
 	let fee = $state("10");
 	const feeOk = $derived(/^[0-9]+$/.test(fee.trim()) && Number(fee) >= 0 && Number(fee) <= 200);
-	const feeNote = $derived.by(() => {
-		const bps = Number(fee) || 0;
-		if (fillable > 0) return `You'll take offers charging ≤ ${bps} bps; the pot covers the first 10 bps, so you'd pay at most ${Math.max(0, bps - 10)} bps.`;
-		return `Your resting intent earns ${bps} bps when taken — the pot pays the first 10 bps, so a taker owes only the rest.`;
-	});
 	let busy = $state(false);
-	const notional = $derived(amount && priceNum ? Number(amount) * Number(leverage) : null);
-	const exposure = $derived(notional && priceNum ? (notional / priceNum).toPrecision(3) : null);
+	// Order mode: AUTO takes if peers rest on the other side, else makes; MAKER/TAKER force the role.
+	let mode = $state("auto"); // auto · maker · taker
 	const opposite = $derived(side === "long" ? "short" : "long");
 	const fillable = $derived(tape.filter((t) => t.side === opposite && !t.mine).reduce((a, t) => a + Number(t.remaining), 0));
-	const matchNow = $derived(Math.min(Number(amount) || 0, fillable));
+	const backstop = $derived(Number(m?.backstopAvailable ?? 0));
+	const takeable = $derived(fillable + backstop); // resting peer depth + liquidity-pot backstop
+	const takerPossible = $derived(takeable > 0);
+	const role = $derived(mode === "maker" ? "maker" : mode === "taker" ? "taker" : fillable > 0 ? "taker" : "maker");
+
+	const feeNote = $derived.by(() => {
+		const bps = Number(fee) || 0;
+		if (role === "taker") return `Takes offers charging ≤ ${bps} bps — the pot covers the first 10, so you'd pay at most ${Math.max(0, bps - 10)} bps.`;
+		return `Your resting intent earns ${bps} bps when taken — the pot pays the first 10, a taker owes the rest.`;
+	});
+
+	const amt = $derived(Math.floor(Number(amount)) || 0);
+	const over = $derived(amt > bal);
+	const matchNow = $derived(Math.min(amt, takeable));
+	const ctaDisabled = $derived(busy || amt <= 0 || over || priceNum == null || !feeOk || (role === "taker" && !takerPossible));
+	const ctaLabel = $derived.by(() => {
+		const S = side === "long" ? "LONG" : "SHORT";
+		if (priceNum == null) return "WAITING FOR PRICE…";
+		if (busy) return "MATCHING…";
+		if (over) return "NOT ENOUGH gBTC";
+		if (role === "taker") return takerPossible ? `TAKE ${S} · ${fmt(matchNow)}` : "NOTHING TO TAKE";
+		return `BROADCAST ${S} · ${leverage}×`;
+	});
+	const roleNote = $derived.by(() => {
+		if (role === "maker") return "MAKER — rests as a signed intent on the tape; a taker opens the matched contract.";
+		if (!takerPossible) return "TAKER — nothing resting on the other side. Switch to MAKER to post your own intent.";
+		return `TAKER — matches ${fmt(matchNow)} gBTC of resting depth now${fillable > 0 ? "" : " (liquidity pot)"}.`;
+	});
+
 	function setMax() { amount = String(myGbtc()); }
 	async function place() {
-		if (!amount || Number(amount) <= 0) return;
+		if (ctaDisabled) return;
 		busy = true;
-		const ok = await act(() => (fillable > 0 ? api.takePosition(side, amount, fee) : api.broadcastIntent(side, amount, leverage, fee)));
+		const ok = await act(() => (role === "maker" ? api.broadcastIntent(side, amount, leverage, fee) : api.takePosition(side, amount, fee)));
 		if (ok) amount = "";
 		busy = false;
 	}
@@ -101,54 +116,40 @@
 	const closeContract = (id) => act(() => api.settleContract(id));
 
 	// ── funds ──
-	let wAmt = $state(""), wAddr = $state(""), wFee = $state("1000"), depTx = $state(""), claimMsg = $state("");
-	const UI_MAX_FEE = 50_000;
-	const wAmtNum = $derived(Number(wAmt) || 0);
-	const wFeeNum = $derived(Number(wFee) || 0);
-	const wFeeMax = $derived(Math.max(0, Math.min(wAmtNum - 546, UI_MAX_FEE)));
-	const wNet = $derived(wAmtNum - wFeeNum);
-	const wFeeOk = $derived(wFee.trim() !== "" && Number.isInteger(wFeeNum) && wFeeNum >= 0 && wFeeNum <= wFeeMax && wNet >= 546);
-	async function withdraw() {
-		if (!wAmt || !wAddr || !wFeeOk) return;
-		const ok = await act(() => api.withdraw(wAmt, wAddr, wFee.trim()));
-		if (ok) wAmt = "";
-	}
+	let fundOpen = $state(false);
+	let depTx = $state("");
+	let claimMsg = $state("");
+	const fundHint = "Send testnet BTC to the address above, paste the txid, and your gBTC is credited 1:1. Bound to your key — no one can front-run it.";
 	async function claim() {
 		if (!depTx.trim()) return;
 		claimMsg = "verifying on-chain…";
 		try {
 			const r = await api.claimDeposit(depTx.trim());
-			claimMsg = Number(r.credited) > 0 ? `credited ${Number(r.credited).toLocaleString()} gBTC` : "no confirmed fund output in that tx yet";
+			claimMsg = Number(r.credited) > 0 ? `✓ credited ${Number(r.credited).toLocaleString()} gBTC` : "no confirmed fund output in that tx yet";
 			if (Number(r.credited) > 0) depTx = "";
 		} catch (e) { claimMsg = String(e.message ?? e); }
 		await refresh();
 	}
-	const processPayouts = () => act(() => api.processWithdrawals());
 
-	// ── live network status ──
+	// ── network status ──
+	let netOpen = $state(false);
 	const height = $derived(c?.tip?.height ?? null);
 	const finalized = $derived(c?.finalizedHeight ?? null);
 	const peers = $derived(c?.peers ?? 0);
 	const producers = $derived(c?.producers ?? 0);
+	const healthy = $derived(peers > 0 && !!c?.farming);
 
-	// CONSENSUS — the daemon's pipeline, each step ✓ when that aspect is live
-	const steps = $derived([
-		{ label: "DAEMON", sub: "keys·vdf", on: true },
-		{ label: "ID", sub: "ed25519", on: !!cu?.committeeId },
-		{ label: "MESH", sub: `${peers} peers`, on: !!c?.mesh },
-		{ label: "POST", sub: c?.vdf ?? "—", on: !!c?.farming },
-		{ label: "ANCHOR", sub: height != null ? "h" + height : "—", on: height != null },
-		{ label: "FINAL", sub: finalized != null ? "✓" + finalized : "—", on: finalized != null },
-	]);
-	const confirmed = $derived(steps.filter((s) => s.on).length);
-
-	// CUSTODY — the committee, with this node's seat highlighted
+	// custody committee
 	const custodyOk = $derived(!!cu?.fundKeyOnChain);
-	const seats = $derived((cu?.committee ?? []).map((id, i) => ({ mine: id === cu.committeeId, label: id === cu.committeeId ? "YOU" : "N" + (i + 1) })));
-	const reshare = $derived(cu?.lastReshare);
-	const fundKeyShort = $derived(cu?.fundKeyOnChain ? short(cu.fundKeyOnChain) : "—");
+	const seats = $derived.by(() => {
+		if (custodyOk && (cu?.committee?.length)) return cu.committee.map((id, i) => ({ mine: id === cu.committeeId, label: id === cu.committeeId ? "YOU" : "N" + (i + 1), dim: false }));
+		return [ { label: "N1", dim: true }, { label: "YOU", mine: true }, { label: "N3", dim: true } ];
+	});
+	const custodyTag = $derived(custodyOk ? `${cu.threshold}-OF-${cu.committee.length}` : `FORMING ${producers}/${needN}`);
+	const custodyThreshold = $derived(custodyOk ? cu.threshold : 2);
+	const fundAddr = $derived(cu?.fundAddress ?? m?.fundAddress ?? null);
 
-	// CONSERVATION — the five buckets that sum to reserves
+	// conservation — the five buckets that sum to reserves
 	const buckets = $derived.by(() => {
 		if (!m) return [];
 		const raw = [
@@ -164,315 +165,409 @@
 	const reservesNum = $derived(Number(m?.reserves ?? 0));
 </script>
 
-<!-- ════ ARTICLE 01 — THE MARKET ════ -->
-<section>
-	<div class="art-h"><span class="art-n">ARTICLE 01 · THE MARKET</span><span class="art-s">THE PRICE IS NAMED, NOT VOTED</span></div>
-	<div class="cols2">
-		<div class="cell div">
-			<div class="px-head">
-				<span class="pair">{base}<span class="quote"> / {quote}</span></span>
-				<span class="marked"><span class="dot"></span>MARKED LIVE</span>
-			</div>
-			{#if priceNum != null}
-				<div class="px-big"><span class="px tnum">${priceNum.toLocaleString(undefined, { maximumFractionDigits: 2, minimumFractionDigits: 2 })}</span>{#if dir !== 0}<span class="caret" class:up={dir > 0} class:down={dir < 0}>{dir > 0 ? "▲" : "▼"}</span>{/if}</div>
-			{:else}
-				<div class="px-big"><span class="px muted">— no price —</span></div>
-			{/if}
-			<div class="px-note">{priceNote}</div>
+<div class="app">
+	<!-- top bar -->
+	<header class="hd">
+		<div class="brand">
+			<span class="logo" aria-label="Gavl">
+				<svg viewBox="0 0 192 106.8" xmlns="http://www.w3.org/2000/svg" role="img">
+					<path fill="currentColor" d="m182.7 80.8c-0.3 0-0.2 0 0 0-5.3-4.4-12.6-6.1-18.9-7.8-11.5-3-23.4-5.1-35-7.2-9.8-1.8-28.3-4.9-37.5-7.8-7.4-2-9.3-4-12.3-5.5-1.6-0.7-2.5-0.9-4.3-0.7-1.8-2.4-4.2-3.5-6.6-2.3l0.8-3.5c4.7-0.5 6-6.5 1.7-8.7-1-0.7-2.1-1-2.3-2-0.3-1.5 0.1-2.7 1.1-3 1.2-0.1 1.9-1 2.2-2.2 3-0.3 5.5-1.6 6.5-5.6 0.9-3.5-0.4-6.1-3.1-7.8 0.9-2.9-2.3-4.7-5.7-6.1-6.7-2.8-19.2-6.1-30.6-7.6-6.1-0.7-10.7-1.6-12.5 1.8h-0.2c-4.4-0.2-6.7 3.7-6.4 7.8 0.2 2.5 1.8 3.8 3.1 4.9-0.5 2.5 1.7 3.2 1.3 4.6-0.2 0.8-0.8 1.7-1.6 2.4-1.4 0.1-2.8-0.1-4.1 0.5-2 0.9-3.2 3.9-1.8 6.3l1.3 2.2-6.7 27c-3.4 0-5.7 4.5-3.2 7.3 1.5 1.8 3.5 1.5 3.4 3.5 0 3.6-2.8 1.1-3.4 4.2-3.8 0.3-5.5 2.8-6 6.1-0.3 3.1 1.1 5 3.4 7.2-0.7 2.6 2 4.8 4.6 5.9 6.1 2.7 15 5.2 21.7 6.8 3.3 0.6 11.7 3 16.8 3.4 1.9 0 4-0.6 4.2-2.3l2.5-0.5c3-0.5 4.9-3.6 4.9-7.6 0-2.1-1.4-4.2-3.4-5.7 0.9-1.5-0.2-2.8-1.5-4.5-0.2-1.4 0.5-2.8 1.5-3.3h2.5c3.9 0 6.2-4.5 3.5-7.4l-1-0.8 0.9-3.7c1.4 2.2 4 3 7.1 1.5 2.8 1.9 3.8 1.3 10 1.4 7.5 0 21 3.8 28.7 5.8 12.7 3.5 30 8.6 45.8 13 5.5 1.3 17.8 6.2 24.3 5.2 1.6 1 3.2 1.9 4.6 2 4.6 0 7.4-3.7 7.4-9.2 0-4.1-3-8-7.7-8z" />
+				</svg>
+			</span>
+			<span class="mark">GAVL</span>
 		</div>
-		<div class="cell">
-			<div class="mid-head"><span class="mid-l">THE MARKET'S PUBLIC IDENTITY</span><button class="copy" onclick={copyId}>{copied ? "✓ COPIED" : "⧉ COPY"}</button></div>
-			<code class="stream"><span class="sg a">{seg[0] ?? "—"}</span><span class="sep"> :: </span><span class="sg b">{seg[1] ?? "—"}</span><span class="sep"> :: </span><span class="sg c">{seg[2] ?? "—"}</span></code>
-			<div class="legend"><span class="lg a">CHANNEL</span><span class="lg b">METHOD</span><span class="lg c">COORDINATE</span></div>
-			{#if topic}<div class="dht">DHT TOPIC <code>{topic}</code>{#if topicMatchesCoord}<span class="okmark">✓ = COORDINATE</span>{/if}</div>{/if}
+		<div class="wallet">
+			<div class="bal tnum">{bal.toLocaleString()}</div>
+			<div class="bal-l">gBTC</div>
 		</div>
-	</div>
-</section>
+	</header>
 
-<!-- ════ ARTICLE 02 — TAKE A SIDE ════ -->
-<section>
-	<div class="art-h"><span class="art-n">ARTICLE 02 · TAKE A SIDE</span><span class="art-s">MATCHED DIRECTIONAL SWAP</span></div>
-	<div class="cols2">
-		<!-- trade -->
-		<div class="cell div">
-			<div class="toggle">
-				<button class="tg long" class:on={side === "long"} onclick={() => (side = "long")}>▲ LONG</button>
-				<button class="tg short" class:on={side === "short"} onclick={() => (side = "short")}>▼ SHORT</button>
-			</div>
-			<div class="fields">
-				<label class="fld">
-					<span class="flbl">AMOUNT (gBTC) <button class="max" onclick={setMax} disabled={bal <= 0}>MAX</button></span>
-					<input class="big" placeholder="0" bind:value={amount} inputmode="numeric" />
-				</label>
-				<label class="fld lev">
-					<span class="flbl">LEVERAGE</span>
-					<select class="big" bind:value={leverage}>
-						{#each Array.from({ length: (m?.maxLeverage ?? 5) - 1 }, (_, i) => String(i + 2)) as L}<option value={L}>{L}×</option>{/each}
-					</select>
-				</label>
-				<label class="fld lev">
-					<span class="flbl" title="Maker fee in basis points. When your order rests you earn it; when it takes, it's your max. The pot covers the first 10 bps.">FEE (bps)</span>
-					<input class="big" class:bad={!feeOk} bind:value={fee} inputmode="numeric" />
-				</label>
-			</div>
-			<div class="expo">{exposure ? `≈ ${exposure} ${base} · ${fmt(notional)} gBTC notional` : "Enter an amount to size the trade."}</div>
-			<div class="feenote">{feeNote}</div>
-			<button class="cta {side}" onclick={place} disabled={busy || priceNum == null || !feeOk}>
-				{#if priceNum == null}WAITING FOR PRICE…{:else if busy}…{:else if !amount}GO {side === "long" ? "LONG" : "SHORT"}{:else if fillable > 0}GO {side === "long" ? "LONG" : "SHORT"} · MATCHES {fmt(matchNow)}{:else}BROADCAST {side === "long" ? "LONG" : "SHORT"} · {leverage}×{/if}
-			</button>
-			<div class="cta-sub">{#if !amount}Sweeps resting peer intents first, then broadcasts the remainder.{:else if fillable > 0}A real counterparty is resting on the tape — this opens a matched contract now.{:else}Nothing to match — your signed intent floods the mesh and waits for a taker.{/if}</div>
-			{#if bal <= 0}<div class="hint">No gBTC yet — fund your wallet in ARTICLE 03 to trade.</div>
-			{:else if decay}<div class="hint" class:warn={decay.decaying}>⏳ {decay.text}</div>{/if}
-		</div>
-		<!-- tape -->
-		<div class="cell">
-			<div class="sub-h"><span class="sub-t">THE TAPE</span><span class="sub-s">SIGNED INTENTS · TAKE THE OTHER SIDE</span></div>
-			{#if tape.length === 0}
-				<div class="empty">Nothing on the tape. Broadcast an intent — a peer takes the other side to open a matched trade. <b>No pool here: a trade needs a real counterparty.</b></div>
+	<!-- price -->
+	<section class="price">
+		<div class="px-live"><span class="px-dot"></span>{base} / {quote} · LIVE</div>
+		<div class="px-row">
+			{#if priceNum != null}
+				<span class="px-big tnum">${priceNum.toLocaleString(undefined, { maximumFractionDigits: 2, minimumFractionDigits: 2 })}</span>
+				{#if dir !== 0}<span class="px-caret" class:up={dir > 0} class:down={dir < 0}>{dir > 0 ? "▲" : "▼"}</span>{/if}
 			{:else}
-				{#each tape as t}
-					<div class="row">
-						<span class="badge {t.side}">{t.side === "long" ? "LONG" : "SHORT"}</span>
-						<span class="grow tnum">{fmt(t.remaining)} <span class="muted">gBTC · {t.leverage}× · {t.spread ?? "0"} bps fee</span></span>
-						<span class="who">{t.mine ? "you" : short(t.maker)}</span>
-						{#if t.mine}<span class="yours">YOURS</span>{:else}<button class="take {t.side === 'long' ? 'short' : 'long'}" onclick={() => take(t)}>TAKE {t.side === "long" ? "▼" : "▲"}</button>{/if}
-					</div>
-				{/each}
+				<span class="px-big muted">— no price —</span>
 			{/if}
 		</div>
-	</div>
-	<!-- positions -->
-	{#if contracts.length}
-		<div class="cell">
-			<div class="sub-h"><span class="sub-t">YOUR POSITIONS</span><span class="sub-s">{contracts.length} OPEN · SETTLES AT THE MARK</span></div>
-			{#each contracts as ct}
-				<div class="row">
-					<span class="badge {ct.side}">{ct.side === "long" ? "LONG" : "SHORT"}</span>
-					<span class="tnum psize">{fmt(ct.stake)} gBTC <span class="muted">@ {fmt(ct.entry)} · {ct.leverage}×</span></span>
-					<span class="who">vs {short(ct.counterparty)}</span>
-					<span class="grow pnl tnum" class:up={Number(ct.pnl) > 0} class:down={Number(ct.pnl) < 0}>{Number(ct.pnl) > 0 ? "+" : ""}{fmt(ct.pnl)}</span>
-					<button class="close" onclick={() => closeContract(ct.id)}>CLOSE</button>
+	</section>
+
+	<!-- trade -->
+	<section class="trade">
+		<div class="toggle">
+			<button class="tg long" class:on={side === "long"} onclick={() => (side = "long")}>▲ LONG</button>
+			<button class="tg short" class:on={side === "short"} onclick={() => (side = "short")}>▼ SHORT</button>
+		</div>
+		<div class="tfields">
+			<label class="tf">
+				<span class="tf-l">AMOUNT (gBTC) <button class="maxbtn" onclick={setMax} disabled={bal <= 0}>MAX</button></span>
+				<input bind:value={amount} inputmode="numeric" placeholder="0" />
+			</label>
+			<label class="tf lev">
+				<span class="tf-l">LEVERAGE</span>
+				<select bind:value={leverage}>
+					{#each Array.from({ length: (m?.maxLeverage ?? 5) - 1 }, (_, i) => String(i + 2)) as L}<option value={L}>{L}×</option>{/each}
+				</select>
+			</label>
+		</div>
+
+		<!-- improvised: maker fee (the mockup has none) -->
+		<div class="fee">
+			<span class="fee-l" title="Maker fee in basis points. When your order rests you earn it; when it takes, it's your max. The pot covers the first 10 bps.">MAKER FEE (bps)</span>
+			<span class="fee-in"><input class:bad={!feeOk} bind:value={fee} inputmode="numeric" /></span>
+		</div>
+		<div class="fee-note">{feeNote}</div>
+
+		<div class="mode">
+			<span class="mode-l">ORDER</span>
+			<div class="mode-seg">
+				<button class:on={mode === "auto"} onclick={() => (mode = "auto")}>AUTO</button>
+				<button class:on={mode === "maker"} onclick={() => (mode = "maker")}>MAKER</button>
+				<button class:on={mode === "taker"} onclick={() => (mode = "taker")}>TAKER</button>
+			</div>
+		</div>
+
+		<button class="cta" class:long={!ctaDisabled && side === "long"} class:short={!ctaDisabled && side === "short"} class:off={ctaDisabled} onclick={place} disabled={ctaDisabled}>
+			{#if busy}<span class="spin"></span>{/if}{ctaLabel}
+		</button>
+		<div class="role-note" class:taker={role === "taker"} class:maker={role === "maker"}>{roleNote}</div>
+	</section>
+
+	<!-- the tape -->
+	<section class="tape">
+		<div class="pos-h"><span class="pos-t">THE TAPE</span><span class="pos-c">{tape.length} RESTING</span></div>
+		{#if tape.length === 0}
+			<div class="pos-empty">Nothing resting. Place a side with no opposite offer and it posts here as a maker — a peer takes the other side.</div>
+		{:else}
+			{#each tape as t}
+				<div class="pos-row">
+					<span class="pbadge {t.side}">{t.side === "long" ? "LONG" : "SHORT"}</span>
+					<div class="pmid">
+						<div class="pmain tnum">{fmt(t.remaining)} gBTC <span class="muted">{t.leverage}× · {t.spread ?? "0"} bps</span></div>
+						<div class="psub">{t.mine ? "your resting intent" : "maker " + short(t.maker)}</div>
+					</div>
+					{#if t.mine}<span class="tape-yours">YOURS</span>
+					{:else}<button class="take {t.side === 'long' ? 'short' : 'long'}" onclick={() => take(t)}>TAKE {t.side === "long" ? "▼" : "▲"}</button>{/if}
 				</div>
 			{/each}
-		</div>
-	{/if}
-</section>
+		{/if}
+	</section>
 
-<!-- ════ ARTICLE 03 — FUND ════ -->
-<section>
-	<div class="art-h"><span class="art-n">ARTICLE 03 · FUND</span><span class="art-s">gBTC = 1:1 CLAIM ON REAL BTC</span></div>
-	{#if fundReady}
-		<div class="cols2">
-			<div class="cell div">
-				<div class="flbl wide">YOUR DEPOSIT ADDRESS · {m.btcNetwork?.toUpperCase()}</div>
-				<div class="addr-box">{m.depositAddress}</div>
-				<div class="line"><input placeholder="deposit txid" bind:value={depTx} /><button class="ghost" onclick={claim} disabled={!depTx.trim()}>CLAIM</button></div>
-				{#if claimMsg}<div class="msg">{claimMsg}</div>{/if}
-				<p class="fnote">Send testnet BTC to your personal address, then claim by txid. Bound to your key — no one can front-run it.</p>
-			</div>
-			<div class="cell">
-				<div class="flbl wide">WITHDRAW · QUORUM THRESHOLD-SIGNS A REAL TX</div>
-				<div class="line"><input style="flex:0 0 5.5rem" placeholder="gBTC" bind:value={wAmt} inputmode="numeric" /><input placeholder="your BTC address (tb1…)" bind:value={wAddr} /></div>
-				<div class="line"><input placeholder="miner fee (sats)" bind:value={wFee} inputmode="numeric" /><button class="solid" onclick={withdraw} disabled={!wAmt || !wAddr || !wFeeOk}>WITHDRAW</button></div>
-				<p class="fnote">{#if wAmtNum > 0 && wFeeNum > wFeeMax}Fee too high — max {wFeeMax.toLocaleString()} sats.{:else if wAmtNum > 0}You receive <b>{wNet.toLocaleString()}</b> sats — fee comes out of your payout.{:else}Burn gBTC → a {cu?.threshold ?? 2}-of-{cu?.committee?.length ?? 3} quorum co-signs and broadcasts. Leave gBTC idle too long and it <b>decays into the liquidity pot</b>.{/if}</p>
-				{#if m.pendingCount > 0}<button class="ghost full" onclick={processPayouts}>PROCESS {m.pendingCount} PENDING PAYOUT{m.pendingCount === 1 ? "" : "S"} → BROADCAST BTC</button>{/if}
-			</div>
-		</div>
-	{:else}
-		<div class="cell forming">
-			<b>Custody is still forming.</b> There's no fund to deposit into yet — a committee of <b>≥{needN} independent farmers</b> must complete its genesis DKG to mint the shared fund key (no node holds it whole). Bring more nodes online; once the committee forms, your deposit address appears here.
-		</div>
-	{/if}
-</section>
+	<!-- positions -->
+	<section class="pos">
+		<div class="pos-h"><span class="pos-t">POSITIONS</span><span class="pos-c">{contracts.length} OPEN</span></div>
+		{#if contracts.length === 0}
+			<div class="pos-empty">No open positions. Pick a side above to place your first trade.</div>
+		{:else}
+			{#each contracts as p}
+				<div class="pos-row">
+					<span class="pbadge {p.side}">{p.side === "long" ? "LONG" : "SHORT"}</span>
+					<div class="pmid">
+						<div class="pmain tnum">{fmt(p.stake)} gBTC <span class="muted">{p.leverage}×</span></div>
+						<div class="psub">entry ${fmt(p.entry)} · vs {short(p.counterparty)}</div>
+					</div>
+					<span class="ppnl tnum" class:up={Number(p.pnl) > 0} class:down={Number(p.pnl) < 0}>{Number(p.pnl) > 0 ? "+" : ""}{fmt(p.pnl)}</span>
+					<button class="pclose" onclick={() => closeContract(p.id)}>CLOSE</button>
+				</div>
+			{/each}
+		{/if}
+	</section>
 
-<!-- ════ ARTICLE 04 — NO HOUSE ════ -->
-<section>
-	<div class="art-h"><span class="art-n">ARTICLE 04 · NO HOUSE, NO CHAIN TO TRUST</span><span class="art-s">THE DIFFERENTIATOR</span></div>
-	<div class="cell lede">
-		<p>There is <span class="hl">no pool</span>, <span class="hl">no house</span>, and <span class="hl">no rake</span>. Every trade is a matched, zero-sum, fully-collateralized bet between two real people — nobody skims a fee, reserves can never be drained, and no one holds the key.</p>
-	</div>
-	<div class="cols3">
-		<!-- CONSENSUS -->
-		<div class="cell div">
-			<div class="sub-h"><span class="sub-t">CONSENSUS</span><span class="badge-on">{confirmed}/6 CONFIRMED</span></div>
-			<div class="steps">
-				{#each steps as s}<div class="step"><div class="node" class:on={s.on}>{s.on ? "✓" : ""}</div><div class="s-l">{s.label}</div><div class="s-s">{s.sub}</div></div>{/each}
+	<!-- add funds -->
+	<section class="fold">
+		<button class="fold-h" onclick={() => (fundOpen = !fundOpen)}>
+			<span>＋ ADD FUNDS</span><span class="fold-c">{fundOpen ? "▲" : "▼"}</span>
+		</button>
+		{#if fundOpen}
+			<div class="fold-b">
+				{#if fundReady}
+					<div class="lbl">YOUR DEPOSIT ADDRESS · {m.btcNetwork?.toUpperCase()}</div>
+					<div class="copyline"><span class="cl-t">{m.depositAddress}</span><button class="cpbtn" title="copy" onclick={copy("deposit", m.depositAddress)}>{cpLbl("deposit")}</button></div>
+					<div class="frow">
+						<input bind:value={depTx} placeholder="paste deposit txid" />
+						<button class="claim" onclick={claim} disabled={!depTx.trim()}>CLAIM</button>
+					</div>
+					<div class="hint">{claimMsg || fundHint}</div>
+				{:else}
+					<div class="hint"><b>Custody is still forming.</b> No deposit address yet — a committee of ≥{needN} independent farmers must finish its genesis DKG to mint the shared fund key. Bring more nodes online.</div>
+				{/if}
 			</div>
-			<p class="pnote">PoST-proven anchors certify everyone's state. Heaviest chain wins — no authority, no vote. Each write pays a proof of <b>space</b> and a proof of <b>time</b>, so identities can't be spun up to flood the network.</p>
-		</div>
-		<!-- CUSTODY -->
-		<div class="cell div">
-			<div class="sub-h"><span class="sub-t">CUSTODY</span><span class="badge-tag">{custodyOk ? `${cu.threshold}-OF-${cu.committee.length} COMMITTEE` : `FORMING · ${producers}/${needN}`}</span></div>
-			{#if custodyOk}
-				<div class="committee">
-					{#each seats as st, i}{#if i > 0}<span class="plus">+</span>{/if}<span class="seat" class:you={st.mine}>{st.label}</span>{/each}
-					<span class="cmt-note">ANY {cu.threshold} CO-SIGN TO MOVE BTC</span>
+		{/if}
+	</section>
+
+	<!-- network status -->
+	<section class="fold">
+		<button class="fold-h" onclick={() => (netOpen = !netOpen)}>
+			<span class="net-l"><span class="net-dot" class:live={healthy}></span>NETWORK</span><span class="fold-c">{netOpen ? "▲" : "▼"}</span>
+		</button>
+		{#if netOpen}
+			<div class="fold-b stack">
+				<!-- connection -->
+				<div class="card">
+					<div class="card-h">CONNECTION <span class="ch-r" class:g={healthy}><span class="mini-dot" class:live={healthy}></span>{healthy ? "HEALTHY" : "CONNECTING"}</span></div>
+					<div class="card-g">
+						<div class="kv"><span class="k">PEERS</span><span class="v tnum">{peers}</span></div>
+						<div class="kv"><span class="k">PRODUCERS</span><span class="v g tnum">{producers}/{needN}</span></div>
+						<div class="kv"><span class="k">TRANSPORT</span><span class="v sm">HYPERDHT</span></div>
+						<div class="kv"><span class="k">PROOF</span><span class="v sm">PoST</span></div>
+					</div>
 				</div>
-				<div class="cgrid">
-					<div><div class="cg-l">EPOCH</div><div class="cg-v">{cu.epoch >= 0 ? cu.epoch : "—"}</div></div>
-					<div><div class="cg-l">RESHARE</div><div class="cg-v {reshare ? (reshare.ok ? 'g' : 'w') : ''}" title={reshare?.detail ?? ""}>{reshare ? (reshare.ok ? "↻ ✓" : "↻ ⚠") : "—"}</div></div>
-					<div><div class="cg-l">THIS NODE</div><div class="cg-v" class:g={cu.holdsShare}>{cu.holdsShare ? "HOLDS A SHARE" : "WATCHING"}</div></div>
-					<div><div class="cg-l">FUND KEY</div><div class="cg-v">{fundKeyShort}</div></div>
+				<!-- consensus -->
+				<div class="card">
+					<div class="card-h">CONSENSUS <span class="ch-d">HEAVIEST CHAIN</span></div>
+					<div class="card-g">
+						<div class="kv"><span class="k">ANCHOR</span><span class="v tnum">{fmt(height)}</span></div>
+						<div class="kv"><span class="k">FINAL</span><span class="v g tnum">{fmt(finalized)}</span></div>
+					</div>
 				</div>
-				<p class="pnote">No one node holds the key. It's DKG'd across independent farmers and re-shuffles every epoch — <b>without moving the address</b>.</p>
-			{:else}
-				<p class="pnote forming-note"><b>Waiting for ≥{needN} farmers.</b> A lone node holds no fund key and can't mint — the committee runs a genesis DKG once enough independent farmers are producing anchors. {producers}/{needN} producing now.</p>
-			{/if}
-		</div>
-		<!-- CONSERVATION -->
-		<div class="cell">
-			<div class="sub-h"><span class="sub-t">CONSERVATION</span><span class="badge-on">✓ BALANCED</span></div>
-			<div class="eqn"><b>reserves</b> <span class="eq">==</span> free <span class="op">+</span> bonded <span class="op">+</span> escrow <span class="op">+</span> pending <span class="op">+</span> pot</div>
-			<div class="bar">{#each buckets as b}<div style="width:{b.pct};background:{b.color}"></div>{/each}</div>
-			<div class="bgrid">
-				{#each buckets as b}<div class="brow"><span class="bl"><span class="sw" style="background:{b.color}"></span>{b.label}</span><span class="bv tnum">{b.valueFmt}</span></div>{/each}
+				<!-- custody -->
+				<div class="card">
+					<div class="card-h">CUSTODY <span class="ch-a">{custodyTag}</span></div>
+					<div class="card-p">
+						<div class="seats">
+							{#each seats as st, i}
+								{#if i > 0}<span class="seat-plus">+</span>{/if}
+								<span class="seat" class:you={st.mine} class:dim={st.dim}>{st.label}</span>
+							{/each}
+						</div>
+						<div class="card-note">
+							{#if custodyOk}No node holds the key alone — any {custodyThreshold} of {seats.length} farmers co-sign to move BTC. Re-shares every epoch, without moving the address.
+							{:else}Waiting for ≥{needN} farmers to run the genesis DKG. A lone node holds no fund key and can't mint — {producers}/{needN} producing now.{/if}
+						</div>
+					</div>
+				</div>
+				<!-- conservation -->
+				<div class="card">
+					<div class="card-h">CONSERVATION <span class="ch-g">✓ BALANCED</span></div>
+					<div class="card-p">
+						<div class="eqn"><b>reserves</b> <span class="eq">==</span> free <span class="op">+</span> bonded <span class="op">+</span> escrow <span class="op">+</span> pending <span class="op">+</span> pot</div>
+						<div class="cbar">{#each buckets as b}<div style="width:{b.pct};background:{b.color}"></div>{/each}</div>
+						<div class="bgrid">
+							{#each buckets as b}<div class="brow"><span class="bl"><span class="sw" style="background:{b.color}"></span>{b.label}</span><span class="bv tnum">{b.valueFmt}</span></div>{/each}
+						</div>
+						<div class="reserves"><span class="r-l">RESERVES (gBTC)</span><span class="r-v tnum">{reservesNum.toLocaleString()}</span></div>
+					</div>
+				</div>
+				<!-- identity / location -->
+				<div class="card">
+					<div class="card-h">IDENTITY &amp; LOCATION</div>
+					<div class="id-b">
+						{#if store.accounts.length > 1}
+							<div><div class="id-l">TRADER</div><select class="trader-sel" value={store.active} onchange={switchAccount}>{#each store.accounts as a}<option value={a.pubHex}>{a.label}</option>{/each}</select></div>
+						{/if}
+						<div>
+							<div class="id-l">YOUR KEY (ED25519)</div>
+							<div class="id-row"><span class="id-t">{short(store.active ?? "") || "—"}</span><button class="cpbtn" title="copy" onclick={copy("key", store.active ?? "")}>{cpLbl("key")}</button></div>
+						</div>
+						<div>
+							<div class="id-l">MARKET STRING (PRE-IMAGE)</div>
+							<div class="chips"><span class="chip a">{seg[0] ?? "—"}</span><span class="chip-sep"> : </span><span class="chip b">{seg[1] ?? "—"}</span><span class="chip-sep"> : </span><span class="chip c">{short(seg[2] ?? "—")}</span></div>
+							<div class="chips-foot"><span class="cf-l">channel : method : feed id</span><button class="cpbtn" title="copy" onclick={copy("string", channel)}>{cpLbl("string")}</button></div>
+						</div>
+						<div class="sha"><span>↓ sha256</span><span class="sha-line"></span></div>
+						<div>
+							<div class="id-l">MARKET DHT TOPIC</div>
+							<div class="id-row"><span class="id-t">{topic ? short(topic) : "—"}{#if topicMatchesCoord}<span class="okmark"> ✓ = COORDINATE</span>{/if}</span><button class="cpbtn" title="copy" onclick={copy("topic", topic)}>{cpLbl("topic")}</button></div>
+						</div>
+						{#if fundAddr}
+							<div class="kv"><span class="k">CUSTODY ADDRESS</span><span class="id-inline">{short(fundAddr)}<button class="cpbtn" title="copy" onclick={copy("custody", fundAddr)}>{cpLbl("custody")}</button></span></div>
+						{/if}
+					</div>
+				</div>
 			</div>
-			<div class="reserves"><span class="r-l">RESERVES (gBTC)</span><span class="r-v tnum">{reservesNum.toLocaleString()}</span></div>
-		</div>
-	</div>
-</section>
+		{/if}
+	</section>
+
+	{#if store.error}<div class="err">{store.error}</div>{/if}
+
+	<!-- quiet trust line -->
+	<footer class="foot"><span class="ok">✓</span> EVERY TRADE FULLY BACKED · NO HOUSE · NO RAKE</footer>
+</div>
 
 <style>
-	/* ── article scaffolding ── */
-	.art-h { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; padding: 0.5rem 1.3rem; background: var(--ink); color: var(--paper); border-bottom: 1.5px solid var(--ink); }
-	.art-n { font-family: var(--display); font-weight: 800; font-size: 0.78rem; letter-spacing: 0.18em; }
-	.art-s { font-size: 0.62rem; letter-spacing: 0.12em; color: var(--bar-dim); text-align: right; }
-	.cols2 { display: grid; grid-template-columns: 1fr 1fr; }
-	.cols3 { display: grid; grid-template-columns: 1fr 1fr 1fr; }
-	.cell { padding: 1.2rem 1.3rem; border-bottom: 1.5px solid var(--ink); }
-	.cell.div { border-right: 1.5px solid var(--ink); }
+	.app { max-width: 460px; margin: 0 auto; min-height: 100vh; background: var(--paper); border-left: 1.5px solid var(--ink); border-right: 1.5px solid var(--ink); display: flex; flex-direction: column; }
 	.muted { color: var(--muted); }
-	.grow { flex: 1; }
+	.tnum { font-variant-numeric: tabular-nums; }
+
+	/* ── header ── */
+	.hd { display: flex; align-items: center; justify-content: space-between; padding: 1rem 1.2rem; border-bottom: 1.5px solid var(--ink); }
+	.brand { display: flex; align-items: center; gap: 0.55rem; }
+	.logo { display: inline-flex; color: var(--ink); }
+	.logo svg { height: 20px; width: auto; display: block; }
+	.mark { font-family: var(--display); font-weight: 900; font-size: 1.15rem; letter-spacing: -0.03em; }
+	.wallet { text-align: right; }
+	.bal { font-family: var(--display); font-weight: 800; font-size: 1.05rem; line-height: 1; }
+	.bal-l { font-size: 0.54rem; letter-spacing: 0.16em; color: var(--muted); margin-top: 0.2rem; }
 
 	/* ── price ── */
-	.px-head { display: flex; align-items: center; gap: 0.7rem; }
-	.pair { font-family: var(--display); font-weight: 800; font-size: 1.25rem; letter-spacing: -0.01em; }
-	.pair .quote { color: var(--muted); font-weight: 500; }
-	.marked { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.62rem; letter-spacing: 0.14em; color: var(--long); }
-	.marked .dot, .px-head .dot { width: 6px; height: 6px; background: var(--long); border-radius: 50%; animation: blink 1.3s steps(1) infinite; }
-	.px-big { display: flex; align-items: flex-end; gap: 0.6rem; margin-top: 0.9rem; }
-	.px { font-family: var(--display); font-weight: 800; font-size: clamp(2.6rem, 7vw, 4rem); line-height: 0.9; letter-spacing: -0.03em; }
-	.px.muted { font-size: 1.8rem; }
-	.caret { font-family: var(--display); font-weight: 800; font-size: 1.5rem; line-height: 1; padding-bottom: 0.35rem; }
-	.caret.up { color: var(--long); } .caret.down { color: var(--short); }
-	.px-note { font-size: 0.66rem; letter-spacing: 0.06em; color: var(--muted); margin-top: 0.85rem; line-height: 1.55; }
-
-	/* ── decoded identity ── */
-	.mid-head { display: flex; align-items: center; justify-content: space-between; gap: 0.6rem; margin-bottom: 0.7rem; }
-	.mid-l { font-size: 0.6rem; letter-spacing: 0.2em; color: var(--muted); }
-	.copy { font-size: 0.6rem; letter-spacing: 0.08em; font-weight: 600; background: transparent; border: 1.5px solid var(--ink); color: var(--ink); padding: 0.2rem 0.5rem; }
-	.stream { display: block; border: 1.5px solid var(--ink); font-size: 0.74rem; line-height: 1.95; word-break: break-all; padding: 0.55rem 0.6rem; background: var(--paper-2); }
-	.stream .sg { padding: 0.1rem 0.35rem; -webkit-box-decoration-break: clone; box-decoration-break: clone; }
-	.stream .sg.a { background: var(--ink); color: var(--paper); }
-	.stream .sg.b { background: var(--long-soft); color: var(--long); font-weight: 600; }
-	.stream .sg.c { background: var(--bonded-soft); color: var(--bonded); font-weight: 600; }
-	.stream .sep { color: var(--faint); }
-	.legend { display: flex; gap: 1.1rem; flex-wrap: wrap; margin-top: 0.6rem; font-size: 0.56rem; letter-spacing: 0.1em; color: var(--muted); }
-	.legend .lg { display: inline-flex; align-items: center; gap: 0.35rem; }
-	.legend .lg::before { content: ""; width: 9px; height: 9px; flex: none; }
-	.legend .lg.a::before { background: var(--ink); }
-	.legend .lg.b::before { background: var(--long); }
-	.legend .lg.c::before { background: var(--bonded); }
-	.dht { margin-top: 0.7rem; font-size: 0.64rem; color: var(--muted); display: flex; align-items: baseline; gap: 0.45rem; flex-wrap: wrap; }
-	.dht code { font-size: 0.64rem; color: var(--ink); word-break: break-all; }
-	.okmark { color: var(--long); font-weight: 600; }
+	.price { padding: 1.6rem 1.2rem 1.4rem; text-align: center; border-bottom: 1.5px solid var(--ink); }
+	.px-live { display: inline-flex; align-items: center; gap: 0.45rem; font-size: 0.6rem; letter-spacing: 0.16em; color: var(--muted); }
+	.px-dot { width: 6px; height: 6px; background: var(--long); border-radius: 50%; display: inline-block; animation: blink 1.3s steps(1) infinite; }
+	.px-row { display: flex; align-items: flex-end; justify-content: center; gap: 0.5rem; margin-top: 0.55rem; }
+	.px-big { font-family: var(--display); font-weight: 800; font-size: clamp(2.6rem, 11vw, 3.4rem); line-height: 0.9; letter-spacing: -0.03em; }
+	.px-big.muted { font-size: 1.8rem; }
+	.px-caret { font-family: var(--display); font-weight: 800; font-size: 1.3rem; line-height: 1; padding-bottom: 0.3rem; }
+	.px-caret.up { color: var(--long); } .px-caret.down { color: var(--short); }
 
 	/* ── trade ── */
+	.trade { padding: 1.2rem; border-bottom: 1.5px solid var(--ink); }
 	.toggle { display: grid; grid-template-columns: 1fr 1fr; border: 1.5px solid var(--ink); margin-bottom: 1rem; }
-	.tg { padding: 0.78rem; font-family: var(--display); font-weight: 800; font-size: 1rem; letter-spacing: 0.03em; border: none; background: transparent; color: var(--muted); }
+	.tg { padding: 0.8rem; font-family: var(--display); font-weight: 800; font-size: 1rem; letter-spacing: 0.03em; border: none; background: transparent; color: var(--muted); }
 	.tg.short { border-left: 1.5px solid var(--ink); }
 	.tg.long.on { background: var(--long-soft); color: var(--long); }
 	.tg.short.on { background: var(--short-soft); color: var(--short); }
-	.fields { display: flex; gap: 0.7rem; }
-	.fld { flex: 1; display: block; }
-	.fld.lev { flex: 0 0 6.2rem; }
-	.flbl { display: flex; align-items: center; justify-content: space-between; font-size: 0.58rem; letter-spacing: 0.12em; color: var(--muted); margin-bottom: 0.35rem; }
-	.flbl.wide { display: block; letter-spacing: 0.14em; margin-bottom: 0.4rem; }
-	.max { font-size: 0.54rem; letter-spacing: 0.06em; font-weight: 700; background: var(--ink); color: var(--paper); border: none; padding: 0.1rem 0.4rem; }
-	input.big, select.big { font-size: 1.1rem; font-weight: 600; padding: 0.6rem 0.65rem; }
-	.expo { margin-top: 0.7rem; font-size: 0.66rem; color: var(--muted); min-height: 1.1rem; }
-	.feenote { margin-top: 0.35rem; font-size: 0.62rem; line-height: 1.5; color: var(--muted); }
-	.fld input.bad { border-color: var(--short); }
-	.cta { width: 100%; margin-top: 0.85rem; padding: 0.85rem; font-family: var(--display); font-weight: 800; font-size: 0.98rem; letter-spacing: 0.02em; border: 1.5px solid var(--ink); color: var(--paper); }
-	.cta.long { background: var(--long); } .cta.short { background: var(--short); color: #fff; }
-	.cta-sub { margin-top: 0.6rem; font-size: 0.62rem; line-height: 1.55; color: var(--muted); }
-	.hint { margin-top: 0.6rem; font-size: 0.64rem; line-height: 1.5; color: var(--muted); border: 1.5px solid var(--ink); padding: 0.4rem 0.6rem; background: var(--paper-2); }
-	.hint.warn { color: var(--bonded); border-color: var(--bonded); background: var(--bonded-soft); }
+	.tfields { display: flex; gap: 0.7rem; }
+	.tf { flex: 1; display: block; }
+	.tf.lev { flex: 0 0 5.4rem; }
+	.tf-l { display: flex; align-items: center; justify-content: space-between; font-size: 0.58rem; letter-spacing: 0.12em; color: var(--muted); margin-bottom: 0.35rem; }
+	.maxbtn { font-size: 0.54rem; letter-spacing: 0.06em; font-weight: 700; background: var(--ink); color: var(--paper); border: none; padding: 0.1rem 0.4rem; }
+	.tf input, .tf select { width: 100%; background: var(--paper-2); border: 1.5px solid var(--ink); padding: 0.65rem; font-size: 1.2rem; font-weight: 600; color: var(--ink); }
+	.tf select { padding: 0.65rem 0.45rem; cursor: pointer; }
 
-	/* ── tape / positions ── */
-	.sub-h { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 0.7rem; gap: 0.6rem; }
-	.sub-t { font-family: var(--display); font-weight: 800; font-size: 0.92rem; }
-	.sub-s { font-size: 0.6rem; letter-spacing: 0.08em; color: var(--muted); text-align: right; }
-	.empty { font-size: 0.7rem; line-height: 1.6; color: var(--muted); border: 1.5px dashed var(--faint); padding: 0.7rem 0.75rem; }
-	.empty b { color: var(--ink); }
-	.row { display: flex; align-items: center; gap: 0.6rem; padding: 0.5rem 0; border-top: 1.5px solid var(--ink); font-size: 0.78rem; flex-wrap: wrap; }
-	.badge { font-size: 0.56rem; font-weight: 700; letter-spacing: 0.06em; padding: 0.12rem 0.4rem; }
-	.badge.long { background: var(--long-soft); color: var(--long); }
-	.badge.short { background: var(--short-soft); color: var(--short); }
-	.who { font-size: 0.64rem; color: var(--muted); }
-	.yours { font-size: 0.6rem; font-weight: 600; color: var(--bonded); letter-spacing: 0.06em; }
-	.take { font-size: 0.6rem; font-weight: 700; letter-spacing: 0.04em; border: 1.5px solid var(--ink); padding: 0.28rem 0.55rem; color: var(--paper); }
-	.take.long { background: var(--long); } .take.short { background: var(--short); color: #fff; }
-	.psize { font-size: 0.8rem; }
-	.pnl { font-weight: 700; font-size: 0.95rem; text-align: right; }
-	.pnl.up { color: var(--long); } .pnl.down { color: var(--short); }
-	.close { font-size: 0.62rem; font-weight: 700; letter-spacing: 0.06em; background: transparent; border: 1.5px solid var(--ink); color: var(--ink); padding: 0.32rem 0.6rem; }
+	/* ── improvised maker-fee ── */
+	.fee { margin-top: 0.9rem; display: flex; align-items: center; justify-content: space-between; gap: 0.7rem; }
+	.fee-l { font-size: 0.58rem; letter-spacing: 0.12em; color: var(--muted); cursor: help; }
+	.fee-in { flex: 0 0 5.4rem; }
+	.fee-in input { width: 100%; background: var(--paper-2); border: 1.5px solid var(--ink); padding: 0.5rem; font-size: 0.95rem; font-weight: 600; color: var(--ink); text-align: right; }
+	.fee-in input.bad { border-color: var(--short); }
+	.fee-note { margin-top: 0.45rem; font-size: 0.56rem; line-height: 1.5; color: var(--muted); }
 
-	/* ── fund ── */
-	.addr-box { border: 1.5px solid var(--ink); background: var(--paper-2); padding: 0.55rem 0.6rem; font-size: 0.72rem; word-break: break-all; margin-bottom: 0.7rem; }
-	.line { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; }
-	.line input { flex: 1; }
-	.ghost { font-size: 0.64rem; font-weight: 700; letter-spacing: 0.06em; background: transparent; border: 1.5px solid var(--ink); color: var(--ink); padding: 0.5rem 0.8rem; }
-	.solid { font-size: 0.64rem; font-weight: 700; letter-spacing: 0.06em; background: var(--ink); color: var(--paper); border: 1.5px solid var(--ink); padding: 0.5rem 0.9rem; }
-	.ghost.full { width: 100%; }
-	.fnote { margin: 0.75rem 0 0; font-size: 0.64rem; line-height: 1.55; color: var(--muted); }
-	.fnote b { color: var(--ink); }
-	.msg { font-size: 0.66rem; color: var(--muted); margin-bottom: 0.4rem; }
-	.forming { font-size: 0.74rem; line-height: 1.6; color: var(--muted); }
-	.forming b { color: var(--ink); }
+	/* ── order mode (auto / maker / taker) ── */
+	.mode { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.9rem; }
+	.mode-l { font-size: 0.58rem; letter-spacing: 0.12em; color: var(--muted); }
+	.mode-seg { display: flex; flex: 1; border: 1.5px solid var(--ink); }
+	.mode-seg button { flex: 1; padding: 0.42rem; font-size: 0.6rem; font-weight: 700; letter-spacing: 0.08em; background: transparent; border: none; border-left: 1.5px solid var(--ink); color: var(--muted); }
+	.mode-seg button:first-child { border-left: none; }
+	.mode-seg button.on { background: var(--ink); color: var(--paper); }
+	.mode-seg button:hover, .mode-seg button:active { transform: none; box-shadow: none; filter: none; }
+	.mode-seg button:not(.on):hover { background: var(--paper-2); }
+	.role-note { margin-top: 0.6rem; font-size: 0.58rem; line-height: 1.5; color: var(--muted); }
+	.role-note.taker { color: var(--long); }
+	.role-note.maker { color: var(--bonded); }
 
-	/* ── no house ── */
-	.lede { padding: 1.1rem 1.3rem 1.2rem; }
-	.lede p { margin: 0; font-family: var(--display); font-weight: 700; font-size: clamp(1.05rem, 2.4vw, 1.5rem); line-height: 1.35; letter-spacing: -0.01em; max-width: 62ch; }
-	.hl { background: var(--ink); color: var(--paper); padding: 0 0.25rem; }
-	.badge-on { font-size: 0.6rem; letter-spacing: 0.1em; color: var(--long); font-weight: 600; }
-	.badge-tag { font-size: 0.6rem; letter-spacing: 0.08em; color: var(--bonded); font-weight: 600; border: 1.5px solid var(--bonded); padding: 0.08rem 0.4rem; }
-	.pnote { margin: 1.1rem 0 0; font-size: 0.66rem; line-height: 1.6; color: var(--muted); }
-	.pnote b { color: var(--ink); }
-	.forming-note { margin-top: 0.4rem; }
+	/* ── the tape ── */
+	.tape { padding: 1.2rem; border-bottom: 1.5px solid var(--ink); }
+	.take { font-size: 0.6rem; font-weight: 700; letter-spacing: 0.04em; border: 1.5px solid var(--ink); padding: 0.32rem 0.55rem; color: var(--paper); }
+	.take.long { background: var(--long); }
+	.take.short { background: var(--short); color: #fff; }
+	.tape-yours { font-size: 0.58rem; font-weight: 700; color: var(--bonded); letter-spacing: 0.06em; }
 
-	.steps { display: flex; align-items: flex-start; }
-	.step { flex: 1; display: flex; flex-direction: column; align-items: center; text-align: center; }
-	.node { width: 22px; height: 22px; border: 1.5px solid var(--long); display: flex; align-items: center; justify-content: center; font-size: 0.62rem; font-weight: 700; border-radius: 50%; color: var(--long); }
-	.node.on { background: var(--long); color: var(--paper); }
-	.s-l { font-size: 0.56rem; font-weight: 600; letter-spacing: 0.04em; margin-top: 0.4rem; }
-	.s-s { font-size: 0.52rem; color: var(--muted); margin-top: 0.15rem; word-break: break-all; }
+	/* ── cta ── */
+	.cta { width: 100%; margin-top: 1rem; padding: 0.9rem; font-family: var(--display); font-weight: 800; font-size: 1.02rem; letter-spacing: 0.02em; border: 1.5px solid var(--ink); color: var(--paper); background: var(--ink); }
+	.cta.long { background: var(--long); }
+	.cta.short { background: var(--short); color: #fff; }
+	.cta.off { background: #b8b09a; color: var(--paper); cursor: default; }
+	.spin { display: inline-block; width: 0.85rem; height: 0.85rem; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; margin-right: 0.5rem; vertical-align: -2px; }
 
-	.committee { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem; }
-	.seat { width: 2.6rem; height: 2.6rem; border: 1.5px solid var(--long); display: flex; align-items: center; justify-content: center; font-size: 0.56rem; font-weight: 700; letter-spacing: 0.06em; }
+	/* ── positions ── */
+	.pos { padding: 1.2rem; flex: 1; }
+	.pos-h { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 0.2rem; }
+	.pos-t { font-family: var(--display); font-weight: 800; font-size: 0.82rem; letter-spacing: 0.02em; }
+	.pos-c { font-size: 0.58rem; letter-spacing: 0.1em; color: var(--muted); }
+	.pos-empty { font-size: 0.72rem; line-height: 1.6; color: var(--muted); padding: 1.1rem 0 0.4rem; }
+	.pos-row { display: flex; align-items: center; gap: 0.7rem; padding: 0.7rem 0; border-top: 1.5px solid var(--ink); animation: pop 0.18s ease; }
+	.pbadge { font-size: 0.56rem; font-weight: 700; letter-spacing: 0.06em; padding: 0.14rem 0.42rem; }
+	.pbadge.long { background: var(--long-soft); color: var(--long); }
+	.pbadge.short { background: var(--short-soft); color: var(--short); }
+	.pmid { flex: 1; min-width: 0; }
+	.pmain { font-size: 0.82rem; font-weight: 600; }
+	.psub { font-size: 0.6rem; color: var(--muted); margin-top: 0.1rem; word-break: break-all; }
+	.ppnl { font-weight: 700; font-size: 1rem; color: var(--ink); }
+	.ppnl.up { color: var(--long); } .ppnl.down { color: var(--short); }
+	.pclose { font-size: 0.6rem; font-weight: 700; letter-spacing: 0.06em; background: transparent; border: 1.5px solid var(--ink); color: var(--ink); padding: 0.36rem 0.6rem; }
+
+	/* ── collapsible folds (add funds / network) ── */
+	.fold { border-top: 1.5px solid var(--ink); }
+	.fold-h { width: 100%; display: flex; align-items: center; justify-content: space-between; padding: 0.85rem 1.2rem; background: transparent; border: none; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.08em; color: var(--ink); }
+	.fold-c { color: var(--muted); }
+	.fold-b { padding: 0 1.2rem 1.2rem; }
+	.fold-b.stack { display: flex; flex-direction: column; gap: 0.7rem; }
+	.net-l { display: inline-flex; align-items: center; gap: 0.5rem; }
+	.net-dot { width: 7px; height: 7px; background: var(--faint); border-radius: 50%; display: inline-block; }
+	.net-dot.live { background: var(--live); animation: blink 1.3s steps(1) infinite; }
+
+	/* funds */
+	.lbl { font-size: 0.56rem; letter-spacing: 0.14em; color: var(--muted); margin-bottom: 0.35rem; }
+	.copyline { display: flex; align-items: center; gap: 0.4rem; border: 1.5px solid var(--ink); background: var(--paper-2); padding: 0.55rem 0.6rem; font-size: 0.68rem; margin-bottom: 0.6rem; }
+	.cl-t { flex: 1; word-break: break-all; }
+	.frow { display: flex; gap: 0.5rem; }
+	.frow input { flex: 1; background: var(--paper-2); border: 1.5px solid var(--ink); padding: 0.55rem 0.6rem; font-size: 0.72rem; color: var(--ink); }
+	.claim { font-size: 0.62rem; font-weight: 700; letter-spacing: 0.06em; background: var(--ink); color: var(--paper); border: 1.5px solid var(--ink); padding: 0.55rem 0.85rem; }
+	.hint { font-size: 0.58rem; color: var(--muted); margin-top: 0.55rem; line-height: 1.5; }
+	.hint b { color: var(--ink); }
+
+	/* network cards */
+	.card { border: 1.5px solid var(--ink); }
+	.card-h { display: flex; align-items: center; justify-content: space-between; padding: 0.5rem 0.65rem; background: var(--ink); color: var(--paper); font-size: 0.58rem; letter-spacing: 0.12em; }
+	.ch-r { display: inline-flex; align-items: center; gap: 0.35rem; color: var(--bar-dim); }
+	.ch-r.g { color: var(--live-text); }
+	.mini-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); display: inline-block; }
+	.mini-dot.live { background: var(--live); }
+	.ch-d { color: var(--bar-dim); }
+	.ch-a { color: #d9b46a; }
+	.card-g { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem 0.9rem; padding: 0.65rem; }
+	.card-p { padding: 0.65rem; }
+	.kv { display: flex; align-items: baseline; justify-content: space-between; }
+	.kv .k { font-size: 0.6rem; color: var(--muted); letter-spacing: 0.06em; }
+	.kv .v { font-size: 0.78rem; font-weight: 600; }
+	.kv .v.sm { font-size: 0.72rem; }
+	.kv .v.g { color: var(--long); }
+
+	.seats { display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.55rem; }
+	.seat { flex: 1; height: 1.9rem; border: 1.5px solid var(--long); display: flex; align-items: center; justify-content: center; font-size: 0.52rem; font-weight: 700; letter-spacing: 0.04em; }
 	.seat.you { background: var(--long); color: var(--paper); }
-	.plus { color: var(--faint); font-weight: 700; }
-	.cmt-note { font-size: 0.6rem; color: var(--muted); letter-spacing: 0.04em; margin-left: 0.3rem; }
-	.cgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.55rem 0.9rem; border-top: 1.5px solid var(--ink); padding-top: 0.75rem; }
-	.cg-l { font-size: 0.54rem; letter-spacing: 0.1em; color: var(--muted); }
-	.cg-v { font-size: 0.8rem; font-weight: 600; }
-	.cg-v.g { color: var(--long); } .cg-v.w { color: var(--bonded); }
+	.seat.dim { border-color: var(--faint); color: var(--faint); }
+	.seat-plus { color: var(--faint); font-weight: 700; }
+	.card-note { font-size: 0.58rem; color: var(--muted); line-height: 1.5; }
 
-	.eqn { font-size: 0.7rem; line-height: 1.7; border: 1.5px solid var(--ink); padding: 0.55rem 0.6rem; margin-bottom: 0.9rem; }
-	.eqn b { font-weight: 700; } .eqn .eq { color: var(--long); font-weight: 700; } .eqn .op { color: var(--faint); }
-	.bar { display: flex; height: 1.5rem; border: 1.5px solid var(--ink); overflow: hidden; }
-	.bar > div { border-right: 1px solid var(--ink); }
-	.bgrid { margin-top: 0.7rem; display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem 0.9rem; }
-	.brow { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; font-size: 0.66rem; }
+	/* conservation */
+	.ch-g { color: var(--live-text); }
+	.eqn { font-size: 0.62rem; line-height: 1.7; word-break: break-word; border: 1.5px solid var(--ink); padding: 0.45rem 0.55rem; margin-bottom: 0.65rem; }
+	.eqn b { font-weight: 700; }
+	.eqn .eq { color: var(--long); font-weight: 700; }
+	.eqn .op { color: var(--faint); }
+	.cbar { display: flex; height: 1.3rem; border: 1.5px solid var(--ink); overflow: hidden; }
+	.cbar > div { border-right: 1px solid var(--ink); }
+	.bgrid { margin-top: 0.6rem; display: grid; grid-template-columns: 1fr 1fr; gap: 0.35rem 0.9rem; }
+	.brow { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; font-size: 0.62rem; }
 	.bl { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--muted); }
-	.sw { width: 9px; height: 9px; display: inline-block; }
+	.sw { width: 9px; height: 9px; display: inline-block; flex: none; }
 	.bv { font-weight: 600; }
-	.reserves { margin-top: 0.7rem; border-top: 1.5px solid var(--ink); padding-top: 0.55rem; display: flex; align-items: baseline; justify-content: space-between; }
-	.r-l { font-size: 0.6rem; letter-spacing: 0.1em; color: var(--muted); }
+	.reserves { margin-top: 0.6rem; border-top: 1.5px solid var(--ink); padding-top: 0.5rem; display: flex; align-items: baseline; justify-content: space-between; }
+	.r-l { font-size: 0.58rem; letter-spacing: 0.1em; color: var(--muted); }
 	.r-v { font-family: var(--display); font-weight: 800; font-size: 1.05rem; }
 
-	@media (max-width: 720px) {
-		.cols2, .cols3 { grid-template-columns: 1fr; }
-		.cell.div { border-right: none; }
-	}
+	.id-b { padding: 0.65rem; display: flex; flex-direction: column; gap: 0.5rem; }
+	.id-l { font-size: 0.56rem; color: var(--muted); letter-spacing: 0.08em; margin-bottom: 0.2rem; }
+	.id-row { display: flex; align-items: center; gap: 0.4rem; font-size: 0.66rem; font-weight: 600; }
+	.id-t { flex: 1; word-break: break-all; }
+	.id-inline { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.7rem; font-weight: 600; }
+	.trader-sel { width: 100%; background: var(--paper-2); border: 1.5px solid var(--ink); color: var(--ink); padding: 0.35rem 0.4rem; font-size: 0.7rem; font-weight: 600; cursor: pointer; }
+	.chips { font-size: 0.66rem; font-weight: 600; word-break: break-all; line-height: 1.7; }
+	.chip { padding: 0.05rem 0.3rem; }
+	.chip.a { background: var(--ink); color: var(--paper); }
+	.chip.b { background: var(--long-soft); color: var(--long); }
+	.chip.c { background: var(--bonded-soft); color: var(--bonded); }
+	.chip-sep { color: var(--faint); }
+	.chips-foot { display: flex; align-items: center; justify-content: space-between; gap: 0.4rem; margin-top: 0.3rem; }
+	.cf-l { font-size: 0.52rem; color: var(--muted); letter-spacing: 0.04em; }
+	.sha { display: flex; align-items: center; gap: 0.45rem; color: var(--muted); font-size: 0.62rem; }
+	.sha-line { flex: 1; height: 1px; background: #cfc7b2; }
+	.okmark { color: var(--long); font-weight: 600; }
+
+	.cpbtn { background: transparent; border: none; cursor: pointer; color: var(--ink); font-size: 0.78rem; padding: 0; line-height: 1; opacity: 0.45; }
+	.cpbtn:hover { opacity: 1; transform: none; box-shadow: none; filter: none; }
+	.cpbtn:active { transform: none; box-shadow: none; filter: none; }
+
+	.err { background: var(--short-soft); border-top: 1.5px solid var(--short); color: var(--short); padding: 0.55rem 1.2rem; font-size: 0.66rem; font-weight: 600; }
+
+	/* ── footer ── */
+	.foot { display: flex; align-items: center; justify-content: center; gap: 0.5rem; padding: 0.7rem 1.2rem; background: var(--ink); color: var(--bar-dim); font-size: 0.58rem; letter-spacing: 0.1em; text-align: center; }
+	.foot .ok { color: var(--live-text); }
+
+	@keyframes spin { to { transform: rotate(360deg); } }
+	@keyframes pop { 0% { transform: scale(0.96); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
 </style>
