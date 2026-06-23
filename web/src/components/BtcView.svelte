@@ -131,6 +131,24 @@
 		await refresh();
 	}
 
+	// withdraw — burn gBTC → a pending payout the committee threshold-signs and broadcasts
+	let wAmt = $state("");
+	let wAddr = $state("");
+	let wFee = $state("1000");
+	const UI_MAX_FEE = 50_000;
+	const wAmtNum = $derived(Number(wAmt) || 0);
+	const wFeeNum = $derived(Number(wFee) || 0);
+	const wFeeMax = $derived(Math.max(0, Math.min(wAmtNum - 546, UI_MAX_FEE)));
+	const wNet = $derived(wAmtNum - wFeeNum);
+	const wFeeOk = $derived(wFee.trim() !== "" && Number.isInteger(wFeeNum) && wFeeNum >= 0 && wFeeNum <= wFeeMax && wNet >= 546);
+	const wOk = $derived(!!wAmt && !!wAddr.trim() && wAmtNum <= bal && wFeeOk);
+	async function withdraw() {
+		if (!wOk) return;
+		const ok = await act(() => api.withdraw(wAmt, wAddr.trim(), wFee.trim()));
+		if (ok) wAmt = "";
+	}
+	const processPayouts = () => act(() => api.processWithdrawals());
+
 	// ── network status ──
 	let netOpen = $state(false);
 	const height = $derived(c?.tip?.height ?? null);
@@ -279,20 +297,40 @@
 	<!-- add funds -->
 	<section class="fold">
 		<button class="fold-h" onclick={() => (fundOpen = !fundOpen)}>
-			<span>＋ ADD FUNDS</span><span class="fold-c">{fundOpen ? "▲" : "▼"}</span>
+			<span>＋ FUNDS</span><span class="fold-c">{fundOpen ? "▲" : "▼"}</span>
 		</button>
 		{#if fundOpen}
 			<div class="fold-b">
 				{#if fundReady}
-					<div class="lbl">YOUR DEPOSIT ADDRESS · {m.btcNetwork?.toUpperCase()}</div>
+					<!-- deposit -->
+					<div class="lbl">DEPOSIT · {m.btcNetwork?.toUpperCase()} · YOUR ADDRESS</div>
 					<div class="copyline"><span class="cl-t">{m.depositAddress}</span><button class="cpbtn" title="copy" onclick={copy("deposit", m.depositAddress)}>{cpLbl("deposit")}</button></div>
 					<div class="frow">
 						<input bind:value={depTx} placeholder="paste deposit txid" />
 						<button class="claim" onclick={claim} disabled={!depTx.trim()}>CLAIM</button>
 					</div>
 					<div class="hint">{claimMsg || fundHint}</div>
+
+					<!-- withdraw -->
+					<div class="fold-div"></div>
+					<div class="lbl">WITHDRAW · A {cu?.threshold ?? 2}-OF-{cu?.committee?.length ?? needN} QUORUM SIGNS A REAL BTC TX</div>
+					<div class="frow">
+						<input class="w-amt" bind:value={wAmt} inputmode="numeric" placeholder="gBTC" />
+						<input bind:value={wAddr} placeholder="your BTC address (tb1…)" />
+					</div>
+					<div class="frow">
+						<input bind:value={wFee} inputmode="numeric" placeholder="miner fee (sats)" />
+						<button class="claim" onclick={withdraw} disabled={!wOk}>WITHDRAW</button>
+					</div>
+					<div class="hint">
+						{#if wAmtNum > bal}Not enough gBTC — you have {bal.toLocaleString()}.
+						{:else if wAmtNum > 0 && wFeeNum > wFeeMax}Miner fee too high — max {wFeeMax.toLocaleString()} sats for this amount.
+						{:else if wAmtNum > 0 && wOk}You receive <b>{wNet.toLocaleString()}</b> sats — the miner fee comes out of your payout.
+						{:else}Burn gBTC → the committee threshold-signs and broadcasts a real Bitcoin tx to your address. Min payout 546 sats (dust).{/if}
+					</div>
+					{#if m.pendingCount > 0}<button class="payouts" onclick={processPayouts}>PROCESS {m.pendingCount} PENDING PAYOUT{m.pendingCount === 1 ? "" : "S"} → BROADCAST BTC</button>{/if}
 				{:else}
-					<div class="hint"><b>Custody is still forming.</b> No deposit address yet — a committee of ≥{needN} independent farmers must finish its genesis DKG to mint the shared fund key. Bring more nodes online.</div>
+					<div class="hint"><b>Custody is still forming.</b> No deposit address or withdrawals yet — a committee of ≥{needN} independent farmers must finish its genesis DKG to mint the shared fund key. Bring more nodes online.</div>
 				{/if}
 			</div>
 		{/if}
@@ -498,6 +536,9 @@
 	.claim { font-size: 0.62rem; font-weight: 700; letter-spacing: 0.06em; background: var(--ink); color: var(--paper); border: 1.5px solid var(--ink); padding: 0.55rem 0.85rem; }
 	.hint { font-size: 0.58rem; color: var(--muted); margin-top: 0.55rem; line-height: 1.5; }
 	.hint b { color: var(--ink); }
+	.fold-div { height: 1.5px; background: var(--ink); margin: 1rem 0 0.9rem; }
+	.frow input.w-amt { flex: 0 0 5.5rem; }
+	.payouts { width: 100%; margin-top: 0.7rem; font-size: 0.62rem; font-weight: 700; letter-spacing: 0.06em; background: transparent; border: 1.5px solid var(--ink); color: var(--ink); padding: 0.55rem; }
 
 	/* network cards */
 	.card { border: 1.5px solid var(--ink); }
