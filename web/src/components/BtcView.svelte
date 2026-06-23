@@ -190,6 +190,7 @@
 	});
 	const custodyTag = $derived(custodyOk ? `${cu.threshold}-OF-${cu.committee.length}` : `FORMING ${producers}/${needN}`);
 	const custodyThreshold = $derived(custodyOk ? cu.threshold : 2);
+	const myBond = $derived(Number(cu?.myBond ?? 0)); // this node's committee bond (gBTC); 0 if not bonded
 	const fundAddr = $derived(cu?.fundAddress ?? m?.fundAddress ?? null);
 
 	// conservation — the five buckets that sum to reserves
@@ -403,6 +404,9 @@
 							{#if custodyOk}No node holds the key alone — any {custodyThreshold} of {seats.length} farmers co-sign to move BTC. Re-shares every epoch, without moving the address.
 							{:else}Waiting for ≥{needN} farmers to run the genesis DKG. A lone node holds no fund key and can't mint — {producers}/{needN} producing now.{/if}
 						</div>
+						{#if myBond > 0}
+							<div class="card-note bond-lock">⚓ Your bond <b>{fmt(myBond)} gBTC</b> is locked while it secures custodied BTC — it releases only as the fund shrinks (BTC withdrawn), so stake can never be pulled out from under the fund. Not stuck: an unbond that would under-secure the fund is refused until reserves fall.</div>
+						{/if}
 					</div>
 				</div>
 				<!-- conservation -->
@@ -593,6 +597,8 @@
 	.seat.dim { border-color: var(--faint); color: var(--faint); }
 	.seat-plus { color: var(--faint); font-weight: 700; }
 	.card-note { font-size: 0.58rem; color: var(--muted); line-height: 1.5; }
+	.card-note.bond-lock { margin-top: 0.5rem; padding: 0.5rem 0.6rem; background: var(--bonded-soft); color: var(--bonded); border-radius: 3px; }
+	.card-note.bond-lock b { font-weight: 700; }
 
 	/* conservation */
 	.ch-g { color: var(--live-text); }
