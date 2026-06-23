@@ -24,7 +24,7 @@ import { finalizedOrdering, orderingFor } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import { verifyPythUpdate } from "./pyth.ts";
 import { verifySignedQuorum } from "./signed-feed.ts";
-import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
+import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, mintCeiling, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
 import { emptyBook, escrowedInContracts, applyMatch, applyMatchPot, applySettle, pruneExpiredOffers, settleExpired } from "./intent.ts";
@@ -272,12 +272,17 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	// appRoot folds (which all share that base). No base yet (pre-first-checkpoint) → 0.
 	const backstop = opts.backstop ?? (opts.base ? { pot: opts.base.bridge.pot, taken: opts.base.bridge.potEscrowTaken } : null);
 	const backstopBudget = backstop ? backstop.pot + backstop.taken : 0n;
+	// Per-epoch custody ceiling: custodied BTC ≤ TVL_PER_BOND × the FINALIZED committee bond, read from
+	// the SAME checkpoint base the backstop budget uses (so it's identical for full and pruned nodes, and
+	// — since CHECKPOINT_EVERY == epochLength — advances exactly one epoch at a time). No base yet
+	// (pre-first-checkpoint / genesis) → bond 0 → just the bootstrap floor.
+	const custodyCeiling = mintCeiling(opts.base ? bondedTotal(opts.base.bridge) : 0n);
 	for (const w of [...writes].sort(cmp)) {
 		const op = w.payload as Op | null;
 		// Effects timed by height (unbond maturity) use the write's STABLE certifying
 		// height (bornAt) so they don't drift as the global nowHeight advances; others
 		// use nowHeight (the current anchor clock).
-		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, opts.market);
+		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, custodyCeiling, opts.market);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
 	settleExpired(view.bridge, view.book, nowHeight); // time-locked directional swaps unwind at entry (base-independent)
@@ -322,7 +327,7 @@ export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: st
 	return computeView(included, { order, nowHeight, bornAt, base, market });
 }
 
-function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, market?: MarketDef): void {
+function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, custodyCeiling = 0n, market?: MarketDef): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized ONLY by the committee
@@ -331,7 +336,7 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			const amt = parseAmount(op.amount);
 			if (amt === null || typeof op.depositId !== "string" || typeof op.depositor !== "string") return;
 			if (!attestationAuthorized(view, w, depositAttestationDigest({ depositId: op.depositId, depositor: op.depositor, amount: amt }), op.sig)) return;
-			mintFromDeposit(view.bridge, { depositId: op.depositId, depositor: op.depositor, amount: amt }, bornHeight);
+			mintFromDeposit(view.bridge, { depositId: op.depositId, depositor: op.depositor, amount: amt }, bornHeight, custodyCeiling);
 			return;
 		}
 		case "gbtc.transfer": {

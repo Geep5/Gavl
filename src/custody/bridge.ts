@@ -93,6 +93,23 @@ export interface BridgeState {
  *  slash proof for any in-flight equivocation to land first. */
 export const UNBOND_DELAY = 16;
 
+// ── per-epoch custody ceiling (the TVL throttle) — consensus-critical, every node must agree ──
+/** Sats of custodied BTC allowed per sat of FINALIZED committee bond (the key economic knob): the
+ *  value the committee secures may not exceed this multiple of its slashable stake. Higher = more
+ *  capital-efficient custody, leaning harder on threshold-honesty; lower = more bond-collateralised. */
+export const TVL_PER_BOND = 10n;
+/** Custody allowed regardless of bond, so a near-empty fund can bootstrap before any stake is bonded
+ *  (mirrors gate #2's uncapped baseline epoch). Above this, the bond ceiling binds. */
+export const TVL_BOOTSTRAP_FLOOR = 100_000_000n; // 1 BTC
+/** The custody ceiling for a given FINALIZED bond: max custodied BTC = TVL_PER_BOND × bond, floored at
+ *  the bootstrap allowance. Because the fold reads `bond` from the checkpoint base — which advances one
+ *  epoch at a time (CHECKPOINT_EVERY == epochLength) — the ceiling rises at most one epoch's worth of
+ *  newly-FINALISED stake per epoch: custodied value can't outrun the slashable stake backing it. */
+export function mintCeiling(finalizedBond: bigint): bigint {
+	const tied = TVL_PER_BOND * finalizedBond;
+	return tied > TVL_BOOTSTRAP_FLOOR ? tied : TVL_BOOTSTRAP_FLOOR;
+}
+
 // ── demurrage (idle-balance decay) — consensus-critical, every node must agree ──
 /** Anchors per demurrage "day". */
 export const DEMURRAGE_DAY = 1440;
@@ -223,8 +240,12 @@ export function backingBps(s: BridgeState): bigint {
  * most once (replays are no-ops), so an attestation can be gossiped freely.
  * Returns true if it minted.
  */
-export function mintFromDeposit(s: BridgeState, att: DepositAttestation, height?: number): boolean {
+export function mintFromDeposit(s: BridgeState, att: DepositAttestation, height?: number, ceiling?: bigint): boolean {
 	if (att.amount <= 0n || s.processed.has(att.depositId)) return false;
+	// Per-epoch custody ceiling: don't mint past what the FINALIZED committee bond can secure. The
+	// deposit isn't lost — it's left UNMINTED (not marked processed, claim kept), and mints on a later
+	// fold once the next epoch's bond lifts the ceiling. Undefined → uncapped (tests / legacy callers).
+	if (ceiling !== undefined && s.reserves + att.amount > ceiling) return false;
 	s.processed.add(att.depositId);
 	s.claims.delete(att.depositId); // the mint request (if any) is satisfied → retire it (was a leak)
 	s.depositors.add(att.depositor); // its per-user deposit address may hold fund BTC
