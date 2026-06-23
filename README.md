@@ -68,7 +68,16 @@ in tests.
 
 ---
 
-## The product — peer-to-peer bull/bear
+## The product — Matched Directional Swaps
+
+A **Matched Directional Swap (MDS)** is a fully-collateralized, zero-sum, **bounded** bet on
+Bitcoin's direction between two real peers — long vs. short, marked to the channel's price. Both
+sides post the *same* stake; settlement splits the `2·stake` pot by directional PnL, with each
+side's payout capped to **`[0, 2·stake]`** — you can win at most the other side's stake and never
+owe more than your own. Either side may **close early** at the mark; a position left open
+**auto-settles at a time-lock** (a hard ~1-month cap), so nothing runs forever. It is deliberately
+*not* a perpetual: there's no funding rate, no liquidation, and no unbounded upside — just a
+matched, time-locked, capped directional bet with an early exit.
 
 1. **Deposit** real (testnet) BTC to *your personal* fund address → mint **gBTC** 1:1.
 2. **Broadcast an intent** — "long/short *N* gBTC at *L*× leverage" — gossiped over the mesh
@@ -91,10 +100,12 @@ No pool, no order book to babysit — just signed intents and matched bilateral 
   the maker signature, checks BOTH peers can cover the stake *right now* (a maker who already
   spent the funds just fails — we verify on-chain anyway), escrows both, and opens the
   contract. No interactive handshake — the signed offer is the authorization.
-- **Bilateral, zero-sum, bounded.** Each side stakes the same; settlement splits the
-  `2·stake` pot by directional PnL at the channel's mark, capped at the stake. The loser can
-  never owe more than it posted. "Leverage" just scales the price move and tightens the cap (at
-  *L*×, a `1/L` move against you wipes your stake).
+- **Bilateral, zero-sum, bounded — a Matched Directional Swap.** Each side stakes the same;
+  settlement splits the `2·stake` pot by directional PnL at the channel's mark, with each payout
+  capped to `[0, 2·stake]`. The loser can never owe more than it posted, and the winner takes at
+  most the other side's stake. "Leverage" just scales the price move and tightens the cap (at
+  *L*×, a `1/L` move against you wipes your stake). Bounded payoff *is* full prefunding — the
+  reason an MDS can be fully collateralized with no liquidation engine and no house at risk.
 - **A liquidity backstop, funded by idle decay.** With no peer on the other side, the **pot**
   (the idle-decay bucket, see below) can take it — staking matching gBTC as the counterparty
   (`match.pot`). The easy long/short button sweeps resting peer intents first, then falls back to
@@ -261,7 +272,7 @@ hyperdht topic whose name *is* the network identity.
 > **Bounded by design — no hard caps.** Every structure that lives in RAM is held in check by
 > the same shape: it **costs** something to create (a PoST cooldown, or real gBTC backing) **and
 > it decays or expires**. History prunes behind checkpoints; the anchor chain keeps only a recent
-> suffix; perps time-lock; idle balances decay (demurrage) into the liquidity pot; stale deposit-claim requests expire
+> suffix; matched swaps time-lock; idle balances decay (demurrage) into the liquidity pot; stale deposit-claim requests expire
 > after a reclaim grace; the gossip offer tape is cover-checked (only offers a maker can back are
 > kept) + TTL'd; and the out-of-order write buffer is PoST-gated + decays. So a small node's
 > memory is bounded by the **real economy**, not by an attacker's willingness to spam — with no

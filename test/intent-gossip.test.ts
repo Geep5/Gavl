@@ -34,7 +34,7 @@ function node() {
 
 function makeOffer(seed: number, nonce: string): Offer {
 	const kp = keyPairFromSeed(sha256("maker-" + seed));
-	return signOffer({ maker: toHex(kp.publicKey), makerSide: "long", size: "1000", leverage: "5", expiryHeight: 2_000_000_000, nonce }, kp.privateKey);
+	return signOffer({ maker: toHex(kp.publicKey), makerSide: "long", size: "1000", leverage: "5", expiryHeight: 2_000_000_000, nonce, spread: "0" }, kp.privateKey);
 }
 
 test("a broadcast intent floods to a connected peer's tape", async () => {

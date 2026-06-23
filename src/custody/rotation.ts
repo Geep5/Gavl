@@ -64,6 +64,13 @@ export interface RotationConfig {
 	/** Finalized committee bonds (pubkey → bonded gBTC). When set, selection is
 	 *  STAKE-weighted (gate #3): only bonded producers are eligible, weighted by bond. */
 	bonds?: () => Map<string, bigint>;
+	/** Per-seat minimum bond (gate #4): producers bonded below this are ineligible, so the
+	 *  eligible set can't be flooded with dust-bonded Sybil identities. Stake-weighted only. */
+	minBond?: bigint;
+	/** Max % the total eligible weight may grow per epoch (gate #2): a sudden influx of fresh
+	 *  stake is trimmed newest-first, so the committee can't be captured faster than the network
+	 *  can react. Undefined → uncapped. */
+	maxGrowthPct?: number;
 	/** Authenticates ceremony messages (signs as this node's committee id, verifies peers'). */
 	auth?: CeremonyAuth;
 	/** This node's stable SECRET (e.g. its producer private key) — seeds DETERMINISTIC DKG material
@@ -131,7 +138,7 @@ export class CommitteeRotation {
 	}
 
 	private epochCommittee(finalized: AnchorView[], epoch: number, size = this.c.size): EpochCommittee | null {
-		return committeeForEpoch(finalized, epoch, { epochLength: this.c.epochLength, size, windowAnchors: this.c.windowAnchors, bonds: this.c.bonds?.() });
+		return committeeForEpoch(finalized, epoch, { epochLength: this.c.epochLength, size, windowAnchors: this.c.windowAnchors, bonds: this.c.bonds?.(), minBond: this.c.minBond, maxGrowthPct: this.c.maxGrowthPct });
 	}
 
 	/** Committee size for `epoch`: the small genesis set AT the genesis epoch, the full target size

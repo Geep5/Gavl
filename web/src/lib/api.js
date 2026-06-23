@@ -22,9 +22,9 @@ export const api = {
 	withdraw: (amount, btcAddress, fee) => req("/withdraw", "POST", { amount, btcAddress, fee }),
 	processWithdrawals: () => req("/withdrawals/process", "POST", {}),
 	// matched market (real counterparty, no pool)
-	broadcastIntent: (side, size, leverage) => req("/intent/broadcast", "POST", { side, size, leverage }),
-	takeIntent: (nonce, fill) => req("/intent/take", "POST", { nonce, fill }),
-	takePosition: (side, size) => req("/intent/take-position", "POST", { side, size }),
+	broadcastIntent: (side, size, leverage, spread) => req("/intent/broadcast", "POST", { side, size, leverage, spread }),
+	takeIntent: (nonce, fill, maxSpread) => req("/intent/take", "POST", { nonce, fill, maxSpread }),
+	takePosition: (side, size, maxSpread) => req("/intent/take-position", "POST", { side, size, maxSpread }),
 	settleContract: (contractId) => req("/contract/settle", "POST", { contractId }),
 	switchChannel: (name) => req("/channel", "POST", { name }),
 	testPythFeed: (feedId) => req("/market/test", "POST", { feedId }),

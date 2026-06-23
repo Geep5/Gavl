@@ -44,6 +44,33 @@ export const MAX_OFFER_LEVERAGE = 100n;
  *  use the same value. ~30 days at a 60s/anchor target. */
 export const CONTRACT_MAX_LIFE = 43_200;
 
+/** Basis-point denominator (10000 bps = 100%). */
+export const BPS = 10_000n;
+/** The protocol's default maker fee, in basis points of the stake. It's used in two consensus spots:
+ *  (1) the pot charges it as a counterparty (a paid maker of last resort), and (2) it's the CAP on how
+ *  much of a peer maker's spread the pot will SUBSIDISE on a peer match. Consensus-critical — every node
+ *  must agree. The client also pre-fills makers' offers with it (editable). */
+export const DEFAULT_SPREAD_BPS = 10n; // 0.10%
+/** Protocol sanity cap on an offer's spread — keeps the fee ≤ stake so coverage can't overflow. The UI
+ *  bounds far lower; this only stops absurd values from being signed into an offer. */
+export const SPREAD_MAX_BPS = BPS; // 100%
+
+/** The maker fee for a fill: `stake · spreadBps / 10000` (sats, truncated). */
+export function feeOf(stake: bigint, spreadBps: bigint): bigint {
+	return (stake * spreadBps) / BPS;
+}
+
+/** Parse a spread (basis points): a non-negative integer string ≤ SPREAD_MAX_BPS. null if invalid. */
+export function parseSpread(s: unknown): bigint | null {
+	if (typeof s !== "string" || !/^[0-9]+$/.test(s)) return null;
+	try {
+		const n = BigInt(s);
+		return n >= 0n && n <= SPREAD_MAX_BPS ? n : null;
+	} catch {
+		return null;
+	}
+}
+
 /** The signed part of an offer (everything except the signature). Canonical-JSON
  *  encoded and signed by the maker — a self-authenticating signal a taker can redeem
  *  on-chain without the maker being online. */
@@ -60,6 +87,10 @@ export interface OfferCore {
 	expiryHeight: number;
 	/** Unique per offer — the redemption key (tracks cumulative fills ≤ size). */
 	nonce: string;
+	/** Maker fee in basis points the taker pays for the fill — the maker's spread. On a peer match the
+	 *  POT subsidises it up to DEFAULT_SPREAD_BPS (so the taker pays only any excess); SIGNED, so a taker
+	 *  can't strip it. "0" = no fee (the old behaviour). */
+	spread: string;
 }
 
 export interface Offer extends OfferCore {
@@ -67,8 +98,8 @@ export interface Offer extends OfferCore {
 	sig: string;
 }
 
-/** A live, escrowed bilateral bet. Pot = 2·stake; closing splits it directionally at the
- *  current mark. Perpetual — either side may close it any time (no expiry). */
+/** A live, escrowed bilateral bet — a Matched Directional Swap. Pot = 2·stake; closing splits it
+ *  directionally at the current mark. Either side may close it any time, up to the time-lock cap. */
 export interface Contract {
 	id: string; // the match write's id
 	long: string; // pubkey holding the long side
@@ -134,6 +165,7 @@ export function offerDigest(core: OfferCore): Uint8Array {
 		leverage: core.leverage,
 		expiryHeight: core.expiryHeight,
 		nonce: core.nonce,
+		spread: core.spread,
 	});
 }
 
@@ -152,6 +184,7 @@ export function verifyOffer(o: Offer): boolean {
 	if (lev === null || lev < MIN_OFFER_LEVERAGE || lev > MAX_OFFER_LEVERAGE) return false; // 2 ≤ leverage ≤ MAX
 	if (!Number.isInteger(o.expiryHeight)) return false;
 	if (typeof o.nonce !== "string" || o.nonce.length === 0) return false;
+	if (parseSpread(o.spread) === null) return false; // non-negative bps ≤ SPREAD_MAX_BPS
 	if (!isHex(o.sig, 64)) return false;
 	try {
 		return verify(fromHex(o.maker), offerDigest(o), fromHex(o.sig));
@@ -178,13 +211,21 @@ export function longPayout(stake: bigint, entry: bigint, leverage: bigint, price
 // ── match / settle (operate on the bridge + book) ────────────────
 
 /**
- * A taker redeems part of a maker's signed offer at the current oracle `mark` (the
- * entry price). Returns the opened contract, or null if rejected (bad/expired offer,
- * self-match, exhausted, no mark, or either side can't cover — the ghost case). The
- * match write's id becomes the contract id. `fill` is clamped to the offer's
- * remaining size (partial fill); both sides escrow `take`.
+ * A taker redeems part of a maker's signed offer at the current oracle `mark` (the entry price).
+ * Returns the opened contract, or null if rejected (bad/expired offer, self-match, exhausted, no
+ * mark, or either side can't cover — the ghost case). The match write's id becomes the contract id.
+ * `fill` is clamped to the offer's remaining size (partial fill); both sides escrow `take`.
+ *
+ * Maker fee: the maker EARNS `feeOf(take, offer.spread)` for providing the fill (compensation for the
+ * timing option a resting intent grants the taker). The fee is sourced first from the liquidity POT —
+ * a community-funded maker rebate so takers can trade for free — up to DEFAULT_SPREAD_BPS and limited
+ * by the deterministic `available` budget; the taker pays only the excess. Paying from the pot draws
+ * the same finalized budget the backstop uses (`available`) and is recorded in `potEscrowTaken`, so
+ * full and checkpoint-pruned nodes agree and the free pot can't go negative. Entry stays the clean
+ * mark for both sides — the fee is an explicit transfer, never a price shift — so the bet is still
+ * zero-sum and 1:1 backing holds (gBTC only moves between buckets).
  */
-export function applyMatch(bridge: BridgeState, book: MarketBook, taker: string, writeId: string, offer: Offer, fill: bigint, nowHeight: number, mark: bigint): Contract | null {
+export function applyMatch(bridge: BridgeState, book: MarketBook, taker: string, writeId: string, offer: Offer, fill: bigint, nowHeight: number, mark: bigint, available: bigint = 0n): Contract | null {
 	if (mark <= 0n) return null; // no oracle price yet → no entry
 	if (!verifyOffer(offer)) return null;
 	if (nowHeight > offer.expiryHeight) return null; // offer no longer takeable (soft TTL)
@@ -198,10 +239,28 @@ export function applyMatch(bridge: BridgeState, book: MarketBook, taker: string,
 	if (remaining <= 0n) return null; // offer fully consumed
 	const take = fill <= remaining ? fill : remaining; // partial fill
 
-	if (gbtcOf(bridge, offer.maker) < take || gbtcOf(bridge, taker) < take) return null; // ghost → no-op
+	// Maker fee = the maker's spread on the filled stake. The pot subsidises up to the default fee,
+	// bounded by the finalised budget; the taker pays any remainder.
+	const fee = feeOf(take, parseSpread(offer.spread)!);
+	const defaultFee = feeOf(take, DEFAULT_SPREAD_BPS);
+	const budget = available > 0n ? available : 0n;
+	const subsidy = fee < defaultFee ? fee : defaultFee; // pot never covers above the default
+	const fromPot = subsidy < budget ? subsidy : budget; // and never more than the budget allows
+	const takerPays = fee - fromPot; // the taker covers whatever the pot didn't
+
+	if (gbtcOf(bridge, offer.maker) < take) return null; // maker ghosted → no-op
+	if (gbtcOf(bridge, taker) < take + takerPays) return null; // taker can't cover stake + its fee share
 
 	addGbtc(bridge, offer.maker, -take); // escrow both stakes → the contract
 	addGbtc(bridge, taker, -take);
+	if (fee > 0n) {
+		addGbtc(bridge, offer.maker, fee, nowHeight); // maker earns the fee (a credit → resets its idle clock)
+		if (takerPays > 0n) addGbtc(bridge, taker, -takerPays);
+		if (fromPot > 0n) {
+			bridge.pot -= fromPot; // the subsidy leaves the pot (permanently — it's spent, not escrowed)
+			bridge.potEscrowTaken += fromPot; // count it against the budget so later draws can't double-spend
+		}
+	}
 	book.offerFills.set(offer.nonce, { filled: already + take, expiryHeight: offer.expiryHeight });
 
 	const long = offer.makerSide === "long" ? offer.maker : taker;
@@ -244,6 +303,10 @@ function creditParty(bridge: BridgeState, who: string, amount: bigint, height?: 
  * also clamped to what the taker can cover. Returns the opened contract, or null if rejected (no
  * mark, bad leverage, id reuse, or no budget/coverage). The pot's PnL flows back into `bridge.pot`
  * at settle — winning trades drain idle capital out to traders; losing trades refill it.
+ *
+ * The pot is a PAID maker too (the same deal a peer maker gets): the taker pays it the DEFAULT-spread
+ * fee on top of the stake, which flows into `bridge.pot` — so providing last-resort liquidity grows
+ * the backstop rather than just risking it.
  */
 export function applyMatchPot(bridge: BridgeState, book: MarketBook, taker: string, writeId: string, takerSide: Side, fill: bigint, leverage: bigint, nowHeight: number, mark: bigint, available: bigint): Contract | null {
 	if (mark <= 0n) return null; // no market price yet → no entry
@@ -253,13 +316,21 @@ export function applyMatchPot(bridge: BridgeState, book: MarketBook, taker: stri
 	if (leverage < MIN_OFFER_LEVERAGE || leverage > MAX_OFFER_LEVERAGE) return null;
 
 	const budget = available > 0n ? available : 0n;
-	let take = fill;
 	const takerFree = gbtcOf(bridge, taker);
-	if (take > takerFree) take = takerFree; // taker can't cover → partial
+	// The taker also pays the pot a DEFAULT-spread fee, so clamp the stake so stake + its fee fits the
+	// taker's balance (as well as the offered fill and the pot's finalized budget).
+	const maxAffordable = (takerFree * BPS) / (BPS + DEFAULT_SPREAD_BPS);
+	let take = fill;
+	if (take > maxAffordable) take = maxAffordable; // taker can't cover stake + fee → partial
 	if (take > budget) take = budget; // pot's finalized budget → partial
 	if (take <= 0n) return null; // taker broke or pot exhausted → no-op
+	const fee = feeOf(take, DEFAULT_SPREAD_BPS); // the pot's maker fee
 
 	addGbtc(bridge, taker, -take); // taker escrows its stake
+	if (fee > 0n) {
+		addGbtc(bridge, taker, -fee); // taker pays the pot its maker fee
+		bridge.pot += fee; // ...which grows the backstop (the pot earns for providing liquidity)
+	}
 	bridge.pot -= take; // pot escrows the matching counter-stake (≥ 0 by the budget invariant)
 	bridge.potEscrowTaken += take; // committed counter the budget is measured against
 	const long = takerSide === "long" ? taker : POT;
@@ -271,7 +342,7 @@ export function applyMatchPot(bridge: BridgeState, book: MarketBook, taker: stri
 
 /**
  * Auto-unwind every contract whose time-lock has elapsed (expiryHeight ≤ nowHeight): settle at
- * its OWN ENTRY price, i.e. return each side its stake (no PnL). A perp can't outlive its cap,
+ * its OWN ENTRY price, i.e. return each side its stake (no PnL). A swap can't outlive its cap,
  * so the open-contract set is bounded by throughput × CONTRACT_MAX_LIFE.
  *
  * Why entry and not the mark: this sweep runs at the fold's `nowHeight`, which a checkpoint-

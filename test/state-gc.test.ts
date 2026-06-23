@@ -55,7 +55,7 @@ test("offer fill-tracking is pruned once the offer can no longer be matched", ()
 	const bridge = emptyBridge();
 	addGbtc(bridge, maker, 1000n);
 	addGbtc(bridge, taker, 1000n);
-	const offer = signOffer({ maker, makerSide: "long", size: "500", leverage: "10", expiryHeight: 5, nonce: "x" }, mk.privateKey);
+	const offer = signOffer({ maker, makerSide: "long", size: "500", leverage: "10", expiryHeight: 5, nonce: "x", spread: "0" }, mk.privateKey);
 	const book = emptyBook();
 
 	const c = applyMatch(bridge, book, taker, "w1", offer, 100n, 3, 61000n); // matched at height 3 (≤ expiry)

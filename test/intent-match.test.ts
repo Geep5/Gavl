@@ -41,6 +41,7 @@ function offer(maker: ReturnType<typeof acct>, over: Partial<OfferCore> = {}) {
 		leverage: "2",
 		expiryHeight: 100,
 		nonce: "n" + (over.nonce ?? Math.random().toString(36).slice(2)),
+		spread: "0", // default: no maker fee (the fee path is exercised in its own tests)
 		...over,
 		maker: maker.pub, // keep maker authoritative even if `over` set it
 	};

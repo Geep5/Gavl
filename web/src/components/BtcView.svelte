@@ -72,6 +72,17 @@
 	let side = $state("long");
 	let amount = $state("");
 	let leverage = $state("2");
+	// Maker fee, in basis points — serves both roles: when this order RESTS as a maker, it's the fee you
+	// EARN; when it TAKES a resting intent, it's the most you'll pay (so you only take offers ≤ this).
+	// Pre-filled to the protocol default; the pot subsidises peer fees up to it, so at the default a
+	// taker pays nothing. Editable — set whatever; the market finds the level.
+	let fee = $state("10");
+	const feeOk = $derived(/^[0-9]+$/.test(fee.trim()) && Number(fee) >= 0 && Number(fee) <= 200);
+	const feeNote = $derived.by(() => {
+		const bps = Number(fee) || 0;
+		if (fillable > 0) return `You'll take offers charging ≤ ${bps} bps; the pot covers the first 10 bps, so you'd pay at most ${Math.max(0, bps - 10)} bps.`;
+		return `Your resting intent earns ${bps} bps when taken — the pot pays the first 10 bps, so a taker owes only the rest.`;
+	});
 	let busy = $state(false);
 	const notional = $derived(amount && priceNum ? Number(amount) * Number(leverage) : null);
 	const exposure = $derived(notional && priceNum ? (notional / priceNum).toPrecision(3) : null);
@@ -82,7 +93,7 @@
 	async function place() {
 		if (!amount || Number(amount) <= 0) return;
 		busy = true;
-		const ok = await act(() => (fillable > 0 ? api.takePosition(side, amount) : api.broadcastIntent(side, amount, leverage)));
+		const ok = await act(() => (fillable > 0 ? api.takePosition(side, amount, fee) : api.broadcastIntent(side, amount, leverage, fee)));
 		if (ok) amount = "";
 		busy = false;
 	}
@@ -180,7 +191,7 @@
 
 <!-- ════ ARTICLE 02 — TAKE A SIDE ════ -->
 <section>
-	<div class="art-h"><span class="art-n">ARTICLE 02 · TAKE A SIDE</span><span class="art-s">MATCHED, BILATERAL, BOUNDED</span></div>
+	<div class="art-h"><span class="art-n">ARTICLE 02 · TAKE A SIDE</span><span class="art-s">MATCHED DIRECTIONAL SWAP</span></div>
 	<div class="cols2">
 		<!-- trade -->
 		<div class="cell div">
@@ -199,9 +210,14 @@
 						{#each Array.from({ length: (m?.maxLeverage ?? 5) - 1 }, (_, i) => String(i + 2)) as L}<option value={L}>{L}×</option>{/each}
 					</select>
 				</label>
+				<label class="fld lev">
+					<span class="flbl" title="Maker fee in basis points. When your order rests you earn it; when it takes, it's your max. The pot covers the first 10 bps.">FEE (bps)</span>
+					<input class="big" class:bad={!feeOk} bind:value={fee} inputmode="numeric" />
+				</label>
 			</div>
 			<div class="expo">{exposure ? `≈ ${exposure} ${base} · ${fmt(notional)} gBTC notional` : "Enter an amount to size the trade."}</div>
-			<button class="cta {side}" onclick={place} disabled={busy || priceNum == null}>
+			<div class="feenote">{feeNote}</div>
+			<button class="cta {side}" onclick={place} disabled={busy || priceNum == null || !feeOk}>
 				{#if priceNum == null}WAITING FOR PRICE…{:else if busy}…{:else if !amount}GO {side === "long" ? "LONG" : "SHORT"}{:else if fillable > 0}GO {side === "long" ? "LONG" : "SHORT"} · MATCHES {fmt(matchNow)}{:else}BROADCAST {side === "long" ? "LONG" : "SHORT"} · {leverage}×{/if}
 			</button>
 			<div class="cta-sub">{#if !amount}Sweeps resting peer intents first, then broadcasts the remainder.{:else if fillable > 0}A real counterparty is resting on the tape — this opens a matched contract now.{:else}Nothing to match — your signed intent floods the mesh and waits for a taker.{/if}</div>
@@ -217,7 +233,7 @@
 				{#each tape as t}
 					<div class="row">
 						<span class="badge {t.side}">{t.side === "long" ? "LONG" : "SHORT"}</span>
-						<span class="grow tnum">{fmt(t.remaining)} <span class="muted">gBTC · {t.leverage}×</span></span>
+						<span class="grow tnum">{fmt(t.remaining)} <span class="muted">gBTC · {t.leverage}× · {t.spread ?? "0"} bps fee</span></span>
 						<span class="who">{t.mine ? "you" : short(t.maker)}</span>
 						{#if t.mine}<span class="yours">YOURS</span>{:else}<button class="take {t.side === 'long' ? 'short' : 'long'}" onclick={() => take(t)}>TAKE {t.side === "long" ? "▼" : "▲"}</button>{/if}
 					</div>
@@ -375,6 +391,8 @@
 	.max { font-size: 0.54rem; letter-spacing: 0.06em; font-weight: 700; background: var(--ink); color: var(--paper); border: none; padding: 0.1rem 0.4rem; }
 	input.big, select.big { font-size: 1.1rem; font-weight: 600; padding: 0.6rem 0.65rem; }
 	.expo { margin-top: 0.7rem; font-size: 0.66rem; color: var(--muted); min-height: 1.1rem; }
+	.feenote { margin-top: 0.35rem; font-size: 0.62rem; line-height: 1.5; color: var(--muted); }
+	.fld input.bad { border-color: var(--short); }
 	.cta { width: 100%; margin-top: 0.85rem; padding: 0.85rem; font-family: var(--display); font-weight: 800; font-size: 0.98rem; letter-spacing: 0.02em; border: 1.5px solid var(--ink); color: var(--paper); }
 	.cta.long { background: var(--long); } .cta.short { background: var(--short); color: #fff; }
 	.cta-sub { margin-top: 0.6rem; font-size: 0.62rem; line-height: 1.55; color: var(--muted); }

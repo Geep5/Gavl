@@ -103,3 +103,59 @@ test("committeeTopic is deterministic and distinct per network/epoch", () => {
 	assert.notEqual(committeeTopic("gavl", 7), committeeTopic("gavl", 8), "different epoch → different topic");
 	assert.notEqual(committeeTopic("gavl", 7), committeeTopic("other", 7), "different network → different topic");
 });
+
+test("minBond (gate #4): producers bonded below the per-seat floor are ineligible", () => {
+	// 4 producers all farm equally (so all are liveness-eligible); they differ only by bond.
+	const c = chain(24, (h) => "p" + (h % 4)); // p0..p3 each produce anchors below boundary 16
+	const bonds = new Map<string, bigint>([
+		["p0", 1000n], // above floor
+		["p1", 500n], // exactly the floor
+		["p2", 499n], // dust — below floor
+		["p3", 0n], // unbonded (already excluded by weight > 0)
+	]);
+	const floored = committeeForEpoch(c, 2, { epochLength: 8, size: 4, bonds, minBond: 500n })!;
+	const ids = floored.members.map((m) => m.id).sort();
+	assert.deepEqual(ids, ["p0", "p1"], "only producers bonded ≥ minBond are eligible");
+
+	// Without a floor, every bonded producer (weight > 0) is eligible — p2's dust counts.
+	const open = committeeForEpoch(c, 2, { epochLength: 8, size: 4, bonds })!;
+	assert.deepEqual(open.members.map((m) => m.id).sort(), ["p0", "p1", "p2"], "no floor → dust still eligible");
+
+	// The floor is denominated in gBTC, so it's a no-op under anchor-count weighting (no bonds).
+	const counted = committeeForEpoch(c, 2, { epochLength: 8, size: 4, minBond: 500n })!;
+	assert.equal(counted.members.length, 4, "minBond does not apply when selection is by anchor count");
+});
+
+test("maxGrowthPct (gate #2): a sudden bonded-stake influx is throttled, oldest-first", () => {
+	// h0,h1 farm from genesis (senior); attackers a0..a3 appear at heights 8..11 with huge bonds.
+	const av: AnchorView[] = [];
+	for (let h = 0; h < 8; h++) av.push({ height: h, producer: "h" + (h % 2), time: { output: "vdf-" + h } });
+	for (let h = 8; h < 12; h++) av.push({ height: h, producer: "a" + (h - 8), time: { output: "vdf-" + h } });
+	av.push({ height: 12, producer: "h0", time: { output: "vdf-12" } }); // epoch-3 boundary anchor (the beacon)
+
+	const bonds = new Map<string, bigint>([
+		["h0", 1000n],
+		["h1", 1000n], // honest baseline total = 2000
+		["a0", 100000n],
+		["a1", 100000n],
+		["a2", 100000n],
+		["a3", 100000n], // attacker flood, each dwarfs the baseline
+	]);
+	const base = { epochLength: 4, size: 10, bonds };
+
+	// Without the cap: the flood dominates — every attacker is fully eligible (catastrophe).
+	const open = committeeForEpoch(av, 3, base)!; // boundary 12, window covers heights 0..11
+	const openW = new Map(open.members.map((m) => [m.id, m.weight] as const));
+	assert.equal(open.members.length, 6, "uncapped: all 6 producers eligible");
+	assert.equal(openW.get("a0"), 100000n, "uncapped: attacker holds its full bond");
+
+	// With a 5%/epoch cap: prior admitted total was 2000, so this epoch's ceiling is 2100.
+	const capped = committeeForEpoch(av, 3, { ...base, maxGrowthPct: 5 })!;
+	const cw = new Map(capped.members.map((m) => [m.id, m.weight] as const));
+	const total = capped.members.reduce((s, m) => s + m.weight, 0n);
+	assert.equal(total, 2100n, "total eligible weight capped at +5% (2000 → 2100)");
+	assert.equal(cw.get("h0"), 1000n, "senior incumbents keep full weight");
+	assert.equal(cw.get("h1"), 1000n, "senior incumbents keep full weight");
+	assert.equal(cw.get("a0"), 100n, "the oldest newcomer takes only the 100 of headroom left");
+	assert.ok(!cw.has("a1") && !cw.has("a2") && !cw.has("a3"), "the rest of the flood is shut out this epoch");
+});

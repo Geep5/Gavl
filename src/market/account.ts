@@ -127,9 +127,10 @@ export class Account {
 	}
 
 	/** Build + sign a non-binding intent OFFER with this identity's key (to gossip over
-	 *  the mesh). Nothing is escrowed; a taker redeems it on-chain via `matchOpen`. */
-	makeOffer(core: Omit<OfferCore, "maker">): Offer {
-		return signOffer({ ...core, maker: this.pubHex }, this.writer.keypair.privateKey);
+	 *  the mesh). Nothing is escrowed; a taker redeems it on-chain via `matchOpen`. `spread`
+	 *  (maker fee in bps) defaults to "0" (no fee) when omitted. */
+	makeOffer(core: Omit<OfferCore, "maker" | "spread"> & { spread?: string }): Offer {
+		return signOffer({ ...core, spread: core.spread ?? "0", maker: this.pubHex }, this.writer.keypair.privateKey);
 	}
 
 	/** Take the opposite side of a peer's signed offer, escrowing `fill` stake on both

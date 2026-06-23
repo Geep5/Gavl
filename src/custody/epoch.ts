@@ -69,7 +69,7 @@ export function thresholdFor(size: number): number {
  * Connectivity, not consensus — so it's fine to compute over the optimistic chain and
  * a couple of candidate epochs (current + next); extra/missed topics are harmless.
  */
-export function committeeEpochsFor(chain: AnchorView[], selfId: string, epochs: number[], opts: { epochLength: number; size: number; minCommittee?: number; windowAnchors?: number; bonds?: Map<string, bigint> }): number[] {
+export function committeeEpochsFor(chain: AnchorView[], selfId: string, epochs: number[], opts: EpochOpts & { minCommittee?: number }): number[] {
 	const minC = opts.minCommittee ?? 1;
 	const out: number[] = [];
 	for (const e of epochs) {
@@ -78,6 +78,105 @@ export function committeeEpochsFor(chain: AnchorView[], selfId: string, epochs: 
 		if (c && c.committee.length >= minC && c.committee.includes(selfId)) out.push(e);
 	}
 	return out;
+}
+
+/** Shared inputs for committee derivation. All are consensus-critical: every node must
+ *  agree on them or it computes a different committee. */
+export interface EpochOpts {
+	epochLength: number;
+	size: number;
+	/** Membership lookback in anchors (default: all below the boundary). */
+	windowAnchors?: number;
+	/** Finalized committee bonds → STAKE-weighted selection (gate #3). */
+	bonds?: Map<string, bigint>;
+	/** Per-seat minimum bonded weight (gate #4). */
+	minBond?: bigint;
+	/** Max % the total eligible weight may grow per epoch (gate #2). Undefined → uncapped. */
+	maxGrowthPct?: number;
+}
+
+/** The raw eligible members for an epoch (before any growth throttle): producers of anchors
+ *  in [lo, boundary), weighted by bond (stake-weighted) or anchor count, with the minBond
+ *  floor applied. Sorted by id (the canonical order the sampler relies on). */
+function rawEligible(finalized: AnchorView[], epoch: number, opts: EpochOpts): Member[] {
+	const boundary = epochBoundary(epoch, opts.epochLength);
+	const lo = opts.windowAnchors === undefined ? 0 : Math.max(0, boundary - opts.windowAnchors);
+	const produced = new Map<string, bigint>();
+	for (const a of finalized) {
+		if (a.height >= boundary || a.height < lo) continue;
+		produced.set(a.producer, (produced.get(a.producer) ?? 0n) + 1n);
+	}
+	const minBond = opts.bonds ? (opts.minBond ?? 0n) : 0n;
+	return [...produced.keys()]
+		.sort()
+		.map((id) => ({ id, weight: opts.bonds ? (opts.bonds.get(id) ?? 0n) : produced.get(id)! }))
+		.filter((m) => m.weight > 0n && m.weight >= minBond);
+}
+
+const sumWeight = (ms: Member[]): bigint => ms.reduce((s, m) => s + m.weight, 0n);
+
+/** One growth step: prev × (1 + maxGrowthPct%), floored to stay strictly increasing despite
+ *  integer truncation (so a tiny total isn't frozen by rounding). */
+function growthStep(prev: bigint, pct: number): bigint {
+	const c = (prev * BigInt(100 + pct)) / 100n;
+	return c > prev ? c : prev + 1n;
+}
+
+/** The ceiling on total eligible weight at `epoch` (gate #2): the network's committee weight
+ *  may rise at most maxGrowthPct% per epoch. Computed by folding the ADMITTED total forward
+ *  from genesis — admitted(e) = min(raw(e), ceiling(e)) — because the cap must compound on what
+ *  was actually let in, not on raw bonds (else a one-epoch wait would unlock the full bond). The
+ *  first epoch with any weight sets the baseline uncapped (the network bootstraps), and growth is
+ *  throttled thereafter. O(epoch·members) — fine at POC scale; checkpoint the running total to
+ *  bound it for a long-lived chain. */
+function eligibleCeiling(finalized: AnchorView[], epoch: number, opts: EpochOpts): bigint {
+	const pct = opts.maxGrowthPct!;
+	let prevAdmitted = 0n;
+	for (let e = 0; e < epoch; e++) {
+		const raw = sumWeight(rawEligible(finalized, e, opts));
+		const ceil = prevAdmitted === 0n ? raw : growthStep(prevAdmitted, pct);
+		prevAdmitted = raw <= ceil ? raw : ceil;
+	}
+	if (prevAdmitted === 0n) return sumWeight(rawEligible(finalized, epoch, opts)); // baseline epoch: uncapped
+	return growthStep(prevAdmitted, pct);
+}
+
+/** First anchor height each producer appears at — its seniority (lower = older). */
+function firstSeenHeights(finalized: AnchorView[]): Map<string, number> {
+	const m = new Map<string, number>();
+	for (const a of finalized) {
+		const cur = m.get(a.producer);
+		if (cur === undefined || a.height < cur) m.set(a.producer, a.height);
+	}
+	return m;
+}
+
+/** Apply the growth cap (gate #2) to an epoch's raw members: if their total exceeds the ceiling,
+ *  admit weight OLDEST-PRODUCER-FIRST until the ceiling is hit — so incumbents keep their full
+ *  weight and only the newest stake is trimmed. This paces how fast freshly-bonded weight becomes
+ *  committee power: an attacker can't bond a fortune overnight and capture a threshold before the
+ *  network has maxGrowthPct%-per-epoch worth of time to react. Trimming the NEWEST (not scaling
+ *  everyone proportionally) is what makes the cap bite — proportional scaling would hand a
+ *  big fresh bond most of the capped pool instantly. */
+function throttleGrowth(finalized: AnchorView[], epoch: number, members: Member[], opts: EpochOpts): Member[] {
+	const ceiling = eligibleCeiling(finalized, epoch, opts);
+	if (sumWeight(members) <= ceiling) return members;
+	const firstSeen = firstSeenHeights(finalized);
+	const bySeniority = [...members].sort((a, b) => {
+		const fa = firstSeen.get(a.id) ?? 0;
+		const fb = firstSeen.get(b.id) ?? 0;
+		return fa !== fb ? fa - fb : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+	});
+	const kept: Member[] = [];
+	let acc = 0n;
+	for (const m of bySeniority) {
+		if (acc >= ceiling) break;
+		const room = ceiling - acc;
+		const w = m.weight <= room ? m.weight : room;
+		kept.push({ id: m.id, weight: w });
+		acc += w;
+	}
+	return kept.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)); // restore canonical order for sampling
 }
 
 /**
@@ -93,25 +192,26 @@ export function committeeEpochsFor(chain: AnchorView[], selfId: string, epochs: 
  * to capture a threshold of seats. Anchor production stays the Sybil/liveness gate
  * (you must be a live farmer to be eligible at all). Without `bonds`, weight is anchor
  * count (the pre-bonding model + the no-bonding tests).
+ *
+ * `minBond` (gate #4) sets a per-seat floor on bonded weight: producers bonding less than it
+ * are dropped from the eligible set, so a wealthy attacker can't dilute the floor by spreading
+ * stake across many dust-bonded identities. Only applies when stake-weighted (`bonds` set).
+ *
+ * `maxGrowthPct` (gate #2) caps how fast the total eligible weight can rise per epoch: a sudden
+ * influx of freshly-bonded stake is trimmed (newest-first) to ≤ maxGrowthPct% above last epoch's
+ * admitted total, so an attacker can't bond a fortune overnight and seize a threshold before the
+ * network has time to react.
  */
-export function committeeForEpoch(finalized: AnchorView[], epoch: number, opts: { epochLength: number; size: number; windowAnchors?: number; bonds?: Map<string, bigint> }): EpochCommittee | null {
+export function committeeForEpoch(finalized: AnchorView[], epoch: number, opts: EpochOpts): EpochCommittee | null {
 	const boundary = epochBoundary(epoch, opts.epochLength);
 	const beaconAnchor = finalized.find((a) => a.height === boundary);
 	if (!beaconAnchor) return null; // boundary not finalized yet → not selectable
 
-	// Producers of anchors strictly below the boundary (within the window) are the
-	// eligible set (proved space-time / liveness). Genesis (height 0) counts like any other.
-	const lo = opts.windowAnchors === undefined ? 0 : Math.max(0, boundary - opts.windowAnchors);
-	const produced = new Map<string, bigint>();
-	for (const a of finalized) {
-		if (a.height >= boundary || a.height < lo) continue;
-		produced.set(a.producer, (produced.get(a.producer) ?? 0n) + 1n);
-	}
-	// Weight = bonded stake (if bonding is on, bonded producers only) else anchors produced.
-	const members: Member[] = [...produced.keys()]
-		.sort()
-		.map((id) => ({ id, weight: opts.bonds ? (opts.bonds.get(id) ?? 0n) : produced.get(id)! }))
-		.filter((m) => m.weight > 0n);
+	// Producers of anchors below the boundary (within the window) are the eligible set (proved
+	// space-time / liveness), weighted by bond (gate #3) or anchor count, floored by minBond (#4).
+	let members = rawEligible(finalized, epoch, opts);
+	// Gate #2: pace how fast the total eligible weight can grow, trimming the newest stake.
+	if (opts.maxGrowthPct !== undefined && members.length > 0) members = throttleGrowth(finalized, epoch, members, opts);
 	if (members.length === 0) return { epoch, beacon: beaconAnchor.time.output, members, committee: [], min: 0 };
 
 	const size = Math.min(opts.size, members.length);

@@ -290,12 +290,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			const lev = parseAmount(String(body.leverage ?? "2"));
 			if (lev === null || !leverageOk(lev)) throw new Error(`leverage must be a whole number from 2 to ${MAX_LEVERAGE}`);
 			requireSpendable(String(body.size), "size"); // advisory: be able to back it when taken
-			const offer = daemon.broadcastIntent(side, String(body.size), String(body.leverage ?? "2"));
+			// spread = the maker fee (bps) the taker pays; the pot subsidises it up to the default. Optional.
+			const offer = daemon.broadcastIntent(side, String(body.size), String(body.leverage ?? "2"), body.spread != null ? String(body.spread) : undefined);
 			return send(res, 200, { nonce: offer.nonce });
 		}
 		if (path === "/api/intent/take") {
 			// Take a specific resting intent → opens a matched contract (you get the opposite side).
-			const id = await daemon.takeIntent(String(body.nonce), body.fill != null ? String(body.fill) : undefined);
+			const id = await daemon.takeIntent(String(body.nonce), body.fill != null ? String(body.fill) : undefined, body.maxSpread != null ? String(body.maxSpread) : undefined);
 			return send(res, 200, { id });
 		}
 		if (path === "/api/intent/take-position") {
@@ -303,11 +304,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			if (mark(daemon.view()) === null) throw new Error("this channel has no reported price yet (or isn't a market channel)");
 			const side = body.side === "short" ? "short" : "long";
 			requireSpendable(String(body.size), "size");
-			const r = await daemon.takePosition(side, String(body.size), String(body.leverage ?? "2"));
+			// maxSpread = the taker's agreement: skip offers whose maker fee exceeds it.
+			const r = await daemon.takePosition(side, String(body.size), String(body.leverage ?? "2"), body.maxSpread != null ? String(body.maxSpread) : undefined);
 			return send(res, 200, r);
 		}
 		if (path === "/api/contract/settle") {
-			// Close a matched contract at the current mark (perpetual — any time).
+			// Close a matched directional swap at the current mark (any time, up to its time-lock cap).
 			await daemon.settleContract(String(body.contractId));
 			return send(res, 200, { ok: true });
 		}

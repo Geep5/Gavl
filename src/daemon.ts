@@ -25,7 +25,7 @@ import type { View, MarketDef } from "./market/btc.ts";
 import { serializeView, deserializeView, viewRoot } from "./market/state.ts";
 import type { Anchor } from "./consensus/anchor.ts";
 import type { Heads } from "./ledger/ledger.ts";
-import { longPayout, verifyOffer } from "./market/intent.ts";
+import { longPayout, verifyOffer, parseSpread, DEFAULT_SPREAD_BPS, SPREAD_MAX_BPS } from "./market/intent.ts";
 import type { Offer, Side } from "./market/intent.ts";
 import type { FundKey } from "./custody/threshold.ts";
 import { DkgCoordinator } from "./custody/dkg-coordinator.ts";
@@ -143,6 +143,16 @@ export interface DaemonOptions {
 		/** Gate #3: stake-weight committee selection by bonded gBTC (only bonded producers
 		 *  are eligible). Off → weight by anchors produced (the pre-bonding model). */
 		bonded?: boolean;
+		/** Gate #4: per-seat minimum bond (gBTC sats). Producers bonded below this are ineligible,
+		 *  so a capital-rich attacker can't field many dust-bonded Sybil identities — each seat costs
+		 *  at least this much real, slashable stake. Consensus-critical: every node must share it.
+		 *  Only applies when `bonded` is on (default 0n → no floor). */
+		minBond?: bigint;
+		/** Gate #2: cap on how many percent the total eligible committee weight may grow per epoch.
+		 *  A sudden influx of freshly-bonded stake is admitted oldest-first up to this much above last
+		 *  epoch's total, so the committee can't be captured faster than the network can react (e.g. 5
+		 *  → ≤5%/epoch). Consensus-critical. Undefined → uncapped (current behavior). */
+		maxGrowthPct?: number;
 	};
 }
 
@@ -404,6 +414,8 @@ export class Daemon {
 			minCommittee: this.custodyOpts.minCommittee ?? 3,
 			windowAnchors: this.custodyOpts.windowAnchors,
 			bonds: this.custodyOpts.bonded ? this.finalView().bridge.bonds : undefined,
+			minBond: this.custodyOpts.minBond,
+			maxGrowthPct: this.custodyOpts.maxGrowthPct,
 		});
 		void this.transport.setCommitteeTopics(mine.map((e) => committeeTopic(this.network, e)));
 	}
@@ -664,16 +676,20 @@ export class Daemon {
 	// authors a match.open write that escrows BOTH peers and opens a matched contract.
 	private offers = new Map<string, Offer>(); // nonce → signed offer
 
-	/** Broadcast a non-binding intent from the active account → local book + the mesh. */
-	broadcastIntent(side: Side, size: string, leverage: string): Offer {
+	/** Broadcast a non-binding intent from the active account → local book + the mesh. `spread` is the
+	 *  maker fee (bps) the taker pays for the fill — the pot subsidises it up to the default; omit → the
+	 *  default. The client pre-fills it, but the protocol accepts any valid value (the market finds the level). */
+	broadcastIntent(side: Side, size: string, leverage: string, spread?: string): Offer {
 		const me = this.active();
+		const spreadBps = parseSpread(spread ?? DEFAULT_SPREAD_BPS.toString());
+		if (spreadBps === null) throw new Error(`spread must be a whole number of basis points from 0 to ${SPREAD_MAX_BPS}`);
 		// Globally-unique nonce (crypto-random) so it never collides with a previously-matched
 		// offer's nonce in the persisted offerFills — even across restarts / store resets.
 		const nonce = `${me.pubHex.slice(0, 8)}-${randomBytes(8).toString("hex")}`;
 		// Finite TTL (anchors) so the offer's fill-tracking can be retired after it expires —
 		// otherwise offerFills (consensus state) grows with every offer ever broadcast.
 		const expiryHeight = (this.node.anchorTip()?.height ?? 0) + OFFER_TTL_ANCHORS;
-		const offer = me.makeOffer({ makerSide: side, size, leverage, expiryHeight, nonce });
+		const offer = me.makeOffer({ makerSide: side, size, leverage, expiryHeight, nonce, spread: spreadBps.toString() });
 		if (!this.canBack(offer)) throw new Error("insufficient gBTC to back this offer"); // peers would drop it anyway
 		this.offers.set(nonce, offer);
 		this.node.gossipIntent(offer); // flood it to peers so their tapes show it
@@ -713,27 +729,31 @@ export class Daemon {
 	/** Live tape: resting offers with their remaining (unfilled) size, freshest first. Doubles
 	 *  as the gossip-tape GC — fully-filled or expired offers are evicted from the local book
 	 *  (it's RAM-only, non-consensus, but should still not grow with every offer ever seen). */
-	intentTape(): { nonce: string; maker: string; side: Side; remaining: string; leverage: string; mine: boolean }[] {
+	intentTape(): { nonce: string; maker: string; side: Side; remaining: string; leverage: string; spread: string; mine: boolean }[] {
 		const fills = this.view().book.offerFills;
 		const me = this.wallet.active().pubHex;
 		const height = this.node.anchorTip()?.height ?? 0;
-		const out: { nonce: string; maker: string; side: Side; remaining: string; leverage: string; mine: boolean }[] = [];
+		const out: { nonce: string; maker: string; side: Side; remaining: string; leverage: string; spread: string; mine: boolean }[] = [];
 		for (const o of [...this.offers.values()].reverse()) {
 			const remaining = BigInt(o.size) - (fills.get(o.nonce)?.filled ?? 0n);
 			if (remaining <= 0n || height > o.expiryHeight) {
 				this.offers.delete(o.nonce); // retire filled/expired offers from the local tape
 				continue;
 			}
-			out.push({ nonce: o.nonce, maker: o.maker, side: o.makerSide, remaining: remaining.toString(), leverage: o.leverage, mine: o.maker === me });
+			out.push({ nonce: o.nonce, maker: o.maker, side: o.makerSide, remaining: remaining.toString(), leverage: o.leverage, spread: o.spread ?? "0", mine: o.maker === me });
 		}
 		return out;
 	}
 
-	/** Take a specific resting intent from the active account → opens a matched contract. */
-	async takeIntent(nonce: string, fill?: string): Promise<string> {
+	/** Take a specific resting intent from the active account → opens a matched contract. `maxSpread`
+	 *  (bps) is the taker's agreement: refuse offers whose maker fee exceeds it (worst case — if the pot
+	 *  doesn't subsidise — the taker pays the maker's full spread, so capping it bounds what they pay). */
+	async takeIntent(nonce: string, fill?: string, maxSpread?: string): Promise<string> {
 		const offer = this.offers.get(nonce);
 		if (!offer) throw new Error("that intent is no longer available");
 		if (offer.maker === this.wallet.active().pubHex) throw new Error("you can't take your own intent — switch to another account");
+		const cap = parseSpread(maxSpread ?? SPREAD_MAX_BPS.toString());
+		if (cap !== null && (parseSpread(offer.spread) ?? 0n) > cap) throw new Error(`this intent's fee (${offer.spread} bps) is above your max (${cap} bps)`);
 		const remaining = BigInt(offer.size) - (this.view().book.offerFills.get(nonce)?.filled ?? 0n);
 		const want = fill ? BigInt(fill) : remaining;
 		const take = want < remaining ? want : remaining;
@@ -763,18 +783,20 @@ export class Daemon {
 	 *  then falling back to the liquidity BACKSTOP (the idle-decay pot) for any remainder — so a
 	 *  trade can be placed even with no peer on the other side. `leverage` applies to the backstop
 	 *  leg (default 2×); peer fills keep the maker's offered leverage. */
-	async takePosition(side: Side, size: string, leverage = "2"): Promise<{ filled: string; contracts: string[]; viaBackstop: string }> {
+	async takePosition(side: Side, size: string, leverage = "2", maxSpread?: string): Promise<{ filled: string; contracts: string[]; viaBackstop: string }> {
 		const want = BigInt(size);
 		const opposite: Side = side === "long" ? "short" : "long";
 		const me = this.wallet.active().pubHex;
+		const cap = parseSpread(maxSpread ?? SPREAD_MAX_BPS.toString());
 		let left = want;
 		const contracts: string[] = [];
 		for (const t of this.intentTape()) {
 			if (left <= 0n) break;
 			if (t.side !== opposite || t.maker === me) continue; // opposite side, not me
+			if (cap !== null && (parseSpread(t.spread) ?? 0n) > cap) continue; // fee above the taker's max → skip this offer
 			const take = left < BigInt(t.remaining) ? left : BigInt(t.remaining);
 			try {
-				contracts.push(await this.takeIntent(t.nonce, take.toString()));
+				contracts.push(await this.takeIntent(t.nonce, take.toString(), maxSpread));
 				left -= take;
 			} catch {
 				/* raced away — skip */
@@ -1035,6 +1057,8 @@ export class Daemon {
 			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
 			windowAnchors: this.custodyOpts.windowAnchors,
 			bonds: this.custodyOpts.bonded ? () => this.finalView().bridge.bonds : undefined, // stake-weighted selection
+			minBond: this.custodyOpts.minBond, // gate #4: per-seat bond floor
+			maxGrowthPct: this.custodyOpts.maxGrowthPct, // gate #2: per-epoch growth cap
 			auth: this.ceremonyAuth(),
 			ceremonySeed: () => this.producerKey().privateKey, // deterministic DKG material across retries
 
@@ -1824,7 +1848,7 @@ export function parseChannel(name: string): ChannelMarket | null {
 }
 
 /** The 32-byte DHT topic a channel rendezvouses on. A market address's `id` (its 32-byte-hex
- *  coordinate) IS the topic — used DIRECTLY, no hash — so a perp market's rendezvous is literally its
+ *  coordinate) IS the topic — used DIRECTLY, no hash — so a swap market's rendezvous is literally its
  *  price-source id (a Pyth feed id / a signer-set hash). The `name` is a label and `source` tells the
  *  fold how to verify; neither needs to be in the topic. Anything else (a plain transfers channel, or
  *  a non-32-byte id) hashes its full name to 32 bytes. Same id ⇒ same topic, regardless of label. */

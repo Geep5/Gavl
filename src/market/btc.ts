@@ -280,7 +280,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, opts.market);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
-	settleExpired(view.bridge, view.book, nowHeight); // time-locked perps unwind at entry (base-independent)
+	settleExpired(view.bridge, view.book, nowHeight); // time-locked directional swaps unwind at entry (base-independent)
 	accrueDemurrage(view, nowHeight); // idle gBTC bleeds to capital working in open contracts
 	pruneExpiredOffers(view.book, nowHeight); // drop fill-tracking for offers that can no longer be matched
 	pruneStaleClaims(view.bridge, nowHeight); // retire deposit-mint requests unminted past the reclaim grace
@@ -418,7 +418,10 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			// expiry/staleness don't drift on replay.
 			const m = mark(view, bornHeight);
 			if (fill === null || m === null) return; // stale/unpriced market → no entry
-			applyMatch(view.bridge, view.book, w.writer, w.id, op.offer, fill, bornHeight, m);
+			// The pot may subsidise the maker fee: it draws the SAME finalized budget the backstop uses,
+			// so full and checkpoint-pruned nodes agree on how much the pot can cover.
+			const subsidyBudget = backstopBudget - view.bridge.potEscrowTaken;
+			applyMatch(view.bridge, view.book, w.writer, w.id, op.offer, fill, bornHeight, m, subsidyBudget);
 			return;
 		}
 		case "match.pot": {
@@ -436,8 +439,8 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 		}
 		case "contract.settle": {
 			// Permissionless close: split the 2·stake pot at the channel's mark per the directional
-			// payoff. Perpetual — either side may close any time; the loser can't dodge the mark by
-			// stalling (the winner just closes it).
+			// payoff. A directional swap — either side may close any time (up to the time-lock cap); the
+			// loser can't dodge the mark by stalling (the winner just closes it).
 			if (typeof op.contractId !== "string") return;
 			const c = view.book.contracts.get(op.contractId);
 			if (!c) return;
