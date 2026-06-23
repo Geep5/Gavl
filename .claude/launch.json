@@ -18,6 +18,12 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "web:dev"],
       "port": 5180
+    },
+    {
+      "name": "gavl-daemon",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "daemon:dev"],
+      "port": 6440
     }
   ]
 }
