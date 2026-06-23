@@ -80,15 +80,40 @@
 	const takerPossible = $derived(takeable > 0);
 	const role = $derived(mode === "maker" ? "maker" : mode === "taker" ? "taker" : fillable > 0 ? "taker" : "maker");
 
-	const feeNote = $derived.by(() => {
-		const bps = Number(fee) || 0;
-		if (role === "taker") return `Takes offers charging ≤ ${bps} bps — the pot covers the first 10, so you'd pay at most ${Math.max(0, bps - 10)} bps.`;
-		return `Your resting intent earns ${bps} bps when taken — the pot pays the first 10, a taker owes the rest.`;
-	});
-
 	const amt = $derived(Math.floor(Number(amount)) || 0);
 	const over = $derived(amt > bal);
 	const matchNow = $derived(Math.min(amt, takeable));
+
+	// fee, made human: bps → %, and the concrete gBTC you earn (maker) or pay (taker).
+	// The fee is stake · bps / 10000 (intent.ts feeOf); the pot subsidises the first 10 bps.
+	const feeBps = $derived(Number(fee) || 0);
+	const feePct = $derived((feeBps / 100).toFixed(2)); // 10 bps → "0.10"
+	const feeBase = $derived(role === "taker" ? matchNow : amt); // fee applies to the matched stake
+	const makerEarn = $derived(Math.floor((feeBase * feeBps) / 10000)); // gBTC the maker earns when taken
+	const takerPay = $derived(Math.floor((feeBase * Math.max(0, feeBps - 10)) / 10000)); // pot covers first 10 bps
+	const feeNote = $derived.by(() => {
+		const pct = `${feePct}%`;
+		if (!amt) {
+			return role === "taker"
+				? `Taker fee ${pct} of the matched stake — the pot covers the first 0.10%, so up to 10 bps it's free to you.`
+				: `Maker rebate ${pct} — you earn it on your stake when a taker fills the intent (the pot funds the first 0.10%).`;
+		}
+		if (role === "taker") {
+			return takerPay > 0
+				? `You pay ≈ ${fmt(takerPay)} gBTC (${pct}) on ${fmt(matchNow)} gBTC matched — the pot covers the first 0.10%.`
+				: `Free to take — the pot covers the whole ${pct} fee on ${fmt(matchNow)} gBTC matched.`;
+		}
+		return makerEarn > 0
+			? `You earn ≈ ${fmt(makerEarn)} gBTC (${pct}) when your ${fmt(amt)} gBTC intent is fully taken.`
+			: `You earn ${pct} of your stake when taken — rounds below 1 gBTC at this size.`;
+	});
+	// the same value is a fee you EARN as a maker, but the MAX you'll pay as a taker — label it by role
+	const feeLabel = $derived(role === "taker" ? "MAX FEE (bps)" : "MAKER FEE (bps)");
+	const feeTitle = $derived(
+		role === "taker"
+			? "The most you'll pay, in basis points (1 bp = 0.01%). You only take offers at or below this — the pot covers the first 10 bps."
+			: "The fee you earn when your resting order is taken, in basis points (1 bp = 0.01%). The pot funds the first 10 bps for the taker.",
+	);
 	const ctaDisabled = $derived(busy || amt <= 0 || over || priceNum == null || !feeOk || (role === "taker" && !takerPossible));
 	const ctaLabel = $derived.by(() => {
 		const S = side === "long" ? "LONG" : "SHORT";
@@ -234,8 +259,11 @@
 
 		<!-- improvised: maker fee (the mockup has none) -->
 		<div class="fee">
-			<span class="fee-l" title="Maker fee in basis points. When your order rests you earn it; when it takes, it's your max. The pot covers the first 10 bps.">MAKER FEE (bps)</span>
-			<span class="fee-in"><input class:bad={!feeOk} bind:value={fee} inputmode="numeric" /></span>
+			<span class="fee-l" title={feeTitle}>{feeLabel}</span>
+			<span class="fee-right">
+				<span class="fee-pct">= {feePct}%</span>
+				<span class="fee-in"><input class:bad={!feeOk} bind:value={fee} inputmode="numeric" /></span>
+			</span>
 		</div>
 		<div class="fee-note">{feeNote}</div>
 
@@ -264,7 +292,7 @@
 				<div class="pos-row">
 					<span class="pbadge {t.side}">{t.side === "long" ? "LONG" : "SHORT"}</span>
 					<div class="pmid">
-						<div class="pmain tnum">{fmt(t.remaining)} gBTC <span class="muted">{t.leverage}× · {t.spread ?? "0"} bps</span></div>
+						<div class="pmain tnum">{fmt(t.remaining)} gBTC <span class="muted">{t.leverage}× · {((Number(t.spread) || 0) / 100).toFixed(2)}% fee</span></div>
 						<div class="psub">{t.mine ? "your resting intent" : "maker " + short(t.maker)}</div>
 					</div>
 					{#if t.mine}<span class="tape-yours">YOURS</span>
@@ -468,6 +496,8 @@
 	/* ── improvised maker-fee ── */
 	.fee { margin-top: 0.9rem; display: flex; align-items: center; justify-content: space-between; gap: 0.7rem; }
 	.fee-l { font-size: 0.58rem; letter-spacing: 0.12em; color: var(--muted); cursor: help; }
+	.fee-right { display: flex; align-items: center; gap: 0.55rem; }
+	.fee-pct { font-size: 0.78rem; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; }
 	.fee-in { flex: 0 0 5.4rem; }
 	.fee-in input { width: 100%; background: var(--paper-2); border: 1.5px solid var(--ink); padding: 0.5rem; font-size: 0.95rem; font-weight: 600; color: var(--ink); text-align: right; }
 	.fee-in input.bad { border-color: var(--short); }
