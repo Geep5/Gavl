@@ -341,16 +341,22 @@ web/             Svelte SPA — the intent tape + bull/bear trading UI
 
 ## Run
 
-Needs **Node ≥ 23.6** (native TypeScript — no build step). Works on macOS, Linux, and
-Windows. No Python needed for the local app (it uses the fast stand-in VDF).
+Needs **Node ≥ 23.6** (native TypeScript — no build step) and **Python ≥ 3.9** (for the real
+Proof-of-Space-Time proofs). Works on macOS, Linux, and Windows.
 
 ```bash
 npm install              # once
-npm run dev              # ← starts daemon + web UI together, then open http://localhost:5180
+npm run setup:chia       # once — venv + chiavdf/chiapos (prebuilt wheels; no C++ toolchain)
+npm run dev              # ← real-PoST daemon + web UI together, then open http://localhost:5180
 ```
 
-`npm run dev` is the zero-setup path: it boots the daemon (fast VDF, price reporting,
-local-only) **and** the web UI in one command, cross-platform — no env vars to type.
+`npm run dev` runs **real Proof-of-Space-Time** by default: the chiavdf Wesolowski VDF (proof of
+time) and chiapos plots (proof of space), plus price reporting and the web UI, in one command.
+
+**No Python? Use the stand-ins.** `npm run dev:hash` is the zero-dependency path — it swaps in the
+fast `hash` VDF and the in-memory space stand-in (`GAVL_VDF=hash GAVL_SPACE=standin`), so it boots
+without `setup:chia`. Great for UI work, tests, and CI — but it is **not** real PoST, and it is far
+faster (real PoST deliberately paces each anchor with a genuine sequential VDF).
 
 > **Windows / browser note:** the UI binds IPv6, so open **`http://localhost:5180`**, not
 > `http://127.0.0.1:5180`.
@@ -359,42 +365,47 @@ Other scripts:
 
 ```bash
 npm test                 # full suite (~238 tests): consensus, checkpoints, genesis-free adoption, matched market, demurrage, liquidity backstop, intent gossip, per-channel pricing, custody + committee DKG, bonding/slashing + auto-slash, bridge
+npm run dev:hash         # zero-setup: same as dev but hash VDF + stand-in space (no venv)
 npm run demo             # PoST cooldown chain — watch space→cooldown
 npm run demo:consensus   # two nodes farm + gossip anchors, finalize the same state over a real mesh
-npm run daemon           # daemon only (real chiavdf VDF — needs the .venv; see below)
+npm run daemon           # real-PoST daemon only (chiavdf + chiapos; needs the .venv)
 npm run web:dev          # web UI only (expects a daemon on :6440)
 ```
 
 Tuning env vars (set inline on macOS/Linux; on Windows use `set VAR=…` or `$env:VAR=…`, or
-just edit the `daemon:dev` script): `GAVL_VDF=hash|chia` · `GAVL_ORACLE_PUBLISH=1` (this node relays
-the channel's Pyth feed; anyone may) · `GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_PERSIST=all|mine|off` ·
+just edit the `daemon:dev` script): `GAVL_VDF=chia|hash` (default `chia`) · `GAVL_SPACE=chiapos|standin`
+(default `chiapos`) · `GAVL_K=<n>` (plot size; defaults to 18 for chiapos, 11 for the stand-in) ·
+`GAVL_ORACLE_PUBLISH=1` (this node relays the channel's Pyth feed; anyone may) ·
+`GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_PERSIST=all|mine|off` ·
 `GAVL_MESH=0` (disable the mesh — runs local-only; on by default) · `GAVL_NETWORK=<channel>` ·
 `GAVL_PVSS_RESHARE=1` (opt-in: the verifiable blob-path reshare; default off, shadow-validated first). A
 **market** channel is named `label::pyth::feedId` (that name is the market's public definition);
 a plain name is a transfers-only channel with no price.
-The real chiavdf VDF (`GAVL_VDF=chia`, the daemon's default) needs a Python venv with
-`chiavdf`/`chiapos`; `npm run dev` sidesteps this by using `GAVL_VDF=hash`.
+Real PoST (`GAVL_VDF=chia` + `GAVL_SPACE=chiapos`, both now the default) needs the Python venv from
+`npm run setup:chia`; `npm run dev:hash` opts out with the stand-ins (`GAVL_VDF=hash GAVL_SPACE=standin`).
 
-### Running a real PoST node
+### Real PoST vs. the stand-ins
 
-`npm run dev` farms with **stand-ins** (`GAVL_VDF=hash`, `space=standin`) — zero-setup and great
-for testing, but it is **not** real Proof-of-Space-and-Time: the VDF is a hash stand-in (no genuine
-sequential delay) and the space proof has no disk cost. A node that wants to contribute *real* PoST
-to the network must run both real backends:
+`npm run dev` farms with **real PoST** by default (`GAVL_VDF=chia`, `GAVL_SPACE=chiapos`): a genuine
+sequential chiavdf VDF (no shortcut through the delay) and a real chiapos plot with disk cost. The
+opt-out `npm run dev:hash` swaps in the stand-ins (hash VDF + in-memory space) — zero-setup and far
+faster, but **not** real PoST. To farm real PoST on a bare daemon (no web UI):
 
 ```bash
-GAVL_VDF=chia GAVL_SPACE=chiapos GAVL_K=20 GAVL_ORACLE_PUBLISH=1 node src/server.ts
+npm run setup:chia                                       # once — venv + chiavdf/chiapos
+GAVL_VDF=chia GAVL_SPACE=chiapos GAVL_ORACLE_PUBLISH=1 node src/server.ts
 ```
 
 Requirements for real PoST:
 
-- **Chia bridge** — a Python venv with `chiavdf` (time) and `chiapos` (space):
+- **Chia bridge** — a Python venv with `chiavdf` (time) and `chiapos` (space). `npm run setup:chia`
+  builds it (prebuilt wheels; no C++ toolchain), or do it by hand:
   `python3 -m venv .venv && .venv/bin/pip install chiavdf chiapos`. Choosing `GAVL_VDF=chia`
   without it throws (the node never silently downgrades).
-- **`GAVL_K` ≥ 18** — chiapos rejects smaller plots with a C++ `std::exception`. The daemon's
-  default `k` is 11 (sized for the stand-in prover), so **`GAVL_K` must be set explicitly** for
-  real space. Larger `k` = more space = higher anchor win-rate, but longer plotting and more disk
-  (k=20 is ~4× k=18). The plot is created once and reused from the plot dir on later starts.
+- **Plot size `k` ≥ 18** — chiapos rejects smaller plots with a C++ `std::exception`. With
+  `GAVL_SPACE=chiapos` the daemon now defaults `k` to **18** automatically (the stand-in still uses
+  11); set `GAVL_K` to go larger — more space = higher anchor win-rate, but longer plotting and more
+  disk (k=20 is ~4× k=18). The plot is created once and reused from the plot dir on later starts.
 
 Verify a node is producing real PoST via `curl -s localhost:6440/api/state | jq '.consensus | {vdf, space}'`
 — real PoST shows `vdf: "chiavdf-wesolowski-1024"` and `space: "chiapos"` (stand-ins show
@@ -418,15 +429,15 @@ the UI shows *"custody is still forming."*
 
 ```bash
 npm install
-npm run dev          # hash VDF + farming + web UI, on the default BTC-USD channel
+npm run setup:chia   # once per machine — the real-PoST proofs
+npm run dev          # real PoST (chiavdf + chiapos) + farming + web UI, on the default BTC-USD channel
 ```
 
-Do **not** use `npm run daemon` for this — that defaults to the real `chiavdf` VDF, which needs the
-Python venv; without it, **farming hangs**: the node connects to the mesh but never produces an anchor,
-so it never joins the committee (this is the #1 cause of "3 nodes but the DKG won't fire"). `npm run dev`
-uses the fast `hash` VDF and farms out of the box. Leave `GAVL_NETWORK` **unset** so all nodes share the
-default channel (its DHT topic is the feed id). To run more than one node on one machine, give each its
-own `GAVL_DATA_DIR` **and** `GAVL_PORT`.
+Every node must farm with the **same** backend, or anchors are rejected — so run them all the same
+way. `npm run dev` farms with real PoST once `setup:chia` has run; if you'd rather skip the venv, run
+`npm run dev:hash` on **every** node (all-hash or all-chia, never mixed). Leave `GAVL_NETWORK` **unset**
+so all nodes share the default channel (its DHT topic is the feed id). To run more than one node on one
+machine, give each its own `GAVL_DATA_DIR` **and** `GAVL_PORT`.
 
 **Check each node is producing, not just connected:**
 
@@ -434,7 +445,7 @@ own `GAVL_DATA_DIR` **and** `GAVL_PORT`.
 curl -s localhost:6440/api/state | jq '.consensus | {farming, vdf, tip, peers, topic}'
 ```
 
-Want: `farming: true`, `vdf: "hash-vdf-v0"`, `tip` climbing, `peers` ≥ 2, and `topic` equal to the feed
+Want: `farming: true`, `vdf: "chiavdf-wesolowski-1024"` (or `"hash-vdf-v0"` on `dev:hash`), `tip` climbing, `peers` ≥ 2, and `topic` equal to the feed
 id (the UI shows a green **`✓ = coordinate`** under the market id when a node is on the right topic — a
 mismatch means it's on older code / a different channel).
 

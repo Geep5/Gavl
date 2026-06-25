@@ -25,8 +25,9 @@ import { totalGbtc, pendingTotal, backingBps as bridgeBackingBps, DEMURRAGE_DAY,
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
-// Space backend: real chiapos (real disk cost) when GAVL_SPACE=chiapos, else the stand-in.
-const SPACE = process.env.GAVL_SPACE === "chiapos" ? "chiapos" : "standin";
+// Space backend: real chiapos (real disk cost) is the DEFAULT — real Proof-of-Space-Time out of the
+// box. Opt out with GAVL_SPACE=standin (the light in-memory stand-in for tests / CI / zero-setup dev).
+const SPACE = process.env.GAVL_SPACE === "standin" ? "standin" : "chiapos";
 // Difficulty schedule: ON by default so the VDF cost is the pace (anti fast-VDF reorg).
 // GAVL_RETARGET=0 disables it (constant difficulty). GAVL_TARGET_ITERS tunes the per-anchor cost.
 const RETARGET = process.env.GAVL_RETARGET !== "0";
@@ -73,10 +74,11 @@ const daemon = new Daemon({
 	walletDir: DATA_DIR,
 	bootstrapEnv: process.env.GAVL_BOOTSTRAP, // comma-separated host:port custom DHT entry nodes
 	space: SPACE,
-	// Plot-size exponent. Default 11 matches the stand-in space prover. Real
-	// chiapos (GAVL_SPACE=chiapos) requires k>=18 or plotting throws, so set
-	// GAVL_K=18+ when farming real Proof-of-Space.
-	k: Number(process.env.GAVL_K ?? "11"),
+	// Plot-size exponent. The stand-in prover uses 11; real chiapos requires k>=18 or
+	// plotting throws, so chiapos defaults to 18 (no need to remember GAVL_K). Override
+	// with GAVL_K for a bigger plot (more disk + higher anchor win-rate); it's created
+	// once and reused from the plot dir.
+	k: process.env.GAVL_K ? Number(process.env.GAVL_K) : SPACE === "chiapos" ? 18 : 11,
 	schedule: RETARGET ? { base: 20n, targetIters: TARGET_ITERS, epoch: 4, window: 8, maxStep: 4n } : undefined,
 	heartbeatMs: HEARTBEAT_MS,
 	store: PERSIST === "off" ? undefined : { dir: DATA_DIR ? `${DATA_DIR}/store` : undefined, persist: PERSIST === "mine" ? "mine" : "all" },

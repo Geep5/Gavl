@@ -6,10 +6,12 @@
   "description": "Gavl — a decentralized peer-to-peer Bitcoin bull/bear market (matched) on a Proof-of-Space-Time cooldown ledger (Holepunch).",
   "scripts": {
     "dev": "concurrently -k -n daemon,web -c blue,magenta \"npm:daemon:dev\" \"npm:web:dev\"",
+    "dev:hash": "concurrently -k -n daemon,web -c blue,magenta \"npm:daemon:hash\" \"npm:web:dev\"",
     "dev:fresh": "concurrently -k -n daemon,web -c blue,magenta \"npm:daemon:fresh\" \"npm:web:dev\"",
     "daemon": "node src/server.ts",
-    "daemon:dev": "cross-env GAVL_VDF=hash GAVL_ORACLE_PUBLISH=1 node src/server.ts",
-    "daemon:fresh": "cross-env GAVL_VDF=hash GAVL_ORACLE_PUBLISH=1 GAVL_PERSIST=off node src/server.ts",
+    "daemon:dev": "cross-env GAVL_ORACLE_PUBLISH=1 node src/server.ts",
+    "daemon:hash": "cross-env GAVL_VDF=hash GAVL_SPACE=standin GAVL_ORACLE_PUBLISH=1 node src/server.ts",
+    "daemon:fresh": "cross-env GAVL_VDF=hash GAVL_SPACE=standin GAVL_ORACLE_PUBLISH=1 GAVL_PERSIST=off node src/server.ts",
     "feed:signer": "node src/feed-signer.ts",
     "feed:member": "node src/feed-member.ts",
     "feed:aggregator": "node src/feed-aggregator.ts",
@@ -18,6 +20,7 @@
     "test": "node --test \"test/*.test.ts\"",
     "test:fast": "node --test test/intent-match.test.ts test/intent-fold.test.ts test/intent-gossip.test.ts test/consensus.test.ts test/consensus-gossip.test.ts test/ledger.test.ts test/post-cooldown.test.ts test/sync.test.ts test/custody-threshold.test.ts test/custody-bridge.test.ts",
     "test:chia": "node --test test/chia.test.ts",
+    "setup:chia": "node scripts/setup_chia.mjs",
     "demo": "node src/index.ts",
     "demo:consensus": "node src/demo-consensus.ts"
   },
