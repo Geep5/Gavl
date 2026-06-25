@@ -411,6 +411,10 @@ Verify a node is producing real PoST via `curl -s localhost:6440/api/state | jq 
 — real PoST shows `vdf: "chiavdf-wesolowski-1024"` and `space: "chiapos"` (stand-ins show
 `hash-vdf-v0` / `standin`).
 
+Moving a *live* channel from stand-ins to real PoST is a coordinated, network-wide upgrade (a single
+node can't opt in alone — it forks). See [`docs/real-post-cutover.md`](docs/real-post-cutover.md) for
+the operator playbook (checkpoint seam, prerequisites, procedure).
+
 **Trade against yourself or a peer.** The market needs two sides, so either flip between two
 identities (the account picker, bottom-left) or run a second node on the same channel:
 broadcast an intent on one, **take** the opposite side on the other → a matched contract
