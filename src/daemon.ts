@@ -298,6 +298,7 @@ export class Daemon {
 		// Verifier must match the space backend producers use, or anchors are rejected.
 		this.verifier = this.spaceMode === "chiapos" ? new ChiaSpaceVerifier() : new StandinSpaceVerifier();
 		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, this.verifier, { schedule: opts.schedule, finalityDepth: this.finalityDepth, verifyState: (a, h) => this.checkAppRoot(a, h) }));
+		this.node.mode = `${this.params.vdf.name}/${this.spaceMode}`; // hello advertises this → peers detect a proof-mode mismatch
 		this.wallet = new Wallet(opts.walletDir);
 		this.wallet.ensureSeeded();
 		for (const wa of this.wallet.list()) this.bind(wa);
@@ -1010,6 +1011,7 @@ export class Daemon {
 			}
 			this.producer = new Producer({ node: this.node, keypair: farmer, prover, params: this.params, appRootFor: (prev) => this.appRootForParent(prev) });
 			this.farming = true;
+			this.startHealthWatch(); // warn if we farm but never produce an anchor
 			this.startCommitteeCustody(); // the only custody path: form/join the M-of-N committee
 			void this.lobbyThenFarm(); // join the channel as a LOBBY first — adopt an existing chain or start with a quorum, never fork a solo genesis
 		}
@@ -1054,6 +1056,29 @@ export class Daemon {
 	/** Stand up the autonomous custody loop: it watches finality (via node.onTip →
 	 *  driveRotation) and runs genesis DKG / per-epoch reshare across the PoST-weighted
 	 *  committee sampled from the chain. The fund key is published on-chain at genesis. */
+	/** DIAGNOSTIC (3): a node that's farming but never produces an anchor (a small plot, a stalled VDF
+	 *  worker, or a forgotten venv) silently never joins the committee. Warn once after a grace period. */
+	private startHealthWatch(): void {
+		if (this.healthTimer) return;
+		this.farmingStart = Date.now();
+		this.warnedNoProduce = false;
+		this.healthTimer = setInterval(() => {
+			if (!this.farming) return;
+			const c = this.consensus();
+			const upMin = (Date.now() - this.farmingStart) / 60000;
+			if (c.myAnchors === 0 && upMin > 5 && !this.warnedNoProduce) {
+				this.warnedNoProduce = true;
+				console.warn(`  ⚠ health: farming for ${upMin.toFixed(0)}m on ${c.vdf}/${c.space} but produced 0 anchors. Real PoST: a small plot rarely wins — raise GAVL_K or give it time. If you have peers (${c.peers}) but the tip is frozen, check they run the SAME proof mode.`);
+			}
+			if (c.myAnchors > 0) this.warnedNoProduce = false; // produced again → re-arm for a later stall
+		}, 60_000);
+	}
+
+	private stopHealthWatch(): void {
+		if (this.healthTimer) clearInterval(this.healthTimer);
+		this.healthTimer = undefined;
+	}
+
 	private startCommitteeCustody(): void {
 		if (this.rotation) return;
 		this.rotation = new CommitteeRotation({
@@ -1473,6 +1498,10 @@ export class Daemon {
 	private shadowCoord?: ShadowReshareCoordinator;
 	/** The latest reshare outcome — surfaced in custodyStatus for the UI's reshare indicator. */
 	private lastReshare?: { epoch: number; ok: boolean; detail: string };
+	/** DIAGNOSTIC (3): farming-health watchdog — warns when a node farms but never produces an anchor. */
+	private healthTimer?: ReturnType<typeof setInterval>;
+	private farmingStart = 0;
+	private warnedNoProduce = false;
 	async refreshOnChainReserves(): Promise<void> {
 		try {
 			const esplora = this.esplora();
@@ -1763,6 +1792,7 @@ export class Daemon {
 		clearInterval(this.encKeyTimer);
 		this.oracleGen++; // the running oracle publisher loop exits on its next tick
 		this.producer?.stop();
+		this.stopHealthWatch();
 		this.producer = undefined;
 		if (this.transport) await this.transport.destroy().catch(() => {});
 		this.transport = undefined;
@@ -1774,6 +1804,7 @@ export class Daemon {
 		//    loop + accounts referenced the OLD node, so drop them; startConsensus rebuilds
 		//    the rotation against the new node when farming.
 		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, this.verifier, { schedule: this.schedule, finalityDepth: this.finalityDepth, verifyState: (a, h) => this.checkAppRoot(a, h) }));
+		this.node.mode = `${this.params.vdf.name}/${this.spaceMode}`; // hello advertises this → peers detect a proof-mode mismatch
 		this.rotation = undefined;
 		this.equivWatcher = undefined;
 		this.custodyAcct = undefined;
@@ -1799,6 +1830,7 @@ export class Daemon {
 		this.farming = false;
 		clearInterval(this.encKeyTimer);
 		this.producer?.stop();
+		this.stopHealthWatch();
 		if (this.transport) await this.transport.destroy().catch(() => {});
 		if (this.store) await this.store.close().catch(() => {});
 		await this.params.vdf.close?.().catch(() => {}); // terminate the VDF worker pool, if any

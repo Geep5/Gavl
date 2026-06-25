@@ -18,6 +18,9 @@
 
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
 import { mark, gbtcOf, MAX_LEVERAGE, parseAmount, leverageOk } from "./market/btc.ts";
 import { escrowedInContracts } from "./market/intent.ts";
@@ -28,6 +31,20 @@ const PORT = Number(process.env.GAVL_PORT ?? 6440);
 // Space backend: real chiapos (real disk cost) is the DEFAULT — real Proof-of-Space-Time out of the
 // box. Opt out with GAVL_SPACE=standin (the light in-memory stand-in for tests / CI / zero-setup dev).
 const SPACE = process.env.GAVL_SPACE === "standin" ? "standin" : "chiapos";
+
+// DIAGNOSTIC (1): real PoST needs the Python venv (chiavdf / chiapos). Fail FAST + LOUD here if it's
+// missing, rather than letting a node that forgot `npm run setup:chia` farm with a worker that can't
+// start — the silent "connected but never produces an anchor" trap. Stand-in mode needs nothing.
+if (process.env.GAVL_VDF !== "hash" || SPACE === "chiapos") {
+	const root = dirname(dirname(fileURLToPath(import.meta.url)));
+	const venvPy = process.platform === "win32" ? join(root, ".venv", "Scripts", "python.exe") : join(root, ".venv", "bin", "python3");
+	if (!existsSync(venvPy)) {
+		console.error("\n✗ Real Proof-of-Space-Time needs the Python venv (chiavdf + chiapos), but `.venv` is missing.");
+		console.error("  Set it up once:                      npm run setup:chia");
+		console.error("  Or run the zero-setup stand-ins:     npm run dev:hash\n");
+		process.exit(1);
+	}
+}
 // Difficulty schedule: ON by default so the VDF cost is the pace (anti fast-VDF reorg).
 // GAVL_RETARGET=0 disables it (constant difficulty). GAVL_TARGET_ITERS tunes the per-anchor cost.
 const RETARGET = process.env.GAVL_RETARGET !== "0";

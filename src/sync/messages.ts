@@ -16,8 +16,10 @@ import type { Deal } from "../custody/pvss.ts";
 
 export type SyncMessage =
 	// ── write sync ───────────────────────────────────────────────
-	/** Advertise my current state: root fingerprint + per-writer heads. */
-	| { t: "hello"; root: string; heads: Heads }
+	/** Advertise my current state: root fingerprint + per-writer heads. `mode` is my PoST proof mode
+	 *  (`<vdf>/<space>`) — peers compare it to detect an incompatible-proof mismatch (a real-PoST node
+	 *  among stand-in peers, or vice versa, can't share a chain). */
+	| { t: "hello"; root: string; heads: Heads; mode?: string }
 	/** Ask a peer for writer→fromSeq (inclusive) that I'm missing. */
 	| { t: "want"; from: Record<string, number> }
 	/** Serve requested writes. */

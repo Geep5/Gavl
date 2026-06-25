@@ -47,6 +47,11 @@ export class GavlNode {
 	onApplied?: (writes: Write[]) => void;
 	/** Notified when the heaviest anchor tip changes. */
 	onTip?: (tip: Anchor) => void;
+	/** This node's PoST proof mode (`<vdf>/<space>`), advertised in hello so peers can detect an
+	 *  incompatible-proof mismatch (real PoST among stand-in peers, or vice versa). Set by the daemon. */
+	mode?: string;
+	/** Distinct peer proof-modes already warned about, so a mismatch logs once — not on every hello. */
+	private readonly warnedModes = new Set<string>();
 	/** Ingest a gossiped matched-market intent; returns true if it was NEW (→ re-gossip). */
 	onIntent?: (offer: Offer) => boolean;
 	/** This node's resting offer book, sent to a peer on connect so it sees the tape. */
@@ -89,7 +94,7 @@ export class GavlNode {
 			this.snapshotOffers.delete(conn); // its checkpoint vote no longer counts toward quorum
 		});
 		conn.onMessage((m) => this.handle(conn, m));
-		conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads() });
+		conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode });
 		const tip = this.anchorTipMsg();
 		if (tip) conn.send(tip);
 		const offers = this.intentsToShare?.();
@@ -101,7 +106,7 @@ export class GavlNode {
 	/** Re-broadcast my write-head fingerprint so peers serve me whatever I now lack (used after
 	 *  seeding a checkpoint: my heads jumped, and I want only the post-checkpoint writes). */
 	advertise(): void {
-		this.broadcast({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads() });
+		this.broadcast({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode });
 	}
 
 	/** Apply a locally-produced write and gossip it. */
@@ -137,11 +142,18 @@ export class GavlNode {
 	private handle(conn: Connection, m: SyncMessage): void {
 		switch (m.t) {
 			case "hello": {
+				// DIAGNOSTIC (2): incompatible PoST proof modes can't share a chain — a real-PoST node among
+				// stand-in peers (or vice versa) silently islands at genesis. Compare modes on the handshake
+				// and warn LOUDLY (once per distinct mismatch) instead of leaving it a mystery to debug.
+				if (m.mode && this.mode && m.mode !== this.mode && !this.warnedModes.has(m.mode)) {
+					this.warnedModes.add(m.mode);
+					console.warn(`  ⚠ PROOF-MODE MISMATCH with a peer — you: ${this.mode}, them: ${m.mode}. Incompatible proofs: you can't share a chain, so you'll sit alone at genesis. All nodes must run the SAME mode — real PoST: 'npm run dev' · stand-ins: 'npm run dev:hash'.`);
+				}
 				const want = this.diffWant(m.heads);
 				if (Object.keys(want).length > 0) conn.send({ t: "want", from: want });
 				// If the sender is BEHIND me (I hold writes it lacks), reply with my hello so it
 				// can pull — e.g. after it seeds a checkpoint and re-advertises its new heads.
-				else if (this.aheadOf(m.heads)) conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads() });
+				else if (this.aheadOf(m.heads)) conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode });
 				return;
 			}
 			case "want": {
@@ -170,7 +182,7 @@ export class GavlNode {
 					this.onApplied?.(learned);
 					this.broadcastExcept(conn, { t: "announce", writes: learned });
 				}
-				if (changed) conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads() });
+				if (changed) conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode });
 				return;
 			}
 			case "snapshot-offer": {
