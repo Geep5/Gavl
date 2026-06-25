@@ -289,6 +289,37 @@ hyperdht topic whose name *is* the network identity.
 
 ---
 
+## Lineage & prior art
+
+Gavl invents no new consensus or cryptography — it's an **integration** of well-known systems, and
+it's worth being precise about what comes from where:
+
+- **Chia** — the Proof-of-Space-and-Time primitive is Chia's, wholesale: chiapos + chiavdf, the
+  quality→required-iters coupling, and the trunk/foliage anti-grind split. The one twist is that PoST
+  gates **every write**, not just blocks (`src/chain/writer.ts`).
+- **Nakamoto / Bitcoin** — the anchor chain is heaviest-cumulative-weight with depth-`k` finality and
+  epoch difficulty retargeting (`src/consensus/`), plus an optional sticky-finality lock (a local
+  finality gadget over the heaviest-chain rule).
+- **Holepunch (hypercore / Autobase)** — each identity is a single-writer append-only log; many such
+  logs folded into one deterministic view is Autobase's model. The novel substitution is the
+  *linearizer*: a permissionless PoST anchor chain instead of a known writer set + designated indexer.
+- **Weak-subjectivity checkpoints (à la post-merge Ethereum)** — genesis is grindable and worthless;
+  trust flows from a recent finalized checkpoint adopted via a peer quorum, never a genesis replay
+  ([`docs/weak-subjectivity.md`](docs/weak-subjectivity.md)). This is *not* zk-succinct (no Mina-style
+  recursive proof) — safety rests on honest full nodes rejecting a wrong `appRoot`.
+- **Threshold-custody BTC peg** — the M-of-N bonded/slashable committee with DKG + reshare is the
+  tBTC / Liquid family of federated pegs, not a new construction.
+- **Pyth + Wormhole** — prices are attested Pyth feeds; a channel name *is* a feed id.
+
+**What's genuinely ours** is the seam, not the parts: PoST as a *per-write* cost, driving a Nakamoto
+anchor chain that linearizes Holepunch multi-writer logs into an account-based fold, pegged to BTC by
+a tBTC-style committee — with everything bounded by cost + decay rather than hard caps. The closest
+single cousin in *network shape* (permissionless, leaderless, space-secured mesh) is **Spacemesh**;
+the closest in *primitive* is **Chia**. Calling Gavl "a novel consensus" would overclaim; "a novel
+integration of Chia + Autobase + Nakamoto + weak-subjectivity" is fair.
+
+---
+
 ## Layout
 
 ```
@@ -343,6 +374,31 @@ the channel's Pyth feed; anyone may) · `GAVL_BTC_NET=testnet|signet|mainnet` ·
 a plain name is a transfers-only channel with no price.
 The real chiavdf VDF (`GAVL_VDF=chia`, the daemon's default) needs a Python venv with
 `chiavdf`/`chiapos`; `npm run dev` sidesteps this by using `GAVL_VDF=hash`.
+
+### Running a real PoST node
+
+`npm run dev` farms with **stand-ins** (`GAVL_VDF=hash`, `space=standin`) — zero-setup and great
+for testing, but it is **not** real Proof-of-Space-and-Time: the VDF is a hash stand-in (no genuine
+sequential delay) and the space proof has no disk cost. A node that wants to contribute *real* PoST
+to the network must run both real backends:
+
+```bash
+GAVL_VDF=chia GAVL_SPACE=chiapos GAVL_K=20 GAVL_ORACLE_PUBLISH=1 node src/server.ts
+```
+
+Requirements for real PoST:
+
+- **Chia bridge** — a Python venv with `chiavdf` (time) and `chiapos` (space):
+  `python3 -m venv .venv && .venv/bin/pip install chiavdf chiapos`. Choosing `GAVL_VDF=chia`
+  without it throws (the node never silently downgrades).
+- **`GAVL_K` ≥ 18** — chiapos rejects smaller plots with a C++ `std::exception`. The daemon's
+  default `k` is 11 (sized for the stand-in prover), so **`GAVL_K` must be set explicitly** for
+  real space. Larger `k` = more space = higher anchor win-rate, but longer plotting and more disk
+  (k=20 is ~4× k=18). The plot is created once and reused from the plot dir on later starts.
+
+Verify a node is producing real PoST via `curl -s localhost:6440/api/state | jq '.consensus | {vdf, space}'`
+— real PoST shows `vdf: "chiavdf-wesolowski-1024"` and `space: "chiapos"` (stand-ins show
+`hash-vdf-v0` / `standin`).
 
 **Trade against yourself or a peer.** The market needs two sides, so either flip between two
 identities (the account picker, bottom-left) or run a second node on the same channel:

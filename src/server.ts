@@ -73,6 +73,10 @@ const daemon = new Daemon({
 	walletDir: DATA_DIR,
 	bootstrapEnv: process.env.GAVL_BOOTSTRAP, // comma-separated host:port custom DHT entry nodes
 	space: SPACE,
+	// Plot-size exponent. Default 11 matches the stand-in space prover. Real
+	// chiapos (GAVL_SPACE=chiapos) requires k>=18 or plotting throws, so set
+	// GAVL_K=18+ when farming real Proof-of-Space.
+	k: Number(process.env.GAVL_K ?? "11"),
 	schedule: RETARGET ? { base: 20n, targetIters: TARGET_ITERS, epoch: 4, window: 8, maxStep: 4n } : undefined,
 	heartbeatMs: HEARTBEAT_MS,
 	store: PERSIST === "off" ? undefined : { dir: DATA_DIR ? `${DATA_DIR}/store` : undefined, persist: PERSIST === "mine" ? "mine" : "all" },
