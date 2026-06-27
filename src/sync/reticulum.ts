@@ -7,15 +7,13 @@
  * propagation nodes — a peer that was offline catches up without a live overlap, which is what
  * keeps the RAM consensus alive across churn.
  *
- * This implements the SAME surface as SwarmTransport (join / dialPeer / connectedPeerKeys /
- * nodeKeyHex / …) and produces the SAME `Connection` objects, so the gossip + consensus layers are
- * untouched — only the wire underneath changes. Select it with GAVL_TRANSPORT=reticulum.
+ * It produces `Connection` objects the gossip layer consumes (join / dialPeer / connectedPeerKeys /
+ * nodeKeyHex / …), so consensus is unaware of the wire underneath. This is Gavl's only transport.
  */
 
 import { createServer, type Server, type Socket } from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { sha256 } from "../det/canonical.ts";
 import type { Connection, GavlNode } from "./node.ts";
 import type { SyncMessage } from "./messages.ts";
 
@@ -101,7 +99,6 @@ export class ReticulumTransport {
 	private child?: ChildProcess;
 	private inbuf = "";
 	private address: string | null = null;
-	private topicHex: string | null = null;
 	private network = "";
 	/** producer public key (hex) → that producer's LXMF address (hex), from verified bindings.
 	 *  Lets the daemon address a consensus-roster member directly — no rendezvous. */
@@ -116,10 +113,6 @@ export class ReticulumTransport {
 		this.poolCap = this.maxPeers * 8;
 	}
 
-	get kind(): string {
-		return "reticulum";
-	}
-
 	get nodeKeyHex(): string {
 		return this.address ?? "";
 	}
@@ -128,10 +121,6 @@ export class ReticulumTransport {
 	 *  resolved, and how many committee members we're directly linked to. */
 	diagnostics(): { maxPeers: number; bindings: number; committeeLinked: number } {
 		return { maxPeers: this.maxPeers, bindings: this.producerToAddress.size, committeeLinked: this.committeePins.size };
-	}
-
-	get topicHexValue(): string | null {
-		return this.topicHex;
 	}
 
 	connectedPeerKeys(): string[] {
@@ -145,10 +134,9 @@ export class ReticulumTransport {
 	}
 
 	/** Spawn the sidecar, wait until it reports its LXMF address (ready), then resolve. */
-	async join(networkName: string, topic32?: Uint8Array): Promise<void> {
+	async join(networkName: string): Promise<void> {
 		const network = this.opts.network ?? networkName;
 		this.network = network;
-		this.topicHex = Buffer.from(topic32 ?? sha256(network)).toString("hex");
 
 		await new Promise<void>((resolveListen) => {
 			this.server = createServer((socket) => {
@@ -194,14 +182,6 @@ export class ReticulumTransport {
 		this.pool.add(clean);
 		this.pinned.add(clean); // pinned peers bypass the cap and are never evicted (eclipse resistance)
 		this.activate(clean);
-	}
-
-	// No rendezvous: committee members are addressed DIRECTLY (see connectCommittee).
-	async setCommitteeTopics(_names: string[]): Promise<void> {
-		/* no-op for the LXMF carrier */
-	}
-	committeeTopicNames(): string[] {
-		return [];
 	}
 
 	/** Addresses we've pinned because they're current committee members (for rotation reconciliation). */

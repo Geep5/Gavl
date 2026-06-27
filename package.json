@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Gavl — a decentralized peer-to-peer Bitcoin bull/bear market (matched) on a Proof-of-Space-Time cooldown ledger (Holepunch).",
+  "description": "Gavl — a decentralized peer-to-peer Bitcoin bull/bear market (matched) on a Proof-of-Space-Time cooldown ledger, networked over Reticulum.",
   "scripts": {
     "dev": "concurrently -k -n daemon,web -c blue,magenta \"npm:daemon:dev\" \"npm:web:dev\"",
     "dev:hash": "concurrently -k -n daemon,web -c blue,magenta \"npm:daemon:hash\" \"npm:web:dev\"",
@@ -21,8 +21,7 @@
     "test:fast": "node --test test/intent-match.test.ts test/intent-fold.test.ts test/intent-gossip.test.ts test/consensus.test.ts test/consensus-gossip.test.ts test/ledger.test.ts test/post-cooldown.test.ts test/sync.test.ts test/custody-threshold.test.ts test/custody-bridge.test.ts",
     "test:chia": "node --test test/chia.test.ts",
     "setup:chia": "node scripts/setup_chia.mjs",
-    "demo": "node src/index.ts",
-    "demo:consensus": "node src/demo-consensus.ts"
+    "demo": "node src/index.ts"
   },
   "engines": {
     "node": ">=23.6"
@@ -41,8 +40,6 @@
     "@scure/base": "^2.2.0",
     "@scure/btc-signer": "^2.2.0",
     "corestore": "^7.10.0",
-    "hypercore": "^11.33.1",
-    "hyperdht": "^6.32.0",
-    "hyperswarm": "^4.17.0"
+    "hypercore": "^11.33.1"
   }
 }

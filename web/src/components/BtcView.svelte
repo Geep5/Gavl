@@ -23,10 +23,7 @@
 	const base = $derived(label.split("-")[0] ?? "BTC");
 	const quote = $derived(label.split("-")[1] ?? "USD");
 	const channel = $derived(mkt?.channel ?? c?.network ?? "");
-	const seg = $derived(channel.split("::"));
-	const topic = $derived((c?.topic ?? "").toLowerCase());
-	const coordIsId = $derived(/^[0-9a-f]{64}$/.test((seg[2] ?? "").toLowerCase()));
-	const topicMatchesCoord = $derived(coordIsId && topic === (seg[2] ?? "").toLowerCase());
+	const seg = $derived(channel.split("::")); // label :: method :: feedId
 
 	// price direction tint
 	let dir = $state(0);
@@ -185,7 +182,7 @@
 	// ── transport / mesh model (Reticulum-aware) ──
 	const transport = $derived(c?.transport ?? null);
 	const isReticulum = $derived(transport === "reticulum");
-	const transportLabel = $derived(transport === "reticulum" ? "RETICULUM · LXMF" : transport === "hyperswarm" ? "HYPERDHT" : "LOCAL");
+	const transportLabel = $derived(transport === "reticulum" ? "RETICULUM · LXMF" : "LOCAL");
 	const maxPeers = $derived(c?.maxPeers ?? null); // bounded-mesh cap (Reticulum)
 	const bindings = $derived(c?.bindings ?? 0); // producer↔address bindings resolved
 	const committeeLinked = $derived(c?.committeeLinked ?? 0); // committee members directly linked
@@ -471,28 +468,13 @@
 							<div class="id-l">YOUR KEY (ED25519)</div>
 							<div class="id-row"><span class="id-t">{short(store.active ?? "") || "—"}</span><button class="cpbtn" title="copy" onclick={copy("key", store.active ?? "")}>{cpLbl("key")}</button></div>
 						</div>
-						{#if isReticulum}
-							<!-- The market is priced by a named Pyth feed; that feed address is what matters now
-							     (the channel string only existed to derive the old DHT topic). -->
-							<div>
-								<div class="id-l">PYTH PRICE FEED</div>
-								<div class="id-row"><span class="id-t">{seg[2] ? short(seg[2]) : "—"}</span><button class="cpbtn" title="copy" onclick={copy("feed", seg[2] ?? "")}>{cpLbl("feed")}</button></div>
-								<div class="chips-foot"><span class="cf-l">{seg[0] ?? "market"} · pyth feed id, attested by Wormhole guardians</span></div>
-							</div>
-						{:else}
-							<!-- Holepunch only: the market string hashes to the DHT rendezvous topic. -->
-							<div>
-								<div class="id-l">MARKET STRING (PRE-IMAGE)</div>
-								<div class="chips"><span class="chip a">{seg[0] ?? "—"}</span><span class="chip-sep"> : </span><span class="chip b">{seg[1] ?? "—"}</span><span class="chip-sep"> : </span><span class="chip c">{short(seg[2] ?? "—")}</span></div>
-								<div class="chips-foot"><span class="cf-l">channel : method : feed id</span><button class="cpbtn" title="copy" onclick={copy("string", channel)}>{cpLbl("string")}</button></div>
-							</div>
-							<div class="sha"><span>↓ sha256</span><span class="sha-line"></span></div>
-							<div>
-								<div class="id-l">MARKET DHT TOPIC</div>
-								<div class="id-row"><span class="id-t">{topic ? short(topic) : "—"}{#if topicMatchesCoord}<span class="okmark"> ✓ = COORDINATE</span>{/if}</span><button class="cpbtn" title="copy" onclick={copy("topic", topic)}>{cpLbl("topic")}</button></div>
-							</div>
-						{/if}
-						{#if isReticulum && nodeAddr}
+						<!-- The market is priced by a named Pyth feed; that feed address is the thing that matters. -->
+						<div>
+							<div class="id-l">PYTH PRICE FEED</div>
+							<div class="id-row"><span class="id-t">{seg[2] ? short(seg[2]) : "—"}</span><button class="cpbtn" title="copy" onclick={copy("feed", seg[2] ?? "")}>{cpLbl("feed")}</button></div>
+							<div class="chips-foot"><span class="cf-l">{seg[0] ?? "market"} · pyth feed id, attested by Wormhole guardians</span></div>
+						</div>
+						{#if nodeAddr}
 							<div>
 								<div class="id-l">NODE ADDRESS (LXMF)</div>
 								<div class="id-row"><span class="id-t">{short(nodeAddr)}</span><button class="cpbtn" title="copy" onclick={copy("addr", nodeAddr)}>{cpLbl("addr")}</button></div>

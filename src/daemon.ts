@@ -6,7 +6,7 @@
  * single monotonic clock (so op timestamps are causally ordered).
  *
  * With consensus wired (the default), the node also carries an AnchorChain, the
- * daemon joins the live hyperswarm/hyperdht mesh (gossiping writes AND anchors),
+ * daemon joins the live Reticulum mesh (gossiping writes AND anchors over LXMF),
  * and runs a Producer that farms anchors over the heaviest tip. The UI can then
  * watch the real consensus advance: tip height/weight climbing, finality
  * deepening, settled auctions becoming final.
@@ -47,7 +47,7 @@ import { schnorr_FROST as FROST } from "@noble/curves/secp256k1.js";
 import type { CeremonyAuth } from "./custody/ceremony-auth.ts";
 import { committeeEpochsFor, committeeForEpoch, epochOf } from "./custody/epoch.ts";
 import type { AnchorView } from "./custody/epoch.ts";
-import { committeeTopic, fid, quorumForRound } from "./custody/committee.ts";
+import { fid, quorumForRound } from "./custody/committee.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "./custody/attestation.ts";
 import { isCeremonyTimeout } from "./custody/ceremony.ts";
 import { Esplora } from "./custody/esplora.ts";
@@ -69,11 +69,8 @@ import { StandinSpaceProver, StandinSpaceVerifier } from "./consensus/space.ts";
 import type { SpaceVerifier, SpaceProver } from "./consensus/space.ts";
 import { ChiaSpaceProver, ChiaSpaceVerifier, ensurePlot } from "./pos/chia.ts";
 import { Plot } from "./pos/space.ts";
-import { SwarmTransport, swarmKeyPair } from "./sync/swarm.ts";
 import { ReticulumTransport } from "./sync/reticulum.ts";
-import type { Transport } from "./sync/transport.ts";
 import { KnownPeers } from "./sync/known-peers.ts";
-import { BootstrapList } from "./sync/bootstrap.ts";
 import { generateKeyPair, keyPairFromSeed, sign } from "./det/ed25519.ts";
 import type { KeyPair } from "./det/ed25519.ts";
 import { toHex, fromHex, sha256 } from "./det/canonical.ts";
@@ -105,10 +102,8 @@ export interface DaemonOptions {
 	replicationTarget?: number;
 	/** Anchor space backend: light stand-in (default) or real chiapos (real disk cost). */
 	space?: SpaceMode;
-	/** Initial channel/network name (the DHT topic is sha256 of it). Default "gavl". */
+	/** Initial channel/network name. Default "gavl". */
 	network?: string;
-	/** GAVL_BOOTSTRAP value (comma-separated host:port) — custom DHT entry nodes, added to defaults. */
-	bootstrapEnv?: string;
 	/** Difficulty schedule. Omit → constant; set → retargets so the VDF cost is the pace. */
 	schedule?: RetargetSchedule;
 	/** Plot directory for chiapos (default ~/.gavl/plots). */
@@ -186,23 +181,19 @@ export interface ConsensusStatus {
 	secPerAnchor: number;
 	/** True if secPerAnchor is a live measurement; false if it's the target fallback (cold/idle). */
 	secPerAnchorMeasured: boolean;
-	/** Wire carrier: "reticulum" (LXMF) | "hyperswarm" (DHT) | null (local). */
+	/** Wire carrier: "reticulum" (LXMF) | null (mesh off). */
 	transport: string | null;
-	/** Bounded-mesh diagnostics (Reticulum carrier): connection cap, resolved producer↔address
-	 *  bindings, and committee members directly linked. Absent on the Holepunch carrier. */
+	/** Bounded-mesh diagnostics: connection cap, resolved producer↔address bindings, and committee
+	 *  members directly linked. */
 	maxPeers?: number;
 	bindings?: number;
 	committeeLinked?: number;
-	/** This node's stable wire address (hex) — DHT/Noise key (Hyperswarm) or LXMF address (Reticulum). Null if mesh off. */
+	/** This node's LXMF address (hex). Null if mesh off. */
 	nodeKey: string | null;
-	/** sha256(network) (hex) — the DHT topic every Gavl peer rendezvouses on. Null if mesh off. */
-	topic: string | null;
-	/** Hex node-keys of currently-connected peers. */
+	/** LXMF addresses of currently-connected peers. */
 	peerKeys: string[];
-	/** Hex node-keys pinned for re-dial on every boot (eclipse resistance). */
+	/** LXMF addresses pinned for re-dial on every boot (eclipse resistance). */
 	pinnedPeers: string[];
-	/** The full effective DHT bootstrap list ("host:port"), each flagged if it's a built-in default. */
-	bootstrap: { node: string; default: boolean }[];
 }
 
 /**
@@ -249,7 +240,6 @@ export class Daemon {
 	readonly node: GavlNode;
 	readonly wallet: Wallet;
 	readonly knownPeers = new KnownPeers();
-	readonly bootstrap: BootstrapList;
 	readonly finalityDepth: number;
 	private readonly adoptQuorum: number;
 	private readonly replicationTarget: number;
@@ -263,7 +253,7 @@ export class Daemon {
 	private readonly accounts = new Map<string, Account>();
 	private clock = 0;
 
-	private transport?: Transport;
+	private transport?: ReticulumTransport;
 	private producer?: Producer;
 	private network: string;
 	private farming = false;
@@ -314,7 +304,6 @@ export class Daemon {
 		this.custodyOpts = opts.custody ?? {};
 		this.schedule = opts.schedule;
 		this.network = opts.network ?? "gavl";
-		this.bootstrap = new BootstrapList(undefined, opts.bootstrapEnv);
 		// Verifier must match the space backend producers use, or anchors are rejected.
 		this.verifier = this.spaceMode === "chiapos" ? new ChiaSpaceVerifier() : new StandinSpaceVerifier();
 		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, this.verifier, { schedule: opts.schedule, finalityDepth: this.finalityDepth, verifyState: (a, h) => this.checkAppRoot(a, h) }));
@@ -335,7 +324,7 @@ export class Daemon {
 				if (this.anchorTimes.length > 32) this.anchorTimes.shift(); // keep a small window
 			}
 			this.driveRotation(); // advance the custody epoch loop on each finality move
-			this.maintainCommitteeTopics(); // keep this node joined to its committee's sub-swarm
+			this.maintainCommittee(); // keep this node directly linked to its committee members
 			this.maybeAuthorizePending(); // co-sign pending withdrawals / mints / settles
 			this.maybeCheckpoint(); // snapshot + prune behind finality so history never grows unbounded
 			this.tryPendingSnapshot(); // a stashed peer checkpoint may now be verifiable
@@ -435,14 +424,14 @@ export class Daemon {
 	}
 
 	/**
-	 * Join the committee sub-swarm topic(s) this node belongs to (and leave the rest),
-	 * so the small committee forms a DIRECT sub-mesh for the ceremonies independent of
-	 * the sparse 100+-node main mesh. Computed over the optimistic chain for the current
-	 * + just-finalized epochs, so a node pre-connects BEFORE its ceremony fires. This is
-	 * connectivity only — ceremony membership stays finalized-deterministic. No-op unless
-	 * committee mode + a live transport.
+	 * Directly link this node to its co-committee members, so the small committee is mutually
+	 * connected for the ceremonies independent of the bounded main mesh. Each member's transport
+	 * address is resolved from its signed producer↔address binding (no rendezvous). Computed over the
+	 * optimistic chain for the current + just-finalized epochs, so a node pre-connects BEFORE its
+	 * ceremony fires. Connectivity only — ceremony membership stays finalized-deterministic. No-op
+	 * unless committee mode + a live transport.
 	 */
-	private maintainCommitteeTopics(): void {
+	private maintainCommittee(): void {
 		if (!this.transport) return;
 		const anchors = this.node.anchors;
 		const tip = anchors?.tip();
@@ -460,19 +449,15 @@ export class Daemon {
 			maxGrowthPct: this.custodyOpts.bonded ? (this.custodyOpts.maxGrowthPct ?? DEFAULT_MAX_GROWTH_PCT) : undefined, // gate #2: default-on under stake weighting
 		};
 		const mine = committeeEpochsFor(chain, this.producerId(), [finEpoch, optEpoch], { ...opts, minCommittee: this.custodyOpts.minCommittee ?? 3 });
-		// Holepunch carrier: rendezvous topics for the epochs I'm in.
-		void this.transport.setCommitteeTopics(mine.map((e) => committeeTopic(this.network, e)));
-		// Reticulum carrier: connect to my co-committee members DIRECTLY via the producer↔address
-		// binding (no rendezvous; works on a bounded mesh). Resolve the rosters for the epochs I'm in.
-		if (this.transport.connectCommittee) {
-			const me = this.producerId();
-			const members = new Set<string>();
-			for (const e of mine) {
-				const c = committeeForEpoch(chain, e, opts);
-				if (c) for (const id of c.committee) if (id !== me) members.add(id);
-			}
-			this.transport.connectCommittee([...members]);
+		// Connect to my co-committee members DIRECTLY via the producer↔address binding (no rendezvous;
+		// works on a bounded mesh). Resolve the rosters for the epochs I'm in and link them.
+		const me = this.producerId();
+		const members = new Set<string>();
+		for (const e of mine) {
+			const c = committeeForEpoch(chain, e, opts);
+			if (c) for (const id of c.committee) if (id !== me) members.add(id);
 		}
+		this.transport.connectCommittee([...members]);
 	}
 
 	/**
@@ -948,7 +933,6 @@ export class Daemon {
 		committee: string[] | null;
 		threshold: number | null;
 		minCommittee: number;
-		subSwarmTopics: string[];
 		bonded: boolean;
 		myBond: string;
 		encKeysKnown: number;
@@ -967,7 +951,6 @@ export class Daemon {
 			committee: cs?.participants ?? null,
 			threshold: cs?.min ?? null,
 			minCommittee: this.custodyOpts.minCommittee ?? 3, // farmers needed to bootstrap genesis custody
-			subSwarmTopics: this.transport?.committeeTopicNames() ?? [],
 			bonded: !!this.custodyOpts.bonded, // stake-weighted selection on?
 			myBond: (this.view().bridge.bonds.get(id) ?? 0n).toString(),
 			encKeysKnown: this.encKeys.size(), // verified peer encryption keys (phase-1 announce liveness)
@@ -1010,13 +993,11 @@ export class Daemon {
 			myAnchors: recent.reduce((n, a) => n + (a.producer === myId ? 1 : 0), 0),
 			secPerAnchor: measured ?? this.targetSecPerAnchor,
 			secPerAnchorMeasured: measured != null,
-			transport: this.transport?.kind ?? null, // "reticulum" | "hyperswarm" | null (local)
+			transport: this.transport ? "reticulum" : null,
 			nodeKey: this.transport ? this.transport.nodeKeyHex : null,
-			topic: this.transport ? this.transport.topicHexValue : null,
 			peerKeys: this.transport ? this.transport.connectedPeerKeys() : [],
 			pinnedPeers: this.knownPeers.list(),
-			bootstrap: this.bootstrap.asStrings().map((node) => ({ node, default: this.bootstrap.isDefault(node) })),
-			// bounded-mesh + binding diagnostics (Reticulum carrier only)
+			// bounded-mesh + binding diagnostics
 			...(this.transport?.diagnostics?.() ?? {}),
 		};
 	}
@@ -1025,26 +1006,21 @@ export class Daemon {
 	 *  Resilient to a slow/absent DHT (soft 8s cap) — falls back to local if it fails. */
 	private async joinMesh(): Promise<void> {
 		try {
-			// Custom bootstrap nodes (the DHT entry/"DNS" layer) are added alongside
-			// Holepunch's defaults; undefined → defaults only.
-			// Wire underneath is swappable (GAVL_TRANSPORT). Reticulum carries gossip over LXMF with
-			// store-and-forward (peers catch up across churn); Hyperswarm is the Holepunch DHT mesh.
-			this.transport =
-				process.env.GAVL_TRANSPORT === "reticulum"
-					? new ReticulumTransport(this.node, {
-							network: this.network,
-							storageDir: join(this.dataDir, "reticulum"),
-							configDir: process.env.GAVL_RNS_CONFIG, // undefined → system ~/.reticulum
-							propagated: process.env.GAVL_RNS_PROPAGATED === "1",
-							maxPeers: process.env.GAVL_MAX_PEERS ? Number(process.env.GAVL_MAX_PEERS) : undefined,
-							onEvent: (kind, text) => this.recordNetEvent(kind, text), // surface peer/binding/committee steps to the UI feed
-							// sign producer↔address binding so peers can address us by our consensus key
-							bindingSigner: (msg) => ({ producer: this.producerId(), sig: toHex(sign(this.producerKey().privateKey, msg)) }),
-						})
-					: new SwarmTransport(this.node, { bootstrap: this.bootstrap.forSwarm(), keyPair: this.swarmKeyPair() });
-			const joined = this.transport.join(this.network, channelTopic(this.network)); // a market's id IS its topic
+			// Gossip rides Reticulum (LXMF): store-and-forward so peers catch up across churn, announce-
+			// based discovery, signed producer↔address bindings, a bounded mesh. Runs via a Python sidecar.
+			this.transport = new ReticulumTransport(this.node, {
+				network: this.network,
+				storageDir: join(this.dataDir, "reticulum"),
+				configDir: process.env.GAVL_RNS_CONFIG, // undefined → system ~/.reticulum
+				propagated: process.env.GAVL_RNS_PROPAGATED === "1",
+				maxPeers: process.env.GAVL_MAX_PEERS ? Number(process.env.GAVL_MAX_PEERS) : undefined,
+				onEvent: (kind, text) => this.recordNetEvent(kind, text), // surface peer/binding/committee steps to the UI feed
+				// sign producer↔address binding so peers can address us by our consensus key
+				bindingSigner: (msg) => ({ producer: this.producerId(), sig: toHex(sign(this.producerKey().privateKey, msg)) }),
+			});
+			const joined = this.transport.join(this.network);
 			await Promise.race([joined, new Promise((r) => setTimeout(r, 8000))]);
-			// Re-dial pinned peers directly (independent of DHT discovery) — eclipse resistance.
+			// Re-dial pinned peers directly (independent of announce discovery) — eclipse resistance.
 			for (const key of this.knownPeers.list()) {
 				try {
 					this.transport.dialPeer(key);
@@ -1431,25 +1407,6 @@ export class Daemon {
 		return this.producerKeyCache;
 	}
 
-	/** This node's STABLE Hyperswarm/Noise keypair (persisted). Without this Hyperswarm mints a fresh
-	 *  identity every boot, so this node's nodeKey changes each restart and any direct-dial pin from a
-	 *  peer goes stale. Pinned to disk (like the producer key) so a restart keeps the same nodeKey. */
-	private swarmKeyCache?: { publicKey: Buffer; secretKey: Buffer };
-	private swarmKeyPair(): { publicKey: Buffer; secretKey: Buffer } {
-		if (this.swarmKeyCache) return this.swarmKeyCache;
-		const path = join(this.dataDir, "swarm-key.json");
-		let seed: Buffer;
-		if (existsSync(path)) {
-			seed = Buffer.from(fromHex(JSON.parse(readFileSync(path, "utf8")).seed));
-		} else {
-			seed = Buffer.from(generateKeyPair().privateKey); // 32-byte seed
-			mkdirSync(this.dataDir, { recursive: true });
-			writeFileSync(path, JSON.stringify({ seed: seed.toString("hex") }), { mode: 0o600 });
-		}
-		this.swarmKeyCache = swarmKeyPair(seed);
-		return this.swarmKeyCache;
-	}
-
 	/** This node's committee id (stable producer pubkey hex). */
 	producerId(): string {
 		return toHex(this.producerKey().publicKey);
@@ -1512,7 +1469,7 @@ export class Daemon {
 	 * all committee members are connected. `selfId` must be this node's committee id.
 	 *
 	 * NOTE: the ceremony is proven over the in-memory transport (which mimics the
-	 * wire); running it across real hyperdht daemons is a live-deployment step. This
+	 * wire); running it across real Reticulum daemons is a live-deployment step. This
 	 * wires the proven coordinator onto `this.node`'s real connections.
 	 */
 	async runCommitteeDkg(opts: { session: string; selfId: string; participants: string[]; min: number }): Promise<string> {
@@ -1816,43 +1773,9 @@ export class Daemon {
 		return this.knownPeers.list();
 	}
 
-	// ── bootstrap control (the DHT "DNS"/entry layer) ────────────────
-
-	/** Custom bootstrap nodes as "host:port" strings (added alongside Holepunch defaults). */
-	bootstrapNodes(): string[] {
-		return this.bootstrap.asStrings();
-	}
-
-	/** Add a custom bootstrap node ("host:port") and reconnect to the DHT through it. */
-	async addBootstrap(hostPort: string): Promise<void> {
-		if (!this.bootstrap.add(hostPort)) return; // malformed or duplicate
-		await this.restartTransport();
-	}
-
-	/** Remove a bootstrap node and reconnect. */
-	async removeBootstrap(hostPort: string): Promise<void> {
-		if (!this.bootstrap.remove(hostPort)) return;
-		await this.restartTransport();
-	}
-
-	/** Restore the built-in default bootstrap nodes and reconnect. */
-	async resetBootstrap(): Promise<void> {
-		this.bootstrap.reset();
-		await this.restartTransport();
-	}
-
-	/** Tear down + rebuild the swarm transport (e.g. after a bootstrap change), same channel.
-	 *  Farming is untouched — it runs off the shared node, not the transport. */
-	private async restartTransport(): Promise<void> {
-		if (!this.meshOn) return; // mesh off → nothing live to restart; the new list applies next start
-		if (this.transport) await this.transport.destroy().catch(() => {});
-		this.transport = undefined;
-		await this.joinMesh();
-	}
-
 	/**
 	 * Leave the current channel and join `name`. A channel is a name-based network:
-	 * its own DHT topic (sha256(name)), its own mesh, anchor chain, and economy. We
+	 * its own mesh, anchor chain, and economy. We
 	 * tear down consensus + the current ledger/store, build a FRESH ledger + anchor
 	 * chain for the new channel, rebind accounts (your keys/identity are shared
 	 * across channels), replay the new channel's persisted writes, and re-join. No-op
@@ -1964,11 +1887,9 @@ export function parseChannel(name: string): ChannelMarket | null {
 	return { label: addr.name, ...method.def(addr.coordinate) };
 }
 
-/** The 32-byte DHT topic a channel rendezvouses on. A market address's `id` (its 32-byte-hex
- *  coordinate) IS the topic — used DIRECTLY, no hash — so a swap market's rendezvous is literally its
- *  price-source id (a Pyth feed id / a signer-set hash). The `name` is a label and `source` tells the
- *  fold how to verify; neither needs to be in the topic. Anything else (a plain transfers channel, or
- *  a non-32-byte id) hashes its full name to 32 bytes. Same id ⇒ same topic, regardless of label. */
+/** A channel's stable 32-byte id. A market address's `id` (its 32-byte-hex coordinate) IS the id —
+ *  used directly, no hash — so a swap market's id is literally its price-source id (a Pyth feed id /
+ *  a signer-set hash); anything else hashes its full name to 32 bytes. Same id ⇒ same network. */
 export function channelTopic(name: string): Uint8Array {
 	const addr = parseChannelAddr(name);
 	if (addr && /^[0-9a-f]{64}$/i.test(addr.coordinate)) return fromHex(addr.coordinate.toLowerCase());

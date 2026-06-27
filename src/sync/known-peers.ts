@@ -1,14 +1,14 @@
 /**
- * Known peers — a small persistent list of node-keys to re-dial on every boot.
+ * Known peers — a small persistent list of peer addresses to re-dial on every boot.
  *
  * "Verify with your current peers" is only as safe as that peer set: if an
- * attacker controls all of your connections (by poisoning DHT discovery), they
- * can feed you a fabricated chain — the eclipse attack. Pinning a few peers you
- * trust and re-dialing them directly (`swarm.joinPeer`) every boot, independent
- * of the DHT, is the standard mitigation. This file persists that pinned set.
+ * attacker controls all of your connections (by flooding announces), they can
+ * feed you a fabricated chain — the eclipse attack. Pinning a few peers you trust
+ * and re-dialing them directly (`transport.dialPeer`) every boot, independent of
+ * announce-based discovery, is the standard mitigation. This file persists that set.
  *
- * Stored at ~/.gavl/known-peers.json as a flat hex array. Per-node (not
- * per-channel): a peer is a node on the wire, reachable across channels.
+ * A peer is identified by its Reticulum LXMF address (16 bytes → 32 hex). Stored at
+ * ~/.gavl/known-peers.json as a flat hex array. Per-node (not per-channel).
  */
 
 import { homedir } from "node:os";
@@ -25,7 +25,7 @@ export class KnownPeers {
 		if (existsSync(this.path)) {
 			try {
 				const arr = JSON.parse(readFileSync(this.path, "utf8"));
-				if (Array.isArray(arr)) this.keys = arr.filter((k) => typeof k === "string" && /^[0-9a-f]{64}$/.test(k));
+				if (Array.isArray(arr)) this.keys = arr.filter((k) => typeof k === "string" && /^[0-9a-f]{32}$/.test(k));
 			} catch {
 				/* corrupt file → start empty */
 			}
@@ -39,7 +39,7 @@ export class KnownPeers {
 	/** Add a pinned peer (idempotent). Returns true if newly added. */
 	add(nodeKeyHex: string): boolean {
 		const clean = nodeKeyHex.trim().toLowerCase();
-		if (!/^[0-9a-f]{64}$/.test(clean)) throw new Error("peer key must be 64 hex chars");
+		if (!/^[0-9a-f]{32}$/.test(clean)) throw new Error("peer address must be 32 hex chars (a 16-byte LXMF address)");
 		if (this.keys.includes(clean)) return false;
 		this.keys.push(clean);
 		this.save();

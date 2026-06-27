@@ -1,7 +1,7 @@
 /**
  * Distributed DKG over the LIVE node transport (gate #2, increment #1) —
  * independent GavlNodes run the ceremony over their gossip connections (the same
- * send/onMessage path the real hyperdht swarm uses), each ending with only its own
+ * send/onMessage path the real Reticulum mesh uses), each ending with only its own
  * share, agreeing on the group key, and a quorum signing a real Bitcoin spend.
  *
  *   node --test test/custody-dkg-mesh.test.ts

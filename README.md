@@ -5,7 +5,7 @@
 # Gavl
 
 A decentralized **peer-to-peer Bitcoin bull/bear market** on a **Proof-of-Space-Time cooldown
-ledger**, networked over the [Reticulum](https://reticulum.network) stack (or Holepunch).
+ledger**, networked over the [Reticulum](https://reticulum.network) stack.
 
 Broadcast an intent to go **long** or **short** on Bitcoin; a real peer takes the opposite side; the
 two of you escrow against *each other* and settle at the channel's market price. **There is no pool
@@ -95,51 +95,41 @@ serving committed *state* rather than history. Everything that lives in RAM is b
 it costs something to create and it decays or expires — so a node's footprint is bounded by the real
 economy, not by spam. (`docs/` has the detail: weak-subjectivity, durability, scaling.)
 
-### Networking — Reticulum or Holepunch (`src/sync/`)
+### Networking — Reticulum (`src/sync/`)
 
-Gossip rides a pluggable transport behind one `Connection`/`Transport` seam, selected with
-`GAVL_TRANSPORT`:
+Gossip rides the [Reticulum](https://reticulum.network) stack: every sync frame travels as an **LXMF**
+message, gaining **store-and-forward** (offline peers catch up via propagation nodes). Peers discover
+each other by **announce** (no rendezvous topic) and learn a **signed producer↔address binding**, so
+any node can address a consensus-roster member directly. The mesh is **bounded** (`GAVL_MAX_PEERS`,
+default 16) so per-node space stays manageable at any network size; committee members are linked
+directly via their bindings. It runs via a small Python sidecar (RNS/LXMF) — see
+[`bridge/README.md`](bridge/README.md).
 
-- **`reticulum`** — carries every sync frame as an **LXMF** message over the [Reticulum](https://reticulum.network)
-  stack, gaining **store-and-forward** (offline peers catch up via propagation nodes). Peers discover
-  each other by **announce** (no rendezvous topic) and learn a **signed producer↔address binding**, so
-  any node can address a consensus-roster member directly. The mesh is **bounded** (`GAVL_MAX_PEERS`,
-  default 16) so per-node space stays manageable at any network size; committee members are linked
-  directly via their bindings. Runs via a small Python sidecar — see [`bridge/README.md`](bridge/README.md).
-- **`hyperswarm`** (default) — the Holepunch DHT mesh: peers rendezvous on a topic derived from the
-  channel name.
-
-Either way, sync is epidemic: nodes compare a `stateRoot`, diff-pull what's missing, and re-advertise
-when they learn something.
+Sync is epidemic: nodes compare a `stateRoot`, diff-pull what's missing, and re-advertise when they
+learn something.
 
 ---
 
 ## Run
 
-Needs **Node ≥ 23.6** (native TypeScript — no build step) and, for real PoST, **Python ≥ 3.9**. Works
-on macOS, Linux, Windows.
+Needs **Node ≥ 23.6** (native TypeScript — no build step) and **Python ≥ 3.9** — for the Reticulum
+networking sidecar (always), and for real PoST. Works on macOS, Linux, Windows.
 
 ```bash
 npm install              # once
+pip install rns lxmf     # once — the Reticulum (RNS/LXMF) networking sidecar
 npm run setup:chia       # once — venv + chiavdf/chiapos (prebuilt wheels; no C++ toolchain)
 npm run dev              # real-PoST daemon + web UI, then open http://localhost:5180
 ```
 
-`npm run dev` runs **real Proof-of-Space-Time** by default (chiavdf + chiapos) plus price relay and
-the web UI. No Python? `npm run dev:hash` swaps in the fast stand-ins (`GAVL_VDF=hash
-GAVL_SPACE=standin`) — zero-setup, but **not** real PoST.
-
-> **Windows / browser:** open `http://localhost:5180` (the UI binds IPv6), not `127.0.0.1`.
-
-### Run over Reticulum
-
-```bash
-pip install rns lxmf                              # the Reticulum sidecar's deps
-GAVL_TRANSPORT=reticulum npm run dev              # gossip over LXMF instead of the DHT
-```
+`npm run dev` runs **real Proof-of-Space-Time** (chiavdf + chiapos) over **Reticulum**, plus price
+relay and the web UI. No Python for the proofs? `npm run dev:hash` swaps in the fast stand-ins
+(`GAVL_VDF=hash GAVL_SPACE=standin`) — but it still networks over Reticulum, so it needs `rns`/`lxmf`.
 
 Point `GAVL_RNS_CONFIG` at a standalone Reticulum config to run Gavl's own RNS instance with its own
 interfaces/hubs; otherwise it uses the system `~/.reticulum`. More in [`bridge/README.md`](bridge/README.md).
+
+> **Windows / browser:** open `http://localhost:5180` (the UI binds IPv6), not `127.0.0.1`.
 
 ### Multi-node (the committee)
 
@@ -174,7 +164,7 @@ npm run daemon           # real-PoST daemon only (no web UI)
 npm run web:dev          # web UI only (expects a daemon on :6440)
 ```
 
-Key env vars: `GAVL_TRANSPORT=reticulum|hyperswarm` · `GAVL_VDF=chia|hash` · `GAVL_SPACE=chiapos|standin`
+Key env vars: `GAVL_VDF=chia|hash` · `GAVL_SPACE=chiapos|standin`
 · `GAVL_K=<n>` (plot size; default 18 for chiapos) · `GAVL_MAX_PEERS=<n>` (bounded mesh; default 16) ·
 `GAVL_PERSIST=all|mine|off` · `GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_DATA_DIR` / `GAVL_PORT`
 (isolate a node) · `GAVL_NETWORK=<channel>` (`label::pyth::feedId` is a market; a plain name is
@@ -192,13 +182,13 @@ src/
   pot/  pos/     proof of time (chiavdf) · proof of space (chiapos) + stand-ins
   ledger/        multi-writer RAM ledger + stateRoot
   consensus/     anchor chain, fork choice, finality, difficulty, canonical order
-  sync/          transport seam: reticulum (LXMF) · hyperswarm (Holepunch) · gossip · bounded mesh
+  sync/          Reticulum (LXMF) transport · gossip · bounded mesh · signed producer↔address bindings
   store/         durable write store + state snapshots/checkpoints + selective persist policy
   market/        matched market: intents + bilateral contracts, btc fold, account, Pyth/signed price feeds
   custody/       real-BTC bridge: FROST threshold · DKG · Taproot · deposits · tx · watcher · reshare
   daemon.ts      boots ledger + node + store + consensus + price relay + bridge + intent book
   server.ts      localhost JSON API for the web UI
-bridge/          Python Reticulum (RNS/LXMF) sidecar for GAVL_TRANSPORT=reticulum
+bridge/          Python Reticulum (RNS/LXMF) networking sidecar (the only transport)
 web/             Svelte SPA — the intent tape + bull/bear trading UI
 ```
 

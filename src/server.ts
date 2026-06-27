@@ -89,7 +89,6 @@ if (BTC_NET === "mainnet" && PERSIST === "off")
 const daemon = new Daemon({
 	network: NETWORK,
 	walletDir: DATA_DIR,
-	bootstrapEnv: process.env.GAVL_BOOTSTRAP, // comma-separated host:port custom DHT entry nodes
 	space: SPACE,
 	// Plot-size exponent. The stand-in prover uses 11; real chiapos requires k>=18 or
 	// plotting throws, so chiapos defaults to 18 (no need to remember GAVL_K). Override
@@ -367,27 +366,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		}
 		// ── peer control ──
 		if (path === "/api/peers/dial") {
-			// Directly dial a peer by node-key; pin (default) → re-dialed every boot (eclipse resistance).
+			// Pin + dial a peer by its LXMF address; re-dialed every boot (eclipse resistance).
 			daemon.dialPeer(String(body.key ?? ""), body.pin !== false);
 			return send(res, 200, { pinned: daemon.pinnedPeers() });
 		}
 		if (path === "/api/peers/unpin") {
 			daemon.unpinPeer(String(body.key ?? ""));
 			return send(res, 200, { pinned: daemon.pinnedPeers() });
-		}
-		// ── bootstrap control (DHT entry / "DNS" layer) ──
-		if (path === "/api/bootstrap/add") {
-			// "host:port" — added alongside Holepunch defaults, then reconnect through it.
-			await daemon.addBootstrap(String(body.node ?? ""));
-			return send(res, 200, { bootstrap: daemon.bootstrapNodes() });
-		}
-		if (path === "/api/bootstrap/remove") {
-			await daemon.removeBootstrap(String(body.node ?? ""));
-			return send(res, 200, { bootstrap: daemon.bootstrapNodes() });
-		}
-		if (path === "/api/bootstrap/reset") {
-			await daemon.resetBootstrap(); // restore Holepunch's built-in defaults
-			return send(res, 200, { bootstrap: daemon.bootstrapNodes() });
 		}
 		const claimMatch = path.match(/^\/api\/auctions\/([0-9a-f]+)\/claim$/);
 		if (claimMatch) {
