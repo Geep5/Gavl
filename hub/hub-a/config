@@ -1,0 +1,26 @@
+# Gavl backbone — Hub A. A Reticulum transport node (a "hub").
+#
+#   rnsd --config hub/hub-a
+#
+# Gavl nodes connect to this hub (or Hub B) and are then on the network. Because Hub A and Hub B
+# PEER with each other (both run enable_transport, and Hub B opens a link to Hub A — see hub-b/config),
+# a node on Hub A and a node on Hub B share ONE network and see each other. Add more hubs the same way
+# to scale out horizontally — the union of peered hubs is a single Reticulum network.
+#
+# In production each hub runs on its own always-on host with a public IP/port. For a local trial you
+# can run both hubs on one machine (different ports, target_host = 127.0.0.1).
+
+[reticulum]
+  enable_transport = Yes
+  share_instance = No
+  instance_name = gavl-hub-a
+
+[logging]
+  loglevel = 3
+
+[interfaces]
+  [[Hub A Server]]
+    type = TCPServerInterface
+    interface_enabled = true
+    listen_ip = 0.0.0.0
+    listen_port = 5242

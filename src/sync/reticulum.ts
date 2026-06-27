@@ -165,6 +165,11 @@ export class ReticulumTransport {
 			"--network", network,
 			"--config-dir", configDir,
 		];
+		// Re-announce cadence: how often we re-broadcast our gavl announce so late-joining peers
+		// discover us. Default (300s in the sidecar) is fine steady-state; lower it for faster
+		// discovery on small/test networks via GAVL_ANNOUNCE_INTERVAL.
+		const announceInterval = process.env.GAVL_ANNOUNCE_INTERVAL;
+		if (announceInterval && /^\d+$/.test(announceInterval)) argv.push("--announce-interval", announceInterval);
 		if (this.opts.propagated) argv.push("--propagated");
 
 		this.child = spawn(py, argv, {

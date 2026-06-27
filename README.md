@@ -155,6 +155,10 @@ curl -s localhost:6440/api/state | jq '.consensus | {farming, vdf, space, tip, p
 Want `farming: true`, `vdf: "chiavdf-wesolowski-1024"` + `space: "chiapos"` (real PoST; stand-ins show
 `hash-vdf-v0` / `standin`), `tip` climbing, and `peers` ≥ 2.
 
+Out of the box every node joins through one shared public hub. To scale past a single point of
+failure, run your own **backbone** — several Reticulum hubs that peer into one network, with nodes
+spread across them. It's a few commands; see [`hub/README.md`](hub/README.md).
+
 ### Other scripts & env
 
 ```bash
@@ -168,7 +172,9 @@ Key env vars: `GAVL_VDF=chia|hash` · `GAVL_SPACE=chiapos|standin`
 · `GAVL_K=<n>` (plot size; default 18 for chiapos) · `GAVL_MAX_PEERS=<n>` (bounded mesh; default 16) ·
 `GAVL_PERSIST=all|mine|off` · `GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_DATA_DIR` / `GAVL_PORT`
 (isolate a node) · `GAVL_NETWORK=<channel>` (`label::pyth::feedId` is a market; a plain name is
-transfers-only). Real PoST needs the `setup:chia` venv; choosing `GAVL_VDF=chia` without it throws
+transfers-only) · `GAVL_RNS_CONFIG=<dir>` (point at your own Reticulum config — e.g. a
+[backbone](hub/README.md) hub) · `GAVL_ANNOUNCE_INTERVAL=<seconds>` (re-announce cadence; default 300,
+lower it for faster discovery while testing). Real PoST needs the `setup:chia` venv; choosing `GAVL_VDF=chia` without it throws
 (never a silent downgrade). Moving a *live* channel from stand-ins to real PoST is a coordinated
 upgrade — see [`docs/real-post-cutover.md`](docs/real-post-cutover.md).
 

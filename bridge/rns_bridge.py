@@ -41,7 +41,9 @@ GAVL_PREFIX = "gavl:"
 DEFAULT_GAVL_RNS_CONFIG = """\
 # Gavl networking config (Reticulum). Hub-only by design — no LAN discovery.
 [reticulum]
-  enable_transport = No
+  # Relay for other nodes so the whole set of nodes + hubs forms ONE connected mesh — without this,
+  # nodes that land on different hubs never see each other and the genesis seeder election deadlocks.
+  enable_transport = Yes
   share_instance = No
   panic_on_interface_error = No
 
@@ -50,19 +52,15 @@ DEFAULT_GAVL_RNS_CONFIG = """\
 
 [interfaces]
 
-  # Public Reticulum hubs — the shared rendezvous every Gavl node connects through.
-  # (Verified reachable; swap in your own hub for a private deployment.)
-  [[Beleth RNS Hub]]
+  # A SINGLE shared Reticulum hub — the rendezvous every Gavl node connects through. One hub (not
+  # several) so every node lands on the SAME network and fully meshes; multiple hubs that aren't
+  # bridged would split nodes onto separate networks that can't see each other. Swap in your own hub
+  # for a private deployment (every node must use the same one).
+  [[Gavl Hub]]
     type = TCPClientInterface
     enabled = yes
     target_host = rns.beleth.net
     target_port = 4242
-
-  [[g00n.cloud DFW Hub]]
-    type = TCPClientInterface
-    enabled = yes
-    target_host = dfw.us.g00n.cloud
-    target_port = 6969
 
   # LAN discovery is intentionally OFF (uncomment to also peer on the local network):
   # [[Local Network]]

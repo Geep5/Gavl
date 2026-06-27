@@ -1,0 +1,19 @@
+# Gavl node → backbone. A leaf config: connect to ONE hub, don't relay.
+#
+#   GAVL_RNS_CONFIG=hub/node npm run dev
+#
+# Point target_host/target_port at whichever hub this node should reach (Hub A 5242 or Hub B 5243,
+# or a hub's public IP). Since the hubs peer, it doesn't matter which one — the node is on the whole
+# network either way. Spread nodes across hubs to share load; that's the point of multiple hubs.
+
+[reticulum]
+  enable_transport = No
+  share_instance = No
+  instance_name = gavl-node
+
+[interfaces]
+  [[Backbone]]
+    type = TCPClientInterface
+    interface_enabled = true
+    target_host = 127.0.0.1
+    target_port = 5242
