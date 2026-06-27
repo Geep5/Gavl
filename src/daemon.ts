@@ -114,7 +114,7 @@ export interface DaemonOptions {
 	targetSecPerAnchor?: number;
 	/** Durable storage. Omit → in-memory only (RAM, lost on restart). */
 	store?: {
-		dir?: string; // corestore dir (default ~/.gavl/store)
+		dir?: string; // store dir (default ~/.gavl/store)
 		/** "all" → archiver (keep everything); "mine" → only my wallet keys + their coins/auctions. */
 		persist?: "all" | "mine";
 		/** Or supply a custom policy directly (overrides `persist`). */
@@ -529,7 +529,7 @@ export class Daemon {
 
 		// Persist every newly-applied write (write-through, policy-filtered). Guarded against
 		// a store that's being torn down mid-flight (a channel switch closes it) — a late
-		// write must NOT crash the daemon with an unhandled "Corestore is closed" rejection.
+		// write must NOT crash the daemon with an unhandled "database is closed" rejection.
 		const prev = this.node.onApplied;
 		this.node.onApplied = (applied) => {
 			prev?.(applied); // chain the base hook (records the gossip event)

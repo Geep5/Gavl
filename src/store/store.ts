@@ -1,24 +1,24 @@
 /**
- * Durable write store — Holepunch hypercore, behind a persist policy.
+ * Durable write store — SQLite (node:sqlite), behind a persist policy.
  *
- * One `corestore` on disk; one append-only `hypercore` per writer (named by the
- * writer's pubkey hex). Each accepted write the policy KEEPS is appended to its
- * writer's core as a JSON line. hypercore is signed, append-only, and
- * crash-durable, and is the same primitive Holepunch replicates natively — so
- * this store is also the seam where, later, disk durability and network
- * replication can unify.
+ * One on-disk SQLite database. Each accepted write the policy KEEPS is appended to the `writes`
+ * table (writer pubkey + seq + the write as a JSON line). This is purely LOCAL durability — the
+ * gossip layer syncs the network independently; nothing here replicates.
  *
- * On boot, `replay()` streams every persisted write back (in per-writer seq
- * order) so the in-RAM Ledger is rebuilt before the node goes live. Writes the
- * policy dropped were never written, so they simply don't come back — that's
- * selective persistence: the node restarts as a partial node holding only what
- * its owner chose to keep.
+ * On boot, `replay()` streams every persisted write back (per-writer, in seq order) so the in-RAM
+ * Ledger is rebuilt before the node goes live. Writes the policy dropped were never written, so they
+ * simply don't come back — selective persistence: the node restarts holding only what its owner chose
+ * to keep. Finalized history below a checkpoint is DELETEd (`pruneBelow`), reclaiming disk.
  *
- * BigInt-safe: writes are plain JSON (amounts are already strings in ops), and
- * the Write shape contains no BigInt, so JSON.stringify/parse round-trips it.
+ * node:sqlite is built into Node (≥22.5; we require ≥23.6), so this adds no dependency. The API is
+ * synchronous; the async method signatures are kept so the daemon's call sites are unchanged.
+ *
+ * BigInt-safe: writes are plain JSON (amounts are already strings in ops), so JSON round-trips them.
  */
 
-import Corestore from "corestore";
+import { DatabaseSync } from "node:sqlite";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import type { Write } from "../chain/writer.ts";
 import type { Heads } from "../ledger/ledger.ts";
 import type { CanonState } from "../market/state.ts";
@@ -35,39 +35,41 @@ export interface StoredSnapshot {
 }
 
 export interface StoreOptions {
-	/** Directory for the corestore (e.g. ~/.gavl/store). */
+	/** Directory for the database (e.g. ~/.gavl/store/channels/<slug>). */
 	dir: string;
-	/** What to durably keep. Defaults to keep-all if omitted. */
+	/** What to durably keep. */
 	policy: PersistPolicy;
 }
 
 export class WriteStore {
-	private readonly store: InstanceType<typeof Corestore>;
+	private readonly db: DatabaseSync;
 	private readonly policy: PersistPolicy;
-	private readonly cores = new Map<string, any>(); // writer hex → hypercore
 	private readonly ctx: PolicyContext = { op: null, keptPositions: new Set() };
+	private readonly insWrite: ReturnType<DatabaseSync["prepare"]>;
+	private readonly insSnap: ReturnType<DatabaseSync["prepare"]>;
 	private kept = 0;
 	private seen = 0;
 
 	constructor(opts: StoreOptions) {
-		this.store = new Corestore(opts.dir);
+		mkdirSync(opts.dir, { recursive: true });
+		this.db = new DatabaseSync(join(opts.dir, "store.db"));
+		// WAL + NORMAL: durable across an OS crash for committed transactions, without an fsync per
+		// write. A power-loss can lose the last few un-checkpointed commits — recoverable, since the
+		// same writes re-sync from peers — but never corrupts the database.
+		this.db.exec("PRAGMA journal_mode = WAL");
+		this.db.exec("PRAGMA synchronous = NORMAL");
+		this.db.exec(`
+			CREATE TABLE IF NOT EXISTS writes (writer TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL);
+			CREATE INDEX IF NOT EXISTS writes_writer_seq ON writes(writer, seq);
+			CREATE TABLE IF NOT EXISTS snapshots (data TEXT NOT NULL);
+		`);
 		this.policy = opts.policy;
+		this.insWrite = this.db.prepare("INSERT INTO writes (writer, seq, data) VALUES (?, ?, ?)");
+		this.insSnap = this.db.prepare("INSERT INTO snapshots (data) VALUES (?)");
 	}
 
 	async ready(): Promise<void> {
-		await this.store.ready();
-	}
-
-	private readonly indexed = new Set<string>();
-
-	private core(writerHex: string): any {
-		let c = this.cores.get(writerHex);
-		if (!c) {
-			// name-addressed: a stable per-writer core (its own keypair, persisted by corestore)
-			c = this.store.get({ name: "writer/" + writerHex });
-			this.cores.set(writerHex, c);
-		}
-		return c;
+		/* opened synchronously in the constructor */
 	}
 
 	/**
@@ -80,14 +82,7 @@ export class WriteStore {
 		this.ctx.op = op;
 		if (!this.policy.keep(write, this.ctx)) return false;
 		recordKept(write, op, this.ctx); // so later bids/settles on this auction are kept too
-
-		const c = this.core(write.writer);
-		await c.ready();
-		if (!this.indexed.has(write.writer)) {
-			this.indexed.add(write.writer);
-			await this.addToIndex(write.writer); // so replay() can discover this writer's core
-		}
-		await c.append(Buffer.from(JSON.stringify(write), "utf8"));
+		this.insWrite.run(write.writer, write.seq, JSON.stringify(write));
 		this.kept++;
 		return true;
 	}
@@ -97,95 +92,40 @@ export class WriteStore {
 	 * The caller feeds these into Ledger.apply() to rebuild RAM state on boot.
 	 */
 	async replay(onWrite: (w: Write) => void): Promise<{ writers: number; writes: number }> {
-		// corestore doesn't enumerate named cores for us; we persist a small index
-		// of known writers alongside. Simpler: discover from the index core.
-		const index = await this.writerIndex();
-		let writes = 0;
-		for (const writerHex of index) {
-			const c = this.core(writerHex);
-			await c.ready();
-			for (let i = 0; i < c.length; i++) {
-				const block = await c.get(i, { wait: false }); // null = pruned below a checkpoint → skip
-				if (!block) continue;
-				const w = JSON.parse(block.toString("utf8")) as Write;
-				onWrite(w);
-				writes++;
-			}
+		const rows = this.db.prepare("SELECT data FROM writes ORDER BY writer, seq, rowid").all() as { data: string }[];
+		const writers = new Set<string>();
+		for (const r of rows) {
+			const w = JSON.parse(r.data) as Write;
+			writers.add(w.writer);
+			onWrite(w);
 		}
-		return { writers: index.length, writes };
-	}
-
-	// ── writer index (so replay knows which cores exist) ─────────────
-
-	private indexCore(): any {
-		return this.store.get({ name: "gavl/writer-index" });
-	}
-
-	/** Record that we have a core for this writer (idempotent-ish; deduped on read). */
-	private async addToIndex(writerHex: string): Promise<void> {
-		const idx = this.indexCore();
-		await idx.ready();
-		await idx.append(Buffer.from(writerHex, "utf8"));
-	}
-
-	private async writerIndex(): Promise<string[]> {
-		const idx = this.indexCore();
-		await idx.ready();
-		const set = new Set<string>();
-		for (let i = 0; i < idx.length; i++) {
-			const block = await idx.get(i);
-			set.add(block.toString("utf8"));
-		}
-		return [...set];
+		return { writers: writers.size, writes: rows.length };
 	}
 
 	// ── state checkpoints (so boot resumes from state, not history) ──
 
-	private snapCore(): any {
-		return this.store.get({ name: "gavl/snapshot" });
-	}
-
-	/** Append a state checkpoint; the latest block is the current snapshot. */
+	/** Append a state checkpoint; the latest row is the current snapshot. */
 	async persistSnapshot(snap: StoredSnapshot): Promise<void> {
-		const c = this.snapCore();
-		await c.ready();
-		await c.append(Buffer.from(JSON.stringify(snap), "utf8"));
+		this.insSnap.run(JSON.stringify(snap));
 	}
 
 	/** The most recent durable snapshot, or null if none taken yet. */
 	async loadSnapshot(): Promise<StoredSnapshot | null> {
-		const c = this.snapCore();
-		await c.ready();
-		if (c.length === 0) return null;
-		const block = await c.get(c.length - 1);
-		return JSON.parse(block.toString("utf8")) as StoredSnapshot;
+		const row = this.db.prepare("SELECT data FROM snapshots ORDER BY rowid DESC LIMIT 1").get() as { data: string } | undefined;
+		return row ? (JSON.parse(row.data) as StoredSnapshot) : null;
 	}
 
 	/**
-	 * Reclaim disk behind a finalized checkpoint: clear persisted blocks for writes at/below
-	 * the checkpoint heads. The log keeps its length (positions stay valid) but the block data
-	 * is freed; replay() skips cleared blocks. Best-effort — never throws into the caller.
+	 * Reclaim disk behind a finalized checkpoint: delete persisted writes at/below the checkpoint
+	 * heads. Unlike the old log-blanking, this frees the rows outright. Returns the count deleted.
 	 */
 	async pruneBelow(heads: Heads): Promise<number> {
+		const del = this.db.prepare("DELETE FROM writes WHERE writer = ? AND seq <= ?");
 		let cleared = 0;
-		for (const writerHex of await this.writerIndex()) {
+		for (const writerHex of Object.keys(heads)) {
 			const h = heads[writerHex];
 			if (!h) continue;
-			const c = this.core(writerHex);
-			await c.ready();
-			for (let i = 0; i < c.length; i++) {
-				try {
-					const block = await c.get(i, { wait: false });
-					if (!block) continue; // already cleared
-					const w = JSON.parse(block.toString("utf8")) as Write;
-					if (w.seq <= h.seq) {
-						await c.clear(i, i + 1);
-						cleared++;
-					}
-				} catch {
-					/* leave the block; pruning is opportunistic */
-				}
-			}
+			cleared += Number(del.run(writerHex, h.seq).changes ?? 0);
 		}
 		return cleared;
 	}
@@ -195,6 +135,6 @@ export class WriteStore {
 	}
 
 	async close(): Promise<void> {
-		await this.store.close();
+		this.db.close();
 	}
 }
