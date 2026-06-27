@@ -1029,8 +1029,11 @@ export class Daemon {
 				}
 			}
 		} catch (e) {
-			console.warn(`[daemon] mesh join failed (continuing local): ${(e as Error).message}`);
-			this.transport = undefined;
+			// Gavl networks ONLY over Reticulum — never silently degrade to a mesh-less "local" node.
+			console.error(`\n✗ Reticulum mesh failed to start: ${(e as Error).message}`);
+			console.error("  Refusing to run mesh-less. Check the sidecar (pip install rns lxmf) and restart,");
+			console.error("  or run an intentional local-only node with GAVL_MESH=0.\n");
+			process.exit(1);
 		}
 	}
 

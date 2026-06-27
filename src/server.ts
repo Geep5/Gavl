@@ -19,6 +19,7 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
@@ -62,13 +63,28 @@ const HEARTBEAT_MS = Number(process.env.GAVL_HEARTBEAT_MS ?? "60000");
 //   GAVL_PERSIST=mine            → keep only writes touching my wallet keys + their coins/auctions
 const PERSIST = process.env.GAVL_PERSIST ?? "all";
 
-// Channel/network: the name IS the address (its DHT topic is sha256 of it). GAVL_NETWORK
-// sets the initial channel; the UI can switch at runtime. MESH/FARM gate consensus. Default is
-// the shipped BTC-USD market channel (name encodes a Pyth feed id), so the app prices + trades
-// out of the box; a plain GAVL_NETWORK name = a transfers-only channel.
+// Channel/network: the name IS the address. GAVL_NETWORK sets the initial channel; the UI can
+// switch at runtime. MESH/FARM gate consensus. Default is the shipped BTC-USD market channel (name
+// encodes a Pyth feed id), so the app prices + trades out of the box; a plain GAVL_NETWORK name = a
+// transfers-only channel.
 const NETWORK = process.env.GAVL_NETWORK ?? defaultMarketChannel();
 const MESH = process.env.GAVL_MESH !== "0";
 const FARM = process.env.GAVL_FARM !== "0";
+
+// DIAGNOSTIC (2): Gavl networks ONLY over Reticulum (RNS/LXMF via a Python sidecar). Fail FAST + LOUD
+// if those modules can't be imported, instead of silently degrading to a mesh-less "local" node —
+// the exact "why won't it connect" trap. Skipped only when the mesh is intentionally off.
+if (MESH) {
+	const py = process.env.GAVL_PYTHON ?? "python";
+	const probe = spawnSync(py, ["-c", "import RNS, LXMF"], { stdio: "ignore" });
+	if (probe.status !== 0) {
+		console.error(`\n✗ Reticulum networking needs the Python RNS + LXMF modules, but \`${py} -c "import RNS, LXMF"\` failed.`);
+		console.error("  Install them once:          pip install rns lxmf");
+		console.error("  Wrong Python? point at it:  GAVL_PYTHON=python3 npm run dev");
+		console.error("  Intentional local node:     GAVL_MESH=0 npm run dev\n");
+		process.exit(1);
+	}
+}
 
 // Threshold custody — there is ONLY one mode: an M-of-N committee. A DKG at genesis, reshare each
 // epoch, and NO node ever holds the key. A node won't custody until ≥minCommittee farmers form the
