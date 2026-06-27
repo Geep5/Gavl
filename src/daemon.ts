@@ -1088,10 +1088,24 @@ export class Daemon {
 	private async lobbyThenFarm(): Promise<void> {
 		const need = this.custodyOpts.minCommittee ?? 3;
 		if (this.transport) {
+			const sk = (k: string) => (k.length > 9 ? k.slice(0, 8) + "…" : k);
+			let lastLobby = "";
 			while (this.farming && !this.node.anchorTip()) {
 				const myKey = this.transport.nodeKeyHex;
 				const roster = [myKey, ...this.transport.connectedPeerKeys()].sort();
 				if (roster.length >= need && roster[0] === myKey) break; // quorum present + I'm the seeder → form the one chain
+				// Visibility: the lobby used to wait SILENTLY, so a stalled genesis was indistinguishable from a
+				// dead node. Say exactly WHY we're waiting — sub-quorum, or quorum-but-not-the-seeder — and log
+				// only when it changes. The seeder is the lowest node-key present; everyone else adopts its genesis,
+				// so if you see this frozen at "waiting for seeder X", X is the node to check (is it farming + producing?).
+				const status =
+					roster.length < need
+						? `lobby: ${roster.length}/${need} farmers present${roster[0] === myKey ? " (I'd seed at quorum)" : ""} — waiting for ${need - roster.length} more`
+						: `lobby: ${roster.length}/${need} present — waiting for seeder ${sk(roster[0])} to mint genesis (I'm ${sk(myKey)}, not the lowest key)`;
+				if (status !== lastLobby) {
+					console.log(`  ${status}`);
+					lastLobby = status;
+				}
 				await new Promise((r) => setTimeout(r, 1000)); // else wait — adopt the seeder's/existing chain when it appears
 			}
 		}
