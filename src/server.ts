@@ -244,6 +244,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		return send(res, 200, serializeState());
 	}
 
+	if (method === "GET" && path === "/api/events") {
+		const since = Number(url.searchParams.get("since") ?? "0") || 0;
+		return send(res, 200, daemon.events(since));
+	}
+
 	if (method === "POST") {
 		const body = await readBody(req);
 

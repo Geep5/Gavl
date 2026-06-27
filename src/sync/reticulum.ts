@@ -74,6 +74,8 @@ export interface ReticulumOptions {
 	/** Hard cap on active peer connections (excluding pinned peers). The mesh stays a bounded partial
 	 *  mesh — gossip relays the rest — so per-node space is manageable at any network size. Default 16. */
 	maxPeers?: number;
+	/** Diagnostic hook — receives human-readable network steps (peer/binding/committee) for the UI feed. */
+	onEvent?: (kind: string, text: string) => void;
 	/** Python executable + bridge script overrides (for non-standard installs). */
 	python?: string;
 	bridgeScript?: string;
@@ -114,8 +116,18 @@ export class ReticulumTransport {
 		this.poolCap = this.maxPeers * 8;
 	}
 
+	get kind(): string {
+		return "reticulum";
+	}
+
 	get nodeKeyHex(): string {
 		return this.address ?? "";
+	}
+
+	/** Mesh diagnostics for the UI: the bounded-mesh cap, how many producer↔address bindings we've
+	 *  resolved, and how many committee members we're directly linked to. */
+	diagnostics(): { maxPeers: number; bindings: number; committeeLinked: number } {
+		return { maxPeers: this.maxPeers, bindings: this.producerToAddress.size, committeeLinked: this.committeePins.size };
 	}
 
 	get topicHexValue(): string | null {
@@ -213,11 +225,14 @@ export class ReticulumTransport {
 			this.pinned.delete(addr);
 		}
 		// current members → pin + dial directly
+		let linked = 0;
 		for (const addr of want) {
 			if (this.committeePins.has(addr)) continue;
 			this.committeePins.add(addr);
 			this.dialPeer(addr); // pins + activates (mesh-exempt)
+			linked++;
 		}
+		if (linked > 0) this.report("committee", `linked ${linked} member${linked === 1 ? "" : "s"} directly (${producerIds.length} in roster)`);
 	}
 
 	async destroy(): Promise<void> {
@@ -233,6 +248,13 @@ export class ReticulumTransport {
 	/** @internal — used by ReticulumConnection.send */
 	sendFrame(peerHex: string, frame: SyncMessage): void {
 		this.ctrl({ op: "send", peer: peerHex, frame });
+	}
+
+	private report(kind: string, text: string): void {
+		this.opts.onEvent?.(kind, text);
+	}
+	private static short(h: string): string {
+		return h.length > 12 ? h.slice(0, 8) + "…" + h.slice(-4) : h;
 	}
 
 	/** Sign and publish our producer↔address binding so peers can directly address us by producer key.
@@ -269,12 +291,16 @@ export class ReticulumTransport {
 		switch (ev.ev) {
 			case "ready":
 				this.address = ev.address ?? null;
+				if (this.address) this.report("net", `online as ${ReticulumTransport.short(this.address)} on "${this.network}"`);
 				this.publishBinding();
 				this.readyResolve?.();
 				this.readyResolve = undefined;
 				return;
 			case "binding":
-				if (ev.producer && ev.address) this.producerToAddress.set(ev.producer, ev.address);
+				if (ev.producer && ev.address) {
+					this.producerToAddress.set(ev.producer, ev.address);
+					this.report("binding", `verified ${ReticulumTransport.short(ev.producer)} → ${ReticulumTransport.short(ev.address)}`);
+				}
 				return;
 			case "discovered":
 			case "peer_connected":
@@ -342,6 +368,7 @@ export class ReticulumTransport {
 			this.active.set(peerHex, c);
 			if (!this.lastSeen.has(peerHex)) this.lastSeen.set(peerHex, Date.now());
 			this.node.addPeer(c); // greets the peer (hello / snapshot-offer) over LXMF
+			this.report("peer", `connected ${ReticulumTransport.short(peerHex)} (${this.active.size} active)`);
 		}
 		return c;
 	}
@@ -351,6 +378,7 @@ export class ReticulumTransport {
 		if (!c) return;
 		this.active.delete(peerHex);
 		c.fireClose(); // gossip layer drops it; stays in the pool, may be re-activated later
+		this.report("peer", `dropped ${ReticulumTransport.short(peerHex)} (${this.active.size} active)`);
 	}
 
 	/** Active peers that count against the cap (pinned peers are exempt). */

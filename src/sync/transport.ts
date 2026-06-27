@@ -5,6 +5,8 @@
  */
 
 export interface Transport {
+	/** Which carrier this is — "reticulum" (LXMF) or "hyperswarm" (Holepunch DHT). */
+	readonly kind: string;
 	/** This node's stable address on the wire (hex). */
 	readonly nodeKeyHex: string;
 	/** The rendezvous topic (hex), for status display. */
@@ -20,6 +22,9 @@ export interface Transport {
 	setCommitteeTopics(names: string[]): Promise<void>;
 	/** Currently-joined committee sub-mesh names. */
 	committeeTopicNames(): string[];
+	/** Carrier-specific mesh diagnostics for the UI (bounded-mesh cap, resolved bindings, committee
+	 *  links). Optional — only the Reticulum carrier reports it. */
+	diagnostics?(): { maxPeers: number; bindings: number; committeeLinked: number };
 	/** Ensure direct, mesh-exempt connections to these committee members (by producer key), so
 	 *  ceremonies work on a bounded mesh without a rendezvous. Resolves each producer→address via the
 	 *  signed bindings; reconciles on each call (drops members no longer in the committee). Optional —

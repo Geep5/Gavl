@@ -117,6 +117,10 @@ export class SwarmTransport {
 		});
 	}
 
+	get kind(): string {
+		return "hyperswarm";
+	}
+
 	/** This node's stable DHT/Noise public key (hex) — its unique address on the wire. */
 	get nodeKeyHex(): string {
 		return this.swarm.keyPair.publicKey.toString("hex");

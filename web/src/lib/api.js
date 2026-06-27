@@ -13,6 +13,7 @@ async function req(path, method = "GET", body) {
 
 export const api = {
 	state: () => req("/state"),
+	events: (since = 0) => req("/events?since=" + since), // network-activity feed (seq cursor; never misses)
 	createAccount: (label) => req("/accounts", "POST", { label }),
 	setActive: (pubHex) => req("/accounts/active", "POST", { pubHex }),
 	// v1: BTC bull/bear

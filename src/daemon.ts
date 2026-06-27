@@ -186,7 +186,14 @@ export interface ConsensusStatus {
 	secPerAnchor: number;
 	/** True if secPerAnchor is a live measurement; false if it's the target fallback (cold/idle). */
 	secPerAnchorMeasured: boolean;
-	/** This node's stable DHT/Noise public key (hex) — its unique address peers dial. Null if mesh off. */
+	/** Wire carrier: "reticulum" (LXMF) | "hyperswarm" (DHT) | null (local). */
+	transport: string | null;
+	/** Bounded-mesh diagnostics (Reticulum carrier): connection cap, resolved producer↔address
+	 *  bindings, and committee members directly linked. Absent on the Holepunch carrier. */
+	maxPeers?: number;
+	bindings?: number;
+	committeeLinked?: number;
+	/** This node's stable wire address (hex) — DHT/Noise key (Hyperswarm) or LXMF address (Reticulum). Null if mesh off. */
 	nodeKey: string | null;
 	/** sha256(network) (hex) — the DHT topic every Gavl peer rendezvouses on. Null if mesh off. */
 	topic: string | null;
@@ -287,6 +294,11 @@ export class Daemon {
 	 *  Display-only (never touches the deterministic fold), so Date.now() is fine here. */
 	private readonly anchorTimes: { height: number; at: number }[] = [];
 
+	/** Recent network/diagnostic steps (seq'd ring buffer) for the web UI's Network feed. Display-only
+	 *  — never touches the deterministic fold, so Date.now() is fine here. */
+	private readonly netEvents: { seq: number; ts: number; kind: string; text: string }[] = [];
+	private netSeq = 0;
+
 	constructor(opts: DaemonOptions = {}) {
 		this.params = opts.params ?? defaultParams();
 		this.k = opts.k ?? 11;
@@ -327,6 +339,12 @@ export class Daemon {
 			this.maybeAuthorizePending(); // co-sign pending withdrawals / mints / settles
 			this.maybeCheckpoint(); // snapshot + prune behind finality so history never grows unbounded
 			this.tryPendingSnapshot(); // a stashed peer checkpoint may now be verifiable
+			this.recordNetEvent("anchor", `tip → height ${tip.height}`);
+		};
+		// surface applied writes to the Network feed (base hook; the store hook below chains this, so
+		// it fires regardless of whether durable persistence is on).
+		this.node.onApplied = (applied) => {
+			if (applied.length) this.recordNetEvent("gossip", `applied ${applied.length} write${applied.length === 1 ? "" : "s"}`);
 		};
 		// matched-market intent gossip — (re)wire onto the fresh node.
 		this.node.onIntent = (offer) => this.receiveIntent(offer);
@@ -341,8 +359,10 @@ export class Daemon {
 		// replication floor — keep RAM state alive across churn by ensuring enough nodes hold the
 		// latest checkpoint. Warn when under target so an operator can bring up more archivers.
 		this.node.replicationTarget = this.replicationTarget;
-		this.node.onUnderReplicated = (i) =>
+		this.node.onUnderReplicated = (i) => {
 			console.warn(`  ⚠ checkpoint ${i.anchorId.slice(0, 8)} (height ${i.height}) held by only ${i.factor}/${i.target} node(s) — bring up more archivers (GAVL_PERSIST=all) to keep state durable`);
+			this.recordNetEvent("replication", `checkpoint ${i.anchorId.slice(0, 8)} held by only ${i.factor}/${i.target} node(s)`);
+		};
 	}
 
 	/** Verify a peer-supplied checkpoint against our synced anchor chain, then seed from it.
@@ -527,12 +547,23 @@ export class Daemon {
 		// write must NOT crash the daemon with an unhandled "Corestore is closed" rejection.
 		const prev = this.node.onApplied;
 		this.node.onApplied = (applied) => {
-			prev?.(applied);
+			prev?.(applied); // chain the base hook (records the gossip event)
 			const store = this.store;
 			if (!store) return;
 			for (const w of applied) void store.persist(w).catch(() => {});
 		};
 		return { replayed: writes };
+	}
+
+	/** Record a network/diagnostic step for the web UI's Network feed. */
+	recordNetEvent(kind: string, text: string): void {
+		this.netEvents.push({ seq: ++this.netSeq, ts: Date.now(), kind, text });
+		if (this.netEvents.length > 500) this.netEvents.shift();
+	}
+
+	/** Network events newer than the `since` seq cursor, plus the current cursor. */
+	events(since: number): { events: { seq: number; ts: number; kind: string; text: string }[]; cursor: number } {
+		return { events: this.netEvents.filter((e) => e.seq > since), cursor: this.netSeq };
 	}
 
 	storeStats() {
@@ -690,6 +721,7 @@ export class Daemon {
 		this.lastSnapshot = snap; // kept in RAM to serve fresh peers (key-only nodes included)
 		this.node.reBeaconHave(); // advertise we hold the new checkpoint; count toward the replication floor
 		this.node.checkReplication(); // warn if too few nodes hold it
+		this.recordNetEvent("checkpoint", `committed @ height ${ckpt.height} (${Object.keys(heads).length} writer head${Object.keys(heads).length === 1 ? "" : "s"})`);
 		const before = this.node.ledger.summary().writes;
 		this.node.ledger.pruneBelow(heads); // drop RAM history below the checkpoint — bounds memory
 		// Bound the anchor chain too (local memory only — not committed in any root). Keep a
@@ -978,11 +1010,14 @@ export class Daemon {
 			myAnchors: recent.reduce((n, a) => n + (a.producer === myId ? 1 : 0), 0),
 			secPerAnchor: measured ?? this.targetSecPerAnchor,
 			secPerAnchorMeasured: measured != null,
+			transport: this.transport?.kind ?? null, // "reticulum" | "hyperswarm" | null (local)
 			nodeKey: this.transport ? this.transport.nodeKeyHex : null,
 			topic: this.transport ? this.transport.topicHexValue : null,
 			peerKeys: this.transport ? this.transport.connectedPeerKeys() : [],
 			pinnedPeers: this.knownPeers.list(),
 			bootstrap: this.bootstrap.asStrings().map((node) => ({ node, default: this.bootstrap.isDefault(node) })),
+			// bounded-mesh + binding diagnostics (Reticulum carrier only)
+			...(this.transport?.diagnostics?.() ?? {}),
 		};
 	}
 
@@ -1002,6 +1037,7 @@ export class Daemon {
 							configDir: process.env.GAVL_RNS_CONFIG, // undefined → system ~/.reticulum
 							propagated: process.env.GAVL_RNS_PROPAGATED === "1",
 							maxPeers: process.env.GAVL_MAX_PEERS ? Number(process.env.GAVL_MAX_PEERS) : undefined,
+							onEvent: (kind, text) => this.recordNetEvent(kind, text), // surface peer/binding/committee steps to the UI feed
 							// sign producer↔address binding so peers can address us by our consensus key
 							bindingSigner: (msg) => ({ producer: this.producerId(), sig: toHex(sign(this.producerKey().privateKey, msg)) }),
 						})

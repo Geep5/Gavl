@@ -12,7 +12,11 @@ export const store = $state({
 	market: null, // { price, oracles, myGbtc, idleDecay, reserves, gbtcOutstanding, depositAddress, tape, myContracts, ... }
 	consensus: null, // { enabled, vdf, mesh, network, peers, farming, tip, finalizedHeight, secPerAnchor, secPerAnchorMeasured }
 	custody: null, // { mode, epoch, fundKeyOnChain, fundAddress, holdsShare, committee, threshold, minCommittee, committeeId, bonded, myBond }
+	netEvents: [], // live network-activity feed: [{ seq, ts, kind, text }] (accumulated, newest last)
 });
+
+// seq cursor for the network-events feed — only pull what's new each poll (no event is missed).
+let eventsCursor = 0;
 
 // Whether the current store.error came from refresh() (a connection problem) —
 // only those may be cleared by a later successful poll. Action errors stay
@@ -28,6 +32,7 @@ export async function refresh() {
 		store.market = s.market ?? null;
 		store.consensus = s.consensus ?? null;
 		store.custody = s.custody ?? null;
+		await refreshEvents();
 		if (errorFromRefresh) {
 			store.error = null;
 			errorFromRefresh = false;
@@ -37,6 +42,26 @@ export async function refresh() {
 		errorFromRefresh = true;
 	} finally {
 		store.loading = false;
+	}
+}
+
+/** Pull network-activity events since our cursor and append them (bounded). Best-effort: a stale
+ *  daemon (cursor ahead of a restarted node) is detected and the feed resets. */
+async function refreshEvents() {
+	try {
+		const r = await api.events(eventsCursor);
+		if (r.cursor < eventsCursor) {
+			// the daemon restarted (cursor went backwards) — reset the feed
+			store.netEvents = [];
+			eventsCursor = 0;
+			return refreshEvents();
+		}
+		if (r.events?.length) {
+			store.netEvents = [...store.netEvents, ...r.events].slice(-400); // keep the last 400
+			eventsCursor = r.cursor;
+		}
+	} catch {
+		/* leave the feed as-is on a transient error */
 	}
 }
 

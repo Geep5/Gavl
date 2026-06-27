@@ -182,6 +182,24 @@
 	const producers = $derived(c?.producers ?? 0);
 	const healthy = $derived(peers > 0 && !!c?.farming);
 
+	// ── transport / mesh model (Reticulum-aware) ──
+	const transport = $derived(c?.transport ?? null);
+	const isReticulum = $derived(transport === "reticulum");
+	const transportLabel = $derived(transport === "reticulum" ? "RETICULUM · LXMF" : transport === "hyperswarm" ? "HYPERDHT" : "LOCAL");
+	const maxPeers = $derived(c?.maxPeers ?? null); // bounded-mesh cap (Reticulum)
+	const bindings = $derived(c?.bindings ?? 0); // producer↔address bindings resolved
+	const committeeLinked = $derived(c?.committeeLinked ?? 0); // committee members directly linked
+	const nodeAddr = $derived(c?.nodeKey ?? ""); // our LXMF address under Reticulum
+
+	// ── live network activity (newest first; streamed from /api/events) ──
+	const recentEvents = $derived([...store.netEvents].slice(-80).reverse());
+	const KIND_COLOR = {
+		net: "var(--ink)", peer: "var(--long)", binding: "var(--bonded)", committee: "var(--bonded)",
+		gossip: "var(--muted)", anchor: "var(--ink)", checkpoint: "var(--long)", replication: "var(--short)", log: "var(--short)",
+	};
+	const kindColor = (k) => KIND_COLOR[k] ?? "var(--ink)";
+	const fmtTime = (ts) => { const d = new Date(ts); return d.toLocaleTimeString([], { hour12: false }); };
+
 	// custody committee
 	const custodyOk = $derived(!!cu?.fundKeyOnChain);
 	const seats = $derived.by(() => {
@@ -376,10 +394,31 @@
 				<div class="card">
 					<div class="card-h">CONNECTION <span class="ch-r" class:g={healthy}><span class="mini-dot" class:live={healthy}></span>{healthy ? "HEALTHY" : "CONNECTING"}</span></div>
 					<div class="card-g">
-						<div class="kv"><span class="k">PEERS</span><span class="v tnum">{peers}</span></div>
+						<div class="kv"><span class="k">PEERS</span><span class="v tnum">{peers}{#if isReticulum && maxPeers}<span class="muted"> / {maxPeers}</span>{/if}</span></div>
 						<div class="kv"><span class="k">PRODUCERS</span><span class="v g tnum">{producers}/{needN}</span></div>
-						<div class="kv"><span class="k">TRANSPORT</span><span class="v sm">HYPERDHT</span></div>
+						<div class="kv"><span class="k">TRANSPORT</span><span class="v sm">{transportLabel}</span></div>
 						<div class="kv"><span class="k">PROOF</span><span class="v sm">PoST</span></div>
+						{#if isReticulum}
+							<div class="kv"><span class="k">BINDINGS</span><span class="v tnum">{bindings}</span></div>
+							<div class="kv"><span class="k">COMMITTEE</span><span class="v tnum">{committeeLinked} linked</span></div>
+						{/if}
+					</div>
+				</div>
+				<!-- live activity -->
+				<div class="card">
+					<div class="card-h">ACTIVITY <span class="ch-d">LIVE · {store.netEvents.length}</span></div>
+					<div class="actlog">
+						{#if recentEvents.length === 0}
+							<div class="act-empty">waiting for network activity… run another client to see peers, bindings and gossip appear here.</div>
+						{:else}
+							{#each recentEvents as e (e.seq)}
+								<div class="act-row">
+									<span class="act-ts">{fmtTime(e.ts)}</span>
+									<span class="act-kind" style="color:{kindColor(e.kind)}">{e.kind}</span>
+									<span class="act-text">{e.text}</span>
+								</div>
+							{/each}
+						{/if}
 					</div>
 				</div>
 				<!-- consensus -->
@@ -432,16 +471,33 @@
 							<div class="id-l">YOUR KEY (ED25519)</div>
 							<div class="id-row"><span class="id-t">{short(store.active ?? "") || "—"}</span><button class="cpbtn" title="copy" onclick={copy("key", store.active ?? "")}>{cpLbl("key")}</button></div>
 						</div>
-						<div>
-							<div class="id-l">MARKET STRING (PRE-IMAGE)</div>
-							<div class="chips"><span class="chip a">{seg[0] ?? "—"}</span><span class="chip-sep"> : </span><span class="chip b">{seg[1] ?? "—"}</span><span class="chip-sep"> : </span><span class="chip c">{short(seg[2] ?? "—")}</span></div>
-							<div class="chips-foot"><span class="cf-l">channel : method : feed id</span><button class="cpbtn" title="copy" onclick={copy("string", channel)}>{cpLbl("string")}</button></div>
-						</div>
-						<div class="sha"><span>↓ sha256</span><span class="sha-line"></span></div>
-						<div>
-							<div class="id-l">MARKET DHT TOPIC</div>
-							<div class="id-row"><span class="id-t">{topic ? short(topic) : "—"}{#if topicMatchesCoord}<span class="okmark"> ✓ = COORDINATE</span>{/if}</span><button class="cpbtn" title="copy" onclick={copy("topic", topic)}>{cpLbl("topic")}</button></div>
-						</div>
+						{#if isReticulum}
+							<!-- The market is priced by a named Pyth feed; that feed address is what matters now
+							     (the channel string only existed to derive the old DHT topic). -->
+							<div>
+								<div class="id-l">PYTH PRICE FEED</div>
+								<div class="id-row"><span class="id-t">{seg[2] ? short(seg[2]) : "—"}</span><button class="cpbtn" title="copy" onclick={copy("feed", seg[2] ?? "")}>{cpLbl("feed")}</button></div>
+								<div class="chips-foot"><span class="cf-l">{seg[0] ?? "market"} · pyth feed id, attested by Wormhole guardians</span></div>
+							</div>
+						{:else}
+							<!-- Holepunch only: the market string hashes to the DHT rendezvous topic. -->
+							<div>
+								<div class="id-l">MARKET STRING (PRE-IMAGE)</div>
+								<div class="chips"><span class="chip a">{seg[0] ?? "—"}</span><span class="chip-sep"> : </span><span class="chip b">{seg[1] ?? "—"}</span><span class="chip-sep"> : </span><span class="chip c">{short(seg[2] ?? "—")}</span></div>
+								<div class="chips-foot"><span class="cf-l">channel : method : feed id</span><button class="cpbtn" title="copy" onclick={copy("string", channel)}>{cpLbl("string")}</button></div>
+							</div>
+							<div class="sha"><span>↓ sha256</span><span class="sha-line"></span></div>
+							<div>
+								<div class="id-l">MARKET DHT TOPIC</div>
+								<div class="id-row"><span class="id-t">{topic ? short(topic) : "—"}{#if topicMatchesCoord}<span class="okmark"> ✓ = COORDINATE</span>{/if}</span><button class="cpbtn" title="copy" onclick={copy("topic", topic)}>{cpLbl("topic")}</button></div>
+							</div>
+						{/if}
+						{#if isReticulum && nodeAddr}
+							<div>
+								<div class="id-l">NODE ADDRESS (LXMF)</div>
+								<div class="id-row"><span class="id-t">{short(nodeAddr)}</span><button class="cpbtn" title="copy" onclick={copy("addr", nodeAddr)}>{cpLbl("addr")}</button></div>
+							</div>
+						{/if}
 						{#if fundAddr}
 							<div class="kv"><span class="k">CUSTODY ADDRESS</span><span class="id-inline">{short(fundAddr)}<button class="cpbtn" title="copy" onclick={copy("custody", fundAddr)}>{cpLbl("custody")}</button></span></div>
 						{/if}
@@ -560,6 +616,14 @@
 	.net-l { display: inline-flex; align-items: center; gap: 0.5rem; }
 	.net-dot { width: 7px; height: 7px; background: var(--faint); border-radius: 50%; display: inline-block; }
 	.net-dot.live { background: var(--live); animation: blink 1.3s steps(1) infinite; }
+
+	/* live network activity log (folded into the NETWORK section) */
+	.actlog { background: var(--bar); color: var(--bar-text); border: 1.5px solid var(--ink); max-height: 13rem; overflow-y: auto; padding: 0.35rem 0; font-size: 0.6rem; line-height: 1.55; margin-top: 0.5rem; }
+	.act-empty { color: var(--bar-dim); padding: 0.5rem 0.6rem; }
+	.act-row { display: grid; grid-template-columns: 3.4rem 4.6rem 1fr; gap: 0.4rem; padding: 0.05rem 0.6rem; }
+	.act-ts { color: var(--bar-dim); font-variant-numeric: tabular-nums; }
+	.act-kind { text-transform: uppercase; letter-spacing: 0.03em; }
+	.act-text { color: var(--bar-text); white-space: normal; word-break: break-word; }
 
 	/* funds */
 	.lbl { font-size: 0.56rem; letter-spacing: 0.14em; color: var(--muted); margin-bottom: 0.35rem; }
