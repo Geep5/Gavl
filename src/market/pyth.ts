@@ -11,17 +11,20 @@
  * Pure + deterministic (no network): the fold verifies bytes, it never fetches. The relayer is
  * untrusted — a forged update simply fails verification.
  *
- * Trust anchor: WORMHOLE_GUARDIANS (mainnet set index 6). If Wormhole rotates the set this constant
+ * Trust anchor: WORMHOLE_GUARDIANS (mainnet set index 7). If Wormhole rotates the set this constant
  * must be updated (a weak-subjectivity pin, like a shipped checkpoint). The verifier checks the
- * update's committed guardianSetIndex matches.
+ * update's committed guardianSetIndex matches. Refresh from the core bridge on-chain:
+ * `getGuardianSet(uint32)` on 0x98f3c9e6E3fAce36bAAd05FE09d375Ef1464288B (Ethereum mainnet).
  */
 
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 
-/** Wormhole mainnet guardian set #6 (19 guardians; Ethereum-style 20-byte addresses, hex). The
- *  signers whose quorum attests every Pyth price. This is the Pyth-market trust anchor. */
-export const WORMHOLE_GUARDIAN_SET_INDEX = 6;
+/** Wormhole mainnet guardian set #7 (19 guardians; Ethereum-style 20-byte addresses, hex). The
+ *  signers whose quorum attests every Pyth price — the Pyth-market trust anchor. Fetched from the
+ *  Wormhole core bridge `getGuardianSet(7)` on Ethereum mainnet; rotated from set 6 (indices 7,
+ *  14, 18 changed). Hermes signs current updates with this set, so set 6 now fails verification. */
+export const WORMHOLE_GUARDIAN_SET_INDEX = 7;
 export const WORMHOLE_GUARDIANS: readonly string[] = [
 	"5893b5a76c3f739645648885bdccc06cd70a3cd3",
 	"ff6cb952589bde862c25ef4392132fb9d4a42157",
@@ -30,18 +33,18 @@ export const WORMHOLE_GUARDIANS: readonly string[] = [
 	"8c82b2fd82faed2711d59af0f2499d16e726f6b2",
 	"42579bffbcf4276e290ab8e4c162bd4052b97970",
 	"938f104aeb5581293216ce97d771e0cb721221b1",
-	"18e41674ccf26329cd111406c1d05c6c80b23edc",
+	"f3ea0ad4ffb5a178ae4ebc21861651b25bdcbb91",
 	"9d16870160e703324d057c3361c34c5befba2c34",
 	"000ac0076727b35fbea2dac28fee5ccb0fea768e",
 	"af45ced136b9d9e24903464ae889f5c8a723fc14",
 	"f93124b7c738843cbb89e864c862c38cddcccf95",
 	"d2cc37a4dc036a8d232b48f62cdd4731412f4890",
 	"da798f6896a3331f64b48c12d1d57fd9cbe70811",
-	"d1f64e26238811de5553c40f64af41ee1b6057cc",
+	"ae565927bb8db25cd8bf3e7bb663d70023e4ea78",
 	"3f851ad586a47cef8d04748f33ab0d71395f06b4",
 	"178e21ad2e77ae06711549cfbb1f9c7a9d8096e8",
 	"7899ceab1dc961dae9defdb7a4f521269a5448fc",
-	"6fbebc898f403e4773e95feb15e80c9a99c8348d",
+	"61d9800f9fcb4160fb0c6cf3a0902592bac2b434",
 ];
 
 export interface PythPrice {
