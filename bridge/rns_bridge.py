@@ -34,6 +34,51 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 GAVL_PREFIX = "gavl:"
 
+# Gavl's default Reticulum config, written on first run. HUB-ONLY: there is no LAN AutoInterface, so
+# every node reaches the network through a shared internet hub — two nodes on the same LAN connect
+# exactly as if they were on opposite sides of the world, never shortcutting over the local network.
+# Standalone instance (own interfaces, never joins a system shared instance). Edit to add/swap hubs.
+DEFAULT_GAVL_RNS_CONFIG = """\
+# Gavl networking config (Reticulum). Hub-only by design — no LAN discovery.
+[reticulum]
+  enable_transport = No
+  share_instance = No
+  panic_on_interface_error = No
+
+[logging]
+  loglevel = 4
+
+[interfaces]
+
+  # Public Reticulum hubs — the shared rendezvous every Gavl node connects through.
+  # (Verified reachable; swap in your own hub for a private deployment.)
+  [[Beleth RNS Hub]]
+    type = TCPClientInterface
+    enabled = yes
+    target_host = rns.beleth.net
+    target_port = 4242
+
+  [[g00n.cloud DFW Hub]]
+    type = TCPClientInterface
+    enabled = yes
+    target_host = dfw.us.g00n.cloud
+    target_port = 6969
+
+  # LAN discovery is intentionally OFF (uncomment to also peer on the local network):
+  # [[Local Network]]
+  #   type = AutoInterface
+  #   enabled = yes
+"""
+
+
+def ensure_gavl_rns_config(config_dir):
+    """Write Gavl's hub-only default config on first run, so a fresh node joins via the shared hub."""
+    os.makedirs(config_dir, exist_ok=True)
+    path = os.path.join(config_dir, "config")
+    if not os.path.isfile(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(DEFAULT_GAVL_RNS_CONFIG)
+
 
 def verify_binding(producer_hex, sig_hex, message):
     """Verify an Ed25519 producer signature over the binding message (matches det/ed25519.ts)."""
@@ -69,6 +114,7 @@ class Bridge:
         self.binding = None              # our signed producer↔address binding (announce app_data)
         self.lock = threading.Lock()
 
+        ensure_gavl_rns_config(config_dir)  # write the hub-only default if this node has no config yet
         self.reticulum = RNS.Reticulum(config_dir)
 
         os.makedirs(storage_dir, exist_ok=True)
@@ -228,7 +274,10 @@ class Bridge:
 
 def serve(args):
     ctrl = socket.create_connection((args.control_host, args.control_port), timeout=10)
-    bridge = Bridge(ctrl, args.config_dir, args.storage_dir, args.network, args.propagated)
+    # Default to Gavl's own hub-only config under the storage dir (never the system ~/.reticulum), so
+    # nodes always meet through the shared hub rather than the LAN.
+    config_dir = args.config_dir or os.path.join(args.storage_dir, "rns")
+    bridge = Bridge(ctrl, config_dir, args.storage_dir, args.network, args.propagated)
 
     # periodic re-announce so peers keep discovering us across churn
     def reannounce():
@@ -265,7 +314,7 @@ def main():
     p = argparse.ArgumentParser(description="Gavl ⇄ Reticulum bridge sidecar (LXMF carrier)")
     p.add_argument("--control-host", default="127.0.0.1")
     p.add_argument("--control-port", type=int, required=True, help="TCP port the Node transport listens on")
-    p.add_argument("--config-dir", default=None, help="Reticulum config dir (default: system ~/.reticulum)")
+    p.add_argument("--config-dir", default=None, help="Reticulum config dir (default: <storage-dir>/rns, Gavl's hub-only config)")
     p.add_argument("--storage-dir", required=True, help="dir for this node's LXMF identity + store")
     p.add_argument("--network", default="gavl", help="Gavl network label (peers must match)")
     p.add_argument("--propagated", action="store_true", help="always route via a propagation node")

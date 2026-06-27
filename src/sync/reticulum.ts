@@ -14,6 +14,7 @@
 import { createServer, type Server, type Socket } from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import type { Connection, GavlNode } from "./node.ts";
 import type { SyncMessage } from "./messages.ts";
 
@@ -153,13 +154,17 @@ export class ReticulumTransport {
 		const port = (this.server!.address() as { port: number }).port;
 		const script = this.opts.bridgeScript ?? fileURLToPath(new URL("../../bridge/rns_bridge.py", import.meta.url));
 		const py = this.opts.python ?? process.env.GAVL_PYTHON ?? "python";
+		// Default to Gavl's OWN Reticulum config (hub-only, no LAN AutoInterface), so every node joins
+		// the network through a shared internet hub — same-LAN or across the world is identical, and
+		// nodes never shortcut over the local network. Point GAVL_RNS_CONFIG at your own config to override.
+		const configDir = this.opts.configDir ?? join(this.opts.storageDir, "rns");
 		const argv = [
 			"-u", script,
 			"--control-port", String(port),
 			"--storage-dir", this.opts.storageDir,
 			"--network", network,
+			"--config-dir", configDir,
 		];
-		if (this.opts.configDir) argv.push("--config-dir", this.opts.configDir);
 		if (this.opts.propagated) argv.push("--propagated");
 
 		this.child = spawn(py, argv, {
