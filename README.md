@@ -183,7 +183,7 @@ src/
   ledger/        multi-writer RAM ledger + stateRoot
   consensus/     anchor chain, fork choice, finality, difficulty, canonical order
   sync/          Reticulum (LXMF) transport · gossip · bounded mesh · signed producer↔address bindings
-  store/         durable write store + state snapshots/checkpoints + selective persist policy
+  store/         durable write store (node:sqlite) + state snapshots/checkpoints + selective persist policy
   market/        matched market: intents + bilateral contracts, btc fold, account, Pyth/signed price feeds
   custody/       real-BTC bridge: FROST threshold · DKG · Taproot · deposits · tx · watcher · reshare
   daemon.ts      boots ledger + node + store + consensus + price relay + bridge + intent book
