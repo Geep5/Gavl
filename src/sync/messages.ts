@@ -45,6 +45,12 @@ export type SyncMessage =
 	| { t: "snapshot-want" }
 	/** Serve the full checkpoint (committed state + heads at a finalized anchor). */
 	| { t: "snapshot"; snap: StoredSnapshot }
+	/** Availability beacon: "I durably hold this checkpoint and can serve it." Re-broadcast
+	 *  periodically and on each new checkpoint so the network can count how many nodes still
+	 *  hold the latest finalized state — the replication floor that keeps RAM state alive across
+	 *  churn. Unlike `snapshot-offer`, this never triggers a bootstrap pull on a synced node;
+	 *  it's purely an availability advertisement. See docs/replication-floor.md. */
+	| { t: "snapshot-have"; anchorId: string; height: number }
 	// ── distributed key generation (custody committee ceremony) ──
 	/** A DKG ceremony message, routed to the node's registered DKG coordinator. */
 	| { t: "dkg"; m: DkgWire }

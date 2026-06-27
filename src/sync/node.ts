@@ -75,6 +75,19 @@ export class GavlNode {
 	snapshotQuorum = 1;
 	/** Latest checkpoint a peer has offered, per connection — the votes counted toward quorum. */
 	private readonly snapshotOffers = new Map<Connection, { anchorId: string; height: number }>();
+	// ── replication floor (keep RAM state alive across churn) ──
+	/** Desired number of DISTINCT nodes (including self) that durably hold the latest checkpoint.
+	 *  State survives the loss of up to `replicationTarget - 1` holders between handoffs. */
+	replicationTarget = 1;
+	/** Latest checkpoint each peer has advertised holding (via snapshot-have / snapshot-offer),
+	 *  per connection — the holders counted toward the replication factor. */
+	private readonly snapshotHolders = new Map<Connection, { anchorId: string; height: number }>();
+	/** Fired when the latest checkpoint is held by fewer than `replicationTarget` distinct nodes —
+	 *  the daemon uses it to warn and (for capable archivers) pull-to-persist so replication rises. */
+	onUnderReplicated?: (info: { anchorId: string; height: number; factor: number; target: number }) => void;
+	/** A capable archiver that lacks an advertised checkpoint may pull it to persist (raising the
+	 *  replication factor), even though it isn't a fresh node. Default: no — only fresh nodes pull. */
+	wantSnapshotForReplication?: (offer: { anchorId: string; height: number }) => boolean;
 	/** Suffix anchors a fresh node received that couldn't link to (its absent) genesis — held until
 	 *  a checkpoint lets us adopt a floor beneath them. Cleared once adopted. */
 	private orphanAnchors = new Map<string, Anchor>();
@@ -92,6 +105,8 @@ export class GavlNode {
 		conn.onClose(() => {
 			this.conns.delete(conn);
 			this.snapshotOffers.delete(conn); // its checkpoint vote no longer counts toward quorum
+			this.snapshotHolders.delete(conn); // its copy no longer counts toward the replication floor
+			this.checkReplication(); // a holder leaving may drop us below target
 		});
 		conn.onMessage((m) => this.handle(conn, m));
 		conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode });
@@ -100,7 +115,10 @@ export class GavlNode {
 		const offers = this.intentsToShare?.();
 		if (offers && offers.length) conn.send({ t: "intents", offers }); // hand the new peer my tape
 		const snap = this.snapshotHeader?.();
-		if (snap) conn.send({ t: "snapshot-offer", anchorId: snap.anchorId, height: snap.height }); // offer a fast-bootstrap checkpoint
+		if (snap) {
+			conn.send({ t: "snapshot-offer", anchorId: snap.anchorId, height: snap.height }); // offer a fast-bootstrap checkpoint
+			conn.send({ t: "snapshot-have", anchorId: snap.anchorId, height: snap.height }); // beacon: counted toward the replication floor
+		}
 	}
 
 	/** Re-broadcast my write-head fingerprint so peers serve me whatever I now lack (used after
@@ -190,7 +208,17 @@ export class GavlNode {
 				// the history it covers (a fresh joiner) AND enough DISTINCT peers vouch for the same
 				// checkpoint (quorum) — so a lone or sybil peer can't feed me a fabricated floor.
 				this.snapshotOffers.set(conn, { anchorId: m.anchorId, height: m.height });
+				this.snapshotHolders.set(conn, { anchorId: m.anchorId, height: m.height }); // offering implies holding
 				if (this.wantSnapshot?.(m) && this.snapshotQuorumMet(m.anchorId)) conn.send({ t: "snapshot-want" });
+				return;
+			}
+			case "snapshot-have": {
+				// Availability beacon — record this peer as a holder so we can measure the replication
+				// floor. A capable archiver that lacks this checkpoint may pull it to persist (raising
+				// replication); a synced/fresh node ignores it (its own bootstrap path handles state).
+				this.snapshotHolders.set(conn, { anchorId: m.anchorId, height: m.height });
+				if (this.wantSnapshotForReplication?.(m)) conn.send({ t: "snapshot-want" });
+				this.checkReplication();
 				return;
 			}
 			case "snapshot-want": {
@@ -370,6 +398,33 @@ export class GavlNode {
 		const vouchers = new Set<string | Connection>();
 		for (const [conn, offer] of this.snapshotOffers) if (offer.anchorId === anchorId) vouchers.add(conn.peerKey ?? conn);
 		return vouchers.size >= this.snapshotQuorum;
+	}
+
+	/** How many DISTINCT nodes (including self) durably hold checkpoint `anchorId`. Peers are deduped
+	 *  by their stable wire identity (peerKey) so one peer over many connections counts once — the
+	 *  same sybil guard as the adoption quorum. This is the replication floor: state survives the loss
+	 *  of up to `replicationFactor - 1` holders between handoffs. */
+	replicationFactor(anchorId: string): number {
+		const holders = new Set<string | Connection>();
+		if (this.snapshotHeader?.()?.anchorId === anchorId) holders.add("self"); // I hold it durably
+		for (const [conn, h] of this.snapshotHolders) if (h.anchorId === anchorId) holders.add(conn.peerKey ?? conn);
+		return holders.size;
+	}
+
+	/** Re-broadcast our holder beacon for the checkpoint we durably hold (called on each new
+	 *  checkpoint and periodically), so holders stay counted as peers churn. */
+	reBeaconHave(): void {
+		const mine = this.snapshotHeader?.();
+		if (mine) this.broadcast({ t: "snapshot-have", anchorId: mine.anchorId, height: mine.height });
+	}
+
+	/** If the checkpoint we hold is under-replicated (fewer than `replicationTarget` distinct holders),
+	 *  notify the daemon so it can warn and, for capable archivers, push the checkpoint to peers. */
+	checkReplication(): void {
+		const mine = this.snapshotHeader?.();
+		if (!mine) return;
+		const factor = this.replicationFactor(mine.anchorId);
+		if (factor < this.replicationTarget) this.onUnderReplicated?.({ anchorId: mine.anchorId, height: mine.height, factor, target: this.replicationTarget });
 	}
 
 	/** Genesis-free bootstrap: on a fresh (tipless) chain, ask the app to adopt a trusted floor from
