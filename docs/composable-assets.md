@@ -27,7 +27,7 @@ asset.create {
   symbol?: string,                    // optional ticker
   fungible?: { supply: string },      // attach → it's a currency (supply minted to creator)
   meta?: { description?: string, ... },   // attach → small inline, hashed into the id
-  content?: { hash: string, urls?: string[], hypercore?: string },  // attach → a payload
+  content?: { hash: string, urls?: string[], rns?: string },        // attach → a payload
   oracle?: { key: string, kind?: string, urls?: string[] },         // attach → a live signed feed
 }
 ```
@@ -43,7 +43,7 @@ asset.create {
 |---|---|---|
 | `fungible` | a mintable supply (currency) | identical to today's `coin.deploy` conservation |
 | `meta` | small inline description/fields | stored verbatim, hashed into the id (like YAML `details`) |
-| `content` | a payload (image/doc/data) | the **hash is the identity**; `urls`/`hypercore` are re-hostable hints, never authority |
+| `content` | a payload (image/doc/data) | the **hash is the identity**; `urls`/`rns` are re-hostable hints, never authority |
 | `oracle` | a live signed value feed | the **signing key is the authority**; updates are gossiped signed writes; URL is a fallback mirror |
 
 The rule that ties it together, repeated from the secret/`details` facets we already
@@ -57,11 +57,11 @@ or re-host it, or ignore the URL entirely.
 content: {
   hash: "sha256-hex of the bytes",   // canonical identity, signed into the asset
   urls?: ["https://a/x", "https://b/x"],  // mirrors — try any, then verify hash
-  hypercore?: "feed-key-hex",        // OR fetch P2P over the same Holepunch swarm
+  rns?: "destination-hash-hex",      // OR fetch P2P over the same Reticulum mesh
 }
 ```
 
-A consumer fetches the bytes (from a URL, or a hypercore, or a friend), and **verifies
+A consumer fetches the bytes (from a URL, or the Reticulum mesh, or a friend), and **verifies
 `sha256(bytes) === content.hash`**. If it matches, it's authentic — no matter where it
 came from. This is the broken-NFT problem solved: the asset can't rot to a dead link,
 because the link was never the asset.
@@ -120,7 +120,7 @@ oracle.post {
   an alias for `asset.create { fungible }`.
 - `state.ts` — extend the `Coin`/asset view with `meta` / `content` / `oracle` fields;
   add the `oracle.post` apply rule (key-checked, monotonic). Conservation/supply logic
-  unchanged. Stays pure — never fetches a URL or hypercore.
+  unchanged. Stays pure — never fetches a URL or over the mesh.
 - `account.ts` + `server.ts` + UI — a richer create form (toggle facets on, Frankenstein
   style) and an asset detail view that shows meta/content (with hash-verify) and the
   latest oracle reading + staleness.

@@ -13,7 +13,7 @@
  * sync" means matching write stateRoots AND the same heaviest anchor tip.
  *
  * The transport is abstracted behind `Connection`, so the identical protocol
- * runs over an in-memory link (tests) or a real Hyperswarm socket (the mesh).
+ * runs over an in-memory link (tests) or a real Reticulum/LXMF link (the mesh).
  */
 
 import type { SyncMessage, DkgWire, SignWire, ReshareWire } from "./messages.ts";

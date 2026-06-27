@@ -1,7 +1,7 @@
 /**
  * Worker-backed HashVdf — the same iterated-SHA-256 cooldown as HashVdf, but `eval` and an async
  * `verifyAsync` run in worker threads so the multi-second hash chain never blocks the daemon's event
- * loop (which would otherwise starve Hyperswarm keepalives → peers dropped, and stall the HTTP API).
+ * loop (which would otherwise stall the sync transport → peers stop hearing from us, and the HTTP API).
  *
  * Output is byte-identical to HashVdf (same `name`, same `sha256`), so a worker node and an inline
  * node fully interoperate — this is a runtime offload, not a consensus change. A small pool keeps one
