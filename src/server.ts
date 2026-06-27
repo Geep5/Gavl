@@ -82,6 +82,9 @@ const daemon = new Daemon({
 	schedule: RETARGET ? { base: 20n, targetIters: TARGET_ITERS, epoch: 4, window: 8, maxStep: 4n } : undefined,
 	heartbeatMs: HEARTBEAT_MS,
 	store: PERSIST === "off" ? undefined : { dir: DATA_DIR ? `${DATA_DIR}/store` : undefined, persist: PERSIST === "mine" ? "mine" : "all" },
+	// Replication floor: warn when fewer than this many distinct nodes hold the latest checkpoint,
+	// so RAM state stays durable across churn. Default 1 (off); set to your archiver count.
+	replicationTarget: Number(process.env.GAVL_REPLICATION_TARGET ?? "1"),
 	custody: {
 		epochLength: Number(process.env.GAVL_CUSTODY_EPOCH ?? "16"),
 		size: Number(process.env.GAVL_CUSTODY_SIZE ?? "5"),

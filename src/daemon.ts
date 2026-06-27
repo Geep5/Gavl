@@ -45,7 +45,7 @@ import { assembleReshare } from "./custody/reshare-blob.ts";
 import { groupKeyOf } from "./custody/pvss.ts";
 import { schnorr_FROST as FROST } from "@noble/curves/secp256k1.js";
 import type { CeremonyAuth } from "./custody/ceremony-auth.ts";
-import { committeeEpochsFor, epochOf } from "./custody/epoch.ts";
+import { committeeEpochsFor, committeeForEpoch, epochOf } from "./custody/epoch.ts";
 import type { AnchorView } from "./custody/epoch.ts";
 import { committeeTopic, fid, quorumForRound } from "./custody/committee.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "./custody/attestation.ts";
@@ -70,9 +70,11 @@ import type { SpaceVerifier, SpaceProver } from "./consensus/space.ts";
 import { ChiaSpaceProver, ChiaSpaceVerifier, ensurePlot } from "./pos/chia.ts";
 import { Plot } from "./pos/space.ts";
 import { SwarmTransport, swarmKeyPair } from "./sync/swarm.ts";
+import { ReticulumTransport } from "./sync/reticulum.ts";
+import type { Transport } from "./sync/transport.ts";
 import { KnownPeers } from "./sync/known-peers.ts";
 import { BootstrapList } from "./sync/bootstrap.ts";
-import { generateKeyPair, keyPairFromSeed } from "./det/ed25519.ts";
+import { generateKeyPair, keyPairFromSeed, sign } from "./det/ed25519.ts";
 import type { KeyPair } from "./det/ed25519.ts";
 import { toHex, fromHex, sha256 } from "./det/canonical.ts";
 import { WriteStore } from "./store/store.ts";
@@ -97,6 +99,10 @@ export interface DaemonOptions {
 	 *  floor (genesis-free bootstrap). Default 1 (trust the first peer); set ≥2 for quorum so a lone
 	 *  or sybil peer can't feed a fabricated history. See docs/weak-subjectivity.md. */
 	adoptQuorum?: number;
+	/** Desired number of DISTINCT nodes (including self) that durably hold the latest checkpoint —
+	 *  the replication floor that keeps RAM state alive across churn. State survives the loss of up
+	 *  to `replicationTarget - 1` holders between handoffs. Default 1. See docs/replication-floor.md. */
+	replicationTarget?: number;
 	/** Anchor space backend: light stand-in (default) or real chiapos (real disk cost). */
 	space?: SpaceMode;
 	/** Initial channel/network name (the DHT topic is sha256 of it). Default "gavl". */
@@ -239,6 +245,7 @@ export class Daemon {
 	readonly bootstrap: BootstrapList;
 	readonly finalityDepth: number;
 	private readonly adoptQuorum: number;
+	private readonly replicationTarget: number;
 	private readonly params: ChainParams;
 	private readonly k: number;
 	private readonly spaceMode: SpaceMode;
@@ -249,7 +256,7 @@ export class Daemon {
 	private readonly accounts = new Map<string, Account>();
 	private clock = 0;
 
-	private transport?: SwarmTransport;
+	private transport?: Transport;
 	private producer?: Producer;
 	private network: string;
 	private farming = false;
@@ -285,6 +292,7 @@ export class Daemon {
 		this.k = opts.k ?? 11;
 		this.finalityDepth = opts.finalityDepth ?? 1;
 		this.adoptQuorum = opts.adoptQuorum ?? 1;
+		this.replicationTarget = opts.replicationTarget ?? 1;
 		this.heartbeatMs = opts.heartbeatMs ?? 120_000;
 		this.targetSecPerAnchor = opts.targetSecPerAnchor ?? 60;
 		this.spaceMode = opts.space ?? "standin";
@@ -329,6 +337,11 @@ export class Daemon {
 		this.node.onSnapshot = (snap) => this.ingestSnapshot(snap);
 		this.node.adoptFloor = (candidates) => this.adoptFloor(candidates);
 		this.node.snapshotQuorum = this.adoptQuorum; // distinct peers required to adopt a checkpoint
+		// replication floor — keep RAM state alive across churn by ensuring enough nodes hold the
+		// latest checkpoint. Warn when under target so an operator can bring up more archivers.
+		this.node.replicationTarget = this.replicationTarget;
+		this.node.onUnderReplicated = (i) =>
+			console.warn(`  ⚠ checkpoint ${i.anchorId.slice(0, 8)} (height ${i.height}) held by only ${i.factor}/${i.target} node(s) — bring up more archivers (GAVL_PERSIST=all) to keep state durable`);
 	}
 
 	/** Verify a peer-supplied checkpoint against our synced anchor chain, then seed from it.
@@ -417,16 +430,28 @@ export class Daemon {
 		const epochLength = this.custodyOpts.epochLength ?? 16;
 		const finEpoch = epochOf(anchors.finalized(this.finalityDepth)?.height ?? 0, epochLength);
 		const optEpoch = epochOf(tip.height, epochLength);
-		const mine = committeeEpochsFor(chain, this.producerId(), [finEpoch, optEpoch], {
+		const opts = {
 			epochLength,
 			size: this.custodyOpts.size ?? 5,
-			minCommittee: this.custodyOpts.minCommittee ?? 3,
 			windowAnchors: this.custodyOpts.windowAnchors,
 			bonds: this.custodyOpts.bonded ? this.finalView().bridge.bonds : undefined,
 			minBond: this.custodyOpts.minBond,
 			maxGrowthPct: this.custodyOpts.bonded ? (this.custodyOpts.maxGrowthPct ?? DEFAULT_MAX_GROWTH_PCT) : undefined, // gate #2: default-on under stake weighting
-		});
+		};
+		const mine = committeeEpochsFor(chain, this.producerId(), [finEpoch, optEpoch], { ...opts, minCommittee: this.custodyOpts.minCommittee ?? 3 });
+		// Holepunch carrier: rendezvous topics for the epochs I'm in.
 		void this.transport.setCommitteeTopics(mine.map((e) => committeeTopic(this.network, e)));
+		// Reticulum carrier: connect to my co-committee members DIRECTLY via the producer↔address
+		// binding (no rendezvous; works on a bounded mesh). Resolve the rosters for the epochs I'm in.
+		if (this.transport.connectCommittee) {
+			const me = this.producerId();
+			const members = new Set<string>();
+			for (const e of mine) {
+				const c = committeeForEpoch(chain, e, opts);
+				if (c) for (const id of c.committee) if (id !== me) members.add(id);
+			}
+			this.transport.connectCommittee([...members]);
+		}
 	}
 
 	/**
@@ -662,6 +687,8 @@ export class Daemon {
 		this.checkpointBase = view;
 		const snap: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(view) };
 		this.lastSnapshot = snap; // kept in RAM to serve fresh peers (key-only nodes included)
+		this.node.reBeaconHave(); // advertise we hold the new checkpoint; count toward the replication floor
+		this.node.checkReplication(); // warn if too few nodes hold it
 		const before = this.node.ledger.summary().writes;
 		this.node.ledger.pruneBelow(heads); // drop RAM history below the checkpoint — bounds memory
 		// Bound the anchor chain too (local memory only — not committed in any root). Keep a
@@ -964,7 +991,20 @@ export class Daemon {
 		try {
 			// Custom bootstrap nodes (the DHT entry/"DNS" layer) are added alongside
 			// Holepunch's defaults; undefined → defaults only.
-			this.transport = new SwarmTransport(this.node, { bootstrap: this.bootstrap.forSwarm(), keyPair: this.swarmKeyPair() });
+			// Wire underneath is swappable (GAVL_TRANSPORT). Reticulum carries gossip over LXMF with
+			// store-and-forward (peers catch up across churn); Hyperswarm is the Holepunch DHT mesh.
+			this.transport =
+				process.env.GAVL_TRANSPORT === "reticulum"
+					? new ReticulumTransport(this.node, {
+							network: this.network,
+							storageDir: join(this.dataDir, "reticulum"),
+							configDir: process.env.GAVL_RNS_CONFIG, // undefined → system ~/.reticulum
+							propagated: process.env.GAVL_RNS_PROPAGATED === "1",
+							maxPeers: process.env.GAVL_MAX_PEERS ? Number(process.env.GAVL_MAX_PEERS) : undefined,
+							// sign producer↔address binding so peers can address us by our consensus key
+							bindingSigner: (msg) => ({ producer: this.producerId(), sig: toHex(sign(this.producerKey().privateKey, msg)) }),
+						})
+					: new SwarmTransport(this.node, { bootstrap: this.bootstrap.forSwarm(), keyPair: this.swarmKeyPair() });
 			const joined = this.transport.join(this.network, channelTopic(this.network)); // a market's id IS its topic
 			await Promise.race([joined, new Promise((r) => setTimeout(r, 8000))]);
 			// Re-dial pinned peers directly (independent of DHT discovery) — eclipse resistance.
