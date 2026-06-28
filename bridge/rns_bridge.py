@@ -90,10 +90,15 @@ DEFAULT_GAVL_RNS_CONFIG = """\
   # several) so every node lands on the SAME network and fully meshes; multiple hubs that aren't
   # bridged would split nodes onto separate networks that can't see each other. Swap in your own hub
   # for a private deployment (every node must use the same one).
+  #
+  # target_host is the IPv4 LITERAL, NOT rns.beleth.net, on purpose: the hostname's AAAA (IPv6) record
+  # points at a DEAD address, and RNS tries IPv6 first and hangs in SYN_SENT forever instead of falling
+  # back to IPv4 — so a node using the hostname never reaches the hub at all (the #1 cause of "nodes
+  # won't mesh"). Pin the working IPv4. Revert to the hostname if/when beleth fixes its IPv6 AAAA.
   [[Gavl Hub]]
     type = TCPClientInterface
     enabled = yes
-    target_host = rns.beleth.net
+    target_host = 129.213.74.184
     target_port = 4242
 
   # LAN discovery is intentionally OFF (uncomment to also peer on the local network):
