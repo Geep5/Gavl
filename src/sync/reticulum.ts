@@ -128,6 +128,15 @@ export class ReticulumTransport {
 		return [...this.active.keys()];
 	}
 
+	/** Every Gavl peer address we KNOW on this network, not just the ones we're actively gossiping with:
+	 *  active links + the discovered-peer reservoir + the addresses behind verified producer↔address
+	 *  bindings. The lobby elects the genesis seeder off this (not `connectedPeerKeys`) so a node behind a
+	 *  bounded or partial mesh elects over the fuller roster it actually knows about — a peer it has
+	 *  discovered but isn't directly wired to still counts toward quorum and toward the seeder ranking. */
+	knownPeerAddrs(): string[] {
+		return [...new Set([...this.active.keys(), ...this.pool, ...this.producerToAddress.values()])];
+	}
+
 	/** Resolve a consensus-roster member's transport address from its producer key (hex), for direct
 	 *  addressing of committee/custody traffic. Undefined until that peer's binding has been seen. */
 	addressForProducer(producerHex: string): string | undefined {

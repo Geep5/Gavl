@@ -1091,19 +1091,46 @@ export class Daemon {
 		const need = this.custodyOpts.minCommittee ?? 3;
 		if (this.transport) {
 			const sk = (k: string) => (k.length > 9 ? k.slice(0, 8) + "…" : k);
+			// Seeder FAILOVER. Genesis is normally minted by the lowest node-key, but a fixed single seeder
+			// WEDGES the whole network if that node is dead, can't produce, or is itself sub-quorum (it
+			// discovered fewer peers than we did — a partial/split mesh, exactly what stalled us before). So:
+			// each node knows its RANK in the sorted roster; rank 0 seeds immediately at quorum, and rank N
+			// takes over after N×grace only if NO chain has appeared. This stays fork-safe — the `!anchorTip()`
+			// guard makes everyone adopt-on-sight the instant any genesis lands (halting escalation), produceOne
+			// re-checks the tip at mint time (a late chain is extended, never double-seeded), and a true genesis
+			// race self-heals via the chain's deterministic id-tiebreak (chain.ts `heavier()`). Roster is the
+			// full known set (knownPeerAddrs: discovered + bound peers), not just active links, so the election
+			// runs over the fuller view each node actually has — and a higher-rank node that DOES see quorum can
+			// rescue a lower-rank seeder that doesn't. Grace is tunable via GAVL_SEEDER_GRACE_MS (ms).
+			const graceMs = Number(process.env.GAVL_SEEDER_GRACE_MS ?? 90_000); // per-rank takeover window
 			let lastLobby = "";
+			let rosterFp = "";
+			let stableSince = Date.now();
+			let quorumSince = 0; // when a STABLE quorum was first reached — origin of the failover clock
 			while (this.farming && !this.node.anchorTip()) {
 				const myKey = this.transport.nodeKeyHex;
-				const roster = [myKey, ...this.transport.connectedPeerKeys()].sort();
-				if (roster.length >= need && roster[0] === myKey) break; // quorum present + I'm the seeder → form the one chain
-				// Visibility: the lobby used to wait SILENTLY, so a stalled genesis was indistinguishable from a
-				// dead node. Say exactly WHY we're waiting — sub-quorum, or quorum-but-not-the-seeder — and log
-				// only when it changes. The seeder is the lowest node-key present; everyone else adopts its genesis,
-				// so if you see this frozen at "waiting for seeder X", X is the node to check (is it farming + producing?).
-				const status =
-					roster.length < need
-						? `lobby: ${roster.length}/${need} farmers present${roster[0] === myKey ? " (I'd seed at quorum)" : ""} — waiting for ${need - roster.length} more`
-						: `lobby: ${roster.length}/${need} present — waiting for seeder ${sk(roster[0])} to mint genesis (I'm ${sk(myKey)}, not the lowest key)`;
+				const roster = [myKey, ...this.transport.knownPeerAddrs()].sort();
+				const t = Date.now();
+				const fp = roster.join(",");
+				if (fp !== rosterFp) {
+					rosterFp = fp;
+					stableSince = t;
+				} // roster moved → restart the stability clock
+				const stable = t - stableSince >= 3_000; // unchanged for 3s, so nobody seeds mid-discovery
+				const atQuorum = roster.length >= need;
+				if (atQuorum && stable) {
+					if (quorumSince === 0) quorumSince = t;
+				} else {
+					quorumSince = 0; // lost quorum or still settling → reset the failover clock
+				}
+				const myRank = roster.indexOf(myKey);
+				if (quorumSince > 0 && t - quorumSince >= myRank * graceMs) break; // my window elapsed → I seed
+				const status = !atQuorum
+					? `lobby: ${roster.length}/${need} farmers known${roster[0] === myKey ? " (I'd seed)" : ""} — waiting for ${need - roster.length} more`
+					: quorumSince === 0
+						? `lobby: ${roster.length}/${need} — quorum forming, roster settling`
+						: `lobby: ${roster.length}/${need} — quorum; seeder ${sk(roster[0])}` +
+							(myRank === 0 ? ` is me — minting genesis` : `; I'm rank ${myRank}, take over in ~${Math.max(0, Math.ceil((myRank * graceMs - (t - quorumSince)) / 1000))}s if no chain`);
 				if (status !== lastLobby) {
 					console.log(`  ${status}`);
 					lastLobby = status;
