@@ -295,7 +295,9 @@ export class Daemon {
 		this.finalityDepth = opts.finalityDepth ?? 1;
 		this.adoptQuorum = opts.adoptQuorum ?? 1;
 		this.replicationTarget = opts.replicationTarget ?? 1;
-		this.heartbeatMs = opts.heartbeatMs ?? 120_000;
+		// Idle anchor heartbeat. Server passes this from GAVL_HEARTBEAT_MS; for a directly-constructed
+		// daemon (tests/embeds) honor the same env so it's tunable everywhere, keeping 120s as the default.
+		this.heartbeatMs = opts.heartbeatMs ?? (Number(process.env.GAVL_HEARTBEAT_MS) || 120_000);
 		this.targetSecPerAnchor = opts.targetSecPerAnchor ?? 60;
 		this.spaceMode = opts.space ?? "standin";
 		this.plotDir = opts.plotDir ?? join(homedir(), ".gavl", "plots");
@@ -1119,6 +1121,12 @@ export class Daemon {
 			finalityDepth: this.finalityDepth,
 			busyPaceMs: 250,
 			heartbeatMs: this.heartbeatMs,
+			// Bootstrap-busy: until genesis publishes the committee fund key, mine at busyPaceMs (not the
+			// idle heartbeat) so the chain reaches its first epoch boundary in seconds — otherwise an idle
+			// no-trade network would crawl there one anchor per heartbeat (~32 min) and the genesis DKG
+			// would never appear to start. `custody.fundKey` is null until genesis completes, then stays
+			// set, so this reverts to normal idle pacing the instant the network is up.
+			bootstrapping: () => this.view().custody.fundKey === null,
 		});
 	}
 

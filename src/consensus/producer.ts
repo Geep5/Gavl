@@ -86,12 +86,19 @@ export class Producer {
 	 *    HEARTBEAT — one anchor every `heartbeatMs` — so a trickle of weight keeps
 	 *    accruing (fresh-node bootstrap safety) without burning compute on empty
 	 *    anchors. A new action makes the ledger heads advance → back to BUSY.
+	 *  - BOOTSTRAP: an optional `bootstrapping()` predicate forces BUSY even when idle.
+	 *    Before the first committee exists, the genesis ceremony can't run until the chain
+	 *    reaches its first epoch boundary — but with no writes to bury, plain IDLE would
+	 *    crawl there one empty anchor per `heartbeatMs` (~32 min at 16 anchors × 120s).
+	 *    While `bootstrapping()` is true we sprint at busyPaceMs to reach genesis; it flips
+	 *    false the moment the fund key is published, reverting to IDLE so an up network never
+	 *    burns compute. (The VDF cost still self-paces each anchor — this is a yield, not a spin.)
 	 *
 	 * `finalityDepth` is the depth at which we consider activity buried (matches the
 	 * chain's sticky-finality lock). Online nodes are already safe via that lock;
 	 * the heartbeat is purely for long-range/bootstrap weight.
 	 */
-	async runAdaptive(opts: { until: () => boolean; finalityDepth: number; busyPaceMs?: number; heartbeatMs?: number }): Promise<void> {
+	async runAdaptive(opts: { until: () => boolean; finalityDepth: number; busyPaceMs?: number; heartbeatMs?: number; bootstrapping?: () => boolean }): Promise<void> {
 		this.active = true;
 		const heartbeatMs = opts.heartbeatMs ?? 120_000;
 		let lastAnchorAt = 0;
@@ -100,7 +107,10 @@ export class Producer {
 			const heads = this.node.ledger.heads();
 			const caughtUp = chain ? chain.headsCovered(heads, opts.finalityDepth) : true;
 
-			if (!caughtUp) {
+			// Busy if there are unfinalized writes to bury, OR we're still bootstrapping (no committee
+			// yet) and must sprint empty anchors to the genesis epoch boundary instead of crawling at
+			// the idle heartbeat.
+			if (!caughtUp || opts.bootstrapping?.()) {
 				// Busy: bury outstanding writes as fast as the cooldown allows.
 				await this.produceOne();
 				lastAnchorAt = this.tick();
