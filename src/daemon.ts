@@ -460,41 +460,62 @@ export class Daemon {
 			if (c) for (const id of c.committee) if (id !== me) members.add(id);
 		}
 		this.transport.connectCommittee([...members]);
-		this.logCommitteeReadiness(optEpoch, [...members]); // surface WHY the committee may not be forming
+		this.logCommitteeReadiness(optEpoch, [...members], chain); // surface WHY the committee may not be forming
 	}
 
 	/** Legibility: surface WHY the committee may not be forming, so a stuck node is DIAGNOSABLE instead
-	 *  of silently waiting (the failure mode that ate whole debugging sessions). For my co-members in the
-	 *  current epoch, report how many I hold a producer↔address binding for (can address at all) and how
-	 *  many I'm actually linked to (can run the ceremony with). Reading it:
-	 *    "bound 2/3 (missing a1b2)" → a1b2's binding never reached me — the binding handshake/announce
-	 *                                 hasn't closed; I literally can't address it yet.
-	 *    "linked 1/3 (waiting 939f)" → bound but the path is cold — keepalive should be re-dialing.
-	 *  Throttled to log only when the picture changes: quiet on a healthy mesh, a clean step-by-step
-	 *  progression on a recovering one. No-op when I'm farming but not in the committee (no co-members). */
-	private logCommitteeReadiness(epoch: number, members: string[]): void {
-		if (!this.transport || members.length === 0) return;
-		const linked = new Set(this.transport.connectedPeerKeys());
-		const sh = (h: string) => h.slice(0, 4);
-		const missing: string[] = []; // co-members whose binding I lack → can't address them
-		const cold: string[] = []; // bound, but no live path right now → ceremony can't reach them yet
-		let bound = 0;
-		let conn = 0;
-		for (const m of members) {
-			const addr = this.transport.addressForProducer(m);
-			if (!addr) {
-				missing.push(m);
-				continue;
+	 *  of silently waiting (the failure mode that ate whole debugging sessions). Two cases:
+	 *
+	 *  (A) I'm NOT in a committee this epoch — usually because there aren't enough distinct anchor-
+	 *      PRODUCERS yet. Connected peers that only gossip/write don't count; a member must be MINTING
+	 *      anchors on THIS chain (e.g. a peer on a different proof mode lands its writes but not its
+	 *      anchors → it's a peer, not a producer). Report the producer count vs the floor — the single
+	 *      most common stuck-state, and previously invisible:
+	 *        "not forming — 1/3 anchor-producers (need 2 more nodes minting anchors)"
+	 *
+	 *  (B) I AM in the committee — report per co-member whether I can ADDRESS it (hold its binding) and
+	 *      whether I'm LINKED to it (live path for the ceremony):
+	 *        "bound 2/3 (missing a1b2)"  → a1b2's binding never reached me (handshake/announce open)
+	 *        "linked 1/3 (waiting 939f)" → bound but the path is cold — keepalive should be re-dialing
+	 *
+	 *  Throttled to log only when the picture changes: quiet when steady, a clean progression otherwise. */
+	private logCommitteeReadiness(epoch: number, members: string[], chain: AnchorView[]): void {
+		if (!this.transport) return;
+		let summary: string;
+		if (members.length === 0) {
+			// (A) not selected — almost always "not enough nodes are actually producing anchors yet".
+			const minC = this.custodyOpts.minCommittee ?? 3;
+			const producers = new Set(chain.map((a) => a.producer));
+			const p = producers.size;
+			const need = minC - p;
+			summary =
+				p < minC
+					? `committee epoch ${epoch}: not forming — ${p}/${minC} anchor-producers (need ${need} more node${need === 1 ? "" : "s"} minting anchors${producers.has(this.producerId()) ? "" : "; THIS node isn't producing"})`
+					: `committee epoch ${epoch}: ${p} producers present but this node isn't in the committee (standby)`;
+		} else {
+			// (B) selected — how reachable are my co-members for the ceremony.
+			const linked = new Set(this.transport.connectedPeerKeys());
+			const sh = (h: string) => h.slice(0, 4);
+			const missing: string[] = []; // co-members whose binding I lack → can't address them
+			const cold: string[] = []; // bound, but no live path right now → ceremony can't reach them yet
+			let bound = 0;
+			let conn = 0;
+			for (const m of members) {
+				const addr = this.transport.addressForProducer(m);
+				if (!addr) {
+					missing.push(m);
+					continue;
+				}
+				bound++;
+				if (linked.has(addr)) conn++;
+				else cold.push(m);
 			}
-			bound++;
-			if (linked.has(addr)) conn++;
-			else cold.push(m);
+			const n = members.length;
+			summary =
+				`committee epoch ${epoch}: ${n} co-member${n === 1 ? "" : "s"}` +
+				` · bound ${bound}/${n}${missing.length ? ` (missing ${missing.map(sh).join(",")})` : ""}` +
+				` · linked ${conn}/${n}${cold.length ? ` (waiting ${cold.map(sh).join(",")})` : ""}`;
 		}
-		const n = members.length;
-		const summary =
-			`committee epoch ${epoch}: ${n} co-member${n === 1 ? "" : "s"}` +
-			` · bound ${bound}/${n}${missing.length ? ` (missing ${missing.map(sh).join(",")})` : ""}` +
-			` · linked ${conn}/${n}${cold.length ? ` (waiting ${cold.map(sh).join(",")})` : ""}`;
 		if (summary === this.lastReadiness) return;
 		this.lastReadiness = summary;
 		console.log(`  ${summary}`);
