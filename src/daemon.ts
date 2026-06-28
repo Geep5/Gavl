@@ -460,6 +460,45 @@ export class Daemon {
 			if (c) for (const id of c.committee) if (id !== me) members.add(id);
 		}
 		this.transport.connectCommittee([...members]);
+		this.logCommitteeReadiness(optEpoch, [...members]); // surface WHY the committee may not be forming
+	}
+
+	/** Legibility: surface WHY the committee may not be forming, so a stuck node is DIAGNOSABLE instead
+	 *  of silently waiting (the failure mode that ate whole debugging sessions). For my co-members in the
+	 *  current epoch, report how many I hold a producer↔address binding for (can address at all) and how
+	 *  many I'm actually linked to (can run the ceremony with). Reading it:
+	 *    "bound 2/3 (missing a1b2)" → a1b2's binding never reached me — the binding handshake/announce
+	 *                                 hasn't closed; I literally can't address it yet.
+	 *    "linked 1/3 (waiting 939f)" → bound but the path is cold — keepalive should be re-dialing.
+	 *  Throttled to log only when the picture changes: quiet on a healthy mesh, a clean step-by-step
+	 *  progression on a recovering one. No-op when I'm farming but not in the committee (no co-members). */
+	private logCommitteeReadiness(epoch: number, members: string[]): void {
+		if (!this.transport || members.length === 0) return;
+		const linked = new Set(this.transport.connectedPeerKeys());
+		const sh = (h: string) => h.slice(0, 4);
+		const missing: string[] = []; // co-members whose binding I lack → can't address them
+		const cold: string[] = []; // bound, but no live path right now → ceremony can't reach them yet
+		let bound = 0;
+		let conn = 0;
+		for (const m of members) {
+			const addr = this.transport.addressForProducer(m);
+			if (!addr) {
+				missing.push(m);
+				continue;
+			}
+			bound++;
+			if (linked.has(addr)) conn++;
+			else cold.push(m);
+		}
+		const n = members.length;
+		const summary =
+			`committee epoch ${epoch}: ${n} co-member${n === 1 ? "" : "s"}` +
+			` · bound ${bound}/${n}${missing.length ? ` (missing ${missing.map(sh).join(",")})` : ""}` +
+			` · linked ${conn}/${n}${cold.length ? ` (waiting ${cold.map(sh).join(",")})` : ""}`;
+		if (summary === this.lastReadiness) return;
+		this.lastReadiness = summary;
+		console.log(`  ${summary}`);
+		this.recordNetEvent("committee", summary);
 	}
 
 	/**
@@ -1069,6 +1108,7 @@ export class Daemon {
 			this.producer = new Producer({ node: this.node, keypair: farmer, prover, params: this.params, appRootFor: (prev) => this.appRootForParent(prev) });
 			this.farming = true;
 			this.startHealthWatch(); // warn if we farm but never produce an anchor
+			this.startStallWatch(); // re-pull a bootstrapping tip that froze while peers remained
 			this.startCommitteeCustody(); // the only custody path: form/join the M-of-N committee
 			void this.lobbyThenFarm(); // join the channel as a LOBBY first — adopt an existing chain or start with a quorum, never fork a solo genesis
 		}
@@ -1181,6 +1221,39 @@ export class Daemon {
 	private stopHealthWatch(): void {
 		if (this.healthTimer) clearInterval(this.healthTimer);
 		this.healthTimer = undefined;
+	}
+
+	/**
+	 * Stall watchdog. During BOOTSTRAP (before the committee's fund key exists) the producer sprints
+	 * empty anchors to the genesis epoch boundary, so the tip should climb every few seconds. If it
+	 * FREEZES while we still have peers, we've most likely missed a heavier chain — a dropped anchor-tip
+	 * broadcast, or a link that went silently quiet (LXMF has no disconnect signal). Re-pull from peers
+	 * and re-warm committee links to reconverge. Scoped to the bootstrap window on purpose: AFTER genesis,
+	 * a frozen tip is just an idle network (the heartbeat), and must NOT trigger churn. Tunable via
+	 * GAVL_STALL_MS; 0 disables.
+	 */
+	private startStallWatch(): void {
+		if (this.stallTimer) return;
+		const ms = Number(process.env.GAVL_STALL_MS ?? 30_000);
+		if (!Number.isFinite(ms) || ms <= 0) return;
+		this.stallTimer = setInterval(() => {
+			if (!this.farming || !this.transport) return;
+			if (this.view().custody.fundKey !== null) return; // bootstrap only — idle tips are normal once the committee exists
+			const peers = this.transport.connectedPeerKeys().length;
+			if (peers === 0) return; // nothing to pull from — the lobby/health watch covers a peerless node
+			const last = this.anchorTimes[this.anchorTimes.length - 1];
+			const frozenMs = last ? Date.now() - last.at : Infinity;
+			if (frozenMs < ms) return; // tip still moving
+			this.recordNetEvent("net", `tip frozen ${Number.isFinite(frozenMs) ? Math.round(frozenMs / 1000) + "s" : "(no anchor yet)"} with ${peers} peer(s) — re-pulling`);
+			this.node.resync(); // ask peers for any heavier chain we missed
+			this.maintainCommittee(); // re-resolve + re-warm committee links so the ceremony mesh recovers
+		}, ms);
+		if (typeof this.stallTimer.unref === "function") this.stallTimer.unref(); // never hold the process open
+	}
+
+	private stopStallWatch(): void {
+		if (this.stallTimer) clearInterval(this.stallTimer);
+		this.stallTimer = undefined;
 	}
 
 	private startCommitteeCustody(): void {
@@ -1587,6 +1660,11 @@ export class Daemon {
 	private healthTimer?: ReturnType<typeof setInterval>;
 	private farmingStart = 0;
 	private warnedNoProduce = false;
+	/** Stall watchdog — re-pulls a bootstrapping tip that froze while peers remained (a missed
+	 *  anchor-tip / a quiet link), so genesis + the committee aren't blocked on a stale view. */
+	private stallTimer?: ReturnType<typeof setInterval>;
+	/** Last committee-readiness line logged, so the diagnostic only prints when the picture changes. */
+	private lastReadiness = "";
 	async refreshOnChainReserves(): Promise<void> {
 		try {
 			const esplora = this.esplora();
@@ -1844,6 +1922,7 @@ export class Daemon {
 		this.oracleGen++; // the running oracle publisher loop exits on its next tick
 		this.producer?.stop();
 		this.stopHealthWatch();
+		this.stopStallWatch();
 		this.producer = undefined;
 		if (this.transport) await this.transport.destroy().catch(() => {});
 		this.transport = undefined;
@@ -1882,6 +1961,7 @@ export class Daemon {
 		clearInterval(this.encKeyTimer);
 		this.producer?.stop();
 		this.stopHealthWatch();
+		this.stopStallWatch();
 		if (this.transport) await this.transport.destroy().catch(() => {});
 		if (this.store) await this.store.close().catch(() => {});
 		await this.params.vdf.close?.().catch(() => {}); // terminate the VDF worker pool, if any

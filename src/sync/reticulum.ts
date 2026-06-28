@@ -105,6 +105,7 @@ export class ReticulumTransport {
 	 *  Lets the daemon address a consensus-roster member directly — no rendezvous. */
 	private readonly producerToAddress = new Map<string, string>();
 	private readyResolve?: (v: void) => void;
+	private keepaliveTimer?: ReturnType<typeof setInterval>;
 
 	constructor(node: GavlNode, opts: ReticulumOptions) {
 		this.node = node;
@@ -235,6 +236,8 @@ export class ReticulumTransport {
 	}
 
 	async destroy(): Promise<void> {
+		if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+		this.keepaliveTimer = undefined;
 		try {
 			this.control?.end();
 		} catch {
@@ -265,6 +268,41 @@ export class ReticulumTransport {
 		this.ctrl({ op: "set_binding", producer, sig });
 	}
 
+	// ── liveness: keepalive + binding handshake ──────────────────────
+	/** Ask a peer to (re)push its signed binding over the RELIABLE direct channel, so we can resolve its
+	 *  producer↔address even if its best-effort announce never relayed to us (or we lost it on restart). */
+	private requestBinding(peerHex: string): void {
+		this.ctrl({ op: "request_binding", peer: peerHex });
+	}
+
+	/** Periodic mesh keepalive. LXMF is connectionless and paths expire SILENTLY (no disconnect event),
+	 *  so two failure modes accumulate unattended: (1) the path to a committee member goes cold and the
+	 *  next ceremony can't reach it, and (2) we gossip with a peer whose binding we never received, so we
+	 *  can't address it by producer key (connectCommittee can't link it — a half-open link). Each tick we
+	 *  re-warm the path to every pinned committee member and ask every active-but-unbound peer to re-push
+	 *  its binding. Cheap and self-quieting: a fully-bound, fully-warm mesh sends (almost) nothing. Tunable
+	 *  via GAVL_KEEPALIVE_MS; 0 disables. */
+	private startKeepalive(): void {
+		if (this.keepaliveTimer) return;
+		const ms = Number(process.env.GAVL_KEEPALIVE_MS ?? 20_000);
+		if (!Number.isFinite(ms) || ms <= 0) return;
+		this.keepaliveTimer = setInterval(() => this.keepaliveTick(), ms);
+		if (typeof this.keepaliveTimer.unref === "function") this.keepaliveTimer.unref(); // never hold the event loop open
+	}
+
+	private keepaliveTick(): void {
+		if (!this.control) return;
+		// 1) Keep committee members reachable: re-warm the RNS path to each pinned member so a transient
+		//    drop self-heals before a ceremony needs it (the sidecar's dial is a no-op if the path is live).
+		for (const addr of this.committeePins) this.ctrl({ op: "dial", peer: addr });
+		// 2) Close half-open links: for every peer we actively gossip with but hold no binding for, ask it
+		//    to (re)push its binding so connectCommittee can resolve it. Bound peers cost nothing here.
+		const bound = new Set(this.producerToAddress.values());
+		for (const peer of this.active.keys()) {
+			if (!bound.has(peer)) this.requestBinding(peer);
+		}
+	}
+
 	// ── control protocol ─────────────────────────────────────────────
 	private ctrl(obj: Record<string, unknown>): void {
 		if (!this.control) return;
@@ -292,6 +330,7 @@ export class ReticulumTransport {
 				this.address = ev.address ?? null;
 				if (this.address) this.report("net", `online as ${ReticulumTransport.short(this.address)} on "${this.network}"`);
 				this.publishBinding();
+				this.startKeepalive();
 				this.readyResolve?.();
 				this.readyResolve = undefined;
 				return;
@@ -415,6 +454,8 @@ export class ReticulumTransport {
 	}
 
 	private onControlClosed(): void {
+		if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+		this.keepaliveTimer = undefined;
 		for (const c of this.active.values()) c.fireClose();
 		this.active.clear();
 		this.pool.clear();

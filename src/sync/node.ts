@@ -127,6 +127,19 @@ export class GavlNode {
 		this.broadcast({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode });
 	}
 
+	/** Actively re-pull from peers. Anchor-tips are normally pushed (on connect, on a new anchor), so a
+	 *  node that misses a broadcast — or whose link went quiet — can sit frozen below a heavier chain with
+	 *  no event to nudge it. Broadcasting anchor-want makes every peer serve its chain from a recent floor;
+	 *  the heavier one wins fork-choice, and a fork deeper than the floor self-heals via the gap→full-pull
+	 *  path in ingestAnchors. Re-advertise heads too, to converge the write set. Idempotent and cheap; the
+	 *  daemon's stall watch calls this when a bootstrapping tip freezes while peers remain. */
+	resync(): void {
+		const tip = this.anchors?.tip();
+		const from = tip ? Math.max(0, tip.height - 8) : 0; // small overlap captures a shallow fork without a full pull
+		this.broadcast({ t: "anchor-want", fromHeight: from });
+		this.advertise();
+	}
+
 	/** Apply a locally-produced write and gossip it. */
 	submit(w: Write): void {
 		const r = this.ledger.apply(w);

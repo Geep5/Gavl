@@ -69,7 +69,7 @@ GAVL_PREFIX = "gavl:"
 GAVL_BIND_PREFIX = "gavlb1:"
 
 # Gavl's default Reticulum config, written on first run. HUB-ONLY: there is no LAN AutoInterface, so
-# every node reaches the network through a shared internet hub — two nodes on the same LAN connect
+# every node reaches the network through shared internet hubs — two nodes on the same LAN connect
 # exactly as if they were on opposite sides of the world, never shortcutting over the local network.
 # Standalone instance (own interfaces, never joins a system shared instance). Edit to add/swap hubs.
 DEFAULT_GAVL_RNS_CONFIG = """\
@@ -86,20 +86,28 @@ DEFAULT_GAVL_RNS_CONFIG = """\
 
 [interfaces]
 
-  # A SINGLE shared Reticulum hub — the rendezvous every Gavl node connects through. One hub (not
-  # several) so every node lands on the SAME network and fully meshes; multiple hubs that aren't
-  # bridged would split nodes onto separate networks that can't see each other. Swap in your own hub
-  # for a private deployment (every node must use the same one).
+  # TWO shared Reticulum hubs, for redundancy. Because enable_transport is on, every node BRIDGES the
+  # interfaces it holds, so connecting to both hubs doesn't split the network — it UNITES them: as long
+  # as each node reaches at least one hub and some node reaches both, the whole set forms one mesh. The
+  # payoff is no single point of failure — if one hub goes down (or briefly blips), nodes stay on the
+  # network through the other, instead of the entire network going dark behind one box. Both are verified
+  # live RNS transit hubs. Swap in your own for a private deployment (every node must share the same set).
   #
-  # target_host is the IPv4 LITERAL, NOT rns.beleth.net, on purpose: the hostname's AAAA (IPv6) record
+  # target_host is the IPv4 LITERAL, NOT a hostname, on purpose: beleth's hostname AAAA (IPv6) record
   # points at a DEAD address, and RNS tries IPv6 first and hangs in SYN_SENT forever instead of falling
-  # back to IPv4 — so a node using the hostname never reaches the hub at all (the #1 cause of "nodes
-  # won't mesh"). Pin the working IPv4. Revert to the hostname if/when beleth fixes its IPv6 AAAA.
-  [[Gavl Hub]]
+  # back to IPv4 — so a node using the hostname never reaches the hub at all (a classic "nodes won't
+  # mesh"). Pin the working IPv4. Revert to the hostname if/when a hub fixes its IPv6 AAAA.
+  [[Gavl Hub beleth]]
     type = TCPClientInterface
     enabled = yes
     target_host = 129.213.74.184
     target_port = 4242
+
+  [[Gavl Hub g00n]]
+    type = TCPClientInterface
+    enabled = yes
+    target_host = 137.220.49.41
+    target_port = 6969
 
   # LAN discovery is intentionally OFF (uncomment to also peer on the local network):
   # [[Local Network]]
@@ -163,6 +171,7 @@ class Bridge:
         self.peers = set()               # discovered Gavl peer hashes (hex)
         self.peer_identities = {}        # peer_hex -> RNS.Identity (so sends don't depend on recall)
         self.binding = None              # our signed producer↔address binding (announce app_data)
+        self.pushed = set()              # peers we've handed our binding to over the reliable channel
         self.lock = threading.Lock()
 
         ensure_gavl_rns_config(config_dir)  # write the hub-only default if this node has no config yet
@@ -214,11 +223,59 @@ class Bridge:
     def set_binding(self, producer_hex, sig_hex):
         """The daemon supplies the producer's signature over our address. Pack it (32-byte producer key
         + 64-byte signature, base64) into our lxmf.delivery announce's display-name field so peers
-        discover AND verify us over the reliable announce path, then re-announce."""
+        discover AND verify us over the reliable announce path, then re-announce. Also hand the fresh
+        binding to every known peer over the RELIABLE direct channel — don't make them wait for the next
+        best-effort announce to relay through the hub."""
         raw = bytes.fromhex(producer_hex) + bytes.fromhex(sig_hex)
         self.binding = raw
         self.local.display_name = GAVL_BIND_PREFIX + base64.b64encode(raw).decode("ascii")
         self.announce()
+        with self.lock:
+            targets = list(self.peers)
+        self.pushed = set(targets)  # binding changed → re-hand to everyone we know
+        for p in targets:
+            self._push_binding_to(p)
+
+    def _binding_parts(self):
+        """Our binding split into (producer_hex, sig_hex), or None until set_binding has run."""
+        if self.binding is None:
+            return None
+        return self.binding[:32].hex(), self.binding[32:96].hex()
+
+    def _push_binding_to(self, peer):
+        """Hand our signed binding to `peer` over the RELIABLE direct LXMF channel (not the best-effort
+        announce), so a connected-but-unbound peer learns our producer↔address immediately. Rides the
+        same delivery destination as sync frames, tagged so the receiver swallows it before consensus."""
+        parts = self._binding_parts()
+        if parts is None:
+            return
+        self.send(peer, {"__gavl_bind__": {"p": parts[0], "s": parts[1]}})
+
+    def _request_binding_from(self, peer):
+        """Ask `peer` to (re)send its binding over the direct channel. Closes a half-open link after a
+        restart, when the peer already pushed to our PREVIOUS process and won't re-push on its own."""
+        self.send(peer, {"__gavl_bind_req__": 1})
+
+    def _record_binding(self, peer, producer_hex, sig_hex):
+        """Verify a producer↔address binding for `peer` (network-scoped, domain-separated) and, if valid,
+        surface it to the Node. Shared by the announce path (on_lxmf_announce) and the reliable direct
+        push (on_message). `peer` is the verified address the producer must have signed over."""
+        if peer == self.address:
+            return
+        message = ("gavl-bind:" + self.network + ":" + peer).encode("utf-8")
+        if not verify_binding(producer_hex, sig_hex, message):
+            self.log("rejected binding for %s (bad signature)" % peer[:8])
+            return
+        new = False
+        with self.lock:
+            if peer not in self.peers:
+                self.peers.add(peer)
+                new = True
+        self.emit({"ev": "binding", "producer": producer_hex, "address": peer})
+        self.emit({"ev": "discovered", "peer": peer})
+        if new:
+            # a verified Gavl peer — model it as a live connection so the Node's gossip greets it
+            self.emit({"ev": "peer_connected", "peer": peer})
 
     def on_lxmf_announce(self, dest_hash, identity, app_data):
         if identity is None:
@@ -236,21 +293,7 @@ class Bridge:
             producer_hex, sig_hex = raw[:32].hex(), raw[32:96].hex()
         except Exception:
             return
-        # verify the producer authorized THIS address (network-scoped, domain-separated)
-        message = ("gavl-bind:" + self.network + ":" + peer).encode("utf-8")
-        if not verify_binding(producer_hex, sig_hex, message):
-            self.log("rejected binding for %s (bad signature)" % peer[:8])
-            return
-        new = False
-        with self.lock:
-            if peer not in self.peers:
-                self.peers.add(peer)
-                new = True
-        self.emit({"ev": "binding", "producer": producer_hex, "address": peer})
-        self.emit({"ev": "discovered", "peer": peer})
-        if new:
-            # a verified Gavl peer — model it as a live connection so the Node's gossip greets it
-            self.emit({"ev": "peer_connected", "peer": peer})
+        self._record_binding(peer, producer_hex, sig_hex)
 
     # ── frame receive ────────────────────────────────────────────────
     def on_message(self, lxmf_message):
@@ -260,6 +303,7 @@ class Bridge:
         except Exception as e:
             self.log("bad inbound frame: " + str(e))
             return
+        # Any inbound frame proves the peer is reachable → model it as a live connection.
         new = False
         with self.lock:
             if peer not in self.peers:
@@ -267,6 +311,21 @@ class Bridge:
                 new = True
         if new:
             self.emit({"ev": "peer_connected", "peer": peer})
+        # First contact over the reliable channel: proactively hand the peer our binding once, so neither
+        # side waits on the best-effort announce to learn the other's producer↔address (closes the
+        # half-open where we gossip with a peer we can't yet address by producer key).
+        if self.binding is not None and peer not in self.pushed:
+            self.pushed.add(peer)
+            self._push_binding_to(peer)
+        # Binding-handshake control frames ride this same reliable channel — handle + swallow them so
+        # they never surface to the consensus layer as sync frames.
+        if isinstance(frame, dict) and "__gavl_bind__" in frame:
+            b = frame["__gavl_bind__"] or {}
+            self._record_binding(peer, b.get("p", ""), b.get("s", ""))
+            return
+        if isinstance(frame, dict) and "__gavl_bind_req__" in frame:
+            self._push_binding_to(peer)
+            return
         self.emit({"ev": "message", "peer": peer, "frame": frame})
 
     # ── frame send ───────────────────────────────────────────────────
@@ -312,6 +371,13 @@ class Bridge:
                     RNS.Transport.request_path(dh)
             except Exception:
                 pass
+        elif op == "push_binding":
+            # Re-hand our binding to a specific peer over the reliable channel (keepalive-driven, for a
+            # peer we gossip with but that hasn't recorded our producer↔address yet).
+            self._push_binding_to(obj["peer"])
+        elif op == "request_binding":
+            # Ask a specific peer to (re)push its binding — closes a half-open link after our restart.
+            self._request_binding_from(obj["peer"])
         elif op == "announce" or op == "join":
             self.announce()
         elif op == "peers":
@@ -330,8 +396,20 @@ def serve(args):
     config_dir = args.config_dir or os.path.join(args.storage_dir, "rns")
     bridge = Bridge(ctrl, config_dir, args.storage_dir, args.network, args.propagated)
 
-    # periodic re-announce so peers keep discovering us across churn
+    # Re-announce so peers keep discovering us. The steady-state cadence (args.announce_interval, 300s)
+    # is fine once the mesh is warm, but on a COLD start it's a trap: a node's first announce often fires
+    # before its link to the hub is fully up (or before a late-joining peer is connected), so it's lost —
+    # and the next isn't for 5 minutes, stranding two nodes that can't see each other (the binding push
+    # can't rescue this; it needs an announce to have crossed first). So announce a few times over the
+    # first ~minute, THEN settle to the configured cadence — cold-start discovery drops from minutes to
+    # seconds, regardless of join order, at the cost of a handful of extra startup announces.
     def reannounce():
+        for delay in (8, 8, 8, 15, 15):  # ~54s of warm-up re-announces
+            time.sleep(delay)
+            try:
+                bridge.announce()
+            except Exception:
+                pass
         while True:
             time.sleep(args.announce_interval)
             try:
