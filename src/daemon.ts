@@ -483,14 +483,23 @@ export class Daemon {
 		if (!this.transport) return;
 		let summary: string;
 		if (members.length === 0) {
-			// (A) not selected — almost always "not enough nodes are actually producing anchors yet".
+			// (A) not selected — almost always too few DISTINCT producers on this node's canonical chain. Show
+			// the per-producer anchor counts so divergence is obvious at a glance: "[me:273]" means this node
+			// sees only ITSELF producing (its peers' anchors aren't on its canonical chain → the net has split,
+			// anchors outrunning gossip); a healthy net shows several keys with similar counts.
 			const minC = this.custodyOpts.minCommittee ?? 3;
-			const producers = new Set(chain.map((a) => a.producer));
-			const p = producers.size;
+			const me = this.producerId();
+			const counts = new Map<string, number>();
+			for (const a of chain) counts.set(a.producer, (counts.get(a.producer) ?? 0) + 1);
+			const p = counts.size;
 			const need = minC - p;
+			const breakdown = [...counts.entries()]
+				.sort((x, y) => y[1] - x[1])
+				.map(([k, n]) => `${k === me ? "me" : k.slice(0, 4)}:${n}`)
+				.join(" ");
 			summary =
 				p < minC
-					? `committee epoch ${epoch}: not forming — ${p}/${minC} anchor-producers (need ${need} more node${need === 1 ? "" : "s"} minting anchors${producers.has(this.producerId()) ? "" : "; THIS node isn't producing"})`
+					? `committee epoch ${epoch}: not forming — ${p}/${minC} producers [${breakdown}] (need ${need} more node${need === 1 ? "" : "s"} minting anchors${counts.has(me) ? "" : "; THIS node isn't producing"})`
 					: `committee epoch ${epoch}: ${p} producers present but this node isn't in the committee (standby)`;
 		} else {
 			// (B) selected — how reachable are my co-members for the ceremony.
@@ -1208,12 +1217,17 @@ export class Daemon {
 			until: () => !this.farming,
 			finalityDepth: this.finalityDepth,
 			busyPaceMs: 250,
+			// Bootstrap pace: until genesis publishes the committee fund key, mint empty anchors toward the
+			// first epoch boundary at THIS interval — between the 250ms busy pace and the ~32-min idle
+			// heartbeat. It must be SLOWER than the mesh gossips a height: mint faster and competing farmers
+			// each build a private run that fork-choice orphans wholesale, collapsing the canonical producer
+			// set so the committee never sees its ≥minCommittee distinct producers (the 3-node real-PoST
+			// `producers`-collapse — see producer.runAdaptive + test/anchor-convergence.test.ts). 8s leaves
+			// margin over hub latency; raise GAVL_BOOTSTRAP_PACE_MS if a slower mesh still diverges.
+			bootstrapPaceMs: Number(process.env.GAVL_BOOTSTRAP_PACE_MS ?? 8000),
 			heartbeatMs: this.heartbeatMs,
-			// Bootstrap-busy: until genesis publishes the committee fund key, mine at busyPaceMs (not the
-			// idle heartbeat) so the chain reaches its first epoch boundary in seconds — otherwise an idle
-			// no-trade network would crawl there one anchor per heartbeat (~32 min) and the genesis DKG
-			// would never appear to start. `custody.fundKey` is null until genesis completes, then stays
-			// set, so this reverts to normal idle pacing the instant the network is up.
+			// `custody.fundKey` is null until genesis completes, then stays set — so bootstrap pacing lifts
+			// (the difficulty retarget owns the rate) the instant the committee is up.
 			bootstrapping: () => this.view().custody.fundKey === null,
 		});
 	}
