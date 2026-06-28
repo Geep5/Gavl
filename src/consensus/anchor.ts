@@ -22,13 +22,25 @@ import { sha256, sha256Hex, canonicalBytes, toHex, fromHex, concatBytes, u32be }
 import type { KeyPair } from "../det/ed25519.ts";
 import type { TimeProof } from "../pot/vdf.ts";
 import { requiredIters, vdfChallenge, expectedPlotSize } from "../chain/iters.ts";
+import type { ConsensusParams } from "../chain/iters.ts";
 import type { ChainParams } from "../chain/writer.ts";
 import { rootOfHeads } from "../ledger/ledger.ts";
 import type { Heads } from "../ledger/ledger.ts";
-import type { SpaceCommitment, SpaceProver, SpaceVerifier } from "./space.ts";
+import type { SpaceCommitment, SpaceProver, SpaceVerifier, MinedProof } from "./space.ts";
 
 const GENESIS_SEED = "gavl-anchor-genesis-v1";
 const GENESIS_GRIND = 256;
+/** Safety bound on the signage-point walk (see `step`). A real plot answers within a handful of
+ *  points; this only stops a hopeless solo prover from looping forever — others still advance the chain. */
+const MAX_SIGNAGE = 4096;
+
+/** VDF iterations between signage points — the sequential cost of revealing one more fresh challenge.
+ *  Derived from the floor cooldown so it scales with the network's minimum unit and is deterministic
+ *  (producer and verifier must agree). Bigger ⇒ stronger anti-grind, slower liveness recovery. */
+function signageStepIters(params: ConsensusParams): number {
+	const f = params.floorIters > 0n ? params.floorIters : 1n;
+	return Number(f);
+}
 
 export interface AnchorBody {
 	height: number;
@@ -36,6 +48,13 @@ export interface AnchorBody {
 	producer: string; // pubkey hex
 	/** Grindable only at genesis (nothing to secure there); 0 for every other anchor. */
 	nonce: number;
+	/** Signage-point VDF chain. A single fixed challenge per height WEDGES the chain whenever no plot
+	 *  answers it (chiapos is probabilistic). Instead each height exposes a SEQUENCE of challenges:
+	 *  `step[i]` proves `signageStepIters` more sequential VDF steps past the previous output, and its
+	 *  output seeds challenge i+1 — so a fresh lottery ticket costs real time to reveal (ungrindable),
+	 *  and the network keeps trying until some plot qualifies. Empty when the FIRST challenge was
+	 *  answered (the common case — byte-identical to a single-challenge anchor) and at genesis. */
+	step: TimeProof[];
 	difficulty: string; // committed difficulty at this height
 	/** Only the writer-heads that ADVANCED since `prev` (a delta), not the full snapshot —
 	 *  so an anchor is O(active-this-round), not O(all writers). The full snapshot is
@@ -79,10 +98,19 @@ export function applyHeadsDelta(prev: Heads, delta: Heads): Heads {
 	return { ...prev, ...delta };
 }
 
-/** Next anchor's challenge. Post-genesis chains from the prev VDF output; at genesis uses `nonce`. */
+/** Next anchor's challenge. Post-genesis chains from the prev VDF output; at genesis uses `nonce`.
+ *  This is the signage-point-0 challenge (the base); later points fold in the VDF walk (see below). */
 export function anchorChallenge(prev: Anchor | null, nonce: number = 0): Uint8Array {
 	if (!prev) return sha256(concatBytes(Buffer.from(GENESIS_SEED, "utf8"), u32be(nonce)));
 	return sha256(concatBytes(fromHex(prev.time.output), fromHex(prev.id)));
+}
+
+/** The space challenge at signage point `sp` (a non-genesis height). `sp = 0` is the base challenge
+ *  (`anchorChallenge(prev)`); each later point folds in `vdfOut` — the VDF output reached after sp
+ *  sequential steps — so a producer must pay real time to even SEE the next ticket (ungrindable). */
+export function signageChallenge(base: Uint8Array, vdfOut: string, sp: number): Uint8Array {
+	if (sp === 0) return base;
+	return sha256(concatBytes(base, fromHex(vdfOut), u32be(sp)));
 }
 
 /** Quality normalization for the backend (see requiredIters). */
@@ -96,6 +124,7 @@ function bodyOf(a: Anchor): AnchorBody {
 		prev: a.prev,
 		producer: a.producer,
 		nonce: a.nonce,
+		step: a.step,
 		difficulty: a.difficulty,
 		headsDelta: a.headsDelta,
 		stateRoot: a.stateRoot,
@@ -123,12 +152,35 @@ export async function mineAnchor(opts: { prev: Anchor | null; prevHeads?: Heads;
 	const sw = spaceWeightFor(commitment);
 
 	let nonce = 0;
-	let challenge = anchorChallenge(prev, 0);
-	let mined = await prover.prove(challenge);
-	while (!mined && !prev && nonce < GENESIS_GRIND) {
-		nonce++;
+	const step: TimeProof[] = []; // signage-point VDF chain — empty when the first challenge is answered
+	let challenge: Uint8Array;
+	let mined: MinedProof | null;
+
+	if (!prev) {
+		// Genesis: grind the nonce (nothing to secure before genesis) until the plot answers.
 		challenge = anchorChallenge(null, nonce);
 		mined = await prover.prove(challenge);
+		while (!mined && nonce < GENESIS_GRIND) {
+			nonce++;
+			challenge = anchorChallenge(null, nonce);
+			mined = await prover.prove(challenge);
+		}
+	} else {
+		// Non-genesis: walk signage points. The first is the base challenge; each unanswered one costs a
+		// VDF step that reveals the next (ungrindable) challenge, so a probabilistic prover can't wedge the
+		// chain on one unanswerable challenge — it (or a peer) keeps getting fresh tickets until one hits.
+		const base = anchorChallenge(prev); // sha256(prev.time.output ++ prev.id)
+		const stepIters = signageStepIters(params);
+		let vdfOut = toHex(base); // output reached so far (o_0 = base — no step at point 0)
+		challenge = signageChallenge(base, vdfOut, 0);
+		mined = await prover.prove(challenge);
+		while (!mined && step.length < MAX_SIGNAGE) {
+			const advance = await params.vdf.eval(fromHex(vdfOut), stepIters); // one more sequential step
+			step.push(advance);
+			vdfOut = advance.output;
+			challenge = signageChallenge(base, vdfOut, step.length);
+			mined = await prover.prove(challenge);
+		}
 	}
 	if (!mined) return null;
 
@@ -140,6 +192,7 @@ export async function mineAnchor(opts: { prev: Anchor | null; prevHeads?: Heads;
 		prev: prev ? prev.id : null,
 		producer: toHex(producer.publicKey),
 		nonce,
+		step,
 		difficulty: difficulty.toString(),
 		headsDelta: diffHeads(prevHeads, heads), // only what changed since prev
 		stateRoot: rootOfHeads(heads), // commitment over the FULL heads
@@ -169,7 +222,29 @@ export async function verifyAnchor(anchor: Anchor, prev: Anchor | null, prevHead
 	const heads = applyHeadsDelta(prevHeads, anchor.headsDelta);
 	if (anchor.stateRoot !== rootOfHeads(heads)) return { ok: false, reason: "stateRoot ≠ heads" };
 
-	const challenge = anchorChallenge(prev, anchor.nonce);
+	// Re-derive the space challenge, validating the signage-point VDF walk it came from. A non-genesis
+	// anchor reaches its challenge by stepping the VDF; each committed step must verify against the
+	// previous output, so the producer genuinely paid the sequential cost to reveal that challenge.
+	if (anchor.step.length > MAX_SIGNAGE) return { ok: false, reason: "too many signage steps" };
+	let challenge: Uint8Array;
+	if (!prev) {
+		if (anchor.step.length !== 0) return { ok: false, reason: "genesis carries signage steps" };
+		challenge = anchorChallenge(null, anchor.nonce);
+	} else {
+		if (anchor.nonce !== 0) return { ok: false, reason: "non-genesis nonce must be 0" };
+		const base = anchorChallenge(prev);
+		const stepIters = signageStepIters(params);
+		let vdfOut = toHex(base);
+		for (let i = 0; i < anchor.step.length; i++) {
+			const s = anchor.step[i];
+			if (s.iters !== stepIters) return { ok: false, reason: `bad signage step ${i} size` };
+			const seed = fromHex(vdfOut);
+			const ok = params.vdf.verifyAsync ? await params.vdf.verifyAsync(seed, s) : params.vdf.verify(seed, s);
+			if (!ok) return { ok: false, reason: `bad signage step ${i} proof` };
+			vdfOut = s.output;
+		}
+		challenge = signageChallenge(base, vdfOut, anchor.step.length);
+	}
 	const v = await verifier.verify(anchor.space, anchor.producer, challenge, anchor.proof);
 	if (!v.ok || !v.quality) return { ok: false, reason: "bad space proof" };
 
