@@ -34,6 +34,33 @@ import LXMF
 import RNS.vendor.umsgpack as msgpack
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+
+def _patch_rns_zero_rtt():
+    """RNS 1.3.x Resource.update_eifr divides the in-flight-rate estimate by the link RTT with no
+    zero-guard. On loopback (two nodes on one box) or very fast LAN links the RTT measures as 0, so
+    the Resource watchdog thread dies with ZeroDivisionError — which silently breaks the LARGE LXMF
+    transfers our anchor/state sync rides on (peers mesh but their tip freezes). Wrap the method to
+    survive a zero RTT and keep syncing. Idempotent; a no-op once upstream guards it."""
+    cls = getattr(RNS, "Resource", None)
+    if cls is None or getattr(cls, "_gavl_zero_rtt_patched", False) or not hasattr(cls, "update_eifr"):
+        return
+    _orig = cls.update_eifr
+
+    def update_eifr(self):
+        try:
+            return _orig(self)
+        except ZeroDivisionError:
+            self.eifr = self.previous_eifr if getattr(self, "previous_eifr", None) is not None \
+                else (self.link.establishment_cost * 8000.0 if self.link else 0.0)
+            if self.link:
+                self.link.expected_rate = self.eifr
+
+    cls.update_eifr = update_eifr
+    cls._gavl_zero_rtt_patched = True
+
+
+_patch_rns_zero_rtt()
+
 GAVL_PREFIX = "gavl:"
 # A Gavl node carries its signed producer↔address binding in the DISPLAY-NAME field of its
 # lxmf.delivery announce, tagged with this prefix. Discovery rides the lxmf.delivery announce — the
