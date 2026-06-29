@@ -1,5 +1,17 @@
 # Weak subjectivity — genesis-free bootstrap
 
+> **Update — hardcoded genesis.** Block 0 is now a fixed constant every node derives identically and
+> installs as the locked root ([`src/consensus/genesis.ts`](../src/consensus/genesis.ts),
+> `AnchorChain.installGenesis`). There is no genesis *minting* anymore and a competing block 0 is
+> rejected, so the short-range genesis **race** this note's checkpoint model worked around is gone — all
+> nodes start from one shared origin. The checkpoint/adopt mechanism below is retained for **long-range**
+> security (PoST history stays grindable far back, like any PoS-class chain), and the two are now
+> **reconciled by sequencing**: `daemon.bootstrapChainRoot()` first gives the mesh a grace window to offer
+> a checkpoint and `adopt`s it if one arrives (JOIN the heaviest existing network); only when nothing is
+> offered — a cold-start or a young chain — does it fall through to `installGenesis` (SEED). So genesis is
+> the bootstrap seed *for when there's nothing to join*, and it's pruned away once the chain matures into
+> checkpoints. Convergence itself is unchanged: follow the heaviest cumulative-PoST chain.
+
 Gavl nodes never replay from genesis. A fresh node loads a recent finalized **checkpoint** and
 folds forward. This is fast and bounds storage — but it means trust is rooted in a *recent
 checkpoint*, not in the origin block. That is a deliberate design choice with a real, named

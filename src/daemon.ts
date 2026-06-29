@@ -63,6 +63,7 @@ import type { WalletAccount } from "./wallet.ts";
 import { defaultParams } from "./config.ts";
 import type { ChainParams } from "./chain/writer.ts";
 import { AnchorChain } from "./consensus/chain.ts";
+import { genesisAnchor, GENESIS_PRODUCER } from "./consensus/genesis.ts";
 import type { RetargetSchedule } from "./consensus/difficulty.ts";
 import { Producer } from "./consensus/producer.ts";
 import { StandinSpaceProver, StandinSpaceVerifier } from "./consensus/space.ts";
@@ -490,7 +491,10 @@ export class Daemon {
 			const minC = this.custodyOpts.minCommittee ?? 3;
 			const me = this.producerId();
 			const counts = new Map<string, number>();
-			for (const a of chain) counts.set(a.producer, (counts.get(a.producer) ?? 0) + 1);
+			for (const a of chain) {
+				if (a.producer === GENESIS_PRODUCER) continue; // the hardcoded-genesis sentinel isn't a real producer
+				counts.set(a.producer, (counts.get(a.producer) ?? 0) + 1);
+			}
 			const p = counts.size;
 			const need = minC - p;
 			const breakdown = [...counts.entries()]
@@ -1048,7 +1052,9 @@ export class Daemon {
 		// op-writer count. Also whether THIS node is among them (it's actually producing, not just connected).
 		const recent = this.node.anchors?.chainTo(tip) ?? [];
 		const myId = this.producerId();
-		const producerSet = new Set(recent.map((a) => a.producer));
+		// Exclude the hardcoded-genesis sentinel — it's the chain root, not a farmer, so it must not
+		// inflate the producer count (a solo node would otherwise read as 2 producers: itself + genesis).
+		const producerSet = new Set(recent.map((a) => a.producer).filter((p) => p !== GENESIS_PRODUCER));
 		return {
 			enabled: !!this.node.anchors,
 			vdf: this.params.vdf.name,
@@ -1115,6 +1121,7 @@ export class Daemon {
 		this.farmOn = opts.farm;
 
 		if (opts.mesh) await this.joinMesh();
+		await this.bootstrapChainRoot(); // JOIN the heaviest existing network (adopt its checkpoint) if there is one, else SEED the deterministic genesis
 
 		if (opts.publishOracle) {
 			this.oraclePublishOpts = opts.publishOracle; // remember so a channel switch re-publishes
@@ -1145,74 +1152,94 @@ export class Daemon {
 	}
 
 	/**
-	 * The LOBBY gate — the channel is a lobby; the chain FORMS ONCE, with a quorum, instead of every
-	 * node minting its own genesis and reconciling forks by longest-chain (which partitioned on any
-	 * churn). A farming node does NOT mint genesis on boot. It joins the channel and WAITS until either:
-	 *   • it has ADOPTED an existing chain (anchorTip != null) — a late/restarting node joins the live
-	 *     network rather than forking a competing chain; or
-	 *   • ≥ minCommittee farmers are present AND this node is the deterministic SEEDER (the lowest
-	 *     node-key among the present farmers) — it mints genesis; every other node waits and adopts that
-	 *     one chain. So exactly one genesis is ever seeded — there are no competing chains to choose.
-	 * A sub-quorum (< minCommittee) node simply waits — no solo chain. This matches the committee's own
-	 * ≥minCommittee requirement and the security the genesis ceremony depends on. (Mesh off → local-only
-	 * dev, farm immediately; for a single-node chain set GAVL_CUSTODY_MIN=1.)
+	 * Root the chain at startup, honoring "follow the heaviest PoST chain": JOIN an existing network if one
+	 * is reachable, else SEED. A MATURE network's peers offer a finalized CHECKPOINT — adopt it (weak
+	 * subjectivity: trust the heaviest chain the network already agreed on) via the node.adoptFloor hook,
+	 * which fires when a quorum-vouched snapshot + its anchor suffix arrive. We give that a grace window but
+	 * don't stall a COLD-START / young network (no checkpoint to offer): once the discovery sweep finishes
+	 * with nothing inbound, fall through to the deterministic genesis. Because every node derives the SAME
+	 * block 0, a young network's peers (same genesis) then sync straight onto it, and a brand-new network is
+	 * seeded race-free. Mesh-off → seed at once. The genesis is just the bootstrap seed for when there's
+	 * nothing to join — it gets pruned away once the chain matures into checkpoints. Tunable: GAVL_BOOTSTRAP_ADOPT_MS.
+	 */
+	private async bootstrapChainRoot(): Promise<void> {
+		const anchors = this.node.anchors;
+		if (!anchors || anchors.tip()) return; // already rooted (e.g. a reused chain)
+		if (this.transport) {
+			this.node.resync(); // solicit chains + snapshot offers from peers
+			const graceMs = Number(process.env.GAVL_BOOTSTRAP_ADOPT_MS ?? 8000);
+			const started = Date.now();
+			const deadline = started + graceMs;
+			while (Date.now() < deadline && !anchors.tip()) {
+				// Wait while a checkpoint could still land: one is being pulled (pendingSnapshot), or we're
+				// still in the initial discovery sweep. Otherwise stop early — there's nothing to adopt.
+				const checkpointInflight = this.pendingSnapshot != null;
+				const stillDiscovering = Date.now() - started < 3000;
+				if (!checkpointInflight && !stillDiscovering) break;
+				await new Promise((r) => setTimeout(r, 400));
+			}
+			if (anchors.tip()) {
+				console.log(`  consensus: adopted a checkpoint (height ${anchors.tip()!.height}) — joined the existing heaviest network`);
+				return;
+			}
+		}
+		this.installGenesisRoot(); // nothing to join → seed the deterministic genesis
+	}
+
+	/**
+	 * Install the hardcoded genesis as block 0 (consensus/genesis.ts). Every node derives the SAME anchor
+	 * from the network + base difficulty and installs it as the locked root — no seeder election, no
+	 * minting, no race. Idempotent and only acts on a fresh chain: a node that already adopted a checkpoint
+	 * floor or synced a tip keeps it. Called by bootstrapChainRoot only when there is no network to join, so
+	 * the chain always has its root before a height-1 anchor (local or gossiped) needs to link to it.
+	 */
+	private installGenesisRoot(): void {
+		const anchors = this.node.anchors;
+		if (!anchors || anchors.tip()) return; // already rooted (checkpoint-adopt or a prior install) — leave it
+		const difficulty = this.schedule?.base ?? this.params.difficulty; // genesis difficulty = schedule base
+		anchors.installGenesis(genesisAnchor({ network: this.network, difficulty, appRoot: this.emptyAppRoot() }));
+	}
+
+	/**
+	 * The LOBBY — start the farmers TOGETHER. With the hardcoded genesis already installed (every node
+	 * shares block 0), there is no seeder to elect and no genesis to race — the old failover is gone. The
+	 * lobby now serves one purpose: wait for a live quorum before minting height 1, so the farmers begin
+	 * from the same root at roughly the same time and interleave from the start, instead of one node
+	 * sprinting ahead alone and building a head-start branch the late joiners must reorg onto. A flaky mesh
+	 * must NOT wedge us, though, so we farm anyway after a grace — solo-start still converges: the shared
+	 * genesis means a late peer's anchors link to OUR chain, and fork-choice + bootstrap pacing settle on
+	 * one heaviest line everyone adopts. Roster is the LIVE peer set (liveQuorumAddrs: peers we've actually
+	 * received a frame from, never cached announces for offline ghosts). Mesh-off or need≤1 → farm at once
+	 * (local dev / single-node chain via GAVL_CUSTODY_MIN=1). Grace tunable via GAVL_LOBBY_GRACE_MS.
 	 */
 	private async lobbyThenFarm(): Promise<void> {
 		const need = this.custodyOpts.minCommittee ?? 3;
-		if (this.transport) {
-			const sk = (k: string) => (k.length > 9 ? k.slice(0, 8) + "…" : k);
-			// Seeder FAILOVER. Genesis is normally minted by the lowest node-key, but a fixed single seeder
-			// WEDGES the whole network if that node is dead, can't produce, or is itself sub-quorum (it
-			// discovered fewer peers than we did — a partial/split mesh, exactly what stalled us before). So:
-			// each node knows its RANK in the sorted roster; rank 0 seeds immediately at quorum, and rank N
-			// takes over after N×grace only if NO chain has appeared. This stays fork-safe — the `!anchorTip()`
-			// guard makes everyone adopt-on-sight the instant any genesis lands (halting escalation), produceOne
-			// re-checks the tip at mint time (a late chain is extended, never double-seeded), and a true genesis
-			// race self-heals via the chain's deterministic id-tiebreak (chain.ts `heavier()`). Roster is the
-			// LIVE peer set (liveQuorumAddrs: peers we've actually received a frame from, not just active links
-			// nor mere announces) — broad enough that a partial mesh still elects a seeder, but it excludes
-			// GHOSTS: a shared hub replays cached announces for offline nodes, and counting those let a lone
-			// node reach quorum and seed a private chain nobody converged with. A higher-rank node that DOES
-			// see quorum can still rescue a lower-rank seeder that doesn't. Grace tunable via GAVL_SEEDER_GRACE_MS.
-			const graceMs = Number(process.env.GAVL_SEEDER_GRACE_MS ?? 90_000); // per-rank takeover window
+		if (this.transport && need > 1) {
+			const graceMs = Number(process.env.GAVL_LOBBY_GRACE_MS ?? 120_000); // farm-anyway fallback if quorum never forms
+			const startedAt = Date.now();
 			let lastLobby = "";
-			let rosterFp = "";
-			let stableSince = Date.now();
-			let quorumSince = 0; // when a STABLE quorum was first reached — origin of the failover clock
-			while (this.farming && !this.node.anchorTip()) {
-				const myKey = this.transport.nodeKeyHex;
-				const roster = [myKey, ...this.transport.liveQuorumAddrs()].sort();
-				const t = Date.now();
-				const fp = roster.join(",");
-				if (fp !== rosterFp) {
-					rosterFp = fp;
-					stableSince = t;
-				} // roster moved → restart the stability clock
-				const stable = t - stableSince >= 3_000; // unchanged for 3s, so nobody seeds mid-discovery
-				const atQuorum = roster.length >= need;
-				if (atQuorum && stable) {
-					if (quorumSince === 0) quorumSince = t;
-				} else {
-					quorumSince = 0; // lost quorum or still settling → reset the failover clock
+			while (this.farming) {
+				const roster = [this.transport.nodeKeyHex, ...this.transport.liveQuorumAddrs()];
+				const waited = Date.now() - startedAt;
+				if (roster.length >= need) {
+					console.log(`  consensus: live quorum of ${need} reached — starting farmers together`);
+					break; // quorum present → all start from the shared genesis ~together
 				}
-				const myRank = roster.indexOf(myKey);
-				if (quorumSince > 0 && t - quorumSince >= myRank * graceMs) break; // my window elapsed → I seed
-				const status = !atQuorum
-					? `lobby: ${roster.length}/${need} farmers known${roster[0] === myKey ? " (I'd seed)" : ""} — waiting for ${need - roster.length} more`
-					: quorumSince === 0
-						? `lobby: ${roster.length}/${need} — quorum forming, roster settling`
-						: `lobby: ${roster.length}/${need} — quorum; seeder ${sk(roster[0])}` +
-							(myRank === 0 ? ` is me — minting genesis` : `; I'm rank ${myRank}, take over in ~${Math.max(0, Math.ceil((myRank * graceMs - (t - quorumSince)) / 1000))}s if no chain`);
+				if (waited >= graceMs) {
+					console.log(`  consensus: no quorum after ${Math.round(graceMs / 1000)}s — farming alone; peers converge onto the shared genesis when they join`);
+					break; // grace elapsed → farm anyway; shared genesis still converges via fork-choice
+				}
+				const status = `lobby: ${roster.length}/${need} live farmers — waiting to start together (or alone in ~${Math.max(0, Math.ceil((graceMs - waited) / 1000))}s)`;
 				if (status !== lastLobby) {
 					console.log(`  ${status}`);
 					lastLobby = status;
 				}
-				await new Promise((r) => setTimeout(r, 1000)); // else wait — adopt the seeder's/existing chain when it appears
+				await new Promise((r) => setTimeout(r, 1000));
 			}
 		}
 		if (!this.farming) return;
-		const adopted = this.node.anchorTip();
-		console.log(adopted ? `  consensus: joined the channel's chain (height ${adopted.height})` : `  consensus: seeding the chain — quorum of ${need} reached, this node is the seeder`);
+		const tip = this.node.anchorTip();
+		console.log(`  consensus: farming from block ${tip?.height ?? 0} on hardcoded genesis ${tip ? tip.id.slice(0, 8) + "…" : "?"}`);
 		// Adaptive: farm hard while there are unfinalized writes to bury, then drop to a slow heartbeat
 		// when idle — work tracks activity. busyPaceMs keeps the event loop (HTTP, gossip) responsive.
 		void this.producer!.runAdaptive({

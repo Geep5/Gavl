@@ -26,6 +26,7 @@
 
 import type { Member } from "./sampling.ts";
 import { sampleCommittee } from "./sampling.ts";
+import { GENESIS_PRODUCER } from "../consensus/genesis.ts";
 
 /** The minimum an epoch derivation needs from an anchor (Anchor satisfies this). */
 export interface AnchorView {
@@ -104,6 +105,7 @@ function rawEligible(finalized: AnchorView[], epoch: number, opts: EpochOpts): M
 	const produced = new Map<string, bigint>();
 	for (const a of finalized) {
 		if (a.height >= boundary || a.height < lo) continue;
+		if (a.producer === GENESIS_PRODUCER) continue; // the hardcoded-genesis sentinel is not a real farmer
 		produced.set(a.producer, (produced.get(a.producer) ?? 0n) + 1n);
 	}
 	const minBond = opts.bonds ? (opts.minBond ?? 0n) : 0n;

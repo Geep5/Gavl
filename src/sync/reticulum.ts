@@ -141,20 +141,21 @@ export class ReticulumTransport {
 
 	/** Every Gavl peer address we KNOW on this network, not just the ones we're actively gossiping with:
 	 *  active links + the discovered-peer reservoir + the addresses behind verified producer↔address
-	 *  bindings. The lobby elects the genesis seeder off this (not `connectedPeerKeys`) so a node behind a
-	 *  bounded or partial mesh elects over the fuller roster it actually knows about — a peer it has
-	 *  discovered but isn't directly wired to still counts toward quorum and toward the seeder ranking. */
+	 *  bindings. The fuller roster a node behind a bounded or partial mesh actually knows about (vs
+	 *  `connectedPeerKeys`) — used to re-dial and to size the known set; live quorum decisions use
+	 *  `liveQuorumAddrs`, which is the subset we've received an actual frame from. */
 	knownPeerAddrs(): string[] {
 		return [...new Set([...this.active.keys(), ...this.pool, ...this.producerToAddress.values()])];
 	}
 
 	/** Peers we have LIVE two-way evidence for: a gossip frame has actually arrived FROM them within the
-	 *  freshness window (default 3 min; `GAVL_LIVE_PEER_MS`). This is what the genesis lobby counts toward
-	 *  quorum — NOT `knownPeerAddrs`, which includes mere announces. A shared hub replays cached announces
-	 *  for OFFLINE nodes (old runs), so a lone node could "know" ≥quorum addresses and seed a private chain
-	 *  that no one converges with. Requiring a received frame excludes those ghosts (an offline peer never
-	 *  sends one) while still counting any real peer the instant it completes its hello handshake — so a
-	 *  genuine partial mesh still elects a seeder. Pinned committee members count (intentional direct links). */
+	 *  freshness window (default 3 min; `GAVL_LIVE_PEER_MS`). This is what the lobby counts toward its
+	 *  start-together quorum — NOT `knownPeerAddrs`, which includes mere announces. A shared hub replays
+	 *  cached announces for OFFLINE nodes (old runs), so a lone node could "know" ≥quorum addresses and
+	 *  start farming as if peers were present, racing ahead alone. Requiring a received frame excludes those
+	 *  ghosts (an offline peer never sends one) while still counting any real peer the instant it completes
+	 *  its hello handshake — so a genuine partial mesh still reaches quorum. Pinned committee members count
+	 *  (intentional direct links). */
 	liveQuorumAddrs(): string[] {
 		const ms = Number(process.env.GAVL_LIVE_PEER_MS ?? 180_000);
 		const now = Date.now();

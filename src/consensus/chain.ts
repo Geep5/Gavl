@@ -74,6 +74,9 @@ export class AnchorChain {
 	 *  reconstruction still works after the ancestry below it is dropped. null = unpruned. */
 	private floorId: string | null = null;
 	private floorHeads: Heads = {};
+	/** The hardcoded genesis's id once installed. Any OTHER prev=null anchor is then a fake genesis and
+	 *  rejected — so a peer can't push a competing block 0 (the whole point of a fixed genesis). */
+	private genesisId: string | null = null;
 
 	constructor(params: ChainParams, verifier: SpaceVerifier, opts: AnchorChainOptions = {}) {
 		this.params = params;
@@ -117,6 +120,10 @@ export class AnchorChain {
 
 	async add(anchor: Anchor): Promise<AddResult> {
 		if (this.anchors.has(anchor.id)) return { ok: true };
+		// Genesis is hardcoded + installed, never gossiped in. The real genesis hits the dedup above; any
+		// OTHER prev=null anchor is a competing block 0 → reject, so no peer can fork the chain at genesis.
+		if (anchor.prev === null && this.genesisId !== null && anchor.id !== this.genesisId)
+			return { ok: false, reason: "wrong genesis — block 0 is hardcoded" };
 		const prev = anchor.prev ? this.anchors.get(anchor.prev) ?? null : null;
 		if (anchor.prev && !prev) return { ok: false, reason: "unknown prev anchor" };
 
@@ -265,6 +272,26 @@ export class AnchorChain {
 		this.tipId = floor.id;
 		this.tipHeads = { ...floorHeads };
 		this.lockedId = floor.id; // the adopted checkpoint is final by assumption
+	}
+
+	/**
+	 * Install the hardcoded genesis as the chain's root (block 0). Unlike adopt() — a weak-subjectivity
+	 * checkpoint FLOOR with verified ancestry above it that the window-vs-epoch guard must bound — genesis
+	 * IS the base: height 0, nothing below it, so a difficulty recompute above it draws a window that
+	 * bottoms at genesis (present), and that guard doesn't apply. Every node installs the byte-identical
+	 * hardcoded genesis (see genesis.ts) instead of racing a seeder election, so all height-1+ anchors
+	 * reference the same block 0 and the network can only ever be on one chain. Genesis is locked final
+	 * and is NOT a prune floor (it's the natural base — head reconstruction walks down to it normally).
+	 */
+	installGenesis(genesis: Anchor, heads: Heads = {}): void {
+		if (this.tipId !== null || this.anchors.size > 0) throw new Error("installGenesis: chain is not empty");
+		if (genesis.height !== 0 || genesis.prev !== null) throw new Error("installGenesis: genesis must be height 0 with no prev");
+		if (rootOfHeads(heads) !== genesis.stateRoot) throw new Error("installGenesis: heads do not match genesis.stateRoot");
+		this.anchors.set(genesis.id, genesis);
+		this.tipId = genesis.id;
+		this.tipHeads = { ...heads };
+		this.lockedId = genesis.id; // genesis is final by definition
+		this.genesisId = genesis.id; // any OTHER prev=null anchor is now a rejected fake (see add)
 	}
 
 	/** Anchors currently held (for tests / diagnostics). */
