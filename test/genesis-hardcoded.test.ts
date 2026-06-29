@@ -19,6 +19,7 @@ import { generateKeyPair } from "../src/det/ed25519.ts";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { AnchorChain } from "../src/consensus/chain.ts";
+import { MemoryNetwork } from "../src/sync/memory.ts";
 import { Producer } from "../src/consensus/producer.ts";
 import { genesisAnchor, GENESIS_PRODUCER } from "../src/consensus/genesis.ts";
 import { committeeForEpoch } from "../src/custody/epoch.ts";
@@ -113,4 +114,52 @@ test("the genesis sentinel producer is excluded from committee selection", () =>
 	const ids = ec!.members.map((m) => m.id);
 	assert.ok(!ids.includes(GENESIS_PRODUCER), "the genesis sentinel is NOT an eligible member");
 	assert.deepEqual(new Set(ids), new Set([realA, realB]), "only the real anchor producers are eligible");
+});
+
+/** Run `fn` with console.warn silenced — the mismatch path logs loudly by design; tests assert STATE. */
+async function quiet(fn: () => Promise<unknown>): Promise<void> {
+	const orig = console.warn;
+	console.warn = () => {};
+	try {
+		await fn();
+	} finally {
+		console.warn = orig;
+	}
+}
+
+test("a peer on a DIFFERENT genesis triggers a mismatch flag (the silent-split alarm)", async () => {
+	// The case that cost an hour live: same proof mode, bound peer, but a different block 0 → its anchors
+	// are silently rejected as `unknown prev`. The hello handshake now makes it loud + diagnosable.
+	const A = consensusNode();
+	const B = consensusNode();
+	A.genesisId = genesisAnchor({ ...GOPTS, network: "net-A" }).id;
+	B.genesisId = genesisAnchor({ ...GOPTS, network: "net-B" }).id; // a different block 0
+	const net = new MemoryNetwork();
+	net.link(A, B);
+	await quiet(() => net.idle());
+	assert.ok(A.warnedGenesis.has(B.genesisId!), "A flagged B's foreign genesis");
+	assert.ok(B.warnedGenesis.has(A.genesisId!), "B flagged A's foreign genesis");
+});
+
+test("matching genesises stay quiet — no false alarm", async () => {
+	const g = genesisAnchor(GOPTS).id;
+	const A = consensusNode();
+	const B = consensusNode();
+	A.genesisId = g;
+	B.genesisId = g;
+	const net = new MemoryNetwork();
+	net.link(A, B);
+	await net.idle();
+	assert.equal(A.warnedGenesis.size, 0, "no mismatch flagged when block 0 matches");
+	assert.equal(B.warnedGenesis.size, 0);
+});
+
+test("a peer that advertises NO genesis (old code) is flagged", async () => {
+	const A = consensusNode();
+	const B = consensusNode(); // B.genesisId stays undefined — an older node whose hello carries no genesis
+	A.genesisId = genesisAnchor(GOPTS).id;
+	const net = new MemoryNetwork();
+	net.link(A, B);
+	await quiet(() => net.idle());
+	assert.ok(A.warnedGenesis.has("∅"), "A flags B's missing genesis as a likely old-code split");
 });

@@ -169,6 +169,13 @@ export interface ConsensusStatus {
 	peers: number;
 	farming: boolean;
 	tip: { height: number; weight: string; id: string } | null;
+	/** This node's network GENESIS id (deterministic block 0). The cross-machine identity check: two nodes
+	 *  on the same network MUST show the same value; a different one means a different chain. Null pre-start. */
+	genesis: string | null;
+	/** Foreign genesises observed on peers — a peer on old code / a different network minted a different
+	 *  block 0, so its anchors are rejected. Non-empty = an active split (surfaced so it isn't silent).
+	 *  "∅" means a peer advertised no genesis at all (older code). */
+	foreignGenesisSeen?: string[];
 	finalizedHeight: number | null;
 	/** Distinct ANCHOR PRODUCERS in the recent chain — the committee is sampled from these, so this is
 	 *  the number that must reach minCommittee for genesis (NOT the op-writer count). */
@@ -1064,6 +1071,8 @@ export class Daemon {
 			peers: this.node.peerCount,
 			farming: this.farming,
 			tip: tip ? { height: tip.height, weight: tip.weight, id: tip.id } : null,
+			genesis: this.node.genesisId ?? null,
+			foreignGenesisSeen: this.node.warnedGenesis.size ? [...this.node.warnedGenesis] : undefined,
 			finalizedHeight: finalized ? finalized.height : null,
 			producers: producerSet.size,
 			iProduce: producerSet.has(myId),
@@ -1119,6 +1128,7 @@ export class Daemon {
 		if (opts.network) this.network = opts.network;
 		this.meshOn = opts.mesh;
 		this.farmOn = opts.farm;
+		this.node.genesisId = this.genesisFor().id; // advertise our network's block 0 in hello, BEFORE joinMesh greets peers
 
 		if (opts.mesh) await this.joinMesh();
 		await this.bootstrapChainRoot(); // JOIN the heaviest existing network (adopt its checkpoint) if there is one, else SEED the deterministic genesis
@@ -1186,6 +1196,15 @@ export class Daemon {
 		this.installGenesisRoot(); // nothing to join → seed the deterministic genesis
 	}
 
+	/** The DETERMINISTIC genesis for this node's network — a pure function of the network label + base
+	 *  difficulty (consensus/genesis.ts). Identical on every node on the same network whether it seeds this
+	 *  as its root or adopts a later checkpoint, so its id is the stable value advertised for genesis-mismatch
+	 *  detection (a peer that minted a different block 0 on the same label is on old code). */
+	private genesisFor(): Anchor {
+		const difficulty = this.schedule?.base ?? this.params.difficulty; // genesis difficulty = schedule base
+		return genesisAnchor({ network: this.network, difficulty, appRoot: this.emptyAppRoot() });
+	}
+
 	/**
 	 * Install the hardcoded genesis as block 0 (consensus/genesis.ts). Every node derives the SAME anchor
 	 * from the network + base difficulty and installs it as the locked root — no seeder election, no
@@ -1196,8 +1215,7 @@ export class Daemon {
 	private installGenesisRoot(): void {
 		const anchors = this.node.anchors;
 		if (!anchors || anchors.tip()) return; // already rooted (checkpoint-adopt or a prior install) — leave it
-		const difficulty = this.schedule?.base ?? this.params.difficulty; // genesis difficulty = schedule base
-		anchors.installGenesis(genesisAnchor({ network: this.network, difficulty, appRoot: this.emptyAppRoot() }));
+		anchors.installGenesis(this.genesisFor());
 	}
 
 	/**

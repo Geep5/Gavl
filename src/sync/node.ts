@@ -52,6 +52,14 @@ export class GavlNode {
 	mode?: string;
 	/** Distinct peer proof-modes already warned about, so a mismatch logs once — not on every hello. */
 	private readonly warnedModes = new Set<string>();
+	/** This node's network GENESIS id (the DETERMINISTIC block 0 for its network label), advertised in
+	 *  hello so peers can detect a different-block-0 split. A node on old code that MINTED a genesis
+	 *  instead of deriving the deterministic one looks identical (same label, same proof mode) yet its
+	 *  anchors are silently rejected as `unknown prev` — this makes that split loud. Set by the daemon. */
+	genesisId?: string;
+	/** Distinct foreign genesises already warned about (plus "∅" for a peer that advertised none), so a
+	 *  mismatch logs once. Public so /api/state can surface the split instead of leaving it silent. */
+	readonly warnedGenesis = new Set<string>();
 	/** Ingest a gossiped matched-market intent; returns true if it was NEW (→ re-gossip). */
 	onIntent?: (offer: Offer) => boolean;
 	/** This node's resting offer book, sent to a peer on connect so it sees the tape. */
@@ -109,7 +117,7 @@ export class GavlNode {
 			this.checkReplication(); // a holder leaving may drop us below target
 		});
 		conn.onMessage((m) => this.handle(conn, m));
-		conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode });
+		conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode, genesis: this.genesisId });
 		const tip = this.anchorTipMsg();
 		if (tip) conn.send(tip);
 		const offers = this.intentsToShare?.();
@@ -124,7 +132,7 @@ export class GavlNode {
 	/** Re-broadcast my write-head fingerprint so peers serve me whatever I now lack (used after
 	 *  seeding a checkpoint: my heads jumped, and I want only the post-checkpoint writes). */
 	advertise(): void {
-		this.broadcast({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode });
+		this.broadcast({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode, genesis: this.genesisId });
 	}
 
 	/** Actively re-pull from peers. Anchor-tips are normally pushed (on connect, on a new anchor), so a
@@ -180,11 +188,21 @@ export class GavlNode {
 					this.warnedModes.add(m.mode);
 					console.warn(`  ⚠ PROOF-MODE MISMATCH with a peer — you: ${this.mode}, them: ${m.mode}. Incompatible proofs: you can't share a chain, so you'll sit alone at genesis. All nodes must run the SAME mode — real PoST: 'npm run dev' · stand-ins: 'npm run dev:hash'.`);
 				}
+				// DIAGNOSTIC (3.5): the SAME network label can still hide a different block 0 — a peer on old
+				// code MINTED its own genesis instead of deriving the deterministic one, so its anchors are
+				// silently rejected as `unknown prev` and the net never converges. Make that split loud too.
+				if (this.genesisId && m.genesis && m.genesis !== this.genesisId && !this.warnedGenesis.has(m.genesis)) {
+					this.warnedGenesis.add(m.genesis);
+					console.warn(`  ⚠ GENESIS MISMATCH with a peer — you: ${this.genesisId.slice(0, 12)}…, them: ${m.genesis.slice(0, 12)}…. Different block 0: your chains can't merge and their anchors are rejected, so you stay split. Same network label almost always means they're on OLD code — update them to the deterministic-genesis build.`);
+				} else if (this.genesisId && m.genesis === undefined && !this.warnedGenesis.has("∅")) {
+					this.warnedGenesis.add("∅");
+					console.warn(`  ⚠ a peer advertised NO genesis — almost certainly older code (pre-deterministic-genesis). On the same network its anchors are silently rejected as 'unknown prev'; update it so it derives the same block 0 and converges.`);
+				}
 				const want = this.diffWant(m.heads);
 				if (Object.keys(want).length > 0) conn.send({ t: "want", from: want });
 				// If the sender is BEHIND me (I hold writes it lacks), reply with my hello so it
 				// can pull — e.g. after it seeds a checkpoint and re-advertises its new heads.
-				else if (this.aheadOf(m.heads)) conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode });
+				else if (this.aheadOf(m.heads)) conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode, genesis: this.genesisId });
 				return;
 			}
 			case "want": {
@@ -213,7 +231,7 @@ export class GavlNode {
 					this.onApplied?.(learned);
 					this.broadcastExcept(conn, { t: "announce", writes: learned });
 				}
-				if (changed) conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode });
+				if (changed) conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode, genesis: this.genesisId });
 				return;
 			}
 			case "snapshot-offer": {

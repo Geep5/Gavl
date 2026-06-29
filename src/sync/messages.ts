@@ -18,8 +18,10 @@ export type SyncMessage =
 	// ── write sync ───────────────────────────────────────────────
 	/** Advertise my current state: root fingerprint + per-writer heads. `mode` is my PoST proof mode
 	 *  (`<vdf>/<space>`) — peers compare it to detect an incompatible-proof mismatch (a real-PoST node
-	 *  among stand-in peers, or vice versa, can't share a chain). */
-	| { t: "hello"; root: string; heads: Heads; mode?: string }
+	 *  among stand-in peers, or vice versa, can't share a chain). `genesis` is my network's DETERMINISTIC
+	 *  block-0 id — peers compare it to detect a different-genesis split (a peer on old code that minted
+	 *  its own block 0; same label + same mode, but anchors silently rejected). */
+	| { t: "hello"; root: string; heads: Heads; mode?: string; genesis?: string }
 	/** Ask a peer for writer→fromSeq (inclusive) that I'm missing. */
 	| { t: "want"; from: Record<string, number> }
 	/** Serve requested writes. */
