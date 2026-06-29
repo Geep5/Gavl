@@ -1169,9 +1169,11 @@ export class Daemon {
 			// guard makes everyone adopt-on-sight the instant any genesis lands (halting escalation), produceOne
 			// re-checks the tip at mint time (a late chain is extended, never double-seeded), and a true genesis
 			// race self-heals via the chain's deterministic id-tiebreak (chain.ts `heavier()`). Roster is the
-			// full known set (knownPeerAddrs: discovered + bound peers), not just active links, so the election
-			// runs over the fuller view each node actually has — and a higher-rank node that DOES see quorum can
-			// rescue a lower-rank seeder that doesn't. Grace is tunable via GAVL_SEEDER_GRACE_MS (ms).
+			// LIVE peer set (liveQuorumAddrs: peers we've actually received a frame from, not just active links
+			// nor mere announces) — broad enough that a partial mesh still elects a seeder, but it excludes
+			// GHOSTS: a shared hub replays cached announces for offline nodes, and counting those let a lone
+			// node reach quorum and seed a private chain nobody converged with. A higher-rank node that DOES
+			// see quorum can still rescue a lower-rank seeder that doesn't. Grace tunable via GAVL_SEEDER_GRACE_MS.
 			const graceMs = Number(process.env.GAVL_SEEDER_GRACE_MS ?? 90_000); // per-rank takeover window
 			let lastLobby = "";
 			let rosterFp = "";
@@ -1179,7 +1181,7 @@ export class Daemon {
 			let quorumSince = 0; // when a STABLE quorum was first reached — origin of the failover clock
 			while (this.farming && !this.node.anchorTip()) {
 				const myKey = this.transport.nodeKeyHex;
-				const roster = [myKey, ...this.transport.knownPeerAddrs()].sort();
+				const roster = [myKey, ...this.transport.liveQuorumAddrs()].sort();
 				const t = Date.now();
 				const fp = roster.join(",");
 				if (fp !== rosterFp) {

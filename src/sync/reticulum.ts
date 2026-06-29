@@ -92,6 +92,7 @@ export class ReticulumTransport {
 	private readonly pool = new Set<string>();    // discovered peer addresses — the activation candidates
 	private readonly pinned = new Set<string>();  // dial-pinned peers: always active, never evicted
 	private readonly lastSeen = new Map<string, number>(); // peer → last activity (ms) for LRU eviction
+	private readonly lastFrame = new Map<string, number>(); // peer → last time a gossip FRAME arrived FROM it (liveness proof, not a mere announce)
 	private readonly maxPeers: number;            // hard cap on active connections (excl. pinned)
 	private readonly target: number;              // outbound fill target (reserves headroom for inbound)
 	private readonly poolCap: number;             // bounded candidate reservoir, so even "known peers" is O(1)
@@ -136,6 +137,22 @@ export class ReticulumTransport {
 	 *  discovered but isn't directly wired to still counts toward quorum and toward the seeder ranking. */
 	knownPeerAddrs(): string[] {
 		return [...new Set([...this.active.keys(), ...this.pool, ...this.producerToAddress.values()])];
+	}
+
+	/** Peers we have LIVE two-way evidence for: a gossip frame has actually arrived FROM them within the
+	 *  freshness window (default 3 min; `GAVL_LIVE_PEER_MS`). This is what the genesis lobby counts toward
+	 *  quorum — NOT `knownPeerAddrs`, which includes mere announces. A shared hub replays cached announces
+	 *  for OFFLINE nodes (old runs), so a lone node could "know" ≥quorum addresses and seed a private chain
+	 *  that no one converges with. Requiring a received frame excludes those ghosts (an offline peer never
+	 *  sends one) while still counting any real peer the instant it completes its hello handshake — so a
+	 *  genuine partial mesh still elects a seeder. Pinned committee members count (intentional direct links). */
+	liveQuorumAddrs(): string[] {
+		const ms = Number(process.env.GAVL_LIVE_PEER_MS ?? 180_000);
+		const now = Date.now();
+		const live = new Set<string>();
+		for (const [peer, t] of this.lastFrame) if (now - t <= ms) live.add(peer);
+		for (const addr of this.committeePins) live.add(addr);
+		return [...live];
 	}
 
 	/** Resolve a consensus-roster member's transport address from its producer key (hex), for direct
@@ -369,7 +386,9 @@ export class ReticulumTransport {
 	 *  activate even past the outbound target, evicting an idle peer to stay under the hard cap. */
 	private onPeerMessage(peerHex: string, frame: SyncMessage): void {
 		this.addToPool(peerHex);
-		this.lastSeen.set(peerHex, Date.now());
+		const now = Date.now();
+		this.lastSeen.set(peerHex, now);
+		this.lastFrame.set(peerHex, now); // a real frame arrived → this peer is LIVE and reachable (we hold its identity)
 		const c = this.active.get(peerHex) ?? this.activateWithRoom(peerHex);
 		c.deliver(frame);
 	}
@@ -378,6 +397,7 @@ export class ReticulumTransport {
 		this.deactivate(peerHex);
 		this.pool.delete(peerHex);
 		this.lastSeen.delete(peerHex);
+		this.lastFrame.delete(peerHex);
 		this.fillOutbound(); // backfill a replacement so our degree stays up
 	}
 
