@@ -107,6 +107,7 @@ export class ReticulumTransport {
 	private readonly producerToAddress = new Map<string, string>();
 	private readyResolve?: (v: void) => void;
 	private keepaliveTimer?: ReturnType<typeof setInterval>;
+	private announceIntervalSec = Number(process.env.GAVL_ANNOUNCE_INTERVAL) || 300; // gossip cadence, live-tunable from the UI
 
 	constructor(node: GavlNode, opts: ReticulumOptions) {
 		this.node = node;
@@ -122,8 +123,16 @@ export class ReticulumTransport {
 
 	/** Mesh diagnostics for the UI: the bounded-mesh cap, how many producer↔address bindings we've
 	 *  resolved, and how many committee members we're directly linked to. */
-	diagnostics(): { maxPeers: number; bindings: number; committeeLinked: number } {
-		return { maxPeers: this.maxPeers, bindings: this.producerToAddress.size, committeeLinked: this.committeePins.size };
+	diagnostics(): { maxPeers: number; bindings: number; committeeLinked: number; gossipIntervalSec: number } {
+		return { maxPeers: this.maxPeers, bindings: this.producerToAddress.size, committeeLinked: this.committeePins.size, gossipIntervalSec: this.announceIntervalSec };
+	}
+
+	/** Live-tune the re-announce (gossip) cadence in seconds — driven from the UI. Clamped to [1, 3600];
+	 *  the sidecar adopts it immediately and re-announces, so a change is observable right away. */
+	setAnnounceInterval(seconds: number): void {
+		const s = Math.max(1, Math.min(3600, Math.floor(seconds)));
+		this.announceIntervalSec = s;
+		this.ctrl({ op: "set_announce_interval", seconds: s });
 	}
 
 	connectedPeerKeys(): string[] {

@@ -186,6 +186,16 @@
 	const maxPeers = $derived(c?.maxPeers ?? null); // bounded-mesh cap (Reticulum)
 	const bindings = $derived(c?.bindings ?? 0); // producer↔address bindings resolved
 	const committeeLinked = $derived(c?.committeeLinked ?? 0); // committee members directly linked
+
+	// ── gossip cadence (live-tunable re-announce interval, seconds) ──
+	const gossipInterval = $derived(c?.gossipIntervalSec ?? null);
+	let gossipEdit = $state(0);
+	$effect(() => { if (gossipInterval != null && gossipEdit === 0) gossipEdit = gossipInterval; }); // seed once from the daemon
+	async function applyGossip(secs) {
+		const v = Math.max(1, Math.min(3600, Math.floor(Number(secs ?? gossipEdit) || 0)));
+		gossipEdit = v;
+		await act(() => api.setGossipInterval(v));
+	}
 	const nodeAddr = $derived(c?.nodeKey ?? ""); // our LXMF address under Reticulum
 
 	// ── live network activity (newest first; streamed from /api/events) ──
@@ -404,6 +414,18 @@
 				<!-- live activity -->
 				<div class="card">
 					<div class="card-h">ACTIVITY <span class="ch-d">LIVE · {store.netEvents.length}</span></div>
+					{#if isReticulum}
+						<div class="gossip-ctl">
+							<span class="gc-lbl">GOSSIP EVERY</span>
+							<input class="gc-in" type="number" min="1" max="3600" bind:value={gossipEdit} onchange={() => applyGossip()} aria-label="gossip interval in seconds" />
+							<span class="gc-lbl">s</span>
+							<span class="gc-presets">
+								<button class="gc-p" class:on={gossipInterval === 20} onclick={() => applyGossip(20)}>20s</button>
+								<button class="gc-p" class:on={gossipInterval === 60} onclick={() => applyGossip(60)}>1m</button>
+								<button class="gc-p" class:on={gossipInterval === 300} onclick={() => applyGossip(300)}>5m</button>
+							</span>
+						</div>
+					{/if}
 					<div class="actlog">
 						{#if recentEvents.length === 0}
 							<div class="act-empty">waiting for network activity… run another client to see peers, bindings and gossip appear here.</div>
@@ -602,6 +624,12 @@
 	/* live network activity log (folded into the NETWORK section) */
 	.actlog { background: var(--bar); color: var(--bar-text); border: 1.5px solid var(--ink); max-height: 13rem; overflow-y: auto; padding: 0.35rem 0; font-size: 0.6rem; line-height: 1.55; margin-top: 0.5rem; }
 	.act-empty { color: var(--bar-dim); padding: 0.5rem 0.6rem; }
+	.gossip-ctl { display: flex; align-items: center; gap: 0.4rem; padding: 0.35rem 0.6rem 0.55rem; flex-wrap: wrap; }
+	.gc-lbl { font-size: 0.58rem; letter-spacing: 0.06em; color: var(--bar-dim); text-transform: uppercase; font-weight: 700; }
+	.gc-in { width: 3.4rem; background: var(--paper-2); border: 1.5px solid var(--ink); color: var(--ink); font: inherit; font-size: 0.8rem; font-weight: 600; padding: 0.2rem 0.35rem; text-align: right; }
+	.gc-presets { display: flex; gap: 0.25rem; margin-left: auto; }
+	.gc-p { font-size: 0.56rem; letter-spacing: 0.04em; font-weight: 700; padding: 0.2rem 0.45rem; border: 1.5px solid var(--ink); background: transparent; color: var(--ink); cursor: pointer; }
+	.gc-p.on { background: var(--ink); color: var(--paper); }
 	.act-row { display: grid; grid-template-columns: 3.4rem 4.6rem 1fr; gap: 0.4rem; padding: 0.05rem 0.6rem; }
 	.act-ts { color: var(--bar-dim); font-variant-numeric: tabular-nums; }
 	.act-kind { text-transform: uppercase; letter-spacing: 0.03em; }

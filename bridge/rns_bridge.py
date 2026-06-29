@@ -173,6 +173,8 @@ class Bridge:
         self.binding = None              # our signed producer↔address binding (announce app_data)
         self.pushed = set()              # peers we've handed our binding to over the reliable channel
         self.lock = threading.Lock()
+        self.announce_interval = 300     # seconds between steady-state re-announces (live-tunable from the UI)
+        self.announce_wake = threading.Event()  # set → re-announce now and adopt the new interval immediately
 
         ensure_gavl_rns_config(config_dir)  # write the hub-only default if this node has no config yet
         self.reticulum = RNS.Reticulum(config_dir)
@@ -380,6 +382,17 @@ class Bridge:
             self._request_binding_from(obj["peer"])
         elif op == "announce" or op == "join":
             self.announce()
+        elif op == "set_announce_interval":
+            # Live-tunable gossip cadence from the UI. Adopt the new interval and re-announce NOW so the
+            # change is observable immediately (the reannounce loop waits on announce_wake, not a fixed sleep).
+            try:
+                secs = int(obj["seconds"])
+                if secs >= 1:
+                    self.announce_interval = secs
+                    self.announce_wake.set()
+                    self.emit({"ev": "log", "msg": "gossip interval set to %ds" % secs})
+            except Exception:
+                pass
         elif op == "peers":
             self.emit({"ev": "peers", "peers": self.connected_peers()})
         elif op == "committee":
@@ -395,6 +408,7 @@ def serve(args):
     # nodes always meet through the shared hub rather than the LAN.
     config_dir = args.config_dir or os.path.join(args.storage_dir, "rns")
     bridge = Bridge(ctrl, config_dir, args.storage_dir, args.network, args.propagated)
+    bridge.announce_interval = args.announce_interval  # initial cadence (live-tunable via set_announce_interval)
 
     # Re-announce so peers keep discovering us. The steady-state cadence (args.announce_interval, 300s)
     # is fine once the mesh is warm, but on a COLD start it's a trap: a node's first announce often fires
@@ -411,7 +425,10 @@ def serve(args):
             except Exception:
                 pass
         while True:
-            time.sleep(args.announce_interval)
+            # Wait the current interval, but wake early if the UI changed it (set_announce_interval) so a
+            # new cadence applies immediately instead of after the old (possibly 5-min) sleep elapses.
+            bridge.announce_wake.wait(timeout=bridge.announce_interval)
+            bridge.announce_wake.clear()
             try:
                 bridge.announce()
             except Exception:

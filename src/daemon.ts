@@ -1940,6 +1940,12 @@ export class Daemon {
 		return this.knownPeers.list();
 	}
 
+	/** Live-tune how often this node re-announces itself for discovery (the "gossip cadence"), in seconds.
+	 *  No-op if the mesh is off. The current value surfaces in consensus().gossipIntervalSec for the UI. */
+	setGossipInterval(seconds: number): void {
+		this.transport?.setAnnounceInterval(seconds);
+	}
+
 	/**
 	 * Leave the current channel and join `name`. A channel is a name-based network:
 	 * its own mesh, anchor chain, and economy. We

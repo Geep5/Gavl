@@ -390,6 +390,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			daemon.unpinPeer(String(body.key ?? ""));
 			return send(res, 200, { pinned: daemon.pinnedPeers() });
 		}
+		if (path === "/api/gossip-interval") {
+			// Live-tune the re-announce (discovery gossip) cadence in seconds; the sidecar adopts it now.
+			const secs = Number(body.seconds);
+			if (!Number.isFinite(secs) || secs < 1) throw new Error("seconds must be a number ≥ 1");
+			daemon.setGossipInterval(secs);
+			return send(res, 200, { ok: true });
+		}
 		const claimMatch = path.match(/^\/api\/auctions\/([0-9a-f]+)\/claim$/);
 		if (claimMatch) {
 			const won = daemon.active().claimWon(claimMatch[1]);
