@@ -209,6 +209,10 @@
 		await act(() => (dir > 0 ? api.fleetUp() : api.fleetDown()));
 		fleetBusy = false;
 	}
+	// carousel: rotate through the fleet nodes to inspect each one's identity + status
+	let fleetSel = $state(0);
+	const fleetCur = $derived(fleetNodes.length ? fleetNodes[Math.min(fleetSel, fleetNodes.length - 1)] : null);
+	function fleetRotate(d) { const n = fleetNodes.length; if (n) fleetSel = (((fleetSel + d) % n) + n) % n; }
 	const nodeAddr = $derived(c?.nodeKey ?? ""); // our LXMF address under Reticulum
 
 	// ── live network activity (newest first; streamed from /api/events) ──
@@ -424,25 +428,6 @@
 						{/if}
 					</div>
 				</div>
-				<!-- local fleet: spin up/down extra independent farmers on this machine -->
-				{#if isReticulum}
-					<div class="card">
-						<div class="card-h">LOCAL FLEET <span class="ch-d">{fleetCount} extra node{fleetCount === 1 ? "" : "s"}</span></div>
-						<div class="fleet-ctl">
-							<button class="fl-btn" onclick={() => fleetStep(-1)} disabled={fleetBusy || fleetCount === 0} aria-label="remove a node">−</button>
-							<span class="fl-n tnum">{fleetCount}</span>
-							<button class="fl-btn" onclick={() => fleetStep(1)} disabled={fleetBusy || fleetCount >= fleetCap} aria-label="add a node">+</button>
-							<span class="fl-hint">independent farmers on this machine — each gets its own plot (real disk + CPU)</span>
-						</div>
-						{#if fleetNodes.length}
-							<div class="fleet-list">
-								{#each fleetNodes as n (n.name)}
-									<div class="fl-row"><span class="fl-name">{n.name}</span><span class="muted">:{n.port}</span><span class="fl-age">{n.upSec}s</span></div>
-								{/each}
-							</div>
-						{/if}
-					</div>
-				{/if}
 				<!-- live activity -->
 				<div class="card">
 					<div class="card-h">ACTIVITY <span class="ch-d">LIVE · {store.netEvents.length}</span></div>
@@ -539,6 +524,32 @@
 						{/if}
 					</div>
 				</div>
+				<!-- local fleet (bottom): step up/down + rotate through each node's identity -->
+				{#if isReticulum}
+					<div class="card">
+						<div class="card-h">LOCAL FLEET <span class="ch-d">{fleetCount} node{fleetCount === 1 ? "" : "s"}</span></div>
+						{#if fleetCur}
+							<div class="fleet-car">
+								<button class="fl-rot" onclick={() => fleetRotate(-1)} disabled={fleetCount < 2} aria-label="previous node">◀</button>
+								<span class="fl-cur">{fleetCur.name}</span>
+								<button class="fl-rot" onclick={() => fleetRotate(1)} disabled={fleetCount < 2} aria-label="next node">▶</button>
+							</div>
+							<div class="fleet-det">
+								<div class="fl-kv"><span class="k">IDENTITY</span><span class="id-inline">{fleetCur.state?.address ? short(fleetCur.state.address) : "starting…"}{#if fleetCur.state?.address}<button class="cpbtn" title="copy" onclick={copy("fl", fleetCur.state.address)}>{cpLbl("fl")}</button>{/if}</span></div>
+								<div class="fl-kv"><span class="k">API</span><span class="v tnum">localhost:{fleetCur.port}</span></div>
+								<div class="fl-kv"><span class="k">STATUS</span><span class="v">tip {fleetCur.state?.tip ?? "—"} · peers {fleetCur.state?.peers ?? 0} · {fleetCur.state?.producing ? "producing" : fleetCur.state?.farming ? "farming" : "starting…"}</span></div>
+							</div>
+						{:else}
+							<div class="act-empty">no extra nodes — press + to spin one up (its own identity + plot; real disk + CPU).</div>
+						{/if}
+						<div class="fleet-ctl">
+							<button class="fl-btn" onclick={() => fleetStep(-1)} disabled={fleetBusy || fleetCount === 0} aria-label="remove a node">−</button>
+							<span class="fl-n tnum">{fleetCount}</span>
+							<button class="fl-btn" onclick={() => fleetStep(1)} disabled={fleetBusy || fleetCount >= fleetCap} aria-label="add a node">+</button>
+							<span class="fl-hint">independent farmers on this machine — one plot ⇄ one identity</span>
+						</div>
+					</div>
+				{/if}
 			</div>
 		{/if}
 	</section>
@@ -667,10 +678,14 @@
 	.fl-btn:disabled { opacity: 0.3; cursor: default; }
 	.fl-n { min-width: 1.6rem; text-align: center; font-size: 1.1rem; font-weight: 800; }
 	.fl-hint { font-size: 0.56rem; letter-spacing: 0.03em; color: var(--bar-dim); flex: 1 1 8rem; }
-	.fleet-list { padding: 0 0.6rem 0.5rem; display: flex; flex-direction: column; gap: 0.15rem; }
-	.fl-row { display: flex; gap: 0.4rem; font-size: 0.62rem; align-items: baseline; }
-	.fl-name { font-weight: 700; }
-	.fl-age { margin-left: auto; color: var(--bar-dim); }
+	.fleet-car { display: flex; align-items: center; justify-content: center; gap: 0.8rem; padding: 0.45rem 0.6rem 0.2rem; }
+	.fl-rot { background: transparent; border: none; color: var(--ink); font-size: 0.9rem; cursor: pointer; padding: 0.2rem 0.45rem; }
+	.fl-rot:disabled { opacity: 0.25; cursor: default; }
+	.fl-cur { font-family: var(--display); font-weight: 800; font-size: 0.95rem; letter-spacing: 0.02em; min-width: 6rem; text-align: center; }
+	.fleet-det { padding: 0.1rem 0.6rem 0.45rem; display: flex; flex-direction: column; gap: 0.22rem; }
+	.fl-kv { display: flex; justify-content: space-between; align-items: baseline; gap: 0.6rem; font-size: 0.66rem; }
+	.fl-kv .k { color: var(--bar-dim); letter-spacing: 0.05em; }
+	.fl-kv .v { font-weight: 600; }
 	.act-row { display: grid; grid-template-columns: 3.4rem 4.6rem 1fr; gap: 0.4rem; padding: 0.05rem 0.6rem; }
 	.act-ts { color: var(--bar-dim); font-variant-numeric: tabular-nums; }
 	.act-kind { text-transform: uppercase; letter-spacing: 0.03em; }

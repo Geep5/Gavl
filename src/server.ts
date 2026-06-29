@@ -135,7 +135,8 @@ const daemon = new Daemon({
 // real disk + CPU. They're torn down with the supervisor so they never outlive it.
 const FLEET_CAP = Number(process.env.GAVL_FLEET_CAP ?? 6);
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-const fleet: { name: string; port: number; child: ReturnType<typeof spawn>; startedAt: number }[] = [];
+type FleetNodeState = { address: string | null; tip: number | null; peers: number; producing: boolean; farming: boolean };
+const fleet: { name: string; port: number; child: ReturnType<typeof spawn>; startedAt: number; state?: FleetNodeState | null }[] = [];
 let fleetSeq = 0;
 
 function freeFleetPort(start = 6450): Promise<number> {
@@ -173,10 +174,29 @@ function fleetDown(): void {
 	if (entry) try { entry.child.kill(); } catch { /* already gone */ }
 }
 
-function fleetStatus(): { count: number; cap: number; nodes: { name: string; port: number; upSec: number }[] } {
+function fleetStatus(): { count: number; cap: number; nodes: { name: string; port: number; upSec: number; state: FleetNodeState | null }[] } {
 	const now = Date.now();
-	return { count: fleet.length, cap: FLEET_CAP, nodes: fleet.map((f) => ({ name: f.name, port: f.port, upSec: Math.round((now - f.startedAt) / 1000) })) };
+	return { count: fleet.length, cap: FLEET_CAP, nodes: fleet.map((f) => ({ name: f.name, port: f.port, upSec: Math.round((now - f.startedAt) / 1000), state: f.state ?? null })) };
 }
+
+// Poll each child's API so the UI carousel can show its live identity + status. Cached (non-blocking
+// to /api/state) and best-effort — a child that's still plotting / sluggish just keeps its last value.
+async function pollFleet(): Promise<void> {
+	await Promise.all(
+		fleet.map(async (f) => {
+			try {
+				const r = await fetch(`http://127.0.0.1:${f.port}/api/state`, { signal: AbortSignal.timeout(3000) });
+				const d = (await r.json()) as { consensus?: { nodeKey?: string; tip?: { height?: number }; peers?: number; iProduce?: boolean; farming?: boolean } };
+				const c = d.consensus ?? {};
+				f.state = { address: c.nodeKey ?? null, tip: c.tip?.height ?? null, peers: c.peers ?? 0, producing: !!c.iProduce, farming: !!c.farming };
+			} catch {
+				/* keep the last known state */
+			}
+		}),
+	);
+}
+const fleetPoll = setInterval(() => void pollFleet(), 2500);
+if (typeof fleetPoll.unref === "function") fleetPoll.unref();
 
 const killFleet = (): void => { for (const f of fleet) try { f.child.kill(); } catch { /* ignore */ } };
 process.on("exit", killFleet);
