@@ -12,6 +12,7 @@
     "daemon:dev": "cross-env GAVL_ORACLE_PUBLISH=1 node src/server.ts",
     "daemon:hash": "cross-env GAVL_VDF=hash GAVL_SPACE=standin GAVL_ORACLE_PUBLISH=1 node src/server.ts",
     "daemon:fresh": "cross-env GAVL_VDF=hash GAVL_SPACE=standin GAVL_ORACLE_PUBLISH=1 GAVL_PERSIST=off node src/server.ts",
+    "node:spawn": "node scripts/spawn-node.mjs",
     "feed:signer": "node src/feed-signer.ts",
     "feed:member": "node src/feed-member.ts",
     "feed:aggregator": "node src/feed-aggregator.ts",
