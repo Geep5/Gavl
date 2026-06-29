@@ -12,6 +12,7 @@ export const store = $state({
 	market: null, // { price, oracles, myGbtc, idleDecay, reserves, gbtcOutstanding, depositAddress, tape, myContracts, ... }
 	consensus: null, // { enabled, vdf, mesh, network, peers, farming, tip, finalizedHeight, secPerAnchor, secPerAnchorMeasured }
 	custody: null, // { mode, epoch, fundKeyOnChain, fundAddress, holdsShare, committee, threshold, minCommittee, committeeId, bonded, myBond }
+	fleet: null, // local node fleet: { count, cap, nodes: [{ name, port, upSec }] }
 	netEvents: [], // live network-activity feed: [{ seq, ts, kind, text }] (accumulated, newest last)
 });
 
@@ -32,6 +33,7 @@ export async function refresh() {
 		store.market = s.market ?? null;
 		store.consensus = s.consensus ?? null;
 		store.custody = s.custody ?? null;
+		store.fleet = s.fleet ?? null;
 		await refreshEvents();
 		if (errorFromRefresh) {
 			store.error = null;

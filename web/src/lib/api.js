@@ -35,4 +35,6 @@ export const api = {
 	dialPeer: (key, pin = true) => req("/peers/dial", "POST", { key, pin }),
 	unpinPeer: (key) => req("/peers/unpin", "POST", { key }),
 	setGossipInterval: (seconds) => req("/gossip-interval", "POST", { seconds }), // live-tune re-announce cadence
+	fleetUp: () => req("/fleet/up", "POST", {}), // spin up one more local node (own data dir + port + plot)
+	fleetDown: () => req("/fleet/down", "POST", {}), // stop the most-recent local node
 };

@@ -196,6 +196,19 @@
 		gossipEdit = v;
 		await act(() => api.setGossipInterval(v));
 	}
+
+	// ── local node fleet (up/down stepper — extra independent farmers on this machine) ──
+	const fleet = $derived(store.fleet ?? { count: 0, cap: 6, nodes: [] });
+	const fleetCount = $derived(fleet.count ?? 0);
+	const fleetCap = $derived(fleet.cap ?? 6);
+	const fleetNodes = $derived(fleet.nodes ?? []);
+	let fleetBusy = $state(false);
+	async function fleetStep(dir) {
+		if (fleetBusy) return;
+		fleetBusy = true;
+		await act(() => (dir > 0 ? api.fleetUp() : api.fleetDown()));
+		fleetBusy = false;
+	}
 	const nodeAddr = $derived(c?.nodeKey ?? ""); // our LXMF address under Reticulum
 
 	// ── live network activity (newest first; streamed from /api/events) ──
@@ -411,6 +424,25 @@
 						{/if}
 					</div>
 				</div>
+				<!-- local fleet: spin up/down extra independent farmers on this machine -->
+				{#if isReticulum}
+					<div class="card">
+						<div class="card-h">LOCAL FLEET <span class="ch-d">{fleetCount} extra node{fleetCount === 1 ? "" : "s"}</span></div>
+						<div class="fleet-ctl">
+							<button class="fl-btn" onclick={() => fleetStep(-1)} disabled={fleetBusy || fleetCount === 0} aria-label="remove a node">−</button>
+							<span class="fl-n tnum">{fleetCount}</span>
+							<button class="fl-btn" onclick={() => fleetStep(1)} disabled={fleetBusy || fleetCount >= fleetCap} aria-label="add a node">+</button>
+							<span class="fl-hint">independent farmers on this machine — each gets its own plot (real disk + CPU)</span>
+						</div>
+						{#if fleetNodes.length}
+							<div class="fleet-list">
+								{#each fleetNodes as n (n.name)}
+									<div class="fl-row"><span class="fl-name">{n.name}</span><span class="muted">:{n.port}</span><span class="fl-age">{n.upSec}s</span></div>
+								{/each}
+							</div>
+						{/if}
+					</div>
+				{/if}
 				<!-- live activity -->
 				<div class="card">
 					<div class="card-h">ACTIVITY <span class="ch-d">LIVE · {store.netEvents.length}</span></div>
@@ -630,6 +662,15 @@
 	.gc-presets { display: flex; gap: 0.25rem; margin-left: auto; }
 	.gc-p { font-size: 0.56rem; letter-spacing: 0.04em; font-weight: 700; padding: 0.2rem 0.45rem; border: 1.5px solid var(--ink); background: transparent; color: var(--ink); cursor: pointer; }
 	.gc-p.on { background: var(--ink); color: var(--paper); }
+	.fleet-ctl { display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 0.6rem; flex-wrap: wrap; }
+	.fl-btn { width: 1.9rem; height: 1.9rem; font-size: 1.15rem; font-weight: 800; line-height: 1; border: 1.5px solid var(--ink); background: transparent; color: var(--ink); cursor: pointer; }
+	.fl-btn:disabled { opacity: 0.3; cursor: default; }
+	.fl-n { min-width: 1.6rem; text-align: center; font-size: 1.1rem; font-weight: 800; }
+	.fl-hint { font-size: 0.56rem; letter-spacing: 0.03em; color: var(--bar-dim); flex: 1 1 8rem; }
+	.fleet-list { padding: 0 0.6rem 0.5rem; display: flex; flex-direction: column; gap: 0.15rem; }
+	.fl-row { display: flex; gap: 0.4rem; font-size: 0.62rem; align-items: baseline; }
+	.fl-name { font-weight: 700; }
+	.fl-age { margin-left: auto; color: var(--bar-dim); }
 	.act-row { display: grid; grid-template-columns: 3.4rem 4.6rem 1fr; gap: 0.4rem; padding: 0.05rem 0.6rem; }
 	.act-ts { color: var(--bar-dim); font-variant-numeric: tabular-nums; }
 	.act-kind { text-transform: uppercase; letter-spacing: 0.03em; }

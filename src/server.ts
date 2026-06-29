@@ -19,7 +19,9 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { existsSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { homedir } from "node:os";
+import { createServer as netServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
@@ -126,6 +128,61 @@ const daemon = new Daemon({
 	},
 });
 
+// ── local fleet: up/down extra independent nodes on this machine, driven by the UI stepper ───────
+// The daemon supervises child node processes. Each is a FULL independent farmer — its own data dir,
+// API port, identity, and auto-plotted k=18 plot (real PoST weight). One plot ⇄ one producer key
+// (Sybil-bound), so extra nodes add weight only by committing real disk; capped because each costs
+// real disk + CPU. They're torn down with the supervisor so they never outlive it.
+const FLEET_CAP = Number(process.env.GAVL_FLEET_CAP ?? 6);
+const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+const fleet: { name: string; port: number; child: ReturnType<typeof spawn>; startedAt: number }[] = [];
+let fleetSeq = 0;
+
+function freeFleetPort(start = 6450): Promise<number> {
+	const probe = (p: number): Promise<number> =>
+		fleet.some((f) => f.port === p)
+			? probe(p + 1)
+			: new Promise<number>((resolve) => {
+					const s = netServer();
+					s.once("error", () => resolve(probe(p + 1)));
+					s.once("listening", () => s.close(() => resolve(p)));
+					s.listen(p, "127.0.0.1");
+				});
+	return probe(start);
+}
+
+async function fleetUp(): Promise<void> {
+	if (fleet.length >= FLEET_CAP) throw new Error(`local fleet cap reached (${FLEET_CAP}); each node is real disk + CPU`);
+	const name = `node-${++fleetSeq}`;
+	const port = await freeFleetPort();
+	const env = { ...process.env };
+	delete env.GAVL_RNS_CONFIG; // each fleet node writes/uses its OWN default config in its data dir
+	env.GAVL_DATA_DIR = join(homedir(), ".gavl-nodes", name);
+	env.GAVL_PORT = String(port);
+	env.GAVL_ORACLE_PUBLISH = "0";
+	const child = spawn(process.execPath, [join(REPO_ROOT, "src", "server.ts")], { cwd: REPO_ROOT, stdio: "ignore", windowsHide: true, env });
+	const entry = { name, port, child, startedAt: Date.now() };
+	const drop = () => { const i = fleet.indexOf(entry); if (i >= 0) fleet.splice(i, 1); };
+	child.on("exit", drop);
+	child.on("error", drop);
+	fleet.push(entry);
+}
+
+function fleetDown(): void {
+	const entry = fleet.pop();
+	if (entry) try { entry.child.kill(); } catch { /* already gone */ }
+}
+
+function fleetStatus(): { count: number; cap: number; nodes: { name: string; port: number; upSec: number }[] } {
+	const now = Date.now();
+	return { count: fleet.length, cap: FLEET_CAP, nodes: fleet.map((f) => ({ name: f.name, port: f.port, upSec: Math.round((now - f.startedAt) / 1000) })) };
+}
+
+const killFleet = (): void => { for (const f of fleet) try { f.child.kill(); } catch { /* ignore */ } };
+process.on("exit", killFleet);
+process.on("SIGINT", () => { killFleet(); process.exit(0); });
+process.on("SIGTERM", () => { killFleet(); process.exit(0); });
+
 // ── View → JSON (Maps + BigInts → plain, string amounts) ─────────
 
 function serializeState() {
@@ -205,7 +262,7 @@ function serializeState() {
 	};
 
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));
-	return { accounts, active: me, gbtc, market, consensus: daemon.consensus(), custody: daemon.custodyStatus(), storage: daemon.storeStats() };
+	return { accounts, active: me, gbtc, market, consensus: daemon.consensus(), custody: daemon.custodyStatus(), storage: daemon.storeStats(), fleet: fleetStatus() };
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -396,6 +453,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			if (!Number.isFinite(secs) || secs < 1) throw new Error("seconds must be a number ≥ 1");
 			daemon.setGossipInterval(secs);
 			return send(res, 200, { ok: true });
+		}
+		if (path === "/api/fleet/up") {
+			// Spin up one more independent local node (own data dir, port, identity, k=18 plot).
+			await fleetUp();
+			return send(res, 200, fleetStatus());
+		}
+		if (path === "/api/fleet/down") {
+			// Stop the most-recently-spawned local node.
+			fleetDown();
+			return send(res, 200, fleetStatus());
 		}
 		const claimMatch = path.match(/^\/api\/auctions\/([0-9a-f]+)\/claim$/);
 		if (claimMatch) {
