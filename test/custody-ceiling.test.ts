@@ -92,24 +92,25 @@ test("through the fold: deposits fill to the bond-tied ceiling; the rest mints n
 	const R = relayer();
 	const depA = toHex(generateKeyPair().publicKey);
 	const depB = toHex(generateKeyPair().publicKey);
-	const dA = { depositId: "aa".repeat(32) + ":0", depositor: depA, amount: 150n * BTC / 100n }; // 1.5 BTC
-	const dB = { depositId: "bb".repeat(32) + ":0", depositor: depB, amount: 50n * BTC / 100n }; //  0.5 BTC
+	const dA = { depositId: "aa".repeat(32) + ":0", depositor: depA, amount: 50n * BTC / 100n }; // 0.5 BTC
+	const dB = { depositId: "bb".repeat(32) + ":0", depositor: depB, amount: 50n * BTC / 100n }; // 0.5 BTC
 	const wA = await R.attestDeposit(dA.depositId, dA.depositor, dA.amount, attestSig(fund, dA)); // ts 1 → sorts first
 	const wB = await R.attestDeposit(dB.depositId, dB.depositor, dB.amount, attestSig(fund, dB)); // ts 2
 	const bornAt = new Map([[wA.id, 1], [wB.id, 1]]);
 
-	// Epoch N: finalized bond 0.2 BTC → ceiling 2 BTC. Base already custodies 0.2 BTC (the bond's
-	// backing), leaving 1.8 BTC of room: A (1.5) mints, B (0.5) would reach 2.2 > 2 → deferred.
-	const baseN = baseWithFund(fund, 20n * BTC / 100n); // 0.2 BTC bonded
+	// Epoch N: finalized bond 0.1 BTC → ceiling 1 BTC (right at the bootstrap floor). Base custodies 0.1 BTC
+	// (the bond's backing), leaving 0.9 BTC of room: A (0.5) mints; B (0.5) would reach 1.1 > 1 → deferred.
+	// Both deposits sit under the per-epoch deposit RATE cap (1 BTC floor), so the CEILING is what binds here.
+	const baseN = baseWithFund(fund, 10n * BTC / 100n); // 0.1 BTC bonded
 	const vN = computeView([wA, wB], { base: baseN, bornAt, nowHeight: 1 });
 	assert.equal(gbtcOf(vN, depA), dA.amount, "A minted (fits under the ceiling)");
 	assert.equal(gbtcOf(vN, depB), 0n, "B deferred — it would breach the per-epoch ceiling");
-	assert.equal(vN.bridge.reserves, 20n * BTC / 100n + dA.amount, "custodied BTC stopped at the ceiling, not the full deposit flow");
+	assert.equal(vN.bridge.reserves, 10n * BTC / 100n + dA.amount, "custodied BTC stopped at the ceiling, not the full deposit flow");
 	assert.ok(marketConserved(vN), "1:1 backing holds with a deposit deferred");
 
-	// Epoch N+1: more stake finalised (0.3 BTC bonded) → ceiling 3 BTC. The SAME deferred deposit
+	// Epoch N+1: more stake finalised (0.2 BTC bonded) → ceiling 2 BTC. The SAME deferred deposit
 	// now mints — no re-submission, the fold just re-applies it under the higher ceiling.
-	const baseN1 = baseWithFund(fund, 30n * BTC / 100n); // 0.3 BTC bonded
+	const baseN1 = baseWithFund(fund, 20n * BTC / 100n); // 0.2 BTC bonded
 	const vN1 = computeView([wA, wB], { base: baseN1, bornAt, nowHeight: 1 });
 	assert.equal(gbtcOf(vN1, depA), dA.amount, "A still minted");
 	assert.equal(gbtcOf(vN1, depB), dB.amount, "B minted now that the next epoch's bond lifted the ceiling");

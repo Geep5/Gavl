@@ -24,7 +24,7 @@ import { finalizedOrdering, orderingFor } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import { verifyPythUpdate } from "./pyth.ts";
 import { verifySignedQuorum } from "./signed-feed.ts";
-import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, mintCeiling, withdrawCap, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
+import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, mintCeiling, withdrawCap, depositCap, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
 import { emptyBook, escrowedInContracts, applyMatch, applyMatchPot, applySettle, pruneExpiredOffers, settleExpired, MAX_OPEN_POSITIONS, rebuildPosCount } from "./intent.ts";
@@ -287,13 +287,14 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	// epoch may withdraw up to withdrawCap(finalized reserves); `available` per write = this minus the
 	// live withdrawnTotal. No base yet (pre-first-checkpoint / full-from-genesis) → undefined → uncapped.
 	const withdrawBudget = opts.base ? opts.base.bridge.withdrawnTotal + withdrawCap(opts.base.bridge.reserves) : undefined;
+	const depositBudget = opts.base ? opts.base.bridge.mintedTotal + depositCap(opts.base.bridge.reserves) : undefined; // Vector B's inflow twin (per-epoch mint cap)
 	const maxPositions = opts.maxPositions ?? MAX_OPEN_POSITIONS; // global open-position cap (consensus constant unless a test overrides)
 	for (const w of [...writes].sort(cmp)) {
 		const op = w.payload as Op | null;
 		// Effects timed by height (unbond maturity) use the write's STABLE certifying
 		// height (bornAt) so they don't drift as the global nowHeight advances; others
 		// use nowHeight (the current anchor clock).
-		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, custodyCeiling, withdrawBudget, opts.market, maxPositions);
+		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, custodyCeiling, withdrawBudget, opts.market, maxPositions, depositBudget);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
 	settleExpired(view.bridge, view.book, nowHeight); // time-locked directional swaps unwind at entry (base-independent)
@@ -338,7 +339,7 @@ export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: st
 	return computeView(included, { order, nowHeight, bornAt, base, market });
 }
 
-function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, custodyCeiling = 0n, withdrawBudget?: bigint, market?: MarketDef, maxPositions = MAX_OPEN_POSITIONS): void {
+function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, custodyCeiling = 0n, withdrawBudget?: bigint, market?: MarketDef, maxPositions = MAX_OPEN_POSITIONS, depositBudget?: bigint): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized ONLY by the committee
@@ -347,7 +348,8 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			const amt = parseAmount(op.amount);
 			if (amt === null || typeof op.depositId !== "string" || typeof op.depositor !== "string") return;
 			if (!attestationAuthorized(view, w, depositAttestationDigest({ depositId: op.depositId, depositor: op.depositor, amount: amt }), op.sig)) return;
-			mintFromDeposit(view.bridge, { depositId: op.depositId, depositor: op.depositor, amount: amt }, bornHeight, custodyCeiling);
+			const dAvail = depositBudget === undefined ? undefined : depositBudget - view.bridge.mintedTotal; // this epoch's remaining mint allowance
+			mintFromDeposit(view.bridge, { depositId: op.depositId, depositor: op.depositor, amount: amt }, bornHeight, custodyCeiling, dAvail);
 			return;
 		}
 		case "gbtc.transfer": {

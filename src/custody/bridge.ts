@@ -130,6 +130,22 @@ export function withdrawCap(finalizedReserves: bigint): bigint {
 	return pct > WITHDRAW_CAP_FLOOR ? pct : WITHDRAW_CAP_FLOOR;
 }
 
+/** Per-epoch DEPOSIT (mint) rate cap — Vector B's inflow twin. Caps how fast money comes IN per epoch;
+ *  the TOTAL stays unbounded (capital isn't capped — only the rate). Same shape as the withdrawal cap. */
+export const MAX_DEPOSIT_PCT_PER_EPOCH = 10n;
+export const DEPOSIT_CAP_FLOOR = TVL_BOOTSTRAP_FLOOR; // ≥ 1 BTC/epoch so a young fund can still bootstrap
+export function depositCap(finalizedReserves: bigint): bigint {
+	const pct = (finalizedReserves * MAX_DEPOSIT_PCT_PER_EPOCH) / 100n;
+	return pct > DEPOSIT_CAP_FLOOR ? pct : DEPOSIT_CAP_FLOOR;
+}
+
+/** Standing caps on OUTSTANDING bridge ops — the count sub-limit that complements the value caps (a
+ *  blanket of tiny ops is still a blanket). They bound the committee's signing backlog AND the pending
+ *  state directly: a new op is refused while the backlog is full, and clears as the committee settles/
+ *  mints and slots free. Consensus-critical. */
+export const MAX_PENDING_WITHDRAWALS = 1_024;
+export const MAX_OUTSTANDING_CLAIMS = 1_024;
+
 // ── demurrage (idle-balance decay) — consensus-critical, every node must agree ──
 /** Anchors per demurrage "day". */
 export const DEMURRAGE_DAY = 1440;
@@ -266,12 +282,16 @@ export function backingBps(s: BridgeState): bigint {
  * most once (replays are no-ops), so an attestation can be gossiped freely.
  * Returns true if it minted.
  */
-export function mintFromDeposit(s: BridgeState, att: DepositAttestation, height?: number, ceiling?: bigint): boolean {
+export function mintFromDeposit(s: BridgeState, att: DepositAttestation, height?: number, ceiling?: bigint, available?: bigint): boolean {
 	if (att.amount <= 0n || s.processed.has(att.depositId)) return false;
 	// Per-epoch custody ceiling: don't mint past what the FINALIZED committee bond can secure. The
 	// deposit isn't lost — it's left UNMINTED (not marked processed, claim kept), and mints on a later
 	// fold once the next epoch's bond lifts the ceiling. Undefined → uncapped (tests / legacy callers).
 	if (ceiling !== undefined && s.reserves + att.amount > ceiling) return false;
+	// Vector B's inflow twin — per-epoch mint rate cap. Over the allowance the deposit is LEFT UNMINTED
+	// (not processed, claim kept) and mints on a later fold once the epoch's budget refreshes. Same clean
+	// no-op as the ceiling: never lost.
+	if (available !== undefined && att.amount > available) return false;
 	s.processed.add(att.depositId);
 	s.claims.delete(att.depositId); // the mint request (if any) is satisfied → retire it (was a leak)
 	s.depositors.add(att.depositor); // its per-user deposit address may hold fund BTC
@@ -312,6 +332,7 @@ export function requestWithdrawal(s: BridgeState, w: PendingWithdrawal, availabl
 	// budget refreshes. Undefined → uncapped (legacy/direct callers, tests). Checked before the burn
 	// so a rejected withdrawal is a clean no-op.
 	if (available !== undefined && w.amount > available) return false;
+	if (s.pending.length >= MAX_PENDING_WITHDRAWALS) return false; // committee-backlog / pending-state count cap
 	// The withdrawer's own fee comes out of their payout (they receive amount − fee). The PROTOCOL
 	// does NOT cap the fee — under the hood you can broadcast whatever you want; the sane upper bound
 	// is a UI guardrail only. It only rejects a fee that can't yield a VALID tx: negative (would
@@ -336,6 +357,7 @@ export function withdrawalPayouts(s: BridgeState): { address: string; amount: bi
  *  no-op once the deposit is already minted — so `claims` only ever holds OUTSTANDING
  *  requests (bounded), never a permanent record of every claim ever. */
 export function recordClaim(s: BridgeState, depositId: string, depositor: string, height = 0): void {
+	if (s.claims.size >= MAX_OUTSTANDING_CLAIMS && !s.claims.has(depositId)) return; // claims-backlog cap (NEW claims only)
 	if (!s.claims.has(depositId) && !s.processed.has(depositId)) s.claims.set(depositId, { depositor, height });
 }
 
