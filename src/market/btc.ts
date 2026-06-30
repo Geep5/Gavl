@@ -27,7 +27,7 @@ import { verifySignedQuorum } from "./signed-feed.ts";
 import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, mintCeiling, withdrawCap, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
-import { emptyBook, escrowedInContracts, applyMatch, applyMatchPot, applySettle, pruneExpiredOffers, settleExpired } from "./intent.ts";
+import { emptyBook, escrowedInContracts, applyMatch, applyMatchPot, applySettle, pruneExpiredOffers, settleExpired, MAX_OPEN_POSITIONS, rebuildPosCount } from "./intent.ts";
 import type { Side } from "./intent.ts";
 import type { MarketBook } from "./intent.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
@@ -160,6 +160,9 @@ export interface ViewOptions {
 	 *  anchor (Pyth's guardian set, or a generic signer set) and matches the feed/set. A per-channel
 	 *  constant (same for every node), so the fold is deterministic. Absent → a transfers-only channel. */
 	market?: MarketDef;
+	/** Global open-position cap. Defaults to the consensus constant MAX_OPEN_POSITIONS — override ONLY in
+	 *  tests; production folds must use the default so every node admits/rejects the same matches. */
+	maxPositions?: number;
 }
 
 /**
@@ -231,7 +234,7 @@ function accrueDemurrage(view: View, nowHeight: number): void {
 export function cloneView(v: View): View {
 	const b = v.bridge;
 	const cp = <T extends object>(m: Map<string, T>): Map<string, T> => new Map([...m].map(([k, x]) => [k, { ...x }]));
-	return {
+	const out: View = {
 		bridge: {
 			gbtc: new Map(b.gbtc), // bigint values are immutable → shallow Map copy is a full copy
 			reserves: b.reserves,
@@ -251,8 +254,10 @@ export function cloneView(v: View): View {
 		},
 		market: { ...v.market },
 		custody: { fundKey: v.custody.fundKey, epoch: v.custody.epoch },
-		book: { contracts: cp(v.book.contracts), offerFills: cp(v.book.offerFills) },
+		book: { contracts: cp(v.book.contracts), offerFills: cp(v.book.offerFills), posCount: new Map() },
 	};
+	rebuildPosCount(out.book);
+	return out;
 }
 
 export function computeView(writes: Write[], opts: ViewOptions = {}): View {
@@ -282,12 +287,13 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	// epoch may withdraw up to withdrawCap(finalized reserves); `available` per write = this minus the
 	// live withdrawnTotal. No base yet (pre-first-checkpoint / full-from-genesis) → undefined → uncapped.
 	const withdrawBudget = opts.base ? opts.base.bridge.withdrawnTotal + withdrawCap(opts.base.bridge.reserves) : undefined;
+	const maxPositions = opts.maxPositions ?? MAX_OPEN_POSITIONS; // global open-position cap (consensus constant unless a test overrides)
 	for (const w of [...writes].sort(cmp)) {
 		const op = w.payload as Op | null;
 		// Effects timed by height (unbond maturity) use the write's STABLE certifying
 		// height (bornAt) so they don't drift as the global nowHeight advances; others
 		// use nowHeight (the current anchor clock).
-		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, custodyCeiling, withdrawBudget, opts.market);
+		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, custodyCeiling, withdrawBudget, opts.market, maxPositions);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
 	settleExpired(view.bridge, view.book, nowHeight); // time-locked directional swaps unwind at entry (base-independent)
@@ -332,7 +338,7 @@ export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: st
 	return computeView(included, { order, nowHeight, bornAt, base, market });
 }
 
-function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, custodyCeiling = 0n, withdrawBudget?: bigint, market?: MarketDef): void {
+function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, custodyCeiling = 0n, withdrawBudget?: bigint, market?: MarketDef, maxPositions = MAX_OPEN_POSITIONS): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized ONLY by the committee
@@ -430,10 +436,11 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			// expiry/staleness don't drift on replay.
 			const m = mark(view, bornHeight);
 			if (fill === null || m === null) return; // stale/unpriced market → no entry
+			const bid = op.bid != null ? parseAmount(op.bid) ?? 0n : 0n; // the slot bid — a one-time entry fee → the pot
 			// The pot may subsidise the maker fee: it draws the SAME finalized budget the backstop uses,
 			// so full and checkpoint-pruned nodes agree on how much the pot can cover.
 			const subsidyBudget = backstopBudget - view.bridge.potEscrowTaken;
-			applyMatch(view.bridge, view.book, w.writer, w.id, op.offer, fill, bornHeight, m, subsidyBudget);
+			applyMatch(view.bridge, view.book, w.writer, w.id, op.offer, fill, bornHeight, m, subsidyBudget, maxPositions, bid);
 			return;
 		}
 		case "match.pot": {
@@ -445,8 +452,9 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			const m = mark(view, bornHeight);
 			if (fill === null || lev === null || m === null) return;
 			if (op.side !== "long" && op.side !== "short") return;
+			const potBid = op.bid != null ? parseAmount(op.bid) ?? 0n : 0n; // slot bid (one-time entry fee → pot)
 			const available = backstopBudget - view.bridge.potEscrowTaken;
-			applyMatchPot(view.bridge, view.book, w.writer, w.id, op.side as Side, fill, lev, bornHeight, m, available);
+			applyMatchPot(view.bridge, view.book, w.writer, w.id, op.side as Side, fill, lev, bornHeight, m, available, maxPositions, potBid);
 			return;
 		}
 		case "contract.settle": {

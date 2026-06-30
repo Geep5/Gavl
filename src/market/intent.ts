@@ -44,6 +44,17 @@ export const MAX_OFFER_LEVERAGE = 100n;
  *  use the same value. ~30 days at a 60s/anchor target. */
 export const CONTRACT_MAX_LIFE = 43_200;
 
+/** Global hard cap on simultaneously-open positions — the folded `book.contracts` can never exceed
+ *  this. A full book rejects new matches (wait-in-line); the bid-to-evict path that lets a higher bid
+ *  displace the lowest-bid position lands in a later step. Consensus-critical: every node must agree.
+ *  Sized from the Phase 0 capacity benchmark — 1,000,000 × ~393 B ≈ 375 MB of committed state. */
+export const MAX_OPEN_POSITIONS = 1_000_000;
+
+/** Per-account hard cap on simultaneously-open positions (contract-sides held). Caps any one account's
+ *  share of the global book so no single account can monopolize the slots — at full capacity at least
+ *  MAX_OPEN_POSITIONS / MAX_POSITIONS_PER_ACCOUNT distinct accounts must be present. Consensus-critical. */
+export const MAX_POSITIONS_PER_ACCOUNT = 1_000;
+
 /** Basis-point denominator (10000 bps = 100%). */
 export const BPS = 10_000n;
 /** The protocol's default maker fee, in basis points of the stake. It's used in two consensus spots:
@@ -109,6 +120,7 @@ export interface Contract {
 	leverage: bigint;
 	nonce: string; // the originating offer (audit)
 	expiryHeight: number; // auto-settles at the mark once the anchor clock reaches this (time-lock)
+	bid: bigint; // one-time entry fee the taker paid to the pot for this slot — ranks the position for cap eviction
 }
 
 /** The matched-market state that lives alongside the bridge in the View. */
@@ -118,10 +130,13 @@ export interface MarketBook {
 	/** Per offer nonce: cumulative stake matched (enforces Σ fills ≤ size) + the offer's expiry
 	 *  height, so the entry can be RETIRED once the offer can no longer be matched (bounds the map). */
 	offerFills: Map<string, { filled: bigint; expiryHeight: number }>;
+	/** DERIVED in-memory index (NOT serialized): per-account count of contract-sides held, for the
+	 *  per-account position cap. Rebuilt from `contracts` on clone/deserialize, maintained during a fold. */
+	posCount: Map<string, number>;
 }
 
 export function emptyBook(): MarketBook {
-	return { contracts: new Map(), offerFills: new Map() };
+	return { contracts: new Map(), offerFills: new Map(), posCount: new Map() };
 }
 
 /** gBTC escrowed across all open contracts (both sides) — the conservation bucket. */
@@ -225,13 +240,14 @@ export function longPayout(stake: bigint, entry: bigint, leverage: bigint, price
  * mark for both sides — the fee is an explicit transfer, never a price shift — so the bet is still
  * zero-sum and 1:1 backing holds (gBTC only moves between buckets).
  */
-export function applyMatch(bridge: BridgeState, book: MarketBook, taker: string, writeId: string, offer: Offer, fill: bigint, nowHeight: number, mark: bigint, available: bigint = 0n): Contract | null {
+export function applyMatch(bridge: BridgeState, book: MarketBook, taker: string, writeId: string, offer: Offer, fill: bigint, nowHeight: number, mark: bigint, available: bigint = 0n, cap: number = MAX_OPEN_POSITIONS, bid: bigint = 0n): Contract | null {
 	if (mark <= 0n) return null; // no oracle price yet → no entry
 	if (!verifyOffer(offer)) return null;
 	if (nowHeight > offer.expiryHeight) return null; // offer no longer takeable (soft TTL)
 	if (offer.maker === taker) return null; // self-match (wash) guard
 	if (book.contracts.has(writeId)) return null; // id reuse
 	if (fill <= 0n) return null;
+	if (posOf(book, taker) >= MAX_POSITIONS_PER_ACCOUNT || posOf(book, offer.maker) >= MAX_POSITIONS_PER_ACCOUNT) return null; // either party at its per-account cap
 
 	const size = parseSats(offer.size)!;
 	const already = book.offerFills.get(offer.nonce)?.filled ?? 0n;
@@ -249,7 +265,9 @@ export function applyMatch(bridge: BridgeState, book: MarketBook, taker: string,
 	const takerPays = fee - fromPot; // the taker covers whatever the pot didn't
 
 	if (gbtcOf(bridge, offer.maker) < take) return null; // maker ghosted → no-op
-	if (gbtcOf(bridge, taker) < take + takerPays) return null; // taker can't cover stake + its fee share
+	if (gbtcOf(bridge, taker) < take + takerPays + bid) return null; // taker can't cover stake + its fee share + the slot bid
+	if (!makeRoom(bridge, book, cap, bid, nowHeight)) return null; // book full and the bid doesn't beat the floor → reject (wait in line)
+	if (bid > 0n) { addGbtc(bridge, taker, -bid); bridge.pot += bid; } // one-time entry fee → the liquidity pot
 
 	addGbtc(bridge, offer.maker, -take); // escrow both stakes → the contract
 	addGbtc(bridge, taker, -take);
@@ -265,8 +283,10 @@ export function applyMatch(bridge: BridgeState, book: MarketBook, taker: string,
 
 	const long = offer.makerSide === "long" ? offer.maker : taker;
 	const short = offer.makerSide === "long" ? taker : offer.maker;
-	const c: Contract = { id: writeId, long, short, stake: take, entry: mark, leverage: parseSats(offer.leverage)!, nonce: offer.nonce, expiryHeight: nowHeight + CONTRACT_MAX_LIFE };
+	const c: Contract = { id: writeId, long, short, stake: take, entry: mark, leverage: parseSats(offer.leverage)!, nonce: offer.nonce, expiryHeight: nowHeight + CONTRACT_MAX_LIFE, bid };
 	book.contracts.set(writeId, c);
+	bumpPos(book, long, 1); // claim the per-account slots (POT exempt inside bumpPos)
+	bumpPos(book, short, 1);
 	return c;
 }
 
@@ -284,8 +304,51 @@ export function applySettle(bridge: BridgeState, book: MarketBook, contractId: s
 	const shortPay = pot - longPay; // exact remainder → zero-sum
 	creditParty(bridge, c.long, longPay, height); // payout = a fresh credit → restarts the idle clock
 	creditParty(bridge, c.short, shortPay, height);
+	bumpPos(book, c.long, -1); // release the per-account slots (POT exempt inside bumpPos)
+	bumpPos(book, c.short, -1);
 	book.contracts.delete(contractId);
 	return true;
+}
+
+/** Make room for one more contract under the cap: true if the book is under cap, or if the lowest-bid
+ *  position was evicted to free a slot; false (caller rejects) when full and the new bid doesn't strictly
+ *  beat the floor. Eviction settles the floor at its ENTRY — stakes returned, no PnL, like a time-lock
+ *  expiry — so it's deterministic + base-independent. Floor = smallest bid (ties: smallest id). O(n) at
+ *  capacity; a bid-ordered index can make it O(log n) if saturation ever becomes real. */
+function makeRoom(bridge: BridgeState, book: MarketBook, cap: number, newBid: bigint, height: number): boolean {
+	if (book.contracts.size < cap) return true;
+	let floorId: string | null = null;
+	let floorBid = 0n;
+	for (const [id, c] of book.contracts) {
+		if (floorId === null || c.bid < floorBid || (c.bid === floorBid && id < floorId)) {
+			floorId = id;
+			floorBid = c.bid;
+		}
+	}
+	if (floorId === null || newBid <= floorBid) return false; // can't outbid the floor → reject (wait in line)
+	applySettle(bridge, book, floorId, book.contracts.get(floorId)!.entry, height); // evict: unwind at entry
+	return true;
+}
+
+/** A party's open-position count (contract-sides held). */
+function posOf(book: MarketBook, who: string): number {
+	return book.posCount.get(who) ?? 0;
+}
+/** Adjust a party's open-position count. The POT backstop isn't an account, so it's exempt from the cap. */
+function bumpPos(book: MarketBook, who: string, delta: number): void {
+	if (who === POT) return;
+	const n = (book.posCount.get(who) ?? 0) + delta;
+	if (n <= 0) book.posCount.delete(who);
+	else book.posCount.set(who, n);
+}
+/** Rebuild `posCount` from `contracts` — the source of truth. Called at every clone/deserialize boundary
+ *  so a full node and a checkpoint-resumed node always start a fold from the identical index (no fork). */
+export function rebuildPosCount(book: MarketBook): void {
+	book.posCount = new Map();
+	for (const c of book.contracts.values()) {
+		bumpPos(book, c.long, 1);
+		bumpPos(book, c.short, 1);
+	}
 }
 
 /** Pay a contract side. The backstop POT is paid into `bridge.pot` (no holder balance, no idle
@@ -308,24 +371,28 @@ function creditParty(bridge: BridgeState, who: string, amount: bigint, height?: 
  * fee on top of the stake, which flows into `bridge.pot` — so providing last-resort liquidity grows
  * the backstop rather than just risking it.
  */
-export function applyMatchPot(bridge: BridgeState, book: MarketBook, taker: string, writeId: string, takerSide: Side, fill: bigint, leverage: bigint, nowHeight: number, mark: bigint, available: bigint): Contract | null {
+export function applyMatchPot(bridge: BridgeState, book: MarketBook, taker: string, writeId: string, takerSide: Side, fill: bigint, leverage: bigint, nowHeight: number, mark: bigint, available: bigint, cap: number = MAX_OPEN_POSITIONS, bid: bigint = 0n): Contract | null {
 	if (mark <= 0n) return null; // no market price yet → no entry
 	if (taker === POT) return null; // the pot can't take its own side
 	if (book.contracts.has(writeId)) return null; // id reuse
 	if (fill <= 0n) return null;
 	if (leverage < MIN_OFFER_LEVERAGE || leverage > MAX_OFFER_LEVERAGE) return null;
+	if (posOf(book, taker) >= MAX_POSITIONS_PER_ACCOUNT) return null; // taker at its per-account cap (the POT side is exempt)
 
 	const budget = available > 0n ? available : 0n;
 	const takerFree = gbtcOf(bridge, taker);
-	// The taker also pays the pot a DEFAULT-spread fee, so clamp the stake so stake + its fee fits the
-	// taker's balance (as well as the offered fill and the pot's finalized budget).
-	const maxAffordable = (takerFree * BPS) / (BPS + DEFAULT_SPREAD_BPS);
+	if (takerFree < bid) return null; // can't even cover the slot bid
+	// The taker pays the pot a DEFAULT-spread fee AND the slot bid, so clamp the stake so bid + stake + its
+	// fee fit the taker's balance (as well as the offered fill and the pot's finalized budget).
+	const maxAffordable = ((takerFree - bid) * BPS) / (BPS + DEFAULT_SPREAD_BPS);
 	let take = fill;
 	if (take > maxAffordable) take = maxAffordable; // taker can't cover stake + fee → partial
 	if (take > budget) take = budget; // pot's finalized budget → partial
 	if (take <= 0n) return null; // taker broke or pot exhausted → no-op
 	const fee = feeOf(take, DEFAULT_SPREAD_BPS); // the pot's maker fee
+	if (!makeRoom(bridge, book, cap, bid, nowHeight)) return null; // book full and the bid doesn't beat the floor → reject
 
+	if (bid > 0n) { addGbtc(bridge, taker, -bid); bridge.pot += bid; } // one-time entry fee → the liquidity pot
 	addGbtc(bridge, taker, -take); // taker escrows its stake
 	if (fee > 0n) {
 		addGbtc(bridge, taker, -fee); // taker pays the pot its maker fee
@@ -335,8 +402,10 @@ export function applyMatchPot(bridge: BridgeState, book: MarketBook, taker: stri
 	bridge.potEscrowTaken += take; // committed counter the budget is measured against
 	const long = takerSide === "long" ? taker : POT;
 	const short = takerSide === "long" ? POT : taker;
-	const c: Contract = { id: writeId, long, short, stake: take, entry: mark, leverage, nonce: writeId, expiryHeight: nowHeight + CONTRACT_MAX_LIFE };
+	const c: Contract = { id: writeId, long, short, stake: take, entry: mark, leverage, nonce: writeId, expiryHeight: nowHeight + CONTRACT_MAX_LIFE, bid };
 	book.contracts.set(writeId, c);
+	bumpPos(book, long, 1); // claim the taker's per-account slot (POT side exempt inside bumpPos)
+	bumpPos(book, short, 1);
 	return c;
 }
 

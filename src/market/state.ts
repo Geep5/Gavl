@@ -21,7 +21,7 @@ import type { View } from "./btc.ts";
 import { emptyBridge } from "../custody/bridge.ts";
 import type { BridgeState, PendingWithdrawal } from "../custody/bridge.ts";
 import type { MarketPrice, CustodyState } from "./btc.ts";
-import { emptyBook } from "./intent.ts";
+import { emptyBook, rebuildPosCount } from "./intent.ts";
 import type { MarketBook, Contract } from "./intent.ts";
 
 // ── canonical (plain-JSON) shape ─────────────────────────────────
@@ -49,7 +49,7 @@ export interface CanonBridge {
 export type CanonMarket = { price: string | null; expo: number; seq: number; at: number };
 
 export interface CanonBook {
-	contracts: Entry<{ id: string; long: string; short: string; stake: string; entry: string; leverage: string; nonce: string; expiryHeight: number }>[]; // sorted by id
+	contracts: Entry<{ id: string; long: string; short: string; stake: string; entry: string; leverage: string; nonce: string; expiryHeight: number; bid: string }>[]; // sorted by id
 	offerFills: Entry<{ filled: string; expiryHeight: number }>[]; // nonce → {filled sats, expiry}, sorted
 }
 
@@ -99,7 +99,7 @@ function serializeBridge(b: BridgeState): CanonBridge {
 
 function serializeBook(book: MarketBook): CanonBook {
 	return {
-		contracts: mapEntries(book.contracts, (c) => ({ id: c.id, long: c.long, short: c.short, stake: c.stake.toString(), entry: c.entry.toString(), leverage: c.leverage.toString(), nonce: c.nonce, expiryHeight: c.expiryHeight })),
+		contracts: mapEntries(book.contracts, (c) => ({ id: c.id, long: c.long, short: c.short, stake: c.stake.toString(), entry: c.entry.toString(), leverage: c.leverage.toString(), nonce: c.nonce, expiryHeight: c.expiryHeight, bid: c.bid.toString() })),
 		offerFills: mapEntries(book.offerFills, (f) => ({ filled: f.filled.toString(), expiryHeight: f.expiryHeight })),
 	};
 }
@@ -146,8 +146,9 @@ function deserializeMarket(m: CanonMarket): MarketPrice {
 
 function deserializeBook(b: CanonBook): MarketBook {
 	const book = emptyBook();
-	for (const [id, c] of b.contracts) book.contracts.set(id, { id: c.id, long: c.long, short: c.short, stake: BigInt(c.stake), entry: BigInt(c.entry), leverage: BigInt(c.leverage), nonce: c.nonce, expiryHeight: c.expiryHeight } as Contract);
+	for (const [id, c] of b.contracts) book.contracts.set(id, { id: c.id, long: c.long, short: c.short, stake: BigInt(c.stake), entry: BigInt(c.entry), leverage: BigInt(c.leverage), nonce: c.nonce, expiryHeight: c.expiryHeight, bid: BigInt(c.bid ?? "0") } as Contract);
 	for (const [k, f] of b.offerFills) book.offerFills.set(k, { filled: BigInt(f.filled), expiryHeight: f.expiryHeight });
+	rebuildPosCount(book);
 	return book;
 }
 

@@ -135,15 +135,15 @@ export class Account {
 
 	/** Take the opposite side of a peer's signed offer, escrowing `fill` stake on both
 	 *  sides → a bilateral matched contract (id = this write's id). Returns the contract id. */
-	async matchOpen(offer: Offer, fill: bigint | number | string): Promise<string> {
-		return (await this.produce({ kind: "match.open", offer, fill: amountStr(fill) })).id;
+	async matchOpen(offer: Offer, fill: bigint | number | string, bid: bigint | number | string = 0): Promise<string> {
+		return (await this.produce({ kind: "match.open", offer, fill: amountStr(fill), bid: amountStr(bid) })).id;
 	}
 
 	/** Open a position directly against the liquidity BACKSTOP — no peer maker needed. The pot
 	 *  (idle-decay pool) takes the opposite side at the mark, capped by its finalized budget.
 	 *  Returns the contract id (= this write's id). */
-	async takePot(side: Side, fill: bigint | number | string, leverage: bigint | number | string): Promise<string> {
-		return (await this.produce({ kind: "match.pot", side, fill: amountStr(fill), leverage: amountStr(leverage) })).id;
+	async takePot(side: Side, fill: bigint | number | string, leverage: bigint | number | string, bid: bigint | number | string = 0): Promise<string> {
+		return (await this.produce({ kind: "match.pot", side, fill: amountStr(fill), leverage: amountStr(leverage), bid: amountStr(bid) })).id;
 	}
 
 	/** Settle a matured matched contract at the current oracle mark (permissionless). */

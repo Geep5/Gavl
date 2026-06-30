@@ -44,8 +44,8 @@ function makeView(rev = false): View {
 
 	const book = emptyBook();
 	const contracts: [string, any][] = [
-		["c1", { id: "c1", long: "aa", short: "bb", stake: 100n, entry: 61000n, leverage: 10n, nonce: "n1", expiryHeight: 43205 }],
-		["c2", { id: "c2", long: "cc", short: "aa", stake: 5n, entry: 62000n, leverage: 5n, nonce: "n2", expiryHeight: 43210 }],
+		["c1", { id: "c1", long: "aa", short: "bb", stake: 100n, entry: 61000n, leverage: 10n, nonce: "n1", expiryHeight: 43205, bid: 0n }],
+		["c2", { id: "c2", long: "cc", short: "aa", stake: 5n, entry: 62000n, leverage: 5n, nonce: "n2", expiryHeight: 43210, bid: 0n }],
 	];
 	const fills: [string, { filled: bigint; expiryHeight: number }][] = [["n1", { filled: 100n, expiryHeight: 50 }], ["n2", { filled: 5n, expiryHeight: 60 }], ["n3", { filled: 250n, expiryHeight: 70 }]];
 	for (const [k, v] of order(contracts)) book.contracts.set(k, v);

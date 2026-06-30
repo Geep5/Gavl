@@ -28,7 +28,7 @@ function stateWithOpenContract(mark: bigint): View {
 	addGbtc(bridge, "bb", 4000n);
 	bridge.reserves = 10_000n; // 8000 free + 2000 escrow
 	const book = emptyBook();
-	book.contracts.set("c1", { id: "c1", long: "aa", short: "bb", stake: 1000n, entry: 61_000n, leverage: 10n, nonce: "n", expiryHeight: 50 });
+	book.contracts.set("c1", { id: "c1", long: "aa", short: "bb", stake: 1000n, entry: 61_000n, leverage: 10n, nonce: "n", expiryHeight: 50, bid: 0n });
 	return { bridge, market: { price: mark, expo: 0, seq: 0, at: 0 }, custody: { fundKey: null, epoch: -1 }, book };
 }
 
