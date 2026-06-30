@@ -94,23 +94,17 @@ DEFAULT_GAVL_RNS_CONFIG = """\
 
 [interfaces]
 
-  # TWO shared Reticulum hubs, for redundancy. Because enable_transport is on, every node BRIDGES the
-  # interfaces it holds, so connecting to both hubs doesn't split the network — it UNITES them: as long
-  # as each node reaches at least one hub and some node reaches both, the whole set forms one mesh. The
-  # payoff is no single point of failure — if one hub goes down (or briefly blips), nodes stay on the
-  # network through the other, instead of the entire network going dark behind one box. Both are verified
-  # live RNS transit hubs. Swap in your own for a private deployment (every node must share the same set).
+  # Shared Reticulum hub(s). Because enable_transport is on, every node BRIDGES the interfaces it holds, so
+  # connecting to multiple hubs doesn't split the network — it UNITES them: each node reaching at least one
+  # hub (and some node reaching all) forms one mesh. Running >=2 hubs removes the single point of failure (a
+  # hub blip doesn't black out the net). Swap in your own for a private deployment (all nodes share the set).
   #
-  # target_host is the IPv4 LITERAL, NOT a hostname, on purpose: beleth's hostname AAAA (IPv6) record
-  # points at a DEAD address, and RNS tries IPv6 first and hangs in SYN_SENT forever instead of falling
-  # back to IPv4 — so a node using the hostname never reaches the hub at all (a classic "nodes won't
-  # mesh"). Pin the working IPv4. Revert to the hostname if/when a hub fixes its IPv6 AAAA.
-  [[Gavl Hub beleth]]
-    type = TCPClientInterface
-    enabled = yes
-    target_host = 129.213.74.184
-    target_port = 4242
-
+  # NOTE: beleth (129.213.74.184:4242) is REMOVED for now — it's down (TCP connect times out) and a dead hub
+  # just adds connect-timeout churn on every boot. Re-add it (or another second hub) for redundancy once live.
+  #
+  # target_host is the IPv4 LITERAL, NOT a hostname, on purpose: a hub's AAAA (IPv6) record can point at a
+  # DEAD address, and RNS tries IPv6 first and hangs in SYN_SENT forever instead of falling back to IPv4 — so
+  # a node using the hostname never reaches the hub (a classic "nodes won't mesh"). Pin the working IPv4.
   [[Gavl Hub g00n]]
     type = TCPClientInterface
     enabled = yes
