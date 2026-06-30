@@ -510,6 +510,8 @@ createServer((req, res) => {
 	const cu = daemon.custodyStatus();
 	if (cu.fundKeyOnChain)
 		console.log(`  custody: committee — fund ${cu.fundAddress} (key ${cu.fundKeyOnChain.slice(0, 12)}…; this node ${cu.holdsShare ? "holds a share" : "is watching"})`);
+	else if (process.env.GAVL_COMMITTEE_INDEX !== undefined && daemon.btcNetwork() !== "mainnet")
+		console.log(`  custody: DEV committee from seed (seat ${process.env.GAVL_COMMITTEE_INDEX}) — share installed, fund key publishing into the chain; finalizes once farming anchors it (no DKG). INSECURE (public seed), testnet only.`);
 	else
 		console.log(`  custody: committee — WAITING for ≥${cu.minCommittee} farmers to run genesis DKG. No fund key yet, so minting is disabled until the committee forms — a lone node waits for peers; there is no single-key fallback.`);
 });

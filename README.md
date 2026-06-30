@@ -84,6 +84,31 @@ Custody is **committee-only**: it needs **≥3 nodes actually farming** to run t
 then a node holds no fund key and can't mint — it waits for peers. Mainnet additionally refuses
 in-memory storage (`GAVL_PERSIST=off`).
 
+#### Genesis committee — a deliberate testnet/mainnet split (a tradeoff, *not* a bug)
+
+The genesis DKG above is the secure path, but it is a **live multi-node ceremony** that must complete on
+the wire before custody works — and it is brittle to bootstrap: it is *n-of-n* for key generation, so a
+single non-completing member **wedges it** (a stale or overloaded node never finishes its round, and the
+deterministic re-selection keeps re-picking it). That is a real failure mode you hit *regardless* of how
+clean the mesh is. So for **testnet/dev** we sidestep it with a **hardcoded genesis committee**: the
+committee is a pure function of the network label — exactly like the [genesis
+block](src/consensus/genesis.ts) — so every node **derives the byte-identical committee locally**, with no
+ceremony on the wire and nothing to wedge. Each node takes one share by `GAVL_COMMITTEE_INDEX=0/1/2`; the
+group key publishes into consensus state and **lives there like genesis** (read by late joiners, survives
+the RAM pruning). See [`src/custody/genesis-committee.ts`](src/custody/genesis-committee.ts).
+
+**The tradeoff, and why it is testnet-only:** the seed is public (it is in this repo), so the derived key
+is reconstructable by anyone who runs it — the custody is **not trustless**. That is the accepted cost of a
+zero-config dev default ("insecure, but anyone can stand up 3 nodes"). **Mainnet ignores it and runs the
+real distributed DKG**, where no one ever holds the whole key; the daemon gates the hardcoded path off
+mainnet.
+
+**This split is intentional — do not "fix" it by deleting one side.** Both paths exist on purpose: the
+hardcoded committee unblocks dev/testnet without a flaky ceremony, and the live DKG is the production path.
+Its bootstrap-robustness (timeout-and-exclude / qualified-set, so one bad member can't wedge it) is a
+*separate, tracked* concern — not something the dev committee is meant to solve, and not a reason to remove
+either path.
+
 ### Consensus + bounded RAM (`src/consensus/`)
 
 A permissionless **anchor chain** of PoST-proven head certificates linearizes the multi-writer logs:

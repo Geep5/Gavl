@@ -30,6 +30,8 @@ import type { Offer, Side } from "./market/intent.ts";
 import type { FundKey } from "./custody/threshold.ts";
 import { DkgCoordinator } from "./custody/dkg-coordinator.ts";
 import { saveShare, loadShare } from "./custody/share-store.ts";
+import { genesisCommitteeMember } from "./custody/genesis-committee.ts";
+import type { GenesisCommitteeMember } from "./custody/genesis-committee.ts";
 import type { StoredShare } from "./custody/share-store.ts";
 import { fundAddress as deriveFundAddress } from "./custody/bitcoin.ts";
 import { depositAddress } from "./custody/deposit.ts";
@@ -443,6 +445,7 @@ export class Daemon {
 	 */
 	private maintainCommittee(): void {
 		if (!this.transport) return;
+		if (this.genesisCommittee()) return; // dev committee is static + installed — no sampled roster to link, no DKG to drive
 		const anchors = this.node.anchors;
 		const tip = anchors?.tip();
 		if (!anchors || !tip) return;
@@ -1343,8 +1346,38 @@ export class Daemon {
 		this.stallTimer = undefined;
 	}
 
+	/** The deterministic dev committee member this node installs instead of running the live DKG, or null.
+	 *  Active only with GAVL_COMMITTEE_INDEX set, off mainnet — a zero-config, insecure-by-design bootstrap
+	 *  (the seed is public, so the key is reconstructable). Mainnet ignores it and runs the real distributed
+	 *  ceremony. See custody/genesis-committee.ts + the README "Genesis committee" design-tradeoff note. */
+	private hardcodedCommitteeCache?: GenesisCommitteeMember | null;
+	private genesisCommittee(): GenesisCommitteeMember | null {
+		if (this.hardcodedCommitteeCache !== undefined) return this.hardcodedCommitteeCache;
+		const raw = process.env.GAVL_COMMITTEE_INDEX;
+		if (raw === undefined || this.btcNetwork() === "mainnet") return (this.hardcodedCommitteeCache = null);
+		try {
+			this.hardcodedCommitteeCache = genesisCommitteeMember(this.currentChannel(), Number(raw));
+		} catch (e) {
+			console.warn(`  custody: GAVL_COMMITTEE_INDEX=${raw} invalid (${(e as Error).message}) — ignoring; running the real DKG`);
+			this.hardcodedCommitteeCache = null;
+		}
+		return this.hardcodedCommitteeCache;
+	}
+
+	/** Install the deterministic dev committee: persist this node's share + publish the group key into
+	 *  consensus state (it then "lives in the RAM system" like the genesis block). Idempotent; no live DKG. */
+	private installGenesisCommittee(hc: GenesisCommitteeMember): void {
+		if (!this.committeeShare()) {
+			saveShare(this.sharePath(), { share: hc.share, pub: hc.pub, groupPubKey: hc.groupPubKey, session: "genesis-committee", selfId: hc.selfId, participants: hc.participants, min: hc.min, epoch: 0 });
+			console.warn(`  custody: DEV committee installed from seed (${hc.min}-of-${hc.participants.length}, seat ${process.env.GAVL_COMMITTEE_INDEX}) — INSECURE (public seed), testnet only; mainnet runs the real DKG.`);
+		}
+		if (this.view().custody.fundKey === null) void this.custodyAccount().announceFund(toHex(hc.groupPubKey), 0).catch(() => {});
+	}
+
 	private startCommitteeCustody(): void {
 		if (this.rotation) return;
+		const hc = this.genesisCommittee();
+		if (hc) return this.installGenesisCommittee(hc); // dev: deterministic committee, no live DKG / rotation
 		this.rotation = new CommitteeRotation({
 			node: this.node,
 			selfId: this.producerId(),
@@ -1634,7 +1667,12 @@ export class Daemon {
 	 *  pubkey) and verifies peers' — so an impersonator on the committee topic is dropped. */
 	private ceremonyAuthCache?: CeremonyAuth;
 	private ceremonyAuth(): CeremonyAuth {
-		if (!this.ceremonyAuthCache) this.ceremonyAuthCache = makeCeremonyAuth(this.producerKey().privateKey);
+		if (!this.ceremonyAuthCache) {
+			// Dev committee: sign ceremony messages as the seat's committee keypair (not the producer key),
+			// since the committee identity is the derived member id, not this node's producer id.
+			const hc = this.genesisCommittee();
+			this.ceremonyAuthCache = makeCeremonyAuth(hc ? hc.secretKey : this.producerKey().privateKey);
+		}
 		return this.ceremonyAuthCache;
 	}
 
