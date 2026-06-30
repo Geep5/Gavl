@@ -69,12 +69,12 @@ GAVL_PREFIX = "gavl:"
 # announce, which (empirically) the transport did not propagate. base64(32-byte key + 64-byte sig).
 GAVL_BIND_PREFIX = "gavlb1:"
 
-# RENDEZVOUS: passive announce-discovery is unreliable cross-machine, so a node ALSO actively registers
-# with a derived directory (bridge/rendezvous.py) and dials whoever else is registered. The rendezvous
-# identity is a pure function of this seed — every node computes the same address with zero config (same
-# idea as the genesis). Keep RDV_SEED + RDV_FRAME byte-identical here and in rendezvous.py.
-RDV_SEED = b"gavl-rendezvous-v1"
-RDV_FRAME = "__gavl_rdv__"
+# PEER EXCHANGE (PEX): announce-discovery (every node announces, every node hears) is the egalitarian
+# discovery primitive — no special node. To make it robust without a central directory, a node also GOSSIPS
+# the peers it already knows to whoever it connects to (this frame); the receiver dials the new ones.
+# Discovery becomes transitive — one node overhearing an announce seeds the whole mesh — and every node runs
+# it identically, so none is privileged.
+PEX_FRAME = "__gavl_peers__"
 
 # Gavl's default Reticulum config, written on first run. HUB-ONLY: there is no LAN AutoInterface, so
 # every node reaches the network through shared internet hubs — two nodes on the same LAN connect
@@ -176,7 +176,7 @@ class Bridge:
         self.network = network           # our network label; we only talk to peers on the same one
         self.display_name = GAVL_PREFIX + network
         self.propagated = propagated     # True → always route via a propagation node
-        self.peers = set()               # discovered Gavl peer hashes (hex)
+        self.peers = set()               # known Gavl peer hashes (hex): connected, announced, or PEX-learned
         self.peer_identities = {}        # peer_hex -> RNS.Identity (so sends don't depend on recall)
         self.binding = None              # our signed producer↔address binding (announce app_data)
         self.pushed = set()              # peers we've handed our binding to over the reliable channel
@@ -211,30 +211,20 @@ class Bridge:
         self.emit({"ev": "ready", "address": self.address})
         self.announce()
 
-        # RENDEZVOUS directory: in addition to passive announce-discovery, actively register with a derived
-        # directory and dial whoever else is there. Compute its address (zero-config), cache its identity so
-        # send() reaches it before any announce, and warm a path. Registration runs in serve()'s loop.
-        self.rdv_addr = None
-        if os.environ.get("GAVL_RENDEZVOUS", "1") != "0":
-            try:
-                rdv_identity = RNS.Identity.from_bytes(hashlib.sha512(RDV_SEED).digest())
-                self.rdv_addr = RNS.Destination(rdv_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery").hash.hex()
-                self.peer_identities[self.rdv_addr] = rdv_identity
-                RNS.Transport.request_path(bytes.fromhex(self.rdv_addr))
-                self.log("rendezvous: directory at %s — registering every cadence" % self.rdv_addr[:8])
-            except Exception as e:
-                self.rdv_addr = None
-                self.log("rendezvous init failed: " + str(e))
-
-    def register_rendezvous(self):
-        """Tell the directory we're here (on our network) and ask who else is — the reply lands in
-        on_message as a 'members' frame, which we turn into dialable discoveries."""
-        if not self.rdv_addr:
+    def gossip_peers(self):
+        """PEX: share the peers we know with each connected peer, so discovery is transitive — a node that
+        overheard an announce passes it on to the others. Every node does this identically; no directory
+        node, no privileged peer. Bootstraps the whole mesh from a single overheard announce."""
+        with self.lock:
+            known = sorted(self.peers)
+        if not known:
             return
-        try:
-            self.send(self.rdv_addr, {RDV_FRAME: {"op": "register", "network": self.network, "address": self.address}})
-        except Exception as e:
-            self.log("rendezvous register failed: " + str(e))
+        frame = {PEX_FRAME: known[:64]}  # cap so the gossiped list stays small on a large mesh
+        for peer in list(known):
+            try:
+                self.send(peer, frame)
+            except Exception:
+                pass
 
     # ── control protocol (bridge → Node) ─────────────────────────────
     def emit(self, obj):
@@ -338,15 +328,6 @@ class Bridge:
         except Exception as e:
             self.log("bad inbound frame: " + str(e))
             return
-        # Rendezvous reply: the directory's member list. Turn each address into a dialable discovery and
-        # RETURN — the rendezvous is a control endpoint, not a consensus peer, so never model it as one.
-        rdv = frame.get(RDV_FRAME) if isinstance(frame, dict) else None
-        if isinstance(rdv, dict):
-            if rdv.get("op") == "members":
-                for addr in rdv.get("members", []):
-                    if isinstance(addr, str) and len(addr) == 32 and addr.lower() != self.address:
-                        self.emit({"ev": "discovered", "peer": addr.lower()})
-            return
         # Any inbound frame proves the peer is reachable → model it as a live connection.
         new = False
         with self.lock:
@@ -369,6 +350,18 @@ class Bridge:
             return
         if isinstance(frame, dict) and "__gavl_bind_req__" in frame:
             self._push_binding_to(peer)
+            return
+        # PEX gossip: the peer shared the addresses it knows. Dial any we haven't seen — this is how a single
+        # overheard announce propagates to the whole mesh, with no directory node and no privileged peer.
+        if isinstance(frame, dict) and PEX_FRAME in frame:
+            for addr in (frame.get(PEX_FRAME) or []):
+                if not (isinstance(addr, str) and len(addr) == 32):
+                    continue
+                a = addr.lower()
+                with self.lock:
+                    seen = a == self.address or a in self.peers
+                if not seen:
+                    self.emit({"ev": "discovered", "peer": a})  # the Node pools + dials it; on first frame it joins self.peers
             return
         self.emit({"ev": "message", "peer": peer, "frame": frame})
 
@@ -463,7 +456,7 @@ def serve(args):
             time.sleep(delay)
             try:
                 bridge.announce()
-                bridge.register_rendezvous()
+                bridge.gossip_peers()
             except Exception:
                 pass
         while True:
@@ -473,7 +466,7 @@ def serve(args):
             bridge.announce_wake.clear()
             try:
                 bridge.announce()
-                bridge.register_rendezvous()
+                bridge.gossip_peers()
             except Exception:
                 pass
     threading.Thread(target=reannounce, daemon=True).start()
