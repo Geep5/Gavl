@@ -303,13 +303,14 @@ export class ReticulumTransport {
 		this.ctrl({ op: "request_binding", peer: peerHex });
 	}
 
-	/** Periodic mesh keepalive. LXMF is connectionless and paths expire SILENTLY (no disconnect event),
-	 *  so two failure modes accumulate unattended: (1) the path to a committee member goes cold and the
-	 *  next ceremony can't reach it, and (2) we gossip with a peer whose binding we never received, so we
-	 *  can't address it by producer key (connectCommittee can't link it — a half-open link). Each tick we
-	 *  re-warm the path to every pinned committee member and ask every active-but-unbound peer to re-push
-	 *  its binding. Cheap and self-quieting: a fully-bound, fully-warm mesh sends (almost) nothing. Tunable
-	 *  via GAVL_KEEPALIVE_MS; 0 disables. */
+	/** Periodic mesh keepalive. LXMF is connectionless and paths expire SILENTLY (no disconnect event), so
+	 *  links rot untended: a cold OR stale-but-cached path drops the next send — anchor gossip AND ceremony
+	 *  frames — with no error, and the peer just goes dark (the live 3-machine mesh decayed to peers=0
+	 *  exactly this way). Each tick we (1) re-warm/refresh the RNS path to EVERY peer we know, not just
+	 *  committee pins, so no path ages out; (2) re-greet any pinned peer that has silently fallen out of the
+	 *  active set and backfill general outbound, so a dropped link self-heals; (3) ask every active-but-
+	 *  unbound peer to re-push its binding so connectCommittee can address it by producer key. Cheap and
+	 *  self-quieting on a bounded mesh. Tunable via GAVL_KEEPALIVE_MS; 0 disables. */
 	private startKeepalive(): void {
 		if (this.keepaliveTimer) return;
 		const ms = Number(process.env.GAVL_KEEPALIVE_MS ?? 20_000);
@@ -320,10 +321,18 @@ export class ReticulumTransport {
 
 	private keepaliveTick(): void {
 		if (!this.control) return;
-		// 1) Keep committee members reachable: re-warm the RNS path to each pinned member so a transient
-		//    drop self-heals before a ceremony needs it (the sidecar's dial is a no-op if the path is live).
-		for (const addr of this.committeePins) this.ctrl({ op: "dial", peer: addr });
-		// 2) Close half-open links: for every peer we actively gossip with but hold no binding for, ask it
+		// 1) Re-warm/refresh the RNS path to EVERY peer we know, not just committee pins. LXMF paths expire
+		//    silently; a cold OR stale-but-cached path drops the next send — anchor gossip AND ceremony
+		//    frames — with no error, so a link rots untended (this is how the live mesh decayed to peers=0).
+		//    The sidecar force-refreshes (request_path even when one is cached), so an aged path is renewed.
+		for (const addr of this.knownPeerAddrs()) this.ctrl({ op: "dial", peer: addr });
+		// 2) Self-heal a silently-dropped link: re-greet any pinned peer (committee member / manual dial)
+		//    that has fallen out of the active set, and backfill general outbound toward the target degree —
+		//    instead of waiting for a fresh announce to happen to arrive. Re-activating an active peer is a
+		//    no-op, and pinned peers are cap-exempt, so this neither churns nor evicts.
+		for (const addr of this.pinned) if (!this.active.has(addr)) this.activate(addr);
+		this.fillOutbound();
+		// 3) Close half-open links: for every peer we actively gossip with but hold no binding for, ask it
 		//    to (re)push its binding so connectCommittee can resolve it. Bound peers cost nothing here.
 		const bound = new Set(this.producerToAddress.values());
 		for (const peer of this.active.keys()) {

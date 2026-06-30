@@ -401,11 +401,12 @@ class Bridge:
         elif op == "set_binding":
             self.set_binding(obj["producer"], obj["sig"])
         elif op == "dial":
-            # no links in LXMF; just warm a path so the first send lands faster
+            # Warm/REFRESH a path (no links in LXMF). request_path even when one is already cached: LXMF
+            # paths expire silently, and a stale cached path keeps has_path()=True while its sends quietly
+            # fail — so re-requesting is what actually renews it before it rots. The node rate-limits this
+            # via the keepalive interval (GAVL_KEEPALIVE_MS), so it stays cheap on a bounded mesh.
             try:
-                dh = bytes.fromhex(obj["peer"])
-                if not RNS.Transport.has_path(dh):
-                    RNS.Transport.request_path(dh)
+                RNS.Transport.request_path(bytes.fromhex(obj["peer"]))
             except Exception:
                 pass
         elif op == "push_binding":
