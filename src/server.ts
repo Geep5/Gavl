@@ -27,7 +27,7 @@ import { dirname, join } from "node:path";
 import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
 import { mark, gbtcOf, MAX_LEVERAGE, parseAmount, leverageOk } from "./market/btc.ts";
 import { escrowedInContracts } from "./market/intent.ts";
-import { totalGbtc, pendingTotal, backingBps as bridgeBackingBps, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS } from "./custody/bridge.ts";
+import { totalGbtc, pendingTotal, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS } from "./custody/bridge.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 

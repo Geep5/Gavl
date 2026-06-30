@@ -28,14 +28,12 @@ export function ensurePlot(pubHex: string, k: number, dir: string, paths: ChiaPa
 }
 
 export class ChiaSpaceProver implements SpaceProver {
-	private readonly pubHex: string;
 	private readonly k: number;
 	private readonly plotPath: string;
 	private readonly plotId: string;
 	private readonly paths: ChiaPaths;
 
 	constructor(opts: { pubHex: string; k: number; plotPath: string; paths?: ChiaPaths }) {
-		this.pubHex = opts.pubHex;
 		this.k = opts.k;
 		this.plotPath = opts.plotPath;
 		this.plotId = plotIdFor(opts.pubHex, opts.k);

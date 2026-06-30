@@ -29,7 +29,7 @@ import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
 import { emptyBook, escrowedInContracts, applyMatch, applyMatchPot, applySettle, pruneExpiredOffers, settleExpired } from "./intent.ts";
 import type { Side } from "./intent.ts";
-import type { MarketBook, Offer } from "./intent.ts";
+import type { MarketBook } from "./intent.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "../custody/attestation.ts";
 import { fromHex } from "../det/canonical.ts";
