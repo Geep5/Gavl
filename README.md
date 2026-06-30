@@ -238,3 +238,22 @@ Esplora chain view per node. A malicious market is sandboxed to its own channel.
 Before any mainnet satoshi: an **independent audit** (the largest open blocker) and **real
 independent bonded stakers** (slashing only bites when the stakers aren't all one operator).
 Distributed DKG and non-public keys are already done. Until then it's testnet-only.
+
+## TODO / not yet built
+
+Tracked custody gaps — listed so they aren't rediscovered or "fixed" by accident:
+
+- [ ] **Genesis-committee derive-and-verify guard** (testnet dev committee). A node should *reject* an
+  on-chain fund-key announce that doesn't equal the committee it independently derives from the seed —
+  turning a "same network, different committee" disagreement into an instant rejection (like the
+  genesis-mismatch detector does for block 0) instead of a silent fork that fork-choice resolves later.
+  Tamper-evidence only: the dev committee is insecure-by-design (public seed), so this is a hardening,
+  not load-bearing security. The live DKG can't do it (no canonical derivation to check against).
+  [`src/custody/genesis-committee.ts`](src/custody/genesis-committee.ts).
+- [ ] **Live-DKG bootstrap robustness** (mainnet committee). The genesis DKG is *n-of-n*, so one
+  non-completing member wedges it; add timeout-and-exclude / a qualified-set so the committee forms among
+  the responsive ≥threshold members and a stale node can't block it. The dev committee sidesteps this for
+  testnet; mainnet still needs it.
+- [ ] **Autonomous signing trigger** (custody ops). Each seat must independently detect a
+  deposit/withdrawal and join the 2-of-3 signing round; coordinating *when* to sign is the piece to
+  finish before real BTC moves in or out.
