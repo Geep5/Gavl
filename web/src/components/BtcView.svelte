@@ -18,6 +18,20 @@
 	const needN = $derived(cu?.minCommittee ?? 3);
 	const fmt = (v) => (v == null ? "—" : Number(v).toLocaleString());
 
+	// ── idle-decay (demurrage) countdown — "use it or lose it": a free balance left idle starts
+	// decaying into the pot after a 7-day grace and is fully reclaimed by 30 days. The daemon gives the
+	// absolute heights (m.idleDecay); we turn them into a live day countdown (1 demurrage day = 1440 anchors).
+	const idleDecay = $derived(m?.idleDecay ?? null);
+	const DEM_DAY = 1440;
+	const idle = $derived.by(() => {
+		const h = c?.tip?.height;
+		if (!idleDecay || h == null || bal <= 0) return null;
+		const toDecay = (idleDecay.decayAtHeight - h) / DEM_DAY;
+		const toSweep = (idleDecay.cutoffHeight - h) / DEM_DAY;
+		return { decaying: toDecay <= 0, toDecay, toSweep };
+	});
+	const fmtDays = (d) => { const x = Math.max(0, d); return x >= 1 ? `${Math.floor(x)}d` : `${Math.max(1, Math.ceil(x * 24))}h`; };
+
 	// instrument + decoded market identity (the channel IS the market)
 	const label = $derived(mkt?.label ?? "BTC-USD");
 	const base = $derived(label.split("-")[0] ?? "BTC");
@@ -268,6 +282,18 @@
 		</div>
 	</header>
 
+	<!-- idle-decay countdown — funds left idle are on a clock (use-it-or-lose-it) -->
+	{#if idle}
+		<div class="idle" class:warn={idle.decaying}>
+			<span class="idle-ico">{idle.decaying ? "⚠" : "⏳"}</span>
+			{#if idle.decaying}
+				<span>Idle gBTC is being <b>reclaimed</b> — {fmtDays(idle.toSweep)} to full sweep. Trade or withdraw now.</span>
+			{:else}
+				<span>Idle gBTC decays in <b>{fmtDays(idle.toDecay)}</b> — keep it working or withdraw. Not a savings account.</span>
+			{/if}
+		</div>
+	{/if}
+
 	<!-- price -->
 	<section class="price">
 		<div class="px-live"><span class="px-dot"></span>{base} / {quote} · LIVE</div>
@@ -356,7 +382,7 @@
 					<span class="pbadge {p.side}">{p.side === "long" ? "LONG" : "SHORT"}</span>
 					<div class="pmid">
 						<div class="pmain tnum">{fmt(p.stake)} gBTC <span class="muted">{p.leverage}×</span></div>
-						<div class="psub">entry ${fmt(p.entry)} · vs {short(p.counterparty)}</div>
+						<div class="psub">entry ${fmt(p.entry)} · vs {short(p.counterparty)}{#if p.expiresIn != null} · <span class="pexp" class:warn={p.expiresIn < 1440}>⏳ {fmtDays(p.expiresIn / 1440)} left</span>{/if}</div>
 					</div>
 					<span class="ppnl tnum" class:up={Number(p.pnl) > 0} class:down={Number(p.pnl) < 0}>{Number(p.pnl) > 0 ? "+" : ""}{fmt(p.pnl)}</span>
 					<button class="pclose" onclick={() => closeContract(p.id)}>CLOSE</button>
@@ -575,6 +601,12 @@
 	.bal { font-family: var(--display); font-weight: 800; font-size: 1.05rem; line-height: 1; }
 	.bal-l { font-size: 0.54rem; letter-spacing: 0.16em; color: var(--muted); margin-top: 0.2rem; }
 
+	/* ── idle-decay countdown banner (use-it-or-lose-it) ── */
+	.idle { display: flex; align-items: center; gap: 0.5rem; padding: 0.55rem 1.2rem; font-size: 0.62rem; line-height: 1.4; letter-spacing: 0.01em; background: var(--bonded-soft); color: var(--bonded); border-bottom: 1.5px solid var(--ink); }
+	.idle.warn { background: var(--short-soft); color: var(--short); }
+	.idle-ico { font-size: 0.85rem; flex: none; }
+	.idle b { font-weight: 800; }
+
 	/* ── price ── */
 	.price { padding: 1.6rem 1.2rem 1.4rem; text-align: center; border-bottom: 1.5px solid var(--ink); }
 	.px-live { display: inline-flex; align-items: center; gap: 0.45rem; font-size: 0.6rem; letter-spacing: 0.16em; color: var(--muted); }
@@ -650,6 +682,8 @@
 	.pmid { flex: 1; min-width: 0; }
 	.pmain { font-size: 0.82rem; font-weight: 600; }
 	.psub { font-size: 0.6rem; color: var(--muted); margin-top: 0.1rem; word-break: break-all; }
+	.pexp { color: var(--bonded); font-weight: 700; white-space: nowrap; }
+	.pexp.warn { color: var(--short); }
 	.ppnl { font-weight: 700; font-size: 1rem; color: var(--ink); }
 	.ppnl.up { color: var(--long); } .ppnl.down { color: var(--short); }
 	.pclose { font-size: 0.6rem; font-weight: 700; letter-spacing: 0.06em; background: transparent; border: 1.5px solid var(--ink); color: var(--ink); padding: 0.36rem 0.6rem; }

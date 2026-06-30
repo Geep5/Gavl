@@ -18,6 +18,14 @@ an attacker can't spin up cheap identities to flood the network.
 Collateral is **gBTC** — a 1:1 claim on real Bitcoin held in a **threshold-custody fund** that only
 an M-of-N committee can spend (no single party ever holds the key).
 
+> [!WARNING]
+> **Gavl is use-it-or-lose-it — not a savings account.** gBTC is meant to be *working*: held in a
+> position or actively trading. A **free balance left idle for 7 days begins to decay** into the
+> shared liquidity pot, and is **fully reclaimed by 30 days**. Open positions and resting orders run
+> on their own timers too — nothing here is set-and-forget. **Only keep money in while you're actively
+> using it, and withdraw what you're done with.** That bound is what keeps the system spam-proof and
+> RAM-light — it is deliberately *not* a place to park BTC.
+
 > **Status:** the matched market runs live; the real-BTC bridge runs end-to-end on **testnet** across
 > a 3-node committee. Custody is committee-only (no single-key path on any network). Still gated on an
 > independent audit + real independent stakers — **don't put real mainnet BTC in it.**
