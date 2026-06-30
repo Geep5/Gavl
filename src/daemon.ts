@@ -1219,35 +1219,36 @@ export class Daemon {
 	}
 
 	/**
-	 * The LOBBY — start the farmers TOGETHER. With the hardcoded genesis already installed (every node
-	 * shares block 0), there is no seeder to elect and no genesis to race — the old failover is gone. The
-	 * lobby now serves one purpose: wait for a live quorum before minting height 1, so the farmers begin
-	 * from the same root at roughly the same time and interleave from the start, instead of one node
-	 * sprinting ahead alone and building a head-start branch the late joiners must reorg onto. A flaky mesh
-	 * must NOT wedge us, though, so we farm anyway after a grace — solo-start still converges: the shared
-	 * genesis means a late peer's anchors link to OUR chain, and fork-choice + bootstrap pacing settle on
-	 * one heaviest line everyone adopts. Roster is the LIVE peer set (liveQuorumAddrs: peers we've actually
-	 * received a frame from, never cached announces for offline ghosts). Mesh-off or need≤1 → farm at once
-	 * (local dev / single-node chain via GAVL_CUSTODY_MIN=1). Grace tunable via GAVL_LOBBY_GRACE_MS.
+	 * The LOBBY — wait for a live quorum, then start the farmers TOGETHER. With the hardcoded genesis already
+	 * installed (every node shares block 0) there's no seeder to elect and no genesis to race; the lobby's
+	 * one job is to hold each node IDLE until `minCommittee` live farmers are present, so they all kick off
+	 * from the same root at once and interleave from the start — never one node sprinting ahead and building
+	 * a head-start branch the late joiners must reorg onto. By DEFAULT a node waits INDEFINITELY: farming
+	 * before quorum is pointless for a committee network (you can't form a 2-of-3 alone, and a late node
+	 * adopts whatever chain exists regardless of head start), and a node that can't see peers should sit
+	 * legible — "waiting for N more" — rather than mint a confusing solo chain that LOOKS like a split.
+	 * Set GAVL_LOBBY_GRACE_MS > 0 to opt into solo-start after that grace (a deliberately single-or-few-node
+	 * deployment). Roster is the LIVE peer set (liveQuorumAddrs: peers we've received a frame from, never
+	 * cached announces for offline ghosts). Mesh-off or need≤1 → farm at once (local dev / single-node chain
+	 * via GAVL_CUSTODY_MIN=1).
 	 */
 	private async lobbyThenFarm(): Promise<void> {
 		const need = this.custodyOpts.minCommittee ?? 3;
 		if (this.transport && need > 1) {
-			const graceMs = Number(process.env.GAVL_LOBBY_GRACE_MS ?? 120_000); // farm-anyway fallback if quorum never forms
+			const graceMs = Number(process.env.GAVL_LOBBY_GRACE_MS ?? 0); // 0 = wait for quorum forever; >0 = opt into solo-start after the grace
 			const startedAt = Date.now();
 			let lastLobby = "";
 			while (this.farming) {
 				const roster = [this.transport.nodeKeyHex, ...this.transport.liveQuorumAddrs()];
-				const waited = Date.now() - startedAt;
 				if (roster.length >= need) {
 					console.log(`  consensus: live quorum of ${need} reached — starting farmers together`);
 					break; // quorum present → all start from the shared genesis ~together
 				}
-				if (waited >= graceMs) {
-					console.log(`  consensus: no quorum after ${Math.round(graceMs / 1000)}s — farming alone; peers converge onto the shared genesis when they join`);
-					break; // grace elapsed → farm anyway; shared genesis still converges via fork-choice
+				if (graceMs > 0 && Date.now() - startedAt >= graceMs) {
+					console.log(`  consensus: GAVL_LOBBY_GRACE_MS elapsed (${Math.round(graceMs / 1000)}s) — solo-starting; peers converge onto the shared genesis when they join`);
+					break; // opt-in: solo start after the configured grace
 				}
-				const status = `lobby: ${roster.length}/${need} live farmers — waiting to start together (or alone in ~${Math.max(0, Math.ceil((graceMs - waited) / 1000))}s)`;
+				const status = `lobby: ${roster.length}/${need} live farmers connected — idle until quorum (need ${need - roster.length} more)`;
 				if (status !== lastLobby) {
 					console.log(`  ${status}`);
 					lastLobby = status;
