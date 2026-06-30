@@ -88,26 +88,30 @@ in-memory storage (`GAVL_PERSIST=off`).
 
 The genesis DKG above is the secure path, but it is a **live multi-node ceremony** that must complete on
 the wire before custody works — and it is brittle to bootstrap: it is *n-of-n* for key generation, so a
-single non-completing member **wedges it** (a stale or overloaded node never finishes its round, and the
-deterministic re-selection keeps re-picking it). That is a real failure mode you hit *regardless* of how
-clean the mesh is. So for **testnet/dev** we sidestep it with a **hardcoded genesis committee**: the
-committee is a pure function of the network label — exactly like the [genesis
-block](src/consensus/genesis.ts) — so every node **derives the byte-identical committee locally**, with no
-ceremony on the wire and nothing to wedge. Each node takes one share by `GAVL_COMMITTEE_INDEX=0/1/2`; the
-group key publishes into consensus state and **lives there like genesis** (read by late joiners, survives
-the RAM pruning). See [`src/custody/genesis-committee.ts`](src/custody/genesis-committee.ts).
+single non-completing member **wedges it**. That is a real failure mode you hit *regardless* of how clean
+the mesh is. So for **testnet/dev** we sidestep the live ceremony with a **trusted-dealer setup** that keeps
+the repo clean:
 
-**The tradeoff, and why it is testnet-only:** the seed is public (it is in this repo), so the derived key
-is reconstructable by anyone who runs it — the custody is **not trustless**. That is the accepted cost of a
-zero-config dev default ("insecure, but anyone can stand up 3 nodes"). **Mainnet ignores it and runs the
-real distributed DKG**, where no one ever holds the whole key; the daemon gates the hardcoded path off
-mainnet.
+1. `npm run committee:setup` mints a 2-of-3 committee **once, on one machine, with fresh randomness**, prints
+   the **public group key**, and writes one secret bundle per seat (its share + committee keypair).
+2. You paste **only the public group key** into [`genesis-committee.ts`](src/custody/genesis-committee.ts)
+   (or set `GAVL_COMMITTEE_PUBKEY`), and copy each seat bundle into that node's `<data>/custody/`
+   **out-of-band — the secret shares never touch git.**
+3. On boot a node loads its share, **verifies it against the repo's public key** (refusing a mismatch),
+   announces the key into consensus state, and signs. No DKG, nothing to wedge.
 
-**This split is intentional — do not "fix" it by deleting one side.** Both paths exist on purpose: the
-hardcoded committee unblocks dev/testnet without a flaky ceremony, and the live DKG is the production path.
-Its bootstrap-robustness (timeout-and-exclude / qualified-set, so one bad member can't wedge it) is a
-*separate, tracked* concern — not something the dev committee is meant to solve, and not a reason to remove
-either path.
+A fresh clone of the repo has the fund **address and no way to spend** — a public key can't sign and can't be
+reversed into the private key. The secret shares live only on the nodes.
+
+**The tradeoff, and why it is testnet-only:** the machine that runs the one-time setup transiently sees the
+whole key while it cuts the shares (a "trusted dealer"). You delete the output afterward and trust that
+one-time setup — a standard trusted-setup assumption, fine for an operator standing up their own nodes, but
+*not* trustless. **Mainnet keeps the live distributed DKG**, where no machine ever sees the whole key; the
+daemon gates the trusted-dealer path off mainnet.
+
+**This split is intentional — do not "fix" it by deleting one side.** The trusted-dealer setup unblocks
+dev/testnet without a flaky ceremony; the live DKG is the trustless production path. Its bootstrap-robustness
+(timeout-and-exclude / qualified-set, so one bad member can't wedge it) is a *separate, tracked* concern.
 
 ### Consensus + bounded RAM (`src/consensus/`)
 
@@ -243,13 +247,10 @@ Distributed DKG and non-public keys are already done. Until then it's testnet-on
 
 Tracked custody gaps — listed so they aren't rediscovered or "fixed" by accident:
 
-- [ ] **Genesis-committee derive-and-verify guard** (testnet dev committee). A node should *reject* an
-  on-chain fund-key announce that doesn't equal the committee it independently derives from the seed —
-  turning a "same network, different committee" disagreement into an instant rejection (like the
-  genesis-mismatch detector does for block 0) instead of a silent fork that fork-choice resolves later.
-  Tamper-evidence only: the dev committee is insecure-by-design (public seed), so this is a hardening,
-  not load-bearing security. The live DKG can't do it (no canonical derivation to check against).
-  [`src/custody/genesis-committee.ts`](src/custody/genesis-committee.ts).
+- [x] **Genesis-committee verify guard** (testnet committee) — *done*. A node refuses an on-disk share whose
+  group key doesn't equal the repo's hardcoded public key, so it won't run a committee that disagrees with the
+  public identity. Built alongside the trusted-dealer setup (which replaced the old seed-derived committee —
+  the seed is gone, so the repo carries no secret). [`src/custody/genesis-committee.ts`](src/custody/genesis-committee.ts).
 - [ ] **Live-DKG bootstrap robustness** (mainnet committee). The genesis DKG is *n-of-n*, so one
   non-completing member wedges it; add timeout-and-exclude / a qualified-set so the committee forms among
   the responsive ≥threshold members and a stale node can't block it. The dev committee sidesteps this for

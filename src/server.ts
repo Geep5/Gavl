@@ -21,6 +21,7 @@ import { createServer as netServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
+import { genesisCommitteeKey } from "./custody/genesis-committee.ts";
 import { mark, gbtcOf, MAX_LEVERAGE, parseAmount, leverageOk } from "./market/btc.ts";
 import { escrowedInContracts } from "./market/intent.ts";
 import { totalGbtc, pendingTotal, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS } from "./custody/bridge.ts";
@@ -510,8 +511,8 @@ createServer((req, res) => {
 	const cu = daemon.custodyStatus();
 	if (cu.fundKeyOnChain)
 		console.log(`  custody: committee — fund ${cu.fundAddress} (key ${cu.fundKeyOnChain.slice(0, 12)}…; this node ${cu.holdsShare ? "holds a share" : "is watching"})`);
-	else if (process.env.GAVL_COMMITTEE_INDEX !== undefined && daemon.btcNetwork() !== "mainnet")
-		console.log(`  custody: DEV committee from seed (seat ${process.env.GAVL_COMMITTEE_INDEX}) — share installed, fund key publishing into the chain; finalizes once farming anchors it (no DKG). INSECURE (public seed), testnet only.`);
+	else if (daemon.btcNetwork() !== "mainnet" && genesisCommitteeKey(daemon.currentChannel()) !== null)
+		console.log(`  custody: trusted-dealer committee (testnet) — fund key publishing into the chain; finalizes once farming anchors it (no DKG). Repo holds only the public key.`);
 	else
 		console.log(`  custody: committee — WAITING for ≥${cu.minCommittee} farmers to run genesis DKG. No fund key yet, so minting is disabled until the committee forms — a lone node waits for peers; there is no single-key fallback.`);
 });

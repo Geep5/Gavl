@@ -30,8 +30,7 @@ import type { Offer, Side } from "./market/intent.ts";
 import type { FundKey } from "./custody/threshold.ts";
 import { DkgCoordinator } from "./custody/dkg-coordinator.ts";
 import { saveShare, loadShare } from "./custody/share-store.ts";
-import { genesisCommitteeMember } from "./custody/genesis-committee.ts";
-import type { GenesisCommitteeMember } from "./custody/genesis-committee.ts";
+import { genesisCommitteeKey } from "./custody/genesis-committee.ts";
 import type { StoredShare } from "./custody/share-store.ts";
 import { fundAddress as deriveFundAddress } from "./custody/bitcoin.ts";
 import { depositAddress } from "./custody/deposit.ts";
@@ -445,7 +444,7 @@ export class Daemon {
 	 */
 	private maintainCommittee(): void {
 		if (!this.transport) return;
-		if (this.genesisCommittee()) return; // dev committee is static + installed — no sampled roster to link, no DKG to drive
+		if (this.trustedCommitteeMode()) return; // trusted-dealer committee is static — no sampled roster, no DKG to drive
 		const anchors = this.node.anchors;
 		const tip = anchors?.tip();
 		if (!anchors || !tip) return;
@@ -1346,38 +1345,53 @@ export class Daemon {
 		this.stallTimer = undefined;
 	}
 
-	/** The deterministic dev committee member this node installs instead of running the live DKG, or null.
-	 *  Active only with GAVL_COMMITTEE_INDEX set, off mainnet — a zero-config, insecure-by-design bootstrap
-	 *  (the seed is public, so the key is reconstructable). Mainnet ignores it and runs the real distributed
-	 *  ceremony. See custody/genesis-committee.ts + the README "Genesis committee" design-tradeoff note. */
-	private hardcodedCommitteeCache?: GenesisCommitteeMember | null;
-	private genesisCommittee(): GenesisCommitteeMember | null {
-		if (this.hardcodedCommitteeCache !== undefined) return this.hardcodedCommitteeCache;
-		const raw = process.env.GAVL_COMMITTEE_INDEX;
-		if (raw === undefined || this.btcNetwork() === "mainnet") return (this.hardcodedCommitteeCache = null);
-		try {
-			this.hardcodedCommitteeCache = genesisCommitteeMember(this.currentChannel(), Number(raw));
-		} catch (e) {
-			console.warn(`  custody: GAVL_COMMITTEE_INDEX=${raw} invalid (${(e as Error).message}) — ignoring; running the real DKG`);
-			this.hardcodedCommitteeCache = null;
-		}
-		return this.hardcodedCommitteeCache;
+	/** TESTNET trusted-dealer committee mode: the PUBLIC group key for this network is hardcoded in the repo
+	 *  (genesis-committee.ts), and each seat's SECRET share was distributed out-of-band into <data>/custody.
+	 *  When that key is set we run NO live DKG. Off mainnet only (mainnet always runs the real ceremony).
+	 *  The repo never carries a secret — only the public key. See README "Genesis committee". */
+	private trustedCommitteeMode(): boolean {
+		return this.btcNetwork() !== "mainnet" && genesisCommitteeKey(this.currentChannel()) !== null;
+	}
+	private committeeKeyPath(): string {
+		return join(this.dataDir, "custody", "committee-key.json");
 	}
 
-	/** Install the deterministic dev committee: persist this node's share + publish the group key into
-	 *  consensus state (it then "lives in the RAM system" like the genesis block). Idempotent; no live DKG. */
-	private installGenesisCommittee(hc: GenesisCommitteeMember): void {
-		if (!this.committeeShare()) {
-			saveShare(this.sharePath(), { share: hc.share, pub: hc.pub, groupPubKey: hc.groupPubKey, session: "genesis-committee", selfId: hc.selfId, participants: hc.participants, min: hc.min, epoch: 0 });
-			console.warn(`  custody: DEV committee installed from seed (${hc.min}-of-${hc.participants.length}, seat ${process.env.GAVL_COMMITTEE_INDEX}) — INSECURE (public seed), testnet only; mainnet runs the real DKG.`);
+	/** This node's loaded committee seat — its out-of-band share + committee keypair — or null if it isn't a
+	 *  member. REFUSES a share whose group key doesn't equal the repo's hardcoded one (the derive-and-verify
+	 *  guard: a node won't run a committee that disagrees with the public identity in the repo). */
+	private trustedCommitteeCache?: { secretKey: Uint8Array; groupPubKey: Uint8Array } | null;
+	private genesisCommittee(): { secretKey: Uint8Array; groupPubKey: Uint8Array } | null {
+		if (this.trustedCommitteeCache !== undefined) return this.trustedCommitteeCache;
+		const key = genesisCommitteeKey(this.currentChannel());
+		const share = this.committeeShare();
+		if (!key || this.btcNetwork() === "mainnet" || !share || !existsSync(this.committeeKeyPath())) return (this.trustedCommitteeCache = null);
+		if (toHex(share.groupPubKey) !== toHex(key)) {
+			console.warn(`  ⚠ custody: on-disk share's group key ${toHex(share.groupPubKey).slice(0, 12)}… ≠ repo's ${toHex(key).slice(0, 12)}… — REFUSING it (re-distribute the right seat bundle).`);
+			return (this.trustedCommitteeCache = null);
 		}
+		try {
+			const secretKey = fromHex(JSON.parse(readFileSync(this.committeeKeyPath(), "utf8")).secretKey);
+			return (this.trustedCommitteeCache = { secretKey, groupPubKey: share.groupPubKey });
+		} catch (e) {
+			console.warn(`  ⚠ custody: committee-key.json unreadable (${(e as Error).message}) — not signing.`);
+			return (this.trustedCommitteeCache = null);
+		}
+	}
+
+	/** Announce the out-of-band-installed committee's group key into consensus state so the fund activates
+	 *  (gate #4). The share is already on disk; nothing secret is generated or persisted here. */
+	private installGenesisCommittee(hc: { groupPubKey: Uint8Array }): void {
 		if (this.view().custody.fundKey === null) void this.custodyAccount().announceFund(toHex(hc.groupPubKey), 0).catch(() => {});
+		console.warn(`  custody: trusted-dealer committee — share loaded, fund key ${toHex(hc.groupPubKey).slice(0, 12)}… publishing into the chain (no DKG). Repo holds only the public key.`);
 	}
 
 	private startCommitteeCustody(): void {
 		if (this.rotation) return;
-		const hc = this.genesisCommittee();
-		if (hc) return this.installGenesisCommittee(hc); // dev: deterministic committee, no live DKG / rotation
+		if (this.trustedCommitteeMode()) {
+			const hc = this.genesisCommittee();
+			if (hc) this.installGenesisCommittee(hc); // member → announce the group key; non-member just learns it from the chain
+			return; // trusted-dealer committee is static — no live DKG / rotation
+		}
 		this.rotation = new CommitteeRotation({
 			node: this.node,
 			selfId: this.producerId(),
@@ -1668,8 +1682,8 @@ export class Daemon {
 	private ceremonyAuthCache?: CeremonyAuth;
 	private ceremonyAuth(): CeremonyAuth {
 		if (!this.ceremonyAuthCache) {
-			// Dev committee: sign ceremony messages as the seat's committee keypair (not the producer key),
-			// since the committee identity is the derived member id, not this node's producer id.
+			// Trusted-dealer committee: sign ceremony messages as the seat's committee keypair (the out-of-band
+			// secret), not this node's producer key. Falls back to the producer key for the live-DKG path.
 			const hc = this.genesisCommittee();
 			this.ceremonyAuthCache = makeCeremonyAuth(hc ? hc.secretKey : this.producerKey().privateKey);
 		}

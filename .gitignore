@@ -1,5 +1,6 @@
 node_modules/
 dist/
+committee-setup/
 *.log
 .DS_Store
 .env
