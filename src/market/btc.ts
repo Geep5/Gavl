@@ -24,7 +24,7 @@ import { finalizedOrdering, orderingFor } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import { verifyPythUpdate } from "./pyth.ts";
 import { verifySignedQuorum } from "./signed-feed.ts";
-import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, mintCeiling, withdrawCap, depositCap, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS, DEMURRAGE_KEEP_NUM, DEMURRAGE_KEEP_DEN, DEMURRAGE_DUST } from "../custody/bridge.ts";
+import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, mintCeiling, withdrawCap, depositCap, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
 import { emptyBook, escrowedInContracts, applyMatch, applyMatchPot, applySettle, pruneExpiredOffers, settleExpired, MAX_OPEN_POSITIONS, rebuildPosCount } from "./intent.ts";
@@ -175,50 +175,27 @@ export interface ViewOptions {
 export type MarketDef = { kind: "pyth"; feedId: string } | { kind: "signed"; signerSet: string };
 
 /**
- * Demurrage — the RAM ledger's "balances can't sit forever" rule, turned into liquidity. State
- * lives in RAM, so an idle balance that never moves is just an unbounded entry; rather than cap it,
- * we let IDLE (free) gBTC decay and reappropriate it into the liquidity POT (which backstops
- * trades). Per balance, from its idle clock `chargeFrom` (= last-credit + grace):
- *   - before chargeFrom: untouched (the ~1-week grace),
- *   - after: −20%/day,
- *   - at the 1-month cutoff (or once it dips below the dust floor): take whatever's left.
- * The whole lifecycle is ≤ 1 month for ANY balance — the % decay is the gentle warning, the
- * cutoff the hard guarantee. The drag goes to `bridge.pot` (a conservation bucket), NOT
- * redistributed per-fold: redistribution to the active-contract set is path-dependent (which
- * contracts are open at a fold differs by checkpoint base → divergent appRoot → fork). The pot
- * is just a counter, so it's base-independent (= cumulative idle decay). It only MOVES gBTC
- * (idle → pot), never mints/burns, so 1:1 backing holds. The pot is the backstop's capital
+ * Demurrage — the RAM ledger's "balances can't sit idle forever" rule, turned into liquidity. State
+ * lives in RAM, so an abandoned balance is just an unbounded entry. Each balance carries an idle clock
+ * (`chargeFrom.charged` = last-credit + grace); once the fold height reaches it, the WHOLE balance is
+ * swept into the liquidity POT in one go — a flat TIMEOUT, not a decay curve (no time-scaling knob). A
+ * credit resets the clock, so an active balance is never touched, and the UI counts the grace down so the
+ * sweep is never a surprise (use-it-or-lose-it). The swept gBTC goes to `bridge.pot` — a conservation
+ * bucket and base-independent counter (checkpoint-pruned and full nodes agree, so no fork). It only MOVES
+ * gBTC (idle → pot), never mints/burns, so 1:1 backing holds. The pot is the backstop's capital
  * (`applyMatchPot`): reclaimed idle balances become the counterparty that lets someone trade.
  */
 function accrueDemurrage(view: View, nowHeight: number): void {
 	const b = view.bridge;
-	const cutoffAge = DEMURRAGE_CUTOFF_DAYS * DEMURRAGE_DAY; // age past `since` at which we take it all
 	for (const [k, bal] of [...b.gbtc]) {
 		const e = b.chargeFrom.get(k);
 		if (e === undefined) {
 			b.chargeFrom.set(k, { since: nowHeight, charged: nowHeight + DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY }); // unstamped → grace from now
 			continue;
 		}
-		if (nowHeight - e.since >= cutoffAge) {
-			b.pot += bal; // past the 1-month cutoff (measured from the FIXED idle-start) → take it all
+		if (nowHeight >= e.charged) {
+			b.pot += bal; // past the grace deadline → sweep the WHOLE idle balance to the pot (flat timeout)
 			addGbtc(b, k, -bal); // (deletes the entry + its clock)
-			continue;
-		}
-		if (nowHeight <= e.charged) continue; // still in grace / nothing new to charge
-		const days = Math.floor((nowHeight - e.charged) / DEMURRAGE_DAY);
-		if (days <= 0) continue;
-		let kept = bal;
-		for (let i = 0; i < days; i++) kept = (kept * DEMURRAGE_KEEP_NUM) / DEMURRAGE_KEEP_DEN; // −20%/day, per-day floor
-		const charge = bal - kept;
-		if (charge > 0n) {
-			addGbtc(b, k, -charge);
-			b.pot += charge;
-		}
-		e.charged += days * DEMURRAGE_DAY; // advance the charged-through boundary (since stays fixed)
-		const left = b.gbtc.get(k) ?? 0n;
-		if (left > 0n && left < DEMURRAGE_DUST) {
-			b.pot += left; // the % tail isn't worth a slot → take it into the pot
-			addGbtc(b, k, -left);
 		}
 	}
 }

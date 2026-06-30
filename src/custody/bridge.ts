@@ -149,17 +149,12 @@ export const MAX_OUTSTANDING_CLAIMS = 1_024;
 // ── demurrage (idle-balance decay) — consensus-critical, every node must agree ──
 /** Anchors per demurrage "day". */
 export const DEMURRAGE_DAY = 1440;
-/** Untouched grace after a balance is last credited (~1 week). */
+/** Idle grace after a balance is last credited (~1 week). PAST this the WHOLE idle balance is swept to
+ *  the pot in one go — a flat TIMEOUT, not a decay curve, so there's no time-scaling knob. A credit
+ *  resets the clock (an active balance is never touched); the UI counts the grace down so the sweep is
+ *  never a surprise (use-it-or-lose-it). */
 export const DEMURRAGE_GRACE_DAYS = 7;
-/** Hard lifecycle cap: an idle balance is fully taken by this age, guaranteeing the whole
- *  process is ≤ 1 month regardless of size (the % decay can't promise a deadline alone). */
-export const DEMURRAGE_CUTOFF_DAYS = 30;
-/** Daily decay during [grace, cutoff): keep 80% / remove 20% per day. */
-export const DEMURRAGE_KEEP_NUM = 8n;
-export const DEMURRAGE_KEEP_DEN = 10n;
-/** Below this, a decaying balance is just taken whole (the % tail isn't worth a state slot). */
-export const DEMURRAGE_DUST = 1000n;
-/** Height demurrage decay begins for a balance credited at `creditHeight` (grace folded in). */
+/** The sweep height for a balance credited at `creditHeight` — its idle deadline (= credit + grace). */
 export function demurrageChargeFrom(creditHeight: number): number {
 	return creditHeight + DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY;
 }

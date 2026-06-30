@@ -24,7 +24,7 @@ import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
 import { genesisCommitteeKey } from "./custody/genesis-committee.ts";
 import { mark, gbtcOf, MAX_LEVERAGE, parseAmount, leverageOk } from "./market/btc.ts";
 import { escrowedInContracts } from "./market/intent.ts";
-import { totalGbtc, pendingTotal, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS, DEMURRAGE_CUTOFF_DAYS } from "./custody/bridge.ts";
+import { totalGbtc, pendingTotal } from "./custody/bridge.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
@@ -230,11 +230,11 @@ function serializeState() {
 
 	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)
 	const onChainR = rsv != null ? rsv.sats : null;
-	// Idle-decay (demurrage) countdown for the active account: its idle clock starts at the last
-	// credit (`since`); decay begins at +grace and the balance is fully reclaimed by +cutoff. The UI
-	// turns these heights into a live countdown via the current tip + secPerAnchor. Null if no clock.
+	// Idle-SWEEP (demurrage) countdown for the active account: a free balance is swept WHOLE to the pot
+	// at its idle deadline (`charged` = last-credit + grace) — a flat timeout, not a decay. The UI turns
+	// this single height into a live countdown via the current tip. Null if the account has no balance/clock.
 	const cf = view.bridge.chargeFrom.get(me);
-	const idleDecay = cf ? { decayAtHeight: cf.since + DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY, cutoffHeight: cf.since + DEMURRAGE_CUTOFF_DAYS * DEMURRAGE_DAY } : null;
+	const idleDecay = cf ? { sweepAtHeight: cf.charged } : null;
 	// Conservation buckets (reserves == free + bonded + escrow + pending + pot) for the UI breakdown.
 	// `free` is the remainder, so the five always sum to reserves regardless of how the ledger rounds.
 	const escrowV = escrowedInContracts(view.book);
@@ -248,7 +248,7 @@ function serializeState() {
 		maxLeverage: Number(MAX_LEVERAGE),
 		// collateral = gBTC, a 1:1 claim on BTC in the custody fund
 		myGbtc: gbtcOf(view, me).toString(),
-		idleDecay, // { decayAtHeight, cutoffHeight } | null — demurrage countdown for your idle gBTC
+		idleDecay, // { sweepAtHeight } | null — idle-sweep countdown for your idle gBTC (flat timeout)
 
 		reserves: view.bridge.reserves.toString(), // BTC sats in the fund
 		gbtcOutstanding: (totalGbtc(view.bridge) + escrowedInContracts(view.book)).toString(),

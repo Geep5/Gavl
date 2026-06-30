@@ -26,9 +26,8 @@
 	const idle = $derived.by(() => {
 		const h = c?.tip?.height;
 		if (!idleDecay || h == null || bal <= 0) return null;
-		const toDecay = (idleDecay.decayAtHeight - h) / DEM_DAY;
-		const toSweep = (idleDecay.cutoffHeight - h) / DEM_DAY;
-		return { decaying: toDecay <= 0, toDecay, toSweep };
+		const toSweep = (idleDecay.sweepAtHeight - h) / DEM_DAY; // flat timeout: the whole idle balance is swept at the deadline
+		return { toSweep, urgent: toSweep < 1 };
 	});
 	const fmtDays = (d) => { const x = Math.max(0, d); return x >= 1 ? `${Math.floor(x)}d` : `${Math.max(1, Math.ceil(x * 24))}h`; };
 
@@ -284,13 +283,9 @@
 
 	<!-- idle-decay countdown — funds left idle are on a clock (use-it-or-lose-it) -->
 	{#if idle}
-		<div class="idle" class:warn={idle.decaying}>
-			<span class="idle-ico">{idle.decaying ? "⚠" : "⏳"}</span>
-			{#if idle.decaying}
-				<span>Idle gBTC is being <b>reclaimed</b> — {fmtDays(idle.toSweep)} to full sweep. Trade or withdraw now.</span>
-			{:else}
-				<span>Idle gBTC decays in <b>{fmtDays(idle.toDecay)}</b> — keep it working or withdraw. Not a savings account.</span>
-			{/if}
+		<div class="idle" class:warn={idle.urgent}>
+			<span class="idle-ico">{idle.urgent ? "⚠" : "⏳"}</span>
+			<span>Idle gBTC is swept to the pot in <b>{fmtDays(idle.toSweep)}</b> — keep it working or withdraw. Not a savings account.</span>
 		</div>
 	{/if}
 
