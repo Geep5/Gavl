@@ -98,7 +98,7 @@ export class Producer {
 	 * chain's sticky-finality lock). Online nodes are already safe via that lock;
 	 * the heartbeat is purely for long-range/bootstrap weight.
 	 */
-	async runAdaptive(opts: { until: () => boolean; finalityDepth: number; busyPaceMs?: number; bootstrapPaceMs?: number; heartbeatMs?: number; bootstrapping?: () => boolean }): Promise<void> {
+	async runAdaptive(opts: { until: () => boolean; finalityDepth: number; busyPaceMs?: number; bootstrapPaceMs?: number; heartbeatMs?: number; bootstrapping?: () => boolean; hasPeers?: () => boolean }): Promise<void> {
 		this.active = true;
 		const heartbeatMs = opts.heartbeatMs ?? 120_000;
 		let lastAnchorAt = 0;
@@ -114,14 +114,18 @@ export class Producer {
 				// Busy: bury outstanding writes as fast as the cooldown allows.
 				await this.produceOne();
 				lastAnchorAt = this.tick();
-				// While BOOTSTRAPPING toward genesis with peers, don't mint faster than the mesh gossips a
-				// height. Fork choice is heaviest-chain winner-take-all: a farmer that outruns gossip builds a
-				// private run that gets orphaned WHOLE, so the losing producers vanish from the canonical chain
-				// and the committee never sees its ≥minCommittee distinct producers (the 3-node real-PoST
-				// `producers`-collapse). bootstrapPaceMs (≥ gossip latency) caps the bootstrap rate so producers
-				// interleave on one chain. Post-genesis the difficulty retarget owns the rate, so this lifts the
-				// instant the committee's fund key exists.
-				const pace = opts.bootstrapping?.() ? Math.max(opts.busyPaceMs ?? 0, opts.bootstrapPaceMs ?? 0) : (opts.busyPaceMs ?? 0);
+				// Whenever there are PEERS, don't mint faster than the mesh gossips a height. Fork choice is
+				// heaviest-chain winner-take-all: a farmer that outruns gossip builds a private run that gets
+				// orphaned WHOLE, so the losing producers vanish from the canonical chain (the 3-node real-PoST
+				// `producers`-collapse). bootstrapPaceMs (≥ gossip latency) caps the rate so producers interleave
+				// on one chain. The floor holds the WHOLE time peers exist, NOT just during bootstrap: the
+				// difficulty retarget ramps GRADUALLY, so right after the committee forms the difficulty is still
+				// at its bootstrap (fast) level — lift the floor then and the node mints far faster than gossip
+				// and the chain RE-SPLITS post-committee (producers 3→1, observed live). The floor stops binding
+				// once the retarget slows anchors past it (toward targetSecPerAnchor), so a converged,
+				// up-to-difficulty network is unaffected.
+				const withPeers = opts.bootstrapping?.() || (opts.hasPeers?.() ?? false);
+				const pace = withPeers ? Math.max(opts.busyPaceMs ?? 0, opts.bootstrapPaceMs ?? 0) : (opts.busyPaceMs ?? 0);
 				if (pace > 0) await this.sleep(pace);
 			} else {
 				// Idle: only mine when a heartbeat interval has elapsed.

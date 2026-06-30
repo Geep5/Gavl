@@ -1274,9 +1274,13 @@ export class Daemon {
 			// margin over hub latency; raise GAVL_BOOTSTRAP_PACE_MS if a slower mesh still diverges.
 			bootstrapPaceMs: Number(process.env.GAVL_BOOTSTRAP_PACE_MS ?? 8000),
 			heartbeatMs: this.heartbeatMs,
-			// `custody.fundKey` is null until genesis completes, then stays set — so bootstrap pacing lifts
-			// (the difficulty retarget owns the rate) the instant the committee is up.
+			// `custody.fundKey` is null until genesis completes, then stays set.
 			bootstrapping: () => this.view().custody.fundKey === null,
+			// Hold the gossip-safe pace floor whenever we have peers, not only during bootstrap: the difficulty
+			// retarget ramps GRADUALLY, so right after the committee forms the difficulty is still at its
+			// bootstrap (fast) level and the chain RE-SPLITS (fast minting outruns gossip, producers 3→1) if the
+			// floor lifts. It stops binding once the retarget slows anchors past it (toward the target rate).
+			hasPeers: () => this.node.peerCount > 0,
 		});
 	}
 
