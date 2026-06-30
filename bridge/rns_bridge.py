@@ -173,7 +173,7 @@ class Bridge:
         self.binding = None              # our signed producer↔address binding (announce app_data)
         self.pushed = set()              # peers we've handed our binding to over the reliable channel
         self.lock = threading.Lock()
-        self.announce_interval = 300     # seconds between steady-state re-announces (live-tunable from the UI)
+        self.announce_interval = 15      # seconds between re-announces — 15s default for fast discovery (live-tunable from the UI)
         self.announce_wake = threading.Event()  # set → re-announce now and adopt the new interval immediately
 
         ensure_gavl_rns_config(config_dir)  # write the hub-only default if this node has no config yet
@@ -410,13 +410,12 @@ def serve(args):
     bridge = Bridge(ctrl, config_dir, args.storage_dir, args.network, args.propagated)
     bridge.announce_interval = args.announce_interval  # initial cadence (live-tunable via set_announce_interval)
 
-    # Re-announce so peers keep discovering us. The steady-state cadence (args.announce_interval, 300s)
-    # is fine once the mesh is warm, but on a COLD start it's a trap: a node's first announce often fires
-    # before its link to the hub is fully up (or before a late-joining peer is connected), so it's lost —
-    # and the next isn't for 5 minutes, stranding two nodes that can't see each other (the binding push
-    # can't rescue this; it needs an announce to have crossed first). So announce a few times over the
-    # first ~minute, THEN settle to the configured cadence — cold-start discovery drops from minutes to
-    # seconds, regardless of join order, at the cost of a handful of extra startup announces.
+    # Re-announce so peers keep discovering us. On a COLD start a single announce is fragile: a node's first
+    # announce often fires before its link to the hub is fully up (or before a late-joining peer is
+    # connected), so it's lost — and a peer that missed it waits for the next (the binding push can't rescue
+    # this; it needs an announce to have crossed first). So we announce a few times over the first ~minute to
+    # front-load discovery regardless of join order, THEN settle to the configured cadence (15s by default —
+    # was 300s, which could strand two nodes that couldn't see each other for up to 5 minutes).
     def reannounce():
         for delay in (8, 8, 8, 15, 15):  # ~54s of warm-up re-announces
             time.sleep(delay)
@@ -464,7 +463,7 @@ def main():
     p.add_argument("--storage-dir", required=True, help="dir for this node's LXMF identity + store")
     p.add_argument("--network", default="gavl", help="Gavl network label (peers must match)")
     p.add_argument("--propagated", action="store_true", help="always route via a propagation node")
-    p.add_argument("--announce-interval", type=int, default=300, help="seconds between re-announces")
+    p.add_argument("--announce-interval", type=int, default=15, help="seconds between re-announces (15s = fast discovery; raise on a large network)")
     args = p.parse_args()
     serve(args)
 

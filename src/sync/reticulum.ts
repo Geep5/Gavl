@@ -107,7 +107,7 @@ export class ReticulumTransport {
 	private readonly producerToAddress = new Map<string, string>();
 	private readyResolve?: (v: void) => void;
 	private keepaliveTimer?: ReturnType<typeof setInterval>;
-	private announceIntervalSec = Number(process.env.GAVL_ANNOUNCE_INTERVAL) || 300; // gossip cadence, live-tunable from the UI
+	private announceIntervalSec = Number(process.env.GAVL_ANNOUNCE_INTERVAL) || 15; // gossip cadence (s) — 15s default for fast cold-start discovery; live-tunable from the UI, raise via GAVL_ANNOUNCE_INTERVAL on a large net
 
 	constructor(node: GavlNode, opts: ReticulumOptions) {
 		this.node = node;
@@ -202,11 +202,12 @@ export class ReticulumTransport {
 			"--network", network,
 			"--config-dir", configDir,
 		];
-		// Re-announce cadence: how often we re-broadcast our gavl announce so late-joining peers
-		// discover us. Default (300s in the sidecar) is fine steady-state; lower it for faster
-		// discovery on small/test networks via GAVL_ANNOUNCE_INTERVAL.
-		const announceInterval = process.env.GAVL_ANNOUNCE_INTERVAL;
-		if (announceInterval && /^\d+$/.test(announceInterval)) argv.push("--announce-interval", announceInterval);
+		// Re-announce cadence: how often we re-broadcast our gavl announce so late-joining peers discover
+		// us. Default 15s — fast peer discovery for a cold-started network: nodes that start apart miss each
+		// other's warm-up burst and would otherwise wait a full cadence to find each other (a 300s default
+		// meant up to 5 min of `peers: 0`). Always passed, so the sidecar uses this single source of truth;
+		// raise via GAVL_ANNOUNCE_INTERVAL to cut announce traffic on a large network.
+		argv.push("--announce-interval", String(this.announceIntervalSec));
 		if (this.opts.propagated) argv.push("--propagated");
 
 		this.child = spawn(py, argv, {
