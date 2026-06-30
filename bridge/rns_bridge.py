@@ -28,6 +28,7 @@ import argparse
 import threading
 import socket
 import base64
+import hashlib
 
 import RNS
 import LXMF
@@ -67,6 +68,13 @@ GAVL_PREFIX = "gavl:"
 # one announce path RNS reliably relays through a hub — instead of a separate raw gavl.<network>
 # announce, which (empirically) the transport did not propagate. base64(32-byte key + 64-byte sig).
 GAVL_BIND_PREFIX = "gavlb1:"
+
+# RENDEZVOUS: passive announce-discovery is unreliable cross-machine, so a node ALSO actively registers
+# with a derived directory (bridge/rendezvous.py) and dials whoever else is registered. The rendezvous
+# identity is a pure function of this seed — every node computes the same address with zero config (same
+# idea as the genesis). Keep RDV_SEED + RDV_FRAME byte-identical here and in rendezvous.py.
+RDV_SEED = b"gavl-rendezvous-v1"
+RDV_FRAME = "__gavl_rdv__"
 
 # Gavl's default Reticulum config, written on first run. HUB-ONLY: there is no LAN AutoInterface, so
 # every node reaches the network through shared internet hubs — two nodes on the same LAN connect
@@ -203,6 +211,31 @@ class Bridge:
         self.emit({"ev": "ready", "address": self.address})
         self.announce()
 
+        # RENDEZVOUS directory: in addition to passive announce-discovery, actively register with a derived
+        # directory and dial whoever else is there. Compute its address (zero-config), cache its identity so
+        # send() reaches it before any announce, and warm a path. Registration runs in serve()'s loop.
+        self.rdv_addr = None
+        if os.environ.get("GAVL_RENDEZVOUS", "1") != "0":
+            try:
+                rdv_identity = RNS.Identity.from_bytes(hashlib.sha512(RDV_SEED).digest())
+                self.rdv_addr = RNS.Destination(rdv_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery").hash.hex()
+                self.peer_identities[self.rdv_addr] = rdv_identity
+                RNS.Transport.request_path(bytes.fromhex(self.rdv_addr))
+                self.log("rendezvous: directory at %s — registering every cadence" % self.rdv_addr[:8])
+            except Exception as e:
+                self.rdv_addr = None
+                self.log("rendezvous init failed: " + str(e))
+
+    def register_rendezvous(self):
+        """Tell the directory we're here (on our network) and ask who else is — the reply lands in
+        on_message as a 'members' frame, which we turn into dialable discoveries."""
+        if not self.rdv_addr:
+            return
+        try:
+            self.send(self.rdv_addr, {RDV_FRAME: {"op": "register", "network": self.network, "address": self.address}})
+        except Exception as e:
+            self.log("rendezvous register failed: " + str(e))
+
     # ── control protocol (bridge → Node) ─────────────────────────────
     def emit(self, obj):
         line = (json.dumps(obj) + "\n").encode("utf-8")
@@ -304,6 +337,15 @@ class Bridge:
             frame = json.loads(lxmf_message.content.decode("utf-8"))
         except Exception as e:
             self.log("bad inbound frame: " + str(e))
+            return
+        # Rendezvous reply: the directory's member list. Turn each address into a dialable discovery and
+        # RETURN — the rendezvous is a control endpoint, not a consensus peer, so never model it as one.
+        rdv = frame.get(RDV_FRAME) if isinstance(frame, dict) else None
+        if isinstance(rdv, dict):
+            if rdv.get("op") == "members":
+                for addr in rdv.get("members", []):
+                    if isinstance(addr, str) and len(addr) == 32 and addr.lower() != self.address:
+                        self.emit({"ev": "discovered", "peer": addr.lower()})
             return
         # Any inbound frame proves the peer is reachable → model it as a live connection.
         new = False
@@ -421,6 +463,7 @@ def serve(args):
             time.sleep(delay)
             try:
                 bridge.announce()
+                bridge.register_rendezvous()
             except Exception:
                 pass
         while True:
@@ -430,6 +473,7 @@ def serve(args):
             bridge.announce_wake.clear()
             try:
                 bridge.announce()
+                bridge.register_rendezvous()
             except Exception:
                 pass
     threading.Thread(target=reannounce, daemon=True).start()
