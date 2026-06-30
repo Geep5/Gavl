@@ -1,7 +1,7 @@
 /**
  * Composition root — the default Gavl configuration.
  *
- * The core (chain/, ledger/, consensus/, auction/) is deliberately VDF-agnostic:
+ * The core (chain/, ledger/, consensus/) is deliberately VDF-agnostic:
  * a `ChainParams` is always injected, so nothing in it hardcodes a backend. This
  * module is where "what does a real Gavl node run by default" is decided — and
  * the answer is the REAL Chia VDF, so the cooldown is genuine, non-parallelizable

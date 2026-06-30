@@ -5,15 +5,11 @@
  * Writes pay the PoST cooldown, so action endpoints are async and can take a
  * few hundred ms.
  *
- *   GET  /api/state                       → { accounts, active, coins, auctions, balances }
+ *   GET  /api/state                       → { accounts, active, coins, balances }
  *   POST /api/accounts        {label}      → create + activate an identity
  *   POST /api/accounts/active {pubHex}     → switch the active identity
  *   POST /api/coins           {name,symbol,supply}        → deploy a coin
  *   POST /api/transfer        {token,to,amount}
- *   POST /api/auctions        {give,ask}    → create a listing (give: item|coin)
- *   POST /api/auctions/:id/bid    {token,amount}
- *   POST /api/auctions/:id/settle {winner}
- *   POST /api/auctions/:id/cancel
  */
 
 import { createServer } from "node:http";
@@ -54,15 +50,13 @@ const RETARGET = process.env.GAVL_RETARGET !== "0";
 const TARGET_ITERS = BigInt(process.env.GAVL_TARGET_ITERS ?? "200000");
 // Idle heartbeat: when caught up, a lone node mints one anchor every this many ms.
 // This sets the anchor cadence when there's no competing work, so it MUST match the
-// time-estimate target (targetSecPerAnchor = 60s) — otherwise listing lifetimes,
-// which are measured in anchors (MAX_LISTING_ANCHORS = 14_400 ≈ 10 days @ 60s),
-// read at the wrong wall-clock. Upstream defaulted this to 120s, which made the
-// 10-day cap display as ~20 days. Default it to 60s to match.
+// time-estimate target (targetSecPerAnchor = 60s) — otherwise anchor-counted durations
+// read at the wrong wall-clock. Default it to 60s to match.
 const HEARTBEAT_MS = Number(process.env.GAVL_HEARTBEAT_MS ?? "60000");
 
 // Durable storage: ON by default (GAVL_PERSIST=off → in-memory only, lost on restart).
 //   GAVL_PERSIST=all  (default) → archiver, keep every write
-//   GAVL_PERSIST=mine            → keep only writes touching my wallet keys + their coins/auctions
+//   GAVL_PERSIST=mine            → keep only writes touching my wallet keys + their coins
 const PERSIST = process.env.GAVL_PERSIST ?? "all";
 
 // Channel/network: the name IS the address. GAVL_NETWORK sets the initial channel; the UI can
@@ -438,7 +432,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		}
 		if (path === "/api/channel") {
 			// Join a different channel by name. Each channel is its own economy (own anchor
-			// chain + listings); your wallet/identity is shared. Returns once the switch lands.
+			// chain + market state); your wallet/identity is shared. Returns once the switch lands.
 			const name = String(body.name ?? "").trim();
 			if (!name) return send(res, 400, { error: "channel name required" });
 			await daemon.switchChannel(name);
@@ -483,24 +477,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			// Stop the most-recently-spawned local node.
 			fleetDown();
 			return send(res, 200, fleetStatus());
-		}
-		const claimMatch = path.match(/^\/api\/auctions\/([0-9a-f]+)\/claim$/);
-		if (claimMatch) {
-			const won = daemon.active().claimWon(claimMatch[1]);
-			if (!won) return send(res, 400, { error: "nothing to claim (not winner, not settled, or already open)" });
-			return send(res, 200, { name: won.name, plaintext: won.plaintext, verified: won.verified });
-		}
-		const bidMatch = path.match(/^\/api\/auctions\/([0-9a-f]+)\/(bid|settle|cancel)$/);
-		if (bidMatch) {
-			const [, id, action] = bidMatch;
-			const acct = daemon.active();
-			if (action === "bid") {
-				validateBid(id, String(body.token), String(body.amount));
-				await acct.bid(id, String(body.token), String(body.amount));
-			}
-			else if (action === "settle") await acct.settle(id, String(body.winner));
-			else await acct.cancel(id);
-			return send(res, 200, { ok: true });
 		}
 	}
 

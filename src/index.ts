@@ -21,7 +21,7 @@ for (const k of [11, 14]) {
 	let prev: string | null = null;
 	let seq = 0;
 	const stateRoot = "00".repeat(32);
-	for (const payload of [{ op: "create", item: "sword" }, { op: "bid", offer: 50 }, { op: "settle" }]) {
+	for (const payload of [{ n: 1 }, { n: 2 }, { n: 3 }]) {
 		const t0 = process.hrtime.bigint();
 		const wr = await w.write({ prev, seq, stateRoot, payload, ts: 1_700_000_000 + seq });
 		const ms = Number(process.hrtime.bigint() - t0) / 1e6;

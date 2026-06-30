@@ -49,7 +49,7 @@ export interface WriteCore extends Trunk {
 	difficulty: string;
 	/** Wall-clock stamp (informational; the VDF, not this, is the clock). */
 	ts: number;
-	/** The operation. Opaque in P0 (auction/coin ops land in P3). */
+	/** The operation. Opaque at the chain layer — interpreted by the market/apply layer. */
 	payload: unknown;
 }
 

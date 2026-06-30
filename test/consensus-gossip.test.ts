@@ -67,7 +67,7 @@ test("two producers converge on a single heaviest anchor chain", async () => {
 	assert.ok(A.anchorTip()!.height >= 3, "the agreed chain advanced");
 });
 
-test("a settled auction finalizes from gossiped anchors on the other node", async () => {
+test("a gBTC balance finalizes from gossiped anchors on the other node", async () => {
 	const A = consensusNode();
 	const B = consensusNode();
 	const net = new MemoryNetwork();

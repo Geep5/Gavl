@@ -81,7 +81,7 @@ export class WriteStore {
 		const op = decode(write);
 		this.ctx.op = op;
 		if (!this.policy.keep(write, this.ctx)) return false;
-		recordKept(write, op, this.ctx); // so later bids/settles on this auction are kept too
+		recordKept(write, op, this.ctx); // hook so writes that later reference this one are kept too
 		this.insWrite.run(write.writer, write.seq, JSON.stringify(write));
 		this.kept++;
 		return true;

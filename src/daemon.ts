@@ -9,7 +9,7 @@
  * daemon joins the live Reticulum mesh (gossiping writes AND anchors over LXMF),
  * and runs a Producer that farms anchors over the heaviest tip. The UI can then
  * watch the real consensus advance: tip height/weight climbing, finality
- * deepening, settled auctions becoming final.
+ * deepening, the custody committee forming.
  *
  * VDF is real chiavdf by default (genuine cooldown). The anchor space proof uses
  * the light stand-in by default so the node boots instantly without plotting —
@@ -116,7 +116,7 @@ export interface DaemonOptions {
 	/** Durable storage. Omit → in-memory only (RAM, lost on restart). */
 	store?: {
 		dir?: string; // store dir (default ~/.gavl/store)
-		/** "all" → archiver (keep everything); "mine" → only my wallet keys + their coins/auctions. */
+		/** "all" → archiver (keep everything); "mine" → only my wallet keys + their coins. */
 		persist?: "all" | "mine";
 		/** Or supply a custom policy directly (overrides `persist`). */
 		policy?: PersistPolicy;
@@ -574,7 +574,7 @@ export class Daemon {
 	async init(): Promise<{ replayed: number } | null> {
 		if (!this.storeOpts) return null;
 		// Per-channel store dir: each channel is its own economy (its own anchor chain +
-		// listings), so its persisted writes live under channels/<slug>/. The wallet
+		// market state), so its persisted writes live under channels/<slug>/. The wallet
 		// (your identity/keys) is shared across all channels, one level up.
 		const base = this.storeOpts.dir ?? join(homedir(), ".gavl", "store");
 		const dir = join(base, "channels", channelSlug(this.network ?? "gavl"));
