@@ -46,7 +46,7 @@ const buildPositions = (n: number): View => {
 	const v = computeView([]);
 	for (let i = 0; i < n; i++) {
 		const id = hx("c" + i);
-		v.book.contracts.set(id, { id, long: hx("L" + i), short: hx("S" + i), stake: 1_000_000n, entry: 5_852_013n, leverage: 3n, nonce: hx("n" + i).slice(0, 16), expiryHeight: 1_000_000 + i } as Contract);
+		v.book.contracts.set(id, { id, long: hx("L" + i), short: hx("S" + i), stake: 1_000_000n, entry: 5_852_013n, leverage: 3n, nonce: hx("n" + i).slice(0, 16), expiryHeight: 1_000_000 + i, bid: 0n } as Contract);
 	}
 	return v;
 };
@@ -64,6 +64,47 @@ const buildOfferFills = (n: number): View => {
 	for (let i = 0; i < n; i++) v.book.offerFills.set(hx("o" + i).slice(0, 24), { filled: 500_000n, expiryHeight: 1_000_000 + i });
 	return v;
 };
+
+// ── 1b. rounds (R0) — the PROPOSED canonical round shape: bytes per entry ──
+// Rounds don't exist in consensus yet; this measures the exact encoding R1 will commit
+// (canonicalize over the planned plain-JSON shape), the same way positions were sized.
+
+const buildRoundCanon = (n: number): unknown => ({
+	idx: 123_456,
+	strike: "6004300000000", // integer Pyth price (expo applied at display)
+	close: null, // still live
+	poolUp: "123456789012",
+	poolDown: "98765432101",
+	settled: false,
+	// entries: pubkey → {side, stake}, key-sorted like every other canonical map
+	entries: Array.from({ length: n }, (_, i) => [hx("player" + i), { side: i % 2 ? "up" : "down", stake: "1000000" }] as [string, unknown]).sort((a, b) => ((a[0] as string) < (b[0] as string) ? -1 : 1)),
+});
+const roundEntryBytes = (n1: number, n2: number): number =>
+	(enc.encode(canonicalize(buildRoundCanon(n2))).length - enc.encode(canonicalize(buildRoundCanon(n1))).length) / (n2 - n1);
+
+/** Parimutuel settle throughput: pro-rata distribution of the losing pool across n winners
+ *  (bigint math per entry — the batch cost the fold pays once per round close). */
+function settleRate(n: number, budgetMs = 500): number {
+	const entries = Array.from({ length: n }, (_, i) => ({ up: i % 2 === 0, stake: 1_000_000n + BigInt(i) }));
+	const VIG_BPS = 300n;
+	const settle = (): bigint => {
+		let winPool = 0n, losePool = 0n;
+		for (const e of entries) e.up ? (winPool += e.stake) : (losePool += e.stake);
+		const vig = (losePool * VIG_BPS) / 10_000n;
+		const dist = losePool - vig;
+		let paid = 0n;
+		for (const e of entries) if (e.up) paid += e.stake + (e.stake * dist) / winPool; // winner: stake back + pro-rata share
+		return vig + (dist - (paid - winPool)); // vig + integer-division dust → the pot
+	};
+	settle(); // warm
+	let reps = 0;
+	const t0 = performance.now();
+	while (performance.now() - t0 < budgetMs) {
+		settle();
+		reps++;
+	}
+	return (reps * n) / ((performance.now() - t0) / 1000);
+}
 
 function heapPerPosition(n: number): number | null {
 	const g = (globalThis as { gc?: () => void }).gc;
@@ -145,6 +186,10 @@ async function main(): Promise<void> {
 	const hp = heapPerPosition(20_000);
 	if (hp != null) console.log(`  in-RAM heap/position ≈ ${fmt(hp)} B  (live JS object + Map overhead; run with --expose-gc)`);
 	else console.log(`  (run with --expose-gc for the in-RAM heap-per-position figure)`);
+
+	const bRound = roundEntryBytes(1000, 4000);
+	console.log(`  round entry   : ${fmt(bRound)} B    10,000/round → ${(bRound * 10_000 / MB * 1000).toFixed(0)} KB · 2 live rounds → ${(bRound * 20_000 / MB).toFixed(1)} MB`);
+	console.log(`  settle sweep  : ${fmt(settleRate(10_000))} entries/s   (parimutuel pro-rata, bigint; one batch per round close)`);
 
 	console.log("\n  FOLD THROUGHPUT — ops/sec the state machine sustains, one core (excl. PoST verify)");
 	console.log(line);
