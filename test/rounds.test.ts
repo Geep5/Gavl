@@ -1,0 +1,247 @@
+/**
+ * Gavl Rounds through the FOLD — the 1-click bull/bear parimutuel primitive. Entries escrow into
+ * height-derived rounds (top-N-by-stake admission); the strike and close are set by the first
+ * confidence-OK oracle write at/after their boundaries (in fold order → deterministic); winners
+ * split the losing pool pro-rata with the vig + dust going to the liquidity pot; every edge (tie,
+ * one-sided, no-strike, oracle-dark) refunds. Oracle writes here are REAL signed-quorum updates
+ * relayed on-chain (the Pyth path shares the code after verification; its conf gate is unit-tested
+ * pure since guardian signatures can't be forged in a test).
+ *
+ *   node --test test/rounds.test.ts
+ */
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+import { Ledger } from "../src/ledger/ledger.ts";
+import { GavlNode } from "../src/sync/node.ts";
+import { Account } from "../src/market/account.ts";
+import { computeView, gbtcOf, marketConserved } from "../src/market/btc.ts";
+import { viewRoot } from "../src/market/state.ts";
+import { ROUND_LEN, ROUND_DARK_TIMEOUT, confOk, applyRoundEnter, roundsOnOracle, emptyRounds } from "../src/market/rounds.ts";
+import { emptyBridge, addGbtc, gbtcOf as bGbtc } from "../src/custody/bridge.ts";
+import { signReading, buildSignedUpdate, signerSetHash } from "../src/market/signed-feed.ts";
+import type { SignerSet } from "../src/market/signed-feed.ts";
+import { generateKeyPair } from "../src/det/ed25519.ts";
+import { toHex } from "../src/det/canonical.ts";
+import { PARAMS, K, withGbtc } from "./helpers.ts";
+
+// Round 0 geometry (ROUND_LEN = 15): entries born < 14 (cutoff), lock = 15, close = 30.
+const LOCK = ROUND_LEN;
+const CLOSE = 2 * ROUND_LEN;
+
+/** Harness: a node, funded accounts, a 2-of-3 signed oracle set, and a relayer for updates. */
+function harness() {
+	const node = new GavlNode(new Ledger(PARAMS));
+	let t = 0;
+	const now = () => ++t;
+	const mk = () => new Account({ node, params: PARAMS, k: K, now, keypair: generateKeyPair() });
+	const members = [generateKeyPair(), generateKeyPair(), generateKeyPair()];
+	const set: SignerSet = { threshold: 2, signers: members.map((m) => toHex(m.publicKey)) };
+	const oracle = { kind: "signed" as const, signerSet: signerSetHash(set) };
+	/** Relay a quorum-signed price on-chain via `acct` (publishTime must increase per update). */
+	const report = (acct: Account, price: bigint, publishTime: number) => {
+		const sigBy: Record<string, string> = {};
+		for (const m of members.slice(0, 2)) sigBy[toHex(m.publicKey)] = signReading(price, 0, publishTime, m.privateKey);
+		return acct.reportMarketUpdate(JSON.stringify(buildSignedUpdate(price, 0, publishTime, set, sigBy)));
+	};
+	const balances: Record<string, bigint> = {};
+	const fund = (a: Account, amt: bigint) => (balances[a.pubHex] = amt);
+	const fold = (bornAt: Map<string, number>, nowHeight: number, extra: object = {}) =>
+		computeView(node.ledger.allWrites(), { bornAt, nowHeight, market: oracle, base: withGbtc(computeView([]), balances), ...extra });
+	return { node, mk, report, fund, fold, oracle, balances };
+}
+const born = (node: GavlNode, at: [string, number][]) => {
+	const m = new Map(node.ledger.allWrites().map((w) => [w.id, 0] as [string, number]));
+	for (const [id, h] of at) m.set(id, h);
+	return m;
+};
+
+test("entries escrow into the round's pools; wrong-round and cutoff-anchor entries are clean no-ops", async () => {
+	const { node, mk, fund, fold } = harness();
+	const A = mk(), B = mk();
+	fund(A, 10_000n);
+	fund(B, 10_000n);
+	const a = await A.enterRound(0, "up", 4_000n);
+	const b = await B.enterRound(0, "down", 3_000n);
+	const wrongIdx = await A.enterRound(1, "up", 1_000n); // says round 1, certified in round 0's window
+	const late = await B.enterRound(0, "down", 1_000n); // certified in the cutoff anchor
+
+	const v = fold(born(node, [[a, 2], [b, 3], [wrongIdx, 4], [late, LOCK - 1]]), 5);
+	const r = v.rounds.get(0)!;
+	assert.equal(r.poolUp, 4_000n, "up pool = A's stake");
+	assert.equal(r.poolDown, 3_000n, "down pool = B's stake (cutoff entry rejected)");
+	assert.equal(gbtcOf(v, A.pubHex), 6_000n, "A escrowed 4000 (wrong-idx entry was a no-op)");
+	assert.equal(gbtcOf(v, B.pubHex), 7_000n, "B escrowed 3000 (late entry was a no-op)");
+	assert.equal(r.strike, null, "not locked yet");
+	assert.ok(marketConserved(v), "pools are a conservation bucket");
+});
+
+test("top-N-by-stake admission: a bigger stake evicts the floor (refunded); an equal one keeps the incumbent", async () => {
+	const { node, mk, fund, fold } = harness();
+	const A = mk(), B = mk(), C = mk(), D = mk();
+	for (const x of [A, B, C, D]) fund(x, 10_000n);
+	const a = await A.enterRound(0, "up", 2_000n);
+	const b = await B.enterRound(0, "down", 3_000n);
+	const c = await C.enterRound(0, "up", 2_500n); // full (cap 2) → evicts floor A (2000)
+	const d = await D.enterRound(0, "up", 2_500n); // ties the new floor C (2500) → rejected
+
+	const v = fold(born(node, [[a, 2], [b, 3], [c, 4], [d, 5]]), 6, { maxRoundEntries: 2 });
+	const r = v.rounds.get(0)!;
+	assert.equal(r.entries.size, 2, "capped at 2");
+	assert.ok(!r.entries.has(A.pubHex), "floor A evicted");
+	assert.ok(r.entries.has(C.pubHex), "C took the slot by out-staking");
+	assert.equal(gbtcOf(v, A.pubHex), 10_000n, "A made whole (refund)");
+	assert.equal(gbtcOf(v, D.pubHex), 10_000n, "D rejected on the tie — incumbent wins, nothing charged");
+	assert.equal(r.poolUp, 2_500n, "up pool reflects the eviction (2000 out, 2500 in)");
+	assert.ok(marketConserved(v));
+});
+
+test("re-entries MERGE (same side) and a side switch is rejected", async () => {
+	const { node, mk, fund, fold } = harness();
+	const A = mk();
+	fund(A, 10_000n);
+	const a1 = await A.enterRound(0, "up", 2_000n);
+	const a2 = await A.enterRound(0, "up", 500n); // top-up (below MIN is fine on a merge)
+	const a3 = await A.enterRound(0, "down", 3_000n); // side switch → no-op
+
+	const v = fold(born(node, [[a1, 2], [a2, 3], [a3, 4]]), 5);
+	const r = v.rounds.get(0)!;
+	assert.equal(r.entries.get(A.pubHex)?.stake, 2_500n, "merged to one slot");
+	assert.equal(r.poolUp, 2_500n);
+	assert.equal(r.poolDown, 0n, "side switch rejected");
+	assert.equal(gbtcOf(v, A.pubHex), 7_500n);
+	assert.ok(marketConserved(v));
+});
+
+test("full lifecycle: strike at lock, close one window later — winners split the losing pool, vig+dust → pot, round deletes", async () => {
+	const { node, mk, report, fund, fold } = harness();
+	const A = mk(), B = mk(), R = mk(); // R = the (untrusted) oracle relayer
+	fund(A, 10_000n);
+	fund(B, 10_000n);
+	const a = await A.enterRound(0, "up", 4_000n);
+	const b = await B.enterRound(0, "down", 6_000n);
+	const strike = await report(R, 100_000n, 1_000); // first update ≥ lock → strike
+	const close = await report(R, 101_000n, 2_000); // first update ≥ close → up wins
+
+	const v = fold(born(node, [[a, 2], [b, 3], [strike.id, LOCK], [close.id, CLOSE]]), CLOSE + 1);
+	assert.equal(v.rounds.size, 0, "round settled and deleted itself");
+	// losePool 6000 → vig 180 (300 bps) → dist 5820; A is the whole win pool → share 5820.
+	assert.equal(gbtcOf(v, A.pubHex), 10_000n - 4_000n + 4_000n + 5_820n, "A: stake back + the losing pool minus vig");
+	assert.equal(gbtcOf(v, B.pubHex), 4_000n, "B lost its stake");
+	assert.equal(v.bridge.pot, 180n, "the vig landed in the liquidity pot");
+	assert.ok(marketConserved(v), "conserved end to end");
+});
+
+test("tie and one-sided rounds refund everyone", async () => {
+	const { node, mk, report, fund, fold } = harness();
+	const A = mk(), B = mk(), R = mk();
+	fund(A, 10_000n);
+	fund(B, 10_000n);
+	// tie: both sides entered, close == strike
+	const a = await A.enterRound(0, "up", 4_000n);
+	const b = await B.enterRound(0, "down", 6_000n);
+	const s1 = await report(R, 100_000n, 1_000);
+	const c1 = await report(R, 100_000n, 2_000); // close == strike → tie
+	const v1 = fold(born(node, [[a, 2], [b, 3], [s1.id, LOCK], [c1.id, CLOSE]]), CLOSE + 1);
+	assert.equal(v1.rounds.size, 0);
+	assert.equal(gbtcOf(v1, A.pubHex), 10_000n, "tie → A refunded");
+	assert.equal(gbtcOf(v1, B.pubHex), 10_000n, "tie → B refunded");
+	assert.equal(v1.bridge.pot, 0n, "no vig on a refund");
+	assert.ok(marketConserved(v1));
+
+	// one-sided: only UP entries; even though up "wins", there's no losing pool → refund
+	const { node: n2, mk: mk2, report: rp2, fund: f2, fold: fold2 } = harness();
+	const C = mk2(), R2 = mk2();
+	f2(C, 10_000n);
+	const c = await C.enterRound(0, "up", 4_000n);
+	const s2 = await rp2(R2, 100_000n, 1_000);
+	const c2 = await rp2(R2, 105_000n, 2_000);
+	const v2 = fold2(born(n2, [[c, 2], [s2.id, LOCK], [c2.id, CLOSE]]), CLOSE + 1);
+	assert.equal(gbtcOf(v2, C.pubHex), 10_000n, "one-sided → refunded");
+	assert.ok(marketConserved(v2));
+});
+
+test("no strike by the close boundary → refund; oracle dark past the timeout → the sweep refunds at the deadline", async () => {
+	// no strike: the FIRST oracle write lands after the close boundary
+	const { node, mk, report, fund, fold } = harness();
+	const A = mk(), B = mk(), R = mk();
+	fund(A, 10_000n);
+	fund(B, 10_000n);
+	const a = await A.enterRound(0, "up", 4_000n);
+	const b = await B.enterRound(0, "down", 6_000n);
+	const lateUpdate = await report(R, 100_000n, 1_000);
+	const v = fold(born(node, [[a, 2], [b, 3], [lateUpdate.id, CLOSE + 2]]), CLOSE + 3);
+	assert.equal(v.rounds.size, 0, "never struck → refunded on the first post-close write");
+	assert.equal(gbtcOf(v, A.pubHex), 10_000n);
+	assert.equal(gbtcOf(v, B.pubHex), 10_000n);
+	assert.ok(marketConserved(v));
+
+	// oracle fully dark: NO update ever → the end-of-fold sweep refunds once past close + timeout
+	const { node: n2, mk: mk2, fund: f2, fold: fold2 } = harness();
+	const C = mk2(), D = mk2();
+	f2(C, 10_000n);
+	f2(D, 10_000n);
+	const c = await C.enterRound(0, "up", 4_000n);
+	const d = await D.enterRound(0, "down", 6_000n);
+	const bornMap = born(n2, [[c, 2], [d, 3]]);
+	const before = fold2(bornMap, CLOSE + ROUND_DARK_TIMEOUT - 1);
+	assert.equal(before.rounds.size, 1, "still waiting one anchor before the deadline");
+	const after = fold2(bornMap, CLOSE + ROUND_DARK_TIMEOUT);
+	assert.equal(after.rounds.size, 0, "dark timeout → swept");
+	assert.equal(gbtcOf(after, C.pubHex), 10_000n);
+	assert.equal(gbtcOf(after, D.pubHex), 10_000n);
+	assert.ok(marketConserved(after));
+});
+
+test("confidence gate (pure): a wide-conf update neither strikes nor settles; the next tight one does", () => {
+	assert.ok(confOk(100_000n, 0n), "conf 0 (signed feeds) always passes");
+	assert.ok(confOk(100_000n, 500n), "exactly 50 bps passes");
+	assert.ok(!confOk(100_000n, 501n), "wider than 50 bps fails");
+
+	const bridge = emptyBridge();
+	addGbtc(bridge, "aa", 10_000n);
+	addGbtc(bridge, "bb", 10_000n);
+	bridge.reserves = 20_000n;
+	const rounds = emptyRounds();
+	assert.ok(applyRoundEnter(bridge, rounds, "aa", 0, "up", 4_000n, 2));
+	assert.ok(applyRoundEnter(bridge, rounds, "bb", 0, "down", 6_000n, 3));
+	// wide-conf update at the lock boundary → skipped (no strike)
+	roundsOnOracle(bridge, rounds, 100_000n, 501n, LOCK);
+	assert.equal(rounds.get(0)!.strike, null, "blurry photo skipped");
+	// tight update one anchor later → strike
+	roundsOnOracle(bridge, rounds, 100_100n, 100n, LOCK + 1);
+	assert.equal(rounds.get(0)!.strike, 100_100n, "next clear update strikes");
+	// wide at close → skipped; tight one settles (up wins: 100_200 > 100_100)
+	roundsOnOracle(bridge, rounds, 100_200n, 1_000n, CLOSE);
+	assert.equal(rounds.size, 1, "blurry close skipped");
+	const toPot = roundsOnOracle(bridge, rounds, 100_200n, 0n, CLOSE + 1);
+	assert.equal(rounds.size, 0, "settled");
+	assert.equal(toPot, 180n, "vig on the 6000 losing pool");
+	assert.equal(bGbtc(bridge, "aa"), 10_000n + 5_820n, "aa won");
+});
+
+test("checkpoint equivalence: resuming from a mid-round snapshot folds to the identical root", async () => {
+	const { node, mk, report, fund, oracle, balances } = harness();
+	const A = mk(), B = mk(), R = mk();
+	fund(A, 10_000n);
+	fund(B, 10_000n);
+	const a = await A.enterRound(0, "up", 4_000n);
+	const b = await B.enterRound(0, "down", 6_000n);
+	const strike = await report(R, 100_000n, 1_000);
+	const close = await report(R, 99_000n, 2_000); // down wins
+	const all = node.ledger.allWrites();
+	const heights = new Map([[a, 2], [b, 3], [strike.id, LOCK], [close.id, CLOSE]]);
+	const bornOf = (ws: typeof all) => new Map(ws.map((w) => [w.id, heights.get(w.id) ?? 0]));
+
+	// one full fold vs. a checkpoint mid-round (entries + strike applied) + folding just the close on top
+	const full = computeView(all, { bornAt: bornOf(all), nowHeight: CLOSE + 1, market: oracle, base: withGbtc(computeView([]), balances) });
+	const half = all.filter((w) => w.id !== close.id);
+	const snapshot = computeView(half, { bornAt: bornOf(half), nowHeight: LOCK + 1, market: oracle, base: withGbtc(computeView([]), balances) });
+	assert.equal(snapshot.rounds.get(0)?.strike, 100_000n, "the snapshot carries a LIVE locked round");
+	const resumed = computeView(all.filter((w) => w.id === close.id), { bornAt: bornOf(all), nowHeight: CLOSE + 1, market: oracle, base: snapshot });
+
+	assert.equal(viewRoot(resumed), viewRoot(full), "full fold and checkpoint-resumed fold agree byte-for-byte");
+	assert.equal(gbtcOf(resumed, B.pubHex), 4_000n + 6_000n + 3_880n, "B: 4000 unspent + stake back + the 4000 losing pool minus 120 vig");
+	assert.ok(marketConserved(resumed));
+});

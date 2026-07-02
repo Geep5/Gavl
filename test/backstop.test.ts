@@ -30,7 +30,7 @@ function scene(pot: bigint, takerFree: bigint): View {
 	addGbtc(bridge, "taker", takerFree);
 	bridge.pot = pot;
 	bridge.reserves = takerFree + pot; // every sat backed
-	return { bridge, market: { price: null, expo: 0, seq: -1, at: 0 }, custody: { fundKey: null, epoch: -1 }, book: emptyBook() };
+	return { bridge, market: { price: null, expo: 0, seq: -1, at: 0 }, custody: { fundKey: null, epoch: -1 }, book: emptyBook(), rounds: new Map() };
 }
 
 test("a taker opens against the pot; pot loses a winning trade (idle → trader)", () => {

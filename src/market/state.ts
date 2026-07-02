@@ -23,6 +23,8 @@ import type { BridgeState, PendingWithdrawal } from "../custody/bridge.ts";
 import type { MarketPrice, CustodyState } from "./btc.ts";
 import { emptyBook, rebuildPosCount } from "./intent.ts";
 import type { MarketBook, Contract } from "./intent.ts";
+import { emptyRounds } from "./rounds.ts";
+import type { Rounds, RoundSide } from "./rounds.ts";
 
 // ── canonical (plain-JSON) shape ─────────────────────────────────
 
@@ -53,11 +55,20 @@ export interface CanonBook {
 	offerFills: Entry<{ filled: string; expiryHeight: number }>[]; // nonce → {filled sats, expiry}, sorted
 }
 
+/** One live parimutuel round: strike (null until locked), the two pools, and the entries (key-sorted). */
+export interface CanonRound {
+	strike: string | null;
+	poolUp: string;
+	poolDown: string;
+	entries: Entry<{ side: string; stake: string }>[]; // pubkey → {side, stake}, sorted by pubkey
+}
+
 export interface CanonState {
 	bridge: CanonBridge;
 	market: CanonMarket; // the channel's single market price (Pyth feed id comes from the channel name)
 	custody: CustodyState; // already plain (string|null, number)
 	book: CanonBook;
+	rounds: [number, CanonRound][]; // live rounds by idx, ascending (self-clearing — only ~2 at a time)
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -104,12 +115,19 @@ function serializeBook(book: MarketBook): CanonBook {
 	};
 }
 
+function serializeRounds(rounds: Rounds): [number, CanonRound][] {
+	return [...rounds]
+		.sort((a, b) => a[0] - b[0])
+		.map(([idx, r]) => [idx, { strike: r.strike === null ? null : r.strike.toString(), poolUp: r.poolUp.toString(), poolDown: r.poolDown.toString(), entries: mapEntries(r.entries, (e) => ({ side: e.side, stake: e.stake.toString() })) }]);
+}
+
 export function serializeView(view: View): CanonState {
 	return {
 		bridge: serializeBridge(view.bridge),
 		market: { price: view.market.price === null ? null : view.market.price.toString(), expo: view.market.expo, seq: view.market.seq, at: view.market.at },
 		custody: { fundKey: view.custody.fundKey, epoch: view.custody.epoch },
 		book: serializeBook(view.book),
+		rounds: serializeRounds(view.rounds),
 	};
 }
 
@@ -152,11 +170,22 @@ function deserializeBook(b: CanonBook): MarketBook {
 	return book;
 }
 
+function deserializeRounds(rs: [number, CanonRound][]): Rounds {
+	const rounds = emptyRounds();
+	for (const [idx, r] of rs) {
+		const entries = new Map<string, { side: RoundSide; stake: bigint }>();
+		for (const [k, e] of r.entries) entries.set(k, { side: e.side as RoundSide, stake: BigInt(e.stake) });
+		rounds.set(idx, { idx, strike: r.strike === null ? null : BigInt(r.strike), poolUp: BigInt(r.poolUp), poolDown: BigInt(r.poolDown), entries });
+	}
+	return rounds;
+}
+
 export function deserializeView(s: CanonState): View {
 	return {
 		bridge: deserializeBridge(s.bridge),
 		market: deserializeMarket(s.market),
 		custody: { fundKey: s.custody.fundKey, epoch: s.custody.epoch },
 		book: deserializeBook(s.book),
+		rounds: deserializeRounds(s.rounds ?? []), // ?? [] → tolerate pre-rounds snapshots
 	};
 }

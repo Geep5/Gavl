@@ -28,6 +28,8 @@ import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, p
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
 import { emptyBook, escrowedInContracts, applyMatch, applyMatchPot, applySettle, pruneExpiredOffers, settleExpired, MAX_OPEN_POSITIONS, rebuildPosCount } from "./intent.ts";
+import { emptyRounds, applyRoundEnter, roundsOnOracle, sweepDarkRounds, roundsEscrowTotal, MAX_ROUND_ENTRIES } from "./rounds.ts";
+import type { Rounds, RoundSide } from "./rounds.ts";
 import type { Side } from "./intent.ts";
 import type { MarketBook } from "./intent.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
@@ -82,6 +84,9 @@ export interface View {
 	/** The peer-to-peer intent market: bilateral matched contracts + offer-fill tracking.
 	 *  The matched, zero-sum, can't-deplete-reserves core (replaced the old pool). */
 	book: MarketBook;
+	/** Gavl Rounds — the 1-click bull/bear parimutuel rounds, keyed by round idx (height-derived).
+	 *  Self-clearing: a round deletes itself at settle/refund, so this holds ~2 live rounds. */
+	rounds: Rounds;
 }
 
 /** Active gBTC balance of `pubkey`. */
@@ -96,7 +101,7 @@ export function gbtcOf(view: View, pubkey: string): bigint {
  * always holds.
  */
 export function marketConserved(view: View): boolean {
-	return view.bridge.reserves === totalGbtc(view.bridge) + bondedTotal(view.bridge) + escrowedInContracts(view.book) + pendingTotal(view.bridge) + view.bridge.pot;
+	return view.bridge.reserves === totalGbtc(view.bridge) + bondedTotal(view.bridge) + escrowedInContracts(view.book) + pendingTotal(view.bridge) + view.bridge.pot + roundsEscrowTotal(view.rounds);
 }
 
 export function parseAmount(s: string): bigint | null {
@@ -163,6 +168,8 @@ export interface ViewOptions {
 	/** Global open-position cap. Defaults to the consensus constant MAX_OPEN_POSITIONS — override ONLY in
 	 *  tests; production folds must use the default so every node admits/rejects the same matches. */
 	maxPositions?: number;
+	/** Per-round entry cap (top-N-by-stake admission). Defaults to MAX_ROUND_ENTRIES — test-only override. */
+	maxRoundEntries?: number;
 }
 
 /**
@@ -232,6 +239,7 @@ export function cloneView(v: View): View {
 		market: { ...v.market },
 		custody: { fundKey: v.custody.fundKey, epoch: v.custody.epoch },
 		book: { contracts: cp(v.book.contracts), offerFills: cp(v.book.offerFills), posCount: new Map() },
+		rounds: new Map([...v.rounds].map(([k, r]) => [k, { ...r, entries: new Map([...r.entries].map(([p, e]) => [p, { ...e }])) }])),
 	};
 	rebuildPosCount(out.book);
 	return out;
@@ -246,6 +254,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 				market: emptyMarket(),
 				custody: { fundKey: null, epoch: -1 },
 				book: emptyBook(),
+				rounds: emptyRounds(),
 			};
 	const nowHeight = opts.nowHeight ?? 0;
 	// Total finalized pot capital the backstop may commit (free + lifetime-drawn); a match.pot
@@ -266,15 +275,17 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	const withdrawBudget = opts.base ? opts.base.bridge.withdrawnTotal + withdrawCap(opts.base.bridge.reserves) : undefined;
 	const depositBudget = opts.base ? opts.base.bridge.mintedTotal + depositCap(opts.base.bridge.reserves) : undefined; // Vector B's inflow twin (per-epoch mint cap)
 	const maxPositions = opts.maxPositions ?? MAX_OPEN_POSITIONS; // global open-position cap (consensus constant unless a test overrides)
+	const maxRoundEntries = opts.maxRoundEntries ?? MAX_ROUND_ENTRIES; // per-round entry cap (top-N-by-stake)
 	for (const w of [...writes].sort(cmp)) {
 		const op = w.payload as Op | null;
 		// Effects timed by height (unbond maturity) use the write's STABLE certifying
 		// height (bornAt) so they don't drift as the global nowHeight advances; others
 		// use nowHeight (the current anchor clock).
-		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, custodyCeiling, withdrawBudget, opts.market, maxPositions, depositBudget);
+		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, custodyCeiling, withdrawBudget, opts.market, maxPositions, depositBudget, maxRoundEntries);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
 	settleExpired(view.bridge, view.book, nowHeight); // time-locked directional swaps unwind at entry (base-independent)
+	sweepDarkRounds(view.bridge, view.rounds, nowHeight); // oracle-dark rounds refund at their (constant) deadline
 	accrueDemurrage(view, nowHeight); // idle gBTC bleeds to capital working in open contracts
 	pruneExpiredOffers(view.book, nowHeight); // drop fill-tracking for offers that can no longer be matched
 	pruneStaleClaims(view.bridge, nowHeight); // retire deposit-mint requests unminted past the reclaim grace
@@ -316,7 +327,7 @@ export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: st
 	return computeView(included, { order, nowHeight, bornAt, base, market });
 }
 
-function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, custodyCeiling = 0n, withdrawBudget?: bigint, market?: MarketDef, maxPositions = MAX_OPEN_POSITIONS, depositBudget?: bigint): void {
+function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, custodyCeiling = 0n, withdrawBudget?: bigint, market?: MarketDef, maxPositions = MAX_OPEN_POSITIONS, depositBudget?: bigint, maxRoundEntries = MAX_ROUND_ENTRIES): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized ONLY by the committee
@@ -375,7 +386,7 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			// set) — so no relayer is trusted, and no single signer can forge. Newer publish-time
 			// wins (monotonic, stored in `seq`); a forged or sub-quorum update simply fails.
 			if (!market || typeof op.update !== "string") return;
-			let r: { price: bigint; expo: number; publishTime: number } | null = null;
+			let r: { price: bigint; conf?: bigint; expo: number; publishTime: number } | null = null;
 			if (market.kind === "pyth") {
 				r = verifyPythUpdate(op.update).find((x) => x.feedId === market.feedId) ?? null;
 			} else {
@@ -392,6 +403,10 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			view.market.expo = r.expo; // the source's scale (for display; the mark stays the integer)
 			view.market.seq = r.publishTime; // monotonic guard = publish time (unix seconds)
 			view.market.at = bornHeight; // certified height → deterministic staleness
+			// Rounds: this verified update is "the next qualifying oracle write in fold order" — it may
+			// strike the locked round, settle (or refund) the closed one; vig + dust land in the pot.
+			// Pyth updates carry a real confidence interval; signed-set updates pass conf 0.
+			view.bridge.pot += roundsOnOracle(view.bridge, view.rounds, r.price, r.conf ?? 0n, bornHeight);
 			return;
 		}
 		case "custody.fund": {
@@ -434,6 +449,16 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			const potBid = op.bid != null ? parseAmount(op.bid) ?? 0n : 0n; // slot bid (one-time entry fee → pot)
 			const available = backstopBudget - view.bridge.potEscrowTaken;
 			applyMatchPot(view.bridge, view.book, w.writer, w.id, op.side as Side, fill, lev, bornHeight, m, available, maxPositions, potBid);
+			return;
+		}
+		case "round.enter": {
+			// 1-click bull/bear: escrow the writer's stake into round `idx`'s side pool. The idx pins
+			// the INTENDED round — a write certified outside that round's entry window is a clean no-op
+			// (you can't be slid into a round you didn't ask for). Full → top-N-by-stake admission.
+			const stake = parseAmount(op.stake);
+			if (stake === null || typeof op.idx !== "number" || !Number.isInteger(op.idx) || op.idx < 0) return;
+			if (op.side !== "up" && op.side !== "down") return;
+			applyRoundEnter(view.bridge, view.rounds, w.writer, op.idx, op.side as RoundSide, stake, bornHeight, maxRoundEntries);
 			return;
 		}
 		case "contract.settle": {

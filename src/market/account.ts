@@ -151,6 +151,11 @@ export class Account {
 		return this.produce({ kind: "contract.settle", contractId });
 	}
 
+	/** Enter round `idx`'s UP or DOWN pool with `stake` gBTC — the 1-click bull/bear action. */
+	async enterRound(idx: number, side: "up" | "down", stake: bigint | number | string): Promise<string> {
+		return (await this.produce({ kind: "round.enter", idx, side, stake: amountStr(stake) })).id;
+	}
+
 	view(): View {
 		return computeView(this.node.ledger.allWrites());
 	}

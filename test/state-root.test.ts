@@ -51,11 +51,16 @@ function makeView(rev = false): View {
 	for (const [k, v] of order(contracts)) book.contracts.set(k, v);
 	for (const [k, v] of order(fills)) book.offerFills.set(k, v);
 
+	// a live parimutuel round (locked — strike set, not yet closed), entries in probe order
+	const rEntries: [string, { side: "up" | "down"; stake: bigint }][] = [["aa", { side: "up", stake: 500n }], ["bb", { side: "down", stake: 300n }], ["cc", { side: "up", stake: 200n }]];
+	const rounds = new Map([[7, { idx: 7, strike: 61_000n as bigint | null, poolUp: 700n, poolDown: 300n, entries: new Map(order(rEntries)) }]]);
+
 	return {
 		bridge,
 		market: { price: 61500n, expo: 0, seq: 3, at: 10 },
 		custody: { fundKey: "deadbeef", epoch: 0 },
 		book,
+		rounds,
 	};
 }
 
@@ -90,7 +95,7 @@ test("a single changed balance changes the root", () => {
 });
 
 test("empty view has a stable, defined root", () => {
-	const empty: View = { bridge: emptyBridge(), market: { price: null, expo: 0, seq: -1, at: 0 }, custody: { fundKey: null, epoch: -1 }, book: emptyBook() };
+	const empty: View = { bridge: emptyBridge(), market: { price: null, expo: 0, seq: -1, at: 0 }, custody: { fundKey: null, epoch: -1 }, book: emptyBook(), rounds: new Map() };
 	assert.equal(viewRoot(empty), viewRoot(empty));
 	assert.match(viewRoot(empty), /^[0-9a-f]{64}$/);
 });

@@ -48,6 +48,10 @@ export type Op =
 	| { kind: "match.pot"; side: "long" | "short"; fill: string; leverage: string; bid?: string }
 	/** Settle a matured matched contract at the current oracle mark — permissionless. */
 	| { kind: "contract.settle"; contractId: string }
+	/** Enter round `idx`'s UP or DOWN pool — the 1-click bull/bear primitive. `idx` pins the intended
+	 *  round (certified outside its entry window → no-op). Full round → top-N-by-stake admission:
+	 *  strictly out-stake the floor entry, which is evicted + refunded. Re-entries merge (same side). */
+	| { kind: "round.enter"; idx: number; side: "up" | "down"; stake: string }
 	/** Lock gBTC as a custody-committee BOND — your committee selection WEIGHT, and
 	 *  SLASHABLE on a proven fault. Bonded gBTC is locked (unspendable) but still backed. */
 	| { kind: "custody.bond"; amount: string }
@@ -65,7 +69,7 @@ export type Op =
 	 *  alongside gate #4 non-public keys.) */
 	| { kind: "custody.fund"; groupKey: string; epoch: number };
 
-const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "market.report", "match.open", "match.pot", "contract.settle", "custody.fund", "custody.bond", "custody.unbond", "custody.slash"]);
+const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "market.report", "match.open", "match.pot", "contract.settle", "round.enter", "custody.fund", "custody.bond", "custody.unbond", "custody.slash"]);
 
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);
