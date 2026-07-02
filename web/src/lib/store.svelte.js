@@ -13,7 +13,6 @@ export const store = $state({
 	consensus: null, // { enabled, vdf, mesh, network, peers, farming, tip, finalizedHeight, secPerAnchor, secPerAnchorMeasured }
 	custody: null, // { mode, epoch, fundKeyOnChain, fundAddress, holdsShare, committee, threshold, minCommittee, committeeId, bonded, myBond }
 	fleet: null, // local node fleet: { count, cap, nodes: [{ name, port, upSec }] }
-	autopilot: null, // rounds autopilot: { config, lastAction, consecutiveLosses, spentToday, samples, openBets }
 	netEvents: [], // live network-activity feed: [{ seq, ts, kind, text }] (accumulated, newest last)
 });
 
@@ -35,7 +34,6 @@ export async function refresh() {
 		store.consensus = s.consensus ?? null;
 		store.custody = s.custody ?? null;
 		store.fleet = s.fleet ?? null;
-		store.autopilot = s.autopilot ?? null;
 		await refreshEvents();
 		if (errorFromRefresh) {
 			store.error = null;

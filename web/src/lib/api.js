@@ -30,8 +30,6 @@ export const api = {
 	// Gavl Rounds — the 1-click bull/bear (idx optional: defaults to the currently-accepting round)
 	rounds: () => req("/rounds"),
 	enterRound: (side, stake, idx) => req("/round/enter", "POST", { side, stake, idx }),
-	autopilot: () => req("/autopilot"),
-	setAutopilot: (cfg) => req("/autopilot", "POST", cfg), // any subset of the config; returns live status
 	switchChannel: (name) => req("/channel", "POST", { name }),
 	testPythFeed: (feedId) => req("/market/test", "POST", { feedId }),
 	rerollIdentity: (label) => req("/identity/reroll", "POST", { label }),

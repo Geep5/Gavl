@@ -6,7 +6,6 @@
 	import { store, act, refresh, myGbtc, short } from "../lib/store.svelte.js";
 	import { api } from "../lib/api.js";
 	import RoundsPanel from "./RoundsPanel.svelte";
-	import AutopilotPanel from "./AutopilotPanel.svelte";
 
 	const m = $derived(store.market);
 	const c = $derived(store.consensus);
@@ -308,9 +307,6 @@
 
 	<!-- Gavl Rounds — the 1-click bull/bear (the main loop) -->
 	<RoundsPanel />
-
-	<!-- the robot thumb: opt-in rules engine that presses the buttons for you -->
-	<AutopilotPanel />
 
 	<!-- the pro market (perp/tape) — advanced, folded away -->
 	<section class="fold">

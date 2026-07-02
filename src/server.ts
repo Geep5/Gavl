@@ -28,7 +28,6 @@ import { roundIdxAt, lockBoundary, closeBoundary, entryOpen, ROUND_LEN, ROUND_VI
 import type { RoundSide } from "./market/rounds.ts";
 import type { View } from "./market/btc.ts";
 import { totalGbtc, pendingTotal } from "./custody/bridge.ts";
-import { Autopilot } from "./autopilot.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
@@ -127,11 +126,6 @@ const daemon = new Daemon({
 	},
 });
 
-// The rounds autopilot (opt-in rules engine) + rounds observer. The observer always runs — it keeps
-// the price samples and the recently-ended-rounds history the UI serves; ACTIONS only when enabled.
-const pilot = new Autopilot(daemon, join(daemon.dataPath(), "autopilot.json"));
-pilot.start();
-
 // ── local fleet: up/down extra independent nodes on this machine, driven by the UI stepper ───────
 // The daemon supervises child node processes. Each is a FULL independent farmer — its own data dir,
 // API port, identity, and auto-plotted k=18 plot (real PoST weight). One plot ⇄ one producer key
@@ -223,6 +217,12 @@ interface RoundInfo {
 	myStake: string;
 }
 
+/** Recently-ended rounds (the history strip): kept by this server process by diffing polls — a
+ *  best-effort UI nicety (resets on restart; the chain is the authority). `close` = the mark at
+ *  detection; payouts recompute exactly from the cached pools. */
+const roundsHistory: { idx: number; strike: string | null; close: string | null; outcome: "up" | "down" | "refund"; mySide: RoundSide | null; myStake: string; myPayout: string }[] = [];
+let lastRoundsSeen = new Map<number, { strike: bigint | null; poolUp: bigint; poolDown: bigint; mySide: RoundSide | null; myStake: bigint }>();
+
 function roundInfoOf(view: View, me: string, idx: number): RoundInfo {
 	const r = view.rounds.get(idx);
 	const mine = r?.entries.get(me);
@@ -239,9 +239,34 @@ function roundInfoOf(view: View, me: string, idx: number): RoundInfo {
 	};
 }
 
-/** The rounds block: the accepting round, the live (locked) one, constants, and recent history
- *  (the history comes from the autopilot's always-on rounds observer). */
+/** The rounds block: the accepting round, the live (locked) one, constants, and recent history. */
 function roundsInfo(view: View, me: string, tipHeight: number) {
+	// Track endings: a cached round that vanished from state settled (or refunded). Outcome derives
+	// from its strike vs the current mark; payouts recompute exactly from the cached pools.
+	const nowSeen = new Map<number, { strike: bigint | null; poolUp: bigint; poolDown: bigint; mySide: RoundSide | null; myStake: bigint }>();
+	for (const [idx, r] of view.rounds) {
+		const mine = r.entries.get(me);
+		nowSeen.set(idx, { strike: r.strike, poolUp: r.poolUp, poolDown: r.poolDown, mySide: mine?.side ?? null, myStake: mine?.stake ?? 0n });
+	}
+	const closeMark = view.market.price;
+	for (const [idx, r] of lastRoundsSeen) {
+		if (nowSeen.has(idx)) continue;
+		const refunded = r.strike === null || r.poolUp === 0n || r.poolDown === 0n || closeMark === null || closeMark === r.strike;
+		const outcome: "up" | "down" | "refund" = refunded ? "refund" : closeMark! > r.strike! ? "up" : "down";
+		let myPayout = 0n;
+		if (r.myStake > 0n) {
+			if (outcome === "refund") myPayout = r.myStake;
+			else if (r.mySide === outcome) {
+				const losePool = outcome === "up" ? r.poolDown : r.poolUp;
+				const winPool = outcome === "up" ? r.poolUp : r.poolDown;
+				myPayout = r.myStake + (r.myStake * (losePool - (losePool * ROUND_VIG_BPS) / 10_000n)) / winPool;
+			}
+		}
+		roundsHistory.unshift({ idx, strike: r.strike?.toString() ?? null, close: closeMark?.toString() ?? null, outcome, mySide: r.mySide, myStake: r.myStake.toString(), myPayout: myPayout.toString() });
+	}
+	if (roundsHistory.length > 20) roundsHistory.length = 20;
+	lastRoundsSeen = nowSeen;
+
 	const enteringIdx = roundIdxAt(tipHeight);
 	return {
 		len: ROUND_LEN,
@@ -251,7 +276,7 @@ function roundsInfo(view: View, me: string, tipHeight: number) {
 		entryOpen: entryOpen(enteringIdx, tipHeight), // false during the pre-lock cutoff anchor
 		entering: roundInfoOf(view, me, enteringIdx),
 		live: enteringIdx > 0 ? roundInfoOf(view, me, enteringIdx - 1) : null, // closes exactly when `entering` locks
-		history: pilot.historyFor(me).slice(0, 12),
+		history: roundsHistory.slice(0, 12),
 	};
 }
 
@@ -338,7 +363,7 @@ function serializeState() {
 	};
 
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));
-	return { accounts, active: me, gbtc, market, consensus, custody: daemon.custodyStatus(), storage: daemon.storeStats(), fleet: fleetStatus(), autopilot: pilot.status() };
+	return { accounts, active: me, gbtc, market, consensus, custody: daemon.custodyStatus(), storage: daemon.storeStats(), fleet: fleetStatus() };
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -395,10 +420,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 	if (method === "GET" && path === "/api/rounds") {
 		// The agent-facing rounds endpoint: same block the UI gets, without the rest of the state.
 		return send(res, 200, roundsInfo(daemon.view(), daemon.wallet.active().pubHex, Number(daemon.consensus()?.tip?.height ?? 0)));
-	}
-
-	if (method === "GET" && path === "/api/autopilot") {
-		return send(res, 200, pilot.status());
 	}
 
 	if (method === "GET" && path === "/api/events") {
@@ -471,12 +492,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			return send(res, 200, r);
 		}
 		// ── Gavl Rounds: the 1-click bull/bear ──
-		if (path === "/api/autopilot") {
-			// Configure the opt-in rules engine (a client preference — persisted beside the wallet,
-			// never consensus). Send any subset of the config; returns the full live status.
-			pilot.setConfig(body ?? {});
-			return send(res, 200, pilot.status());
-		}
 		if (path === "/api/round/enter") {
 			// Enter the current round's UP or DOWN pool (idx optional — agents may pin one). These are
 			// UX guards only; the fold is authoritative and rejects the same conditions deterministically.
