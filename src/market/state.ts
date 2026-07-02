@@ -48,11 +48,14 @@ export interface CanonBridge {
 
 export type CanonMarket = { price: string | null; expo: number; seq: number; at: number };
 
-/** One live parimutuel round: strike (null until locked), the two pools, and the entries (key-sorted). */
+/** One live parimutuel round: strike (null until locked), the two pools, the pot's lock-time
+ *  thin-side seeds (pool-level, not entries), and the entries (key-sorted). */
 export interface CanonRound {
 	strike: string | null;
 	poolUp: string;
 	poolDown: string;
+	seedUp: string;
+	seedDown: string;
 	entries: Entry<{ side: string; stake: string }>[]; // pubkey → {side, stake}, sorted by pubkey
 }
 
@@ -103,7 +106,7 @@ function serializeBridge(b: BridgeState): CanonBridge {
 function serializeRounds(rounds: Rounds): [number, CanonRound][] {
 	return [...rounds]
 		.sort((a, b) => a[0] - b[0])
-		.map(([idx, r]) => [idx, { strike: r.strike === null ? null : r.strike.toString(), poolUp: r.poolUp.toString(), poolDown: r.poolDown.toString(), entries: mapEntries(r.entries, (e) => ({ side: e.side, stake: e.stake.toString() })) }]);
+		.map(([idx, r]) => [idx, { strike: r.strike === null ? null : r.strike.toString(), poolUp: r.poolUp.toString(), poolDown: r.poolDown.toString(), seedUp: r.seedUp.toString(), seedDown: r.seedDown.toString(), entries: mapEntries(r.entries, (e) => ({ side: e.side, stake: e.stake.toString() })) }]);
 }
 
 export function serializeView(view: View): CanonState {
@@ -151,7 +154,7 @@ function deserializeRounds(rs: [number, CanonRound][]): Rounds {
 	for (const [idx, r] of rs) {
 		const entries = new Map<string, { side: RoundSide; stake: bigint }>();
 		for (const [k, e] of r.entries) entries.set(k, { side: e.side as RoundSide, stake: BigInt(e.stake) });
-		rounds.set(idx, { idx, strike: r.strike === null ? null : BigInt(r.strike), poolUp: BigInt(r.poolUp), poolDown: BigInt(r.poolDown), entries });
+		rounds.set(idx, { idx, strike: r.strike === null ? null : BigInt(r.strike), poolUp: BigInt(r.poolUp), poolDown: BigInt(r.poolDown), seedUp: BigInt(r.seedUp ?? "0"), seedDown: BigInt(r.seedDown ?? "0"), entries }); // ?? "0" → tolerate pre-seeding snapshots
 	}
 	return rounds;
 }

@@ -20,6 +20,12 @@
       "port": 5180
     },
     {
+      "name": "gavl-web-rounds",
+      "runtimeExecutable": "env",
+      "runtimeArgs": ["GAVL_API=http://127.0.0.1:6441", "npm", "run", "web:dev"],
+      "port": 5180
+    },
+    {
       "name": "gavl-daemon",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "daemon:dev"],

@@ -57,6 +57,15 @@ const born = (node: GavlNode, at: [string, number][]) => {
 	return m;
 };
 
+/** A fold base whose liquidity pot holds `pot` (backed 1:1 by reserves so marketConserved holds) —
+ *  the finalized-pot input the per-fold POT-SEEDING budget (base pot / 10) derives from. */
+const potBase = (balances: Record<string, bigint>, pot: bigint) => {
+	const base = withGbtc(computeView([]), balances);
+	base.bridge.pot += pot;
+	base.bridge.reserves += pot;
+	return base;
+};
+
 test("entries escrow into the round's pools; wrong-round and cutoff-anchor entries are clean no-ops", async () => {
 	const { node, mk, fund, fold } = harness();
 	const A = mk(), B = mk();
@@ -219,6 +228,121 @@ test("confidence gate (pure): a wide-conf update neither strikes nor settles; th
 	assert.equal(rounds.size, 0, "settled");
 	assert.equal(toPot, 180n, "vig on the 6000 losing pool");
 	assert.equal(bGbtc(bridge, "aa"), 10_000n + 5_820n, "aa won");
+});
+
+// ── POT-SEEDING: at lock the pot stakes the thin side, capped at 10% of the FOLD-BASE pot ──
+
+test("pot-seeding at lock: the thin side is seeded to balance, capped at 10% of the BASE pot", async () => {
+	// big pot: a one-sided round (only UP) gets its whole imbalance seeded — totals balance
+	const { node, mk, report, fund, fold, balances } = harness();
+	const A = mk(), R = mk();
+	fund(A, 10_000n);
+	const a = await A.enterRound(0, "up", 4_000n);
+	const strike = await report(R, 100_000n, 1_000);
+	const v = fold(born(node, [[a, 2], [strike.id, LOCK]]), LOCK + 1, { base: potBase(balances, 100_000n) });
+	const r = v.rounds.get(0)!;
+	assert.equal(r.strike, 100_000n, "locked");
+	assert.equal(r.seedDown, 4_000n, "need 4000 ≤ budget 10000 → fully balanced");
+	assert.equal(r.seedUp, 0n);
+	assert.equal(r.poolUp + r.seedUp, r.poolDown + r.seedDown, "a fully-seeded round has equal totals");
+	assert.equal(v.bridge.pot, 100_000n - 4_000n, "the pot dropped by exactly the seed");
+	assert.ok(marketConserved(v), "the seed is escrow, not a leak");
+
+	// small pot: the same round only draws pot/10
+	const h2 = harness();
+	const C = h2.mk(), R2 = h2.mk();
+	h2.fund(C, 10_000n);
+	const c = await C.enterRound(0, "up", 4_000n);
+	const s2 = await h2.report(R2, 100_000n, 1_000);
+	const v2 = h2.fold(born(h2.node, [[c, 2], [s2.id, LOCK]]), LOCK + 1, { base: potBase(h2.balances, 5_000n) });
+	assert.equal(v2.rounds.get(0)!.seedDown, 500n, "capped at 10% of the base pot (5000/10)");
+	assert.equal(v2.bridge.pot, 5_000n - 500n);
+	assert.ok(marketConserved(v2));
+});
+
+test("seeded side LOSES: winners split loseStakes+seed minus vig; the pot nets vig+dust−seed", async () => {
+	const { node, mk, report, fund, fold, balances } = harness();
+	const A = mk(), B = mk(), R = mk();
+	fund(A, 10_000n);
+	fund(B, 10_000n);
+	const a = await A.enterRound(0, "up", 4_000n); // up-heavy: 4000 vs 1000 → need 3000
+	const b = await B.enterRound(0, "down", 1_000n);
+	const strike = await report(R, 100_000n, 1_000); // lock → seedDown = 3000 (budget 10000)
+	const close = await report(R, 101_000n, 2_000); // up wins → the seeded side lost
+	const v = fold(born(node, [[a, 2], [b, 3], [strike.id, LOCK], [close.id, CLOSE]]), CLOSE + 1, { base: potBase(balances, 100_000n) });
+	assert.equal(v.rounds.size, 0, "settled and deleted");
+	// loseTotal = 1000 stakes + 3000 seed = 4000 → vig 120 → dist 3880; A is the whole win total
+	// (winTotal 4000) → share 4000·3880/4000 = 3880, dust 0. A: 6000 free + 4000 stake + 3880.
+	assert.equal(gbtcOf(v, A.pubHex), 6_000n + 4_000n + 3_880n, "A won the seed-fattened losing total minus vig");
+	assert.equal(gbtcOf(v, B.pubHex), 9_000n, "B lost its stake");
+	// pot's net for the round = vig 120 + dust 0 − seed 3000: 100000 − 3000 + 120 = 97120.
+	assert.equal(v.bridge.pot, 100_000n - 3_000n + 120n, "the pot paid the seed, kept the vig");
+	assert.ok(marketConserved(v));
+});
+
+test("seeded side WINS: the pot takes its seed back plus a stake-like pro-rata share", async () => {
+	const { node, mk, report, fund, fold, balances } = harness();
+	const A = mk(), B = mk(), R = mk();
+	fund(A, 10_000n);
+	fund(B, 10_000n);
+	const a = await A.enterRound(0, "up", 4_000n); // up-heavy again → seedDown = 3000 at lock
+	const b = await B.enterRound(0, "down", 1_000n);
+	const strike = await report(R, 100_000n, 1_000);
+	const close = await report(R, 99_000n, 2_000); // down wins → the pot's seed rode the winner
+	const v = fold(born(node, [[a, 2], [b, 3], [strike.id, LOCK], [close.id, CLOSE]]), CLOSE + 1, { base: potBase(balances, 100_000n) });
+	assert.equal(v.rounds.size, 0);
+	// winTotal = 1000 (B) + 3000 (seed) = 4000; loseTotal = 4000 → vig 120, dist 3880.
+	// B: stake + 1000·3880/4000 = 1970. Pot: seed 3000 + 3000·3880/4000 = 2910 + vig 120 + dust 0.
+	assert.equal(gbtcOf(v, B.pubHex), 9_000n + 1_000n + 970n, "B's entry earns on its stake only");
+	assert.equal(gbtcOf(v, A.pubHex), 6_000n, "A lost its stake");
+	assert.equal(v.bridge.pot, 100_000n - 3_000n + 3_000n + 2_910n + 120n, "seed home + winnings + vig");
+	assert.ok(v.bridge.pot > 100_000n, "the pot GREW on a winning seed");
+	assert.ok(marketConserved(v));
+});
+
+test("refund path returns the seed: the dark sweep restores the pot to its pre-seed value", async () => {
+	const { node, mk, report, fund, fold, balances } = harness();
+	const A = mk(), R = mk();
+	fund(A, 10_000n);
+	const a = await A.enterRound(0, "up", 4_000n);
+	const strike = await report(R, 100_000n, 1_000); // lock seeds down 4000 — then the oracle goes dark
+	const bornMap = born(node, [[a, 2], [strike.id, LOCK]]);
+	const before = fold(bornMap, CLOSE + ROUND_DARK_TIMEOUT - 1, { base: potBase(balances, 100_000n) });
+	assert.equal(before.rounds.get(0)!.seedDown, 4_000n, "seeded and still live before the deadline");
+	assert.ok(marketConserved(before));
+	const after = fold(bornMap, CLOSE + ROUND_DARK_TIMEOUT, { base: potBase(balances, 100_000n) });
+	assert.equal(after.rounds.size, 0, "dark timeout → swept");
+	assert.equal(gbtcOf(after, A.pubHex), 10_000n, "the entry was refunded");
+	assert.equal(after.bridge.pot, 100_000n, "the pot got its seed back — restored exactly");
+	assert.ok(marketConserved(after));
+});
+
+test("pot-seeding determinism: full fold vs checkpoint-resumed fold agree byte-for-byte", async () => {
+	const { node, mk, report, fund, oracle, balances } = harness();
+	const A = mk(), B = mk(), R = mk();
+	fund(A, 10_000n);
+	fund(B, 10_000n);
+	const a = await A.enterRound(0, "up", 4_000n);
+	const b = await B.enterRound(0, "down", 1_000n);
+	const strike = await report(R, 100_000n, 1_000); // lock → seeds 3000 down
+	const close = await report(R, 101_000n, 2_000); // up wins over the seeded side
+	const all = node.ledger.allWrites();
+	const heights = new Map([[a, 2], [b, 3], [strike.id, LOCK], [close.id, CLOSE]]);
+	const bornOf = (ws: typeof all) => new Map(ws.map((w) => [w.id, heights.get(w.id) ?? 0]));
+
+	// The budget derives from each fold's BASE pot, so equivalence needs the snapshot pot to equal
+	// the full fold's base pot — arranged here by snapshotting AFTER the entries but BEFORE the
+	// strike, with nothing (no vig, no demurrage) touching the pot in between.
+	const POT = 50_000n;
+	const full = computeView(all, { bornAt: bornOf(all), nowHeight: CLOSE + 1, market: oracle, base: potBase(balances, POT) });
+	const half = all.filter((w) => w.id !== strike.id && w.id !== close.id); // entries only
+	const snapshot = computeView(half, { bornAt: bornOf(half), nowHeight: 5, market: oracle, base: potBase(balances, POT) });
+	assert.equal(snapshot.bridge.pot, POT, "nothing touched the pot before the strike → same budget");
+	const resumed = computeView(all.filter((w) => w.id === strike.id || w.id === close.id), { bornAt: bornOf(all), nowHeight: CLOSE + 1, market: oracle, base: snapshot });
+
+	assert.equal(viewRoot(resumed), viewRoot(full), "seeded full fold and checkpoint-resumed fold agree byte-for-byte");
+	assert.equal(resumed.bridge.pot, POT - 3_000n + 120n, "both paths seeded 3000 and kept the 120 vig");
+	assert.ok(marketConserved(resumed));
 });
 
 test("checkpoint equivalence: resuming from a mid-round snapshot folds to the identical root", async () => {

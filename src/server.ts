@@ -209,8 +209,9 @@ interface RoundInfo {
 	locksAt: number; // strike boundary (anchor height)
 	closesAt: number; // settle boundary
 	strike: string | null;
-	poolUp: string;
+	poolUp: string; // TOTAL depth: entry stakes + the pot's lock-time seed (odds/payouts run on totals)
 	poolDown: string;
+	seeded: string; // the pot's seed in this round (seedUp + seedDown) — 0 until lock, badge-able
 	entries: number;
 	mySide: RoundSide | null;
 	myStake: string;
@@ -230,8 +231,9 @@ function roundInfoOf(view: View, me: string, idx: number): RoundInfo {
 		locksAt: lockBoundary(idx),
 		closesAt: closeBoundary(idx),
 		strike: r?.strike?.toString() ?? null,
-		poolUp: (r?.poolUp ?? 0n).toString(),
-		poolDown: (r?.poolDown ?? 0n).toString(),
+		poolUp: ((r?.poolUp ?? 0n) + (r?.seedUp ?? 0n)).toString(), // totals — real settleable depth
+		poolDown: ((r?.poolDown ?? 0n) + (r?.seedDown ?? 0n)).toString(),
+		seeded: ((r?.seedUp ?? 0n) + (r?.seedDown ?? 0n)).toString(),
 		entries: r?.entries.size ?? 0,
 		mySide: mine?.side ?? null,
 		myStake: (mine?.stake ?? 0n).toString(),
@@ -245,7 +247,8 @@ function roundsInfo(view: View, me: string, tipHeight: number) {
 	const nowSeen = new Map<number, { strike: bigint | null; poolUp: bigint; poolDown: bigint; mySide: RoundSide | null; myStake: bigint }>();
 	for (const [idx, r] of view.rounds) {
 		const mine = r.entries.get(me);
-		nowSeen.set(idx, { strike: r.strike, poolUp: r.poolUp, poolDown: r.poolDown, mySide: mine?.side ?? null, myStake: mine?.stake ?? 0n });
+		// Cache TOTAL pools (stakes + pot seed) — settle runs on totals, so the payout recompute stays exact.
+		nowSeen.set(idx, { strike: r.strike, poolUp: r.poolUp + r.seedUp, poolDown: r.poolDown + r.seedDown, mySide: mine?.side ?? null, myStake: mine?.stake ?? 0n });
 	}
 	const closeMark = view.market.price;
 	for (const [idx, r] of lastRoundsSeen) {

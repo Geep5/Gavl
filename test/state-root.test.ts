@@ -41,9 +41,9 @@ function makeView(rev = false): View {
 		{ id: "burn2", owner: "bb", amount: 31n, btcAddress: "bc1qbb", fee: 700n },
 	]; // pending is FIFO — order is itself state, NOT reversed
 
-	// a live parimutuel round (locked — strike set, not yet closed), entries in probe order
+	// a live parimutuel round (locked — strike set, not yet closed, thin side pot-seeded), entries in probe order
 	const rEntries: [string, { side: "up" | "down"; stake: bigint }][] = [["aa", { side: "up", stake: 500n }], ["bb", { side: "down", stake: 300n }], ["cc", { side: "up", stake: 200n }]];
-	const rounds = new Map([[7, { idx: 7, strike: 61_000n as bigint | null, poolUp: 700n, poolDown: 300n, entries: new Map(order(rEntries)) }]]);
+	const rounds = new Map([[7, { idx: 7, strike: 61_000n as bigint | null, poolUp: 700n, poolDown: 300n, seedUp: 0n, seedDown: 400n, entries: new Map(order(rEntries)) }]]);
 
 	return {
 		bridge,

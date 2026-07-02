@@ -7,15 +7,24 @@
  * pool pro-rata, a small vig + integer dust go to the liquidity pot, and the round deletes itself.
  * Always one round accepting + one live → a hammer every ROUND_LEN anchors.
  *
+ * POT-SEEDING (the pot's one outflow): at each round's LOCK — the moment the strike is set — the
+ * liquidity pot stakes the THIN side up to the imbalance, budget-capped per fold (see RoundSeed).
+ * The vig/demurrage the pot collects thus flows back out to the next cycle's opposite end, and a
+ * one-sided round becomes settleable instead of refunding. The seed is pool-level (no entry slot,
+ * invisible to top-N admission) and moves LAST — set only after the lock, it can't be positioned
+ * against.
+ *
  * Determinism (the reason for every shape here):
  *   - STRIKE/CLOSE are set inside the market.report APPLY — "the first qualifying write in fold
  *     order" — so full and checkpoint-resumed nodes can never disagree (the mark-at-sweep trap is
  *     structurally avoided).
+ *   - The SEED BUDGET derives from the FOLD BASE's pot, never the live mid-fold pot (see btc.ts
+ *     computeView) — a checkpoint-resumed node's live pot differs mid-fold, the base's doesn't.
  *   - Refunds credit at write- or constant-derived heights, never the fold's moving nowHeight.
  *   - Admission is TOP-N BY STAKE: a full round admits only a strictly-bigger stake, evicting (and
  *     refunding) the floor — squatting costs real capital; ties keep the incumbent. Stake IS the bid.
- *   - Everything only MOVES gBTC (balance ⇄ pools ⇄ pot), so 1:1 backing holds; pools are a
- *     conservation bucket (see marketConserved).
+ *   - Everything only MOVES gBTC (balance ⇄ pools ⇄ pot ⇄ seeds), so 1:1 backing holds; pools and
+ *     seeds are a conservation bucket (see marketConserved).
  *
  * PoST is the clock and the doorman: heights only advance by farmed anchors (the strike/close
  * moments are consensus), and every entry is a cooldown-stamped write (spam costs space-and-time).
@@ -59,6 +68,11 @@ export interface Round {
 	strike: bigint | null; // set by the first conf-OK oracle write ≥ lock boundary
 	poolUp: bigint;
 	poolDown: bigint;
+	/** The pot's thin-side stake, placed at LOCK (see roundsOnOracle). POOL-LEVEL fields, NOT
+	 *  entries: they take no slot and are invisible to top-N admission. Settle/refund math uses
+	 *  TOTALS (pool + seed); a winning seed earns like a stake and drains back to the pot. */
+	seedUp: bigint;
+	seedDown: bigint;
 	entries: Map<string, RoundEntry>; // pubkey → entry
 }
 
@@ -76,10 +90,10 @@ export const closeBoundary = (idx: number): number => (idx + 2) * ROUND_LEN;
 /** Is `height` inside round `idx`'s entry window (its own window, minus the cutoff tail)? */
 export const entryOpen = (idx: number, height: number): boolean => roundIdxAt(height) === idx && height < lockBoundary(idx) - ROUND_ENTRY_CUTOFF;
 
-/** gBTC escrowed across all live round pools — the conservation bucket. */
+/** gBTC escrowed across all live round pools + pot seeds — the conservation bucket. */
 export function roundsEscrowTotal(rounds: Rounds): bigint {
 	let t = 0n;
-	for (const r of rounds.values()) t += r.poolUp + r.poolDown;
+	for (const r of rounds.values()) t += r.poolUp + r.poolDown + r.seedUp + r.seedDown;
 	return t;
 }
 
@@ -103,7 +117,7 @@ export function applyRoundEnter(bridge: BridgeState, rounds: Rounds, who: string
 	if (stake <= 0n) return false;
 	if (side !== "up" && side !== "down") return false;
 	if (!entryOpen(idx, bornHeight)) return false; // wrong round for this write's certified height, or inside the cutoff
-	const r = rounds.get(idx) ?? { idx, strike: null, poolUp: 0n, poolDown: 0n, entries: new Map<string, RoundEntry>() };
+	const r = rounds.get(idx) ?? { idx, strike: null, poolUp: 0n, poolDown: 0n, seedUp: 0n, seedDown: 0n, entries: new Map<string, RoundEntry>() };
 
 	const mine = r.entries.get(who);
 	if (mine) {
@@ -143,45 +157,88 @@ export function applyRoundEnter(bridge: BridgeState, rounds: Rounds, who: string
 // ── settle / refund (called from the market.report apply + the dark sweep) ──
 
 /** Refund every entry its stake (credited at `height` — write- or constant-derived, never the
- *  fold's moving clock) and delete the round. Used for: tie, one-sided round, no strike by close,
- *  oracle dark past the timeout. */
+ *  fold's moving clock), send any pot seed home, and delete the round. Used for: tie, one-sided
+ *  round, no strike by close, oracle dark past the timeout. */
 export function refundRound(bridge: BridgeState, rounds: Rounds, r: Round, height: number): void {
 	for (const [who, e] of r.entries) addGbtc(bridge, who, e.stake, height);
+	bridge.pot += r.seedUp + r.seedDown; // the seed placed at lock goes back to the pot
 	rounds.delete(r.idx);
 }
 
-/** Settle a closed round at `close` vs its strike: winners split the losing pool pro-rata; the vig
- *  and the integer-division dust go to the pot. Tie or one-sided → refund. Deletes the round.
- *  Returns what the pot gained. */
+/** Settle a closed round at `close` vs its strike: winners split the losing TOTAL (stakes + pot
+ *  seed) pro-rata; the vig and the integer-division dust go to the pot. All checks and denominators
+ *  use TOTALS, so a round whose thin side is only pot-seed settles instead of refunding. The pot's
+ *  winning seed earns exactly like a stake (seed back + pro-rata share); a losing seed just stays
+ *  distributed (it left the pot at lock). Tie or one-sided-by-total → refund. Deletes the round.
+ *  Returns what the pot gained — pools + seeds drain to exactly zero across winners + pot. */
 export function settleRound(bridge: BridgeState, rounds: Rounds, r: Round, close: bigint, height: number): bigint {
-	if (r.strike === null || close === r.strike || r.poolUp === 0n || r.poolDown === 0n) {
-		refundRound(bridge, rounds, r, height); // tie / one-sided / shouldn't-happen → everyone made whole
+	const totalUp = r.poolUp + r.seedUp;
+	const totalDown = r.poolDown + r.seedDown;
+	if (r.strike === null || close === r.strike || totalUp === 0n || totalDown === 0n) {
+		refundRound(bridge, rounds, r, height); // tie / one-sided / shouldn't-happen → everyone (pot included) made whole
 		return 0n;
 	}
 	const upWins = close > r.strike;
-	const winPool = upWins ? r.poolUp : r.poolDown;
-	const losePool = upWins ? r.poolDown : r.poolUp;
-	const vig = (losePool * ROUND_VIG_BPS) / 10_000n;
-	const dist = losePool - vig;
+	const winSeed = upWins ? r.seedUp : r.seedDown;
+	const winTotal = (upWins ? r.poolUp : r.poolDown) + winSeed;
+	const loseTotal = upWins ? totalDown : totalUp;
+	const vig = (loseTotal * ROUND_VIG_BPS) / 10_000n;
+	const dist = loseTotal - vig;
 	let paidShares = 0n;
 	for (const [who, e] of r.entries) {
 		if ((e.side === "up") !== upWins) continue; // losers' stakes stay in the pool → distributed
-		const share = (e.stake * dist) / winPool;
+		const share = (e.stake * dist) / winTotal;
 		paidShares += share;
 		addGbtc(bridge, who, e.stake + share, height); // stake back + pro-rata winnings (a credit)
 	}
-	const toPot = vig + (dist - paidShares); // vig + division dust — the pools drain to exactly zero
+	const potShare = (winSeed * dist) / winTotal; // the pot's seed wins like any stake
+	paidShares += potShare;
+	// pot: its winning seed back + its winnings + vig + division dust (dust counts the pot's share too).
+	const toPot = winSeed + potShare + vig + (dist - paidShares);
 	rounds.delete(r.idx);
 	return toPot;
 }
 
 /**
+ * The fold's per-fold pot-seeding budget, computed ONCE at fold start from the FOLD BASE's pot
+ * (never the live mid-fold pot — see btc.ts computeView) and threaded through every market.report
+ * apply so `drawn` accumulates across the fold's locks. The budget is per-FOLD from the fold's
+ * base: checkpoint cadence (every 16 finalized anchors ≈ one epoch) makes this "≤10% of the
+ * finalized pot per epoch" in production.
+ */
+export interface RoundSeed {
+	budget: bigint; // base pot / 10 (0 with no base → seeding off)
+	drawn: bigint; // total seeded so far this fold (monotonic within the fold)
+}
+
+/**
+ * POT-SEEDING at LOCK: the moment a strike is set, the pot stakes the THIN side up to the
+ * imbalance, capped by the fold's remaining budget. Seed ONLY at lock — the pot moves last, so it
+ * can't be positioned against; a round the pot fully balances has equal totals. Only rounds with
+ * at least one entry exist in the map, so an empty round never draws a seed.
+ */
+function seedAtLock(bridge: BridgeState, r: Round, seed: RoundSeed): void {
+	const totalUp = r.poolUp + r.seedUp;
+	const totalDown = r.poolDown + r.seedDown;
+	if (totalUp === totalDown) return; // already balanced
+	const need = totalUp > totalDown ? totalUp - totalDown : totalDown - totalUp;
+	const avail = seed.budget - seed.drawn;
+	const take = need < avail ? need : avail;
+	if (take <= 0n) return;
+	bridge.pot -= take; // safe: within a fold the pot only grows (vig/refunds) or shrinks by these
+	seed.drawn += take; //   draws, so live pot ≥ base pot − drawn ≥ base pot − base pot/10 ≥ 0.
+	if (totalUp > totalDown) r.seedDown += take;
+	else r.seedUp += take;
+}
+
+/**
  * Feed one VERIFIED oracle update (price+conf, certified at `bornHeight`) to the rounds — called
  * from the market.report apply, so it's "the first qualifying write in fold order": deterministic
- * and base-independent. Sets strikes, settles closes, refunds rounds that never got a strike.
- * Returns the pot's gain (the caller credits bridge.pot).
+ * and base-independent. Sets strikes (then pot-seeds the thin side, budget permitting), settles
+ * closes, refunds rounds that never got a strike. Returns the pot's gain (the caller credits
+ * bridge.pot). Omitting `roundSeed` (pure/unit callers) leaves a zero budget — seeding off.
  */
-export function roundsOnOracle(bridge: BridgeState, rounds: Rounds, price: bigint, conf: bigint, bornHeight: number): bigint {
+export function roundsOnOracle(bridge: BridgeState, rounds: Rounds, price: bigint, conf: bigint, bornHeight: number, roundSeed: RoundSeed = { budget: 0n, drawn: 0n }): bigint {
 	if (rounds.size === 0) return 0n;
 	const ok = confOk(price, conf);
 	let toPot = 0n;
@@ -189,7 +246,10 @@ export function roundsOnOracle(bridge: BridgeState, rounds: Rounds, price: bigin
 		const r = rounds.get(idx)!;
 		if (r.strike === null) {
 			if (bornHeight >= closeBoundary(idx)) refundRound(bridge, rounds, r, bornHeight); // never struck in time
-			else if (bornHeight >= lockBoundary(idx) && ok) r.strike = price;
+			else if (bornHeight >= lockBoundary(idx) && ok) {
+				r.strike = price;
+				seedAtLock(bridge, r, roundSeed); // the lock IS the seeding moment
+			}
 		} else if (bornHeight >= closeBoundary(idx) && ok) {
 			toPot += settleRound(bridge, rounds, r, price, bornHeight);
 		}

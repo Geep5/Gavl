@@ -28,7 +28,7 @@ import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, p
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
 import { emptyRounds, applyRoundEnter, roundsOnOracle, sweepDarkRounds, roundsEscrowTotal, MAX_ROUND_ENTRIES } from "./rounds.ts";
-import type { Rounds, RoundSide } from "./rounds.ts";
+import type { Rounds, RoundSide, RoundSeed } from "./rounds.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "../custody/attestation.ts";
 import { fromHex } from "../det/canonical.ts";
@@ -174,8 +174,8 @@ export type MarketDef = { kind: "pyth"; feedId: string } | { kind: "signed"; sig
  * credit resets the clock, so an active balance is never touched, and the UI counts the grace down so the
  * sweep is never a surprise (use-it-or-lose-it). The swept gBTC goes to `bridge.pot` — a conservation
  * bucket and base-independent counter (checkpoint-pruned and full nodes agree, so no fork). It only MOVES
- * gBTC (idle → pot), never mints/burns, so 1:1 backing holds. The pot just accumulates (rounds vig +
- * demurrage); it has no outflow.
+ * gBTC (idle → pot), never mints/burns, so 1:1 backing holds. The pot accumulates (rounds vig +
+ * demurrage); its one outflow is round pot-seeding at lock (budget-capped off the fold base — rounds.ts).
  */
 function accrueDemurrage(view: View, nowHeight: number): void {
 	const b = view.bridge;
@@ -251,12 +251,20 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	const withdrawBudget = opts.base ? opts.base.bridge.withdrawnTotal + withdrawCap(opts.base.bridge.reserves) : undefined;
 	const depositBudget = opts.base ? opts.base.bridge.mintedTotal + depositCap(opts.base.bridge.reserves) : undefined; // Vector B's inflow twin (per-epoch mint cap)
 	const maxRoundEntries = opts.maxRoundEntries ?? MAX_ROUND_ENTRIES; // per-round entry cap (top-N-by-stake)
+	// POT-SEEDING budget — computed ONCE at fold start from the FOLD BASE's pot, NEVER the live
+	// mid-fold pot (the mark-at-sweep fork trap's cousin): a checkpoint-resumed node's base already
+	// contains end-of-fold demurrage sweeps that a full fold applies only after ops, so the live pot
+	// differs mid-fold → reading it would fork. ≤10% of the finalized pot per fold; no base → 0 →
+	// seeding simply off (the same convention the removed backstop used). Safe: during a fold the
+	// live pot only grows (vig/refunds) or shrinks by these seeds, so
+	// live pot ≥ base pot − drawn ≥ base pot − base pot/10 ≥ 0 — the pot can never go negative.
+	const roundSeed: RoundSeed = { budget: opts.base ? opts.base.bridge.pot / 10n : 0n, drawn: 0n };
 	for (const w of [...writes].sort(cmp)) {
 		const op = w.payload as Op | null;
 		// Effects timed by height (unbond maturity) use the write's STABLE certifying
 		// height (bornAt) so they don't drift as the global nowHeight advances; others
 		// use nowHeight (the current anchor clock).
-		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, custodyCeiling, withdrawBudget, opts.market, depositBudget, maxRoundEntries);
+		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, custodyCeiling, withdrawBudget, opts.market, depositBudget, maxRoundEntries, roundSeed);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
 	sweepDarkRounds(view.bridge, view.rounds, nowHeight); // oracle-dark rounds refund at their (constant) deadline
@@ -300,7 +308,7 @@ export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: st
 	return computeView(included, { order, nowHeight, bornAt, base, market });
 }
 
-function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, custodyCeiling = 0n, withdrawBudget?: bigint, market?: MarketDef, depositBudget?: bigint, maxRoundEntries = MAX_ROUND_ENTRIES): void {
+function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, custodyCeiling = 0n, withdrawBudget?: bigint, market?: MarketDef, depositBudget?: bigint, maxRoundEntries = MAX_ROUND_ENTRIES, roundSeed: RoundSeed = { budget: 0n, drawn: 0n }): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized ONLY by the committee
@@ -377,9 +385,13 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			view.market.seq = r.publishTime; // monotonic guard = publish time (unix seconds)
 			view.market.at = bornHeight; // certified height → deterministic staleness
 			// Rounds: this verified update is "the next qualifying oracle write in fold order" — it may
-			// strike the locked round, settle (or refund) the closed one; vig + dust land in the pot.
+			// strike the locked round (then pot-seed its thin side against the fold-base budget),
+			// settle (or refund) the closed one; vig + dust + the pot's winning seed land in the pot.
 			// Pyth updates carry a real confidence interval; signed-set updates pass conf 0.
-			view.bridge.pot += roundsOnOracle(view.bridge, view.rounds, r.price, r.conf ?? 0n, bornHeight);
+			// NOTE: the call mutates bridge.pot itself (seed draws / seed refunds), so it must run
+			// BEFORE the `+=` — `pot += f()` reads pot first and would clobber the in-call draws.
+			const potGain = roundsOnOracle(view.bridge, view.rounds, r.price, r.conf ?? 0n, bornHeight, roundSeed);
+			view.bridge.pot += potGain;
 			return;
 		}
 		case "custody.fund": {

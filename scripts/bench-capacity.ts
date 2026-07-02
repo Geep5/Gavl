@@ -61,6 +61,8 @@ const buildRoundCanon = (n: number): unknown => ({
 	close: null, // still live
 	poolUp: "123456789012",
 	poolDown: "98765432101",
+	seedUp: "0", // the pot's lock-time thin-side seed — two pool-level fields per round
+	seedDown: "12345678901",
 	settled: false,
 	// entries: pubkey → {side, stake}, key-sorted like every other canonical map
 	entries: Array.from({ length: n }, (_, i) => [hx("player" + i), { side: i % 2 ? "up" : "down", stake: "1000000" }] as [string, unknown]).sort((a, b) => ((a[0] as string) < (b[0] as string) ? -1 : 1)),

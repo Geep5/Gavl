@@ -112,6 +112,7 @@
 					{:else if !live.strike}<span class="lead">waiting for strike…</span>{/if}
 					<span class="down">▼ {fmt(live.poolDown)}</span>
 				</div>
+				{#if Number(live.seeded) > 0}<div class="lv-seed">pot seeded {fmt(live.seeded)} gBTC</div>{/if}
 				{#if live.mySide}<div class="lv-mine">your {fmt(live.myStake)} gBTC rides <b class={live.mySide}>{live.mySide === "up" ? "▲ BULL" : "▼ BEAR"}</b></div>{/if}
 			</div>
 		{/if}
@@ -176,6 +177,7 @@
 	.up { color: var(--long); font-weight: 700; } .down { color: var(--short); font-weight: 700; }
 	.lead { font-size: 0.58rem; font-weight: 800; letter-spacing: 0.06em; }
 	.lead.up { color: var(--long); } .lead.down { color: var(--short); }
+	.lv-seed { margin-top: 0.4rem; font-size: 0.56rem; letter-spacing: 0.04em; color: var(--muted); }
 	.lv-mine { margin-top: 0.4rem; font-size: 0.58rem; color: var(--muted); }
 	.lv-mine b.up { color: var(--long); } .lv-mine b.down { color: var(--short); }
 
