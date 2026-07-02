@@ -27,6 +27,9 @@ export const api = {
 	takeIntent: (nonce, fill, maxSpread) => req("/intent/take", "POST", { nonce, fill, maxSpread }),
 	takePosition: (side, size, maxSpread) => req("/intent/take-position", "POST", { side, size, maxSpread }),
 	settleContract: (contractId) => req("/contract/settle", "POST", { contractId }),
+	// Gavl Rounds — the 1-click bull/bear (idx optional: defaults to the currently-accepting round)
+	rounds: () => req("/rounds"),
+	enterRound: (side, stake, idx) => req("/round/enter", "POST", { side, stake, idx }),
 	switchChannel: (name) => req("/channel", "POST", { name }),
 	testPythFeed: (feedId) => req("/market/test", "POST", { feedId }),
 	rerollIdentity: (label) => req("/identity/reroll", "POST", { label }),

@@ -24,6 +24,9 @@ import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
 import { genesisCommitteeKey } from "./custody/genesis-committee.ts";
 import { mark, gbtcOf, MAX_LEVERAGE, parseAmount, leverageOk } from "./market/btc.ts";
 import { escrowedInContracts } from "./market/intent.ts";
+import { roundIdxAt, lockBoundary, closeBoundary, entryOpen, ROUND_LEN, ROUND_VIG_BPS, MIN_ROUND_STAKE } from "./market/rounds.ts";
+import type { RoundSide } from "./market/rounds.ts";
+import type { View } from "./market/btc.ts";
 import { totalGbtc, pendingTotal } from "./custody/bridge.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
@@ -198,6 +201,84 @@ process.on("exit", killFleet);
 process.on("SIGINT", () => { killFleet(); process.exit(0); });
 process.on("SIGTERM", () => { killFleet(); process.exit(0); });
 
+// ── Gavl Rounds → JSON (the 1-click bull/bear panel + agent API) ──
+
+/** A round as the client sees it. Synthesized from the height geometry even when nobody has entered
+ *  yet (a round with no entries doesn't exist in consensus state — but the CLOCK always does). */
+interface RoundInfo {
+	idx: number;
+	locksAt: number; // strike boundary (anchor height)
+	closesAt: number; // settle boundary
+	strike: string | null;
+	poolUp: string;
+	poolDown: string;
+	entries: number;
+	mySide: RoundSide | null;
+	myStake: string;
+}
+
+/** Recently-ended rounds (a UI nicety): kept by this server process by diffing polls — best-effort
+ *  (resets on restart; the authoritative record is the chain). `close` is the mark at detection. */
+const roundsHistory: { idx: number; strike: string | null; close: string | null; outcome: "up" | "down" | "refund"; mySide: RoundSide | null; myStake: string; myPayout: string }[] = [];
+let lastRoundsSeen = new Map<number, { strike: bigint | null; poolUp: bigint; poolDown: bigint; mySide: RoundSide | null; myStake: bigint }>();
+
+function roundInfoOf(view: View, me: string, idx: number): RoundInfo {
+	const r = view.rounds.get(idx);
+	const mine = r?.entries.get(me);
+	return {
+		idx,
+		locksAt: lockBoundary(idx),
+		closesAt: closeBoundary(idx),
+		strike: r?.strike?.toString() ?? null,
+		poolUp: (r?.poolUp ?? 0n).toString(),
+		poolDown: (r?.poolDown ?? 0n).toString(),
+		entries: r?.entries.size ?? 0,
+		mySide: mine?.side ?? null,
+		myStake: (mine?.stake ?? 0n).toString(),
+	};
+}
+
+/** The rounds block: the accepting round, the live (locked) one, constants, and recent history. */
+function roundsInfo(view: View, me: string, tipHeight: number) {
+	// Track endings: a cached round that vanished from state settled (or refunded). Outcome derives
+	// from its strike vs the current mark; payouts recompute exactly from the cached pools.
+	const nowSeen = new Map<number, { strike: bigint | null; poolUp: bigint; poolDown: bigint; mySide: RoundSide | null; myStake: bigint }>();
+	for (const [idx, r] of view.rounds) {
+		const mine = r.entries.get(me);
+		nowSeen.set(idx, { strike: r.strike, poolUp: r.poolUp, poolDown: r.poolDown, mySide: mine?.side ?? null, myStake: mine?.stake ?? 0n });
+	}
+	const closeMark = view.market.price;
+	for (const [idx, r] of lastRoundsSeen) {
+		if (nowSeen.has(idx)) continue;
+		const refunded = r.strike === null || r.poolUp === 0n || r.poolDown === 0n || closeMark === null || closeMark === r.strike;
+		const outcome: "up" | "down" | "refund" = refunded ? "refund" : closeMark! > r.strike! ? "up" : "down";
+		let myPayout = 0n;
+		if (r.myStake > 0n) {
+			if (outcome === "refund") myPayout = r.myStake;
+			else if (r.mySide === outcome) {
+				const losePool = outcome === "up" ? r.poolDown : r.poolUp;
+				const winPool = outcome === "up" ? r.poolUp : r.poolDown;
+				myPayout = r.myStake + (r.myStake * (losePool - (losePool * ROUND_VIG_BPS) / 10_000n)) / winPool;
+			}
+		}
+		roundsHistory.unshift({ idx, strike: r.strike?.toString() ?? null, close: closeMark?.toString() ?? null, outcome, mySide: r.mySide, myStake: r.myStake.toString(), myPayout: myPayout.toString() });
+	}
+	if (roundsHistory.length > 20) roundsHistory.length = 20;
+	lastRoundsSeen = nowSeen;
+
+	const enteringIdx = roundIdxAt(tipHeight);
+	return {
+		len: ROUND_LEN,
+		vigBps: Number(ROUND_VIG_BPS),
+		minStake: MIN_ROUND_STAKE.toString(),
+		tip: tipHeight,
+		entryOpen: entryOpen(enteringIdx, tipHeight), // false during the pre-lock cutoff anchor
+		entering: roundInfoOf(view, me, enteringIdx),
+		live: enteringIdx > 0 ? roundInfoOf(view, me, enteringIdx - 1) : null, // closes exactly when `entering` locks
+		history: roundsHistory.slice(0, 12),
+	};
+}
+
 // ── View → JSON (Maps + BigInts → plain, string amounts) ─────────
 
 function serializeState() {
@@ -228,6 +309,8 @@ function serializeState() {
 			}
 		: null;
 
+	const consensus = daemon.consensus(); // hoisted: the rounds clock needs the tip height
+	const tipH = Number(consensus?.tip?.height ?? 0);
 	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)
 	const onChainR = rsv != null ? rsv.sats : null;
 	// Idle-SWEEP (demurrage) countdown for the active account: a free balance is swept WHOLE to the pot
@@ -274,10 +357,12 @@ function serializeState() {
 		free: freeV.toString(),
 		bonded: bondedV.toString(),
 		escrow: escrowV.toString(),
+		// ── Gavl Rounds: the 1-click bull/bear panel (accepting + live round, odds, history) ──
+		rounds: roundsInfo(view, me, tipH),
 	};
 
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));
-	return { accounts, active: me, gbtc, market, consensus: daemon.consensus(), custody: daemon.custodyStatus(), storage: daemon.storeStats(), fleet: fleetStatus() };
+	return { accounts, active: me, gbtc, market, consensus, custody: daemon.custodyStatus(), storage: daemon.storeStats(), fleet: fleetStatus() };
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -329,6 +414,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
 	if (method === "GET" && path === "/api/state") {
 		return send(res, 200, serializeState());
+	}
+
+	if (method === "GET" && path === "/api/rounds") {
+		// The agent-facing rounds endpoint: same block the UI gets, without the rest of the state.
+		return send(res, 200, roundsInfo(daemon.view(), daemon.wallet.active().pubHex, Number(daemon.consensus()?.tip?.height ?? 0)));
 	}
 
 	if (method === "GET" && path === "/api/events") {
@@ -399,6 +489,23 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			// Hermes and verify the guardian-attested quorum + Merkle proof, returning the decoded price.
 			const r = await daemon.testPythFeed(String(body.feedId ?? ""));
 			return send(res, 200, r);
+		}
+		// ── Gavl Rounds: the 1-click bull/bear ──
+		if (path === "/api/round/enter") {
+			// Enter the current round's UP or DOWN pool (idx optional — agents may pin one). These are
+			// UX guards only; the fold is authoritative and rejects the same conditions deterministically.
+			const side = body.side === "up" ? "up" : body.side === "down" ? "down" : null;
+			if (!side) throw new Error('side must be "up" or "down"');
+			const stake = requireSpendable(String(body.stake), "stake");
+			const tip = Number(daemon.consensus()?.tip?.height ?? 0);
+			const idx = body.idx != null ? Number(body.idx) : roundIdxAt(tip);
+			if (!Number.isInteger(idx) || idx < 0) throw new Error("idx must be a non-negative integer");
+			if (!entryOpen(idx, tip)) throw new Error(`round #${idx} isn't accepting entries right now — entries close 1 anchor before lock; the next round opens at height ${lockBoundary(idx)}`);
+			const mine = daemon.view().rounds.get(idx)?.entries.get(daemon.wallet.active().pubHex);
+			if (!mine && stake < MIN_ROUND_STAKE) throw new Error(`minimum first entry is ${MIN_ROUND_STAKE} gBTC`);
+			if (mine && mine.side !== side) throw new Error(`you're already ${mine.side.toUpperCase()} in round #${idx} — same side only (a re-entry tops up)`);
+			const id = await daemon.active().enterRound(idx, side, stake);
+			return send(res, 200, { id, idx, side, stake: stake.toString() });
 		}
 		// ── peer-to-peer matched market (the real product: no pool, real counterparty) ──
 		if (path === "/api/intent/broadcast") {

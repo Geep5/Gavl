@@ -5,6 +5,7 @@
 	// amount/leverage row in the same visual language.
 	import { store, act, refresh, myGbtc, short } from "../lib/store.svelte.js";
 	import { api } from "../lib/api.js";
+	import RoundsPanel from "./RoundsPanel.svelte";
 
 	const m = $derived(store.market);
 	const c = $derived(store.consensus);
@@ -186,6 +187,8 @@
 
 	// ── network status ──
 	let netOpen = $state(false);
+	// the pro market (perp/tape) lives behind an Advanced fold — rounds are the main loop
+	let advOpen = $state(false);
 	const height = $derived(c?.tip?.height ?? null);
 	const finalized = $derived(c?.finalizedHeight ?? null);
 	const peers = $derived(c?.peers ?? 0);
@@ -302,6 +305,16 @@
 		</div>
 	</section>
 
+	<!-- Gavl Rounds — the 1-click bull/bear (the main loop) -->
+	<RoundsPanel />
+
+	<!-- the pro market (perp/tape) — advanced, folded away -->
+	<section class="fold">
+		<button class="fold-h" onclick={() => (advOpen = !advOpen)}>
+			<span>⚙ ADVANCED · PRO MARKET</span><span class="fold-c">{advOpen ? "▲" : "▼"}</span>
+		</button>
+	</section>
+	{#if advOpen}
 	<!-- trade -->
 	<section class="trade">
 		<div class="toggle">
@@ -385,6 +398,7 @@
 			{/each}
 		{/if}
 	</section>
+	{/if}
 
 	<!-- add funds -->
 	<section class="fold">
