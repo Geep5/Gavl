@@ -16,10 +16,15 @@
 
 export type EsploraNet = "mainnet" | "testnet" | "signet";
 
-const DEFAULT_BASE: Record<EsploraNet, string> = {
-	mainnet: "https://mempool.space/api",
-	testnet: "https://mempool.space/testnet/api",
-	signet: "https://mempool.space/signet/api",
+/** Esplora-compatible endpoints per network, tried IN ORDER (failover). A custody bridge must not
+ *  hang off a single provider: deposits can't verify and the committee can't co-sign while the one
+ *  explorer is down (exactly what happened when mempool.space's testnet API went dark). The client
+ *  fails over on connection errors, timeouts, and 5xx, and remembers the endpoint that worked so
+ *  steady-state traffic doesn't re-pay a dead endpoint's timeout on every call. */
+const DEFAULT_BASES: Record<EsploraNet, string[]> = {
+	mainnet: ["https://mempool.space/api", "https://blockstream.info/api"],
+	testnet: ["https://mempool.space/testnet/api", "https://blockstream.info/testnet/api"],
+	signet: ["https://mempool.space/signet/api", "https://blockstream.info/signet/api"],
 };
 
 export interface EsploraStatus {
@@ -44,23 +49,42 @@ export interface EsploraUtxo {
 
 export class Esplora {
 	readonly net: EsploraNet;
-	private readonly base: string;
+	private readonly bases: string[];
+	private preferred = 0; // index of the last endpoint that answered — start there next time
 	private readonly timeoutMs: number;
 
-	constructor(opts: { net?: EsploraNet; base?: string; timeoutMs?: number } = {}) {
+	constructor(opts: { net?: EsploraNet; base?: string; bases?: string[]; timeoutMs?: number } = {}) {
 		this.net = opts.net ?? "testnet";
-		this.base = opts.base ?? DEFAULT_BASE[this.net];
+		this.bases = opts.base ? [opts.base] : opts.bases ?? DEFAULT_BASES[this.net];
 		this.timeoutMs = opts.timeoutMs ?? 10_000;
 	}
 
+	/** One request with endpoint FAILOVER: try each base, starting from the last one that worked. A
+	 *  connection error, timeout, or 5xx moves to the next; a 4xx (incl. 404) is a real answer from a
+	 *  healthy endpoint and is returned, never failed over. Safe for broadcast too: rebroadcasting an
+	 *  identical raw tx is idempotent on Bitcoin (same txid), so retrying POST /tx elsewhere can't
+	 *  double-spend. */
 	private async req(path: string, init?: RequestInit): Promise<Response> {
-		const ctrl = new AbortController();
-		const t = setTimeout(() => ctrl.abort(), this.timeoutMs);
-		try {
-			return await fetch(this.base + path, { ...init, signal: ctrl.signal });
-		} finally {
-			clearTimeout(t);
+		let lastErr: unknown = null;
+		for (let i = 0; i < this.bases.length; i++) {
+			const at = (this.preferred + i) % this.bases.length;
+			const ctrl = new AbortController();
+			const t = setTimeout(() => ctrl.abort(), this.timeoutMs);
+			try {
+				const r = await fetch(this.bases[at] + path, { ...init, signal: ctrl.signal });
+				if (r.status >= 500) {
+					lastErr = new Error(`esplora ${this.bases[at]}: HTTP ${r.status}`);
+					continue; // a sick endpoint — try the next
+				}
+				this.preferred = at; // healthy — start here next time
+				return r;
+			} catch (e) {
+				lastErr = e; // network error / abort (timeout) — try the next
+			} finally {
+				clearTimeout(t);
+			}
 		}
+		throw new Error(`esplora: all endpoints failed (${this.bases.join(", ")}) — last: ${String((lastErr as Error)?.message ?? lastErr)}`);
 	}
 
 	/** Current chain tip height (for computing confirmations). */
