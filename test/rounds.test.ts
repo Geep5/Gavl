@@ -2,8 +2,8 @@
  * Gavl Rounds through the FOLD — the 1-click bull/bear parimutuel primitive. Entries escrow into
  * height-derived rounds (top-N-by-stake admission); the strike and close are set by the first
  * confidence-OK oracle write at/after their boundaries (in fold order → deterministic); winners
- * split the losing pool pro-rata with the vig + dust going to the liquidity pot; every edge (tie,
- * one-sided, no-strike, oracle-dark) refunds. Oracle writes here are REAL signed-quorum updates
+ * split the losing pool pro-rata — ALL of it (pure parimutuel, no rake; only integer-division dust
+ * goes to the liquidity pot); every edge (tie, one-sided, no-strike, oracle-dark) refunds. Oracle writes here are REAL signed-quorum updates
  * relayed on-chain (the Pyth path shares the code after verification; its conf gate is unit-tested
  * pure since guardian signatures can't be forged in a test).
  *
@@ -123,7 +123,7 @@ test("re-entries MERGE (same side) and a side switch is rejected", async () => {
 	assert.ok(marketConserved(v));
 });
 
-test("full lifecycle: strike at lock, close one window later — winners split the losing pool, vig+dust → pot, round deletes", async () => {
+test("full lifecycle: strike at lock, close one window later — winners split the WHOLE losing pool, round deletes", async () => {
 	const { node, mk, report, fund, fold } = harness();
 	const A = mk(), B = mk(), R = mk(); // R = the (untrusted) oracle relayer
 	fund(A, 10_000n);
@@ -135,10 +135,10 @@ test("full lifecycle: strike at lock, close one window later — winners split t
 
 	const v = fold(born(node, [[a, 2], [b, 3], [strike.id, LOCK], [close.id, CLOSE]]), CLOSE + 1);
 	assert.equal(v.rounds.size, 0, "round settled and deleted itself");
-	// losePool 6000 → vig 180 (300 bps) → dist 5820; A is the whole win pool → share 5820.
-	assert.equal(gbtcOf(v, A.pubHex), 10_000n - 4_000n + 4_000n + 5_820n, "A: stake back + the losing pool minus vig");
+	// losePool 6000 → dist 6000 (pure parimutuel, no rake); A is the whole win pool → share 6000, dust 0.
+	assert.equal(gbtcOf(v, A.pubHex), 10_000n - 4_000n + 4_000n + 6_000n, "A: stake back + the WHOLE losing pool");
 	assert.equal(gbtcOf(v, B.pubHex), 4_000n, "B lost its stake");
-	assert.equal(v.bridge.pot, 180n, "the vig landed in the liquidity pot");
+	assert.equal(v.bridge.pot, 0n, "no rake — nothing to the pot (dust 0)");
 	assert.ok(marketConserved(v), "conserved end to end");
 });
 
@@ -156,7 +156,7 @@ test("tie and one-sided rounds refund everyone", async () => {
 	assert.equal(v1.rounds.size, 0);
 	assert.equal(gbtcOf(v1, A.pubHex), 10_000n, "tie → A refunded");
 	assert.equal(gbtcOf(v1, B.pubHex), 10_000n, "tie → B refunded");
-	assert.equal(v1.bridge.pot, 0n, "no vig on a refund");
+	assert.equal(v1.bridge.pot, 0n, "nothing to the pot on a refund");
 	assert.ok(marketConserved(v1));
 
 	// one-sided: only UP entries; even though up "wins", there's no losing pool → refund
@@ -226,8 +226,8 @@ test("confidence gate (pure): a wide-conf update neither strikes nor settles; th
 	assert.equal(rounds.size, 1, "blurry close skipped");
 	const toPot = roundsOnOracle(bridge, rounds, 100_200n, 0n, CLOSE + 1);
 	assert.equal(rounds.size, 0, "settled");
-	assert.equal(toPot, 180n, "vig on the 6000 losing pool");
-	assert.equal(bGbtc(bridge, "aa"), 10_000n + 5_820n, "aa won");
+	assert.equal(toPot, 0n, "no rake — dust 0 on this settle");
+	assert.equal(bGbtc(bridge, "aa"), 10_000n + 6_000n, "aa won the whole 6000 losing pool");
 });
 
 // ── POT-SEEDING: at lock the pot stakes the thin side, capped at 10% of the FOLD-BASE pot ──
@@ -260,7 +260,7 @@ test("pot-seeding at lock: the thin side is seeded to balance, capped at 10% of 
 	assert.ok(marketConserved(v2));
 });
 
-test("seeded side LOSES: winners split loseStakes+seed minus vig; the pot nets vig+dust−seed", async () => {
+test("seeded side LOSES: winners split ALL of loseStakes+seed; the pot nets −seed (+ dust)", async () => {
 	const { node, mk, report, fund, fold, balances } = harness();
 	const A = mk(), B = mk(), R = mk();
 	fund(A, 10_000n);
@@ -271,12 +271,12 @@ test("seeded side LOSES: winners split loseStakes+seed minus vig; the pot nets v
 	const close = await report(R, 101_000n, 2_000); // up wins → the seeded side lost
 	const v = fold(born(node, [[a, 2], [b, 3], [strike.id, LOCK], [close.id, CLOSE]]), CLOSE + 1, { base: potBase(balances, 100_000n) });
 	assert.equal(v.rounds.size, 0, "settled and deleted");
-	// loseTotal = 1000 stakes + 3000 seed = 4000 → vig 120 → dist 3880; A is the whole win total
-	// (winTotal 4000) → share 4000·3880/4000 = 3880, dust 0. A: 6000 free + 4000 stake + 3880.
-	assert.equal(gbtcOf(v, A.pubHex), 6_000n + 4_000n + 3_880n, "A won the seed-fattened losing total minus vig");
+	// loseTotal = 1000 stakes + 3000 seed = 4000 → dist 4000 (no rake); A is the whole win total
+	// (winTotal 4000) → share 4000·4000/4000 = 4000, dust 0. A: 6000 free + 4000 stake + 4000.
+	assert.equal(gbtcOf(v, A.pubHex), 6_000n + 4_000n + 4_000n, "A won the WHOLE seed-fattened losing total");
 	assert.equal(gbtcOf(v, B.pubHex), 9_000n, "B lost its stake");
-	// pot's net for the round = vig 120 + dust 0 − seed 3000: 100000 − 3000 + 120 = 97120.
-	assert.equal(v.bridge.pot, 100_000n - 3_000n + 120n, "the pot paid the seed, kept the vig");
+	// pot's net for the round = dust 0 − seed 3000: 100000 − 3000 = 97000.
+	assert.equal(v.bridge.pot, 100_000n - 3_000n, "the pot paid the seed; nothing comes back on a loss");
 	assert.ok(marketConserved(v));
 });
 
@@ -291,11 +291,11 @@ test("seeded side WINS: the pot takes its seed back plus a stake-like pro-rata s
 	const close = await report(R, 99_000n, 2_000); // down wins → the pot's seed rode the winner
 	const v = fold(born(node, [[a, 2], [b, 3], [strike.id, LOCK], [close.id, CLOSE]]), CLOSE + 1, { base: potBase(balances, 100_000n) });
 	assert.equal(v.rounds.size, 0);
-	// winTotal = 1000 (B) + 3000 (seed) = 4000; loseTotal = 4000 → vig 120, dist 3880.
-	// B: stake + 1000·3880/4000 = 1970. Pot: seed 3000 + 3000·3880/4000 = 2910 + vig 120 + dust 0.
-	assert.equal(gbtcOf(v, B.pubHex), 9_000n + 1_000n + 970n, "B's entry earns on its stake only");
+	// winTotal = 1000 (B) + 3000 (seed) = 4000; loseTotal = 4000 → dist 4000 (no rake).
+	// B: stake + 1000·4000/4000 = 2000. Pot: seed 3000 + 3000·4000/4000 = 3000 + dust 0.
+	assert.equal(gbtcOf(v, B.pubHex), 9_000n + 1_000n + 1_000n, "B's entry earns on its stake only");
 	assert.equal(gbtcOf(v, A.pubHex), 6_000n, "A lost its stake");
-	assert.equal(v.bridge.pot, 100_000n - 3_000n + 3_000n + 2_910n + 120n, "seed home + winnings + vig");
+	assert.equal(v.bridge.pot, 100_000n - 3_000n + 3_000n + 3_000n, "seed home + winnings");
 	assert.ok(v.bridge.pot > 100_000n, "the pot GREW on a winning seed");
 	assert.ok(marketConserved(v));
 });
@@ -332,7 +332,7 @@ test("pot-seeding determinism: full fold vs checkpoint-resumed fold agree byte-f
 
 	// The budget derives from each fold's BASE pot, so equivalence needs the snapshot pot to equal
 	// the full fold's base pot — arranged here by snapshotting AFTER the entries but BEFORE the
-	// strike, with nothing (no vig, no demurrage) touching the pot in between.
+	// strike, with nothing (no settles, no demurrage) touching the pot in between.
 	const POT = 50_000n;
 	const full = computeView(all, { bornAt: bornOf(all), nowHeight: CLOSE + 1, market: oracle, base: potBase(balances, POT) });
 	const half = all.filter((w) => w.id !== strike.id && w.id !== close.id); // entries only
@@ -341,7 +341,7 @@ test("pot-seeding determinism: full fold vs checkpoint-resumed fold agree byte-f
 	const resumed = computeView(all.filter((w) => w.id === strike.id || w.id === close.id), { bornAt: bornOf(all), nowHeight: CLOSE + 1, market: oracle, base: snapshot });
 
 	assert.equal(viewRoot(resumed), viewRoot(full), "seeded full fold and checkpoint-resumed fold agree byte-for-byte");
-	assert.equal(resumed.bridge.pot, POT - 3_000n + 120n, "both paths seeded 3000 and kept the 120 vig");
+	assert.equal(resumed.bridge.pot, POT - 3_000n, "both paths seeded 3000; the losing seed stayed distributed (dust 0)");
 	assert.ok(marketConserved(resumed));
 });
 
@@ -366,6 +366,6 @@ test("checkpoint equivalence: resuming from a mid-round snapshot folds to the id
 	const resumed = computeView(all.filter((w) => w.id === close.id), { bornAt: bornOf(all), nowHeight: CLOSE + 1, market: oracle, base: snapshot });
 
 	assert.equal(viewRoot(resumed), viewRoot(full), "full fold and checkpoint-resumed fold agree byte-for-byte");
-	assert.equal(gbtcOf(resumed, B.pubHex), 4_000n + 6_000n + 3_880n, "B: 4000 unspent + stake back + the 4000 losing pool minus 120 vig");
+	assert.equal(gbtcOf(resumed, B.pubHex), 4_000n + 6_000n + 4_000n, "B: 4000 unspent + stake back + the WHOLE 4000 losing pool");
 	assert.ok(marketConserved(resumed));
 });

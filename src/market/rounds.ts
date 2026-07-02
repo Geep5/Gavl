@@ -4,15 +4,16 @@
  * [N·ROUND_LEN, (N+1)·ROUND_LEN). While a round's window is open anyone enters UP or DOWN with a
  * stake; at the window's end the round LOCKS (strike = the first confidence-OK oracle write at or
  * after the boundary); one window later it CLOSES (same rule) and settles: winners split the losing
- * pool pro-rata, a small vig + integer dust go to the liquidity pot, and the round deletes itself.
- * Always one round accepting + one live → a hammer every ROUND_LEN anchors.
+ * pool pro-rata — ALL of it (pure parimutuel, no rake; only integer-division dust reaches the
+ * liquidity pot) — and the round deletes itself. Always one round accepting + one live → a hammer
+ * every ROUND_LEN anchors.
  *
  * POT-SEEDING (the pot's one outflow): at each round's LOCK — the moment the strike is set — the
  * liquidity pot stakes the THIN side up to the imbalance, budget-capped per fold (see RoundSeed).
- * The vig/demurrage the pot collects thus flows back out to the next cycle's opposite end, and a
- * one-sided round becomes settleable instead of refunding. The seed is pool-level (no entry slot,
- * invisible to top-N admission) and moves LAST — set only after the lock, it can't be positioned
- * against.
+ * The pot is fed by the demurrage idle-sweep, not a rake — what idle balances forfeit thus flows
+ * back out to the next cycle's opposite end, and a one-sided round becomes settleable instead of
+ * refunding. The seed is pool-level (no entry slot, invisible to top-N admission) and moves LAST —
+ * set only after the lock, it can't be positioned against.
  *
  * Determinism (the reason for every shape here):
  *   - STRIKE/CLOSE are set inside the market.report APPLY — "the first qualifying write in fold
@@ -44,8 +45,6 @@ export const ROUND_ENTRY_CUTOFF = 1;
 export const MAX_ROUND_ENTRIES = 10_000;
 /** Smallest NEW entry (dust floor — an entry must be worth its state). Top-ups may be smaller. */
 export const MIN_ROUND_STAKE = 1_000n;
-/** The vig on the losing pool, in basis points → the liquidity pot (with integer-division dust). */
-export const ROUND_VIG_BPS = 300n;
 /** Strike/close accept only oracle updates with conf ≤ this many bps of price ("clear photo" rule);
  *  a wider update is skipped and the next one (≈5s later) is tried. Signed feeds carry conf 0. */
 export const ROUND_CONF_MAX_BPS = 50n;
@@ -166,11 +165,12 @@ export function refundRound(bridge: BridgeState, rounds: Rounds, r: Round, heigh
 }
 
 /** Settle a closed round at `close` vs its strike: winners split the losing TOTAL (stakes + pot
- *  seed) pro-rata; the vig and the integer-division dust go to the pot. All checks and denominators
- *  use TOTALS, so a round whose thin side is only pot-seed settles instead of refunding. The pot's
- *  winning seed earns exactly like a stake (seed back + pro-rata share); a losing seed just stays
- *  distributed (it left the pot at lock). Tie or one-sided-by-total → refund. Deletes the round.
- *  Returns what the pot gained — pools + seeds drain to exactly zero across winners + pot. */
+ *  seed) pro-rata — ALL of it (pure parimutuel, no rake); only the integer-division dust goes to
+ *  the pot. All checks and denominators use TOTALS, so a round whose thin side is only pot-seed
+ *  settles instead of refunding. The pot's winning seed earns exactly like a stake (seed back +
+ *  pro-rata share); a losing seed just stays distributed (it left the pot at lock). Tie or
+ *  one-sided-by-total → refund. Deletes the round. Returns what the pot gained — pools + seeds
+ *  drain to exactly zero across winners + pot. */
 export function settleRound(bridge: BridgeState, rounds: Rounds, r: Round, close: bigint, height: number): bigint {
 	const totalUp = r.poolUp + r.seedUp;
 	const totalDown = r.poolDown + r.seedDown;
@@ -181,9 +181,7 @@ export function settleRound(bridge: BridgeState, rounds: Rounds, r: Round, close
 	const upWins = close > r.strike;
 	const winSeed = upWins ? r.seedUp : r.seedDown;
 	const winTotal = (upWins ? r.poolUp : r.poolDown) + winSeed;
-	const loseTotal = upWins ? totalDown : totalUp;
-	const vig = (loseTotal * ROUND_VIG_BPS) / 10_000n;
-	const dist = loseTotal - vig;
+	const dist = upWins ? totalDown : totalUp; // the WHOLE losing total is distributed — no vig
 	let paidShares = 0n;
 	for (const [who, e] of r.entries) {
 		if ((e.side === "up") !== upWins) continue; // losers' stakes stay in the pool → distributed
@@ -193,8 +191,8 @@ export function settleRound(bridge: BridgeState, rounds: Rounds, r: Round, close
 	}
 	const potShare = (winSeed * dist) / winTotal; // the pot's seed wins like any stake
 	paidShares += potShare;
-	// pot: its winning seed back + its winnings + vig + division dust (dust counts the pot's share too).
-	const toPot = winSeed + potShare + vig + (dist - paidShares);
+	// pot: its winning seed back + its winnings + division dust ONLY (dust counts the pot's share too).
+	const toPot = winSeed + potShare + (dist - paidShares);
 	rounds.delete(r.idx);
 	return toPot;
 }
@@ -225,8 +223,8 @@ function seedAtLock(bridge: BridgeState, r: Round, seed: RoundSeed): void {
 	const avail = seed.budget - seed.drawn;
 	const take = need < avail ? need : avail;
 	if (take <= 0n) return;
-	bridge.pot -= take; // safe: within a fold the pot only grows (vig/refunds) or shrinks by these
-	seed.drawn += take; //   draws, so live pot ≥ base pot − drawn ≥ base pot − base pot/10 ≥ 0.
+	bridge.pot -= take; // safe: within a fold the pot only grows (settle dust/seed returns) or shrinks
+	seed.drawn += take; //   by these draws, so live pot ≥ base pot − drawn ≥ base pot − base pot/10 ≥ 0.
 	if (totalUp > totalDown) r.seedDown += take;
 	else r.seedUp += take;
 }

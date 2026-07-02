@@ -4,9 +4,10 @@
  *   computeView(writes) -> { bridge, market, custody, rounds }
  *
  * The whole product: Gavl Rounds — height-derived parimutuel up/down rounds on the
- * channel's oracle price (see ./rounds.ts). Winners split the losing pool pro-rata,
- * a small vig feeds the liquidity pot, and everything only MOVES gBTC between
- * buckets, so the protocol is never a counterparty and reserves can't be drained.
+ * channel's oracle price (see ./rounds.ts). Winners split the losing pool pro-rata —
+ * ALL of it, no rake (the liquidity pot is fed by the demurrage idle-sweep) — and
+ * everything only MOVES gBTC between buckets, so the protocol is never a
+ * counterparty and reserves can't be drained.
  * This fold wires round.enter (+ the strike/close snapshotting inside market.report)
  * alongside the gBTC bridge and threshold custody.
  *
@@ -174,8 +175,8 @@ export type MarketDef = { kind: "pyth"; feedId: string } | { kind: "signed"; sig
  * credit resets the clock, so an active balance is never touched, and the UI counts the grace down so the
  * sweep is never a surprise (use-it-or-lose-it). The swept gBTC goes to `bridge.pot` — a conservation
  * bucket and base-independent counter (checkpoint-pruned and full nodes agree, so no fork). It only MOVES
- * gBTC (idle → pot), never mints/burns, so 1:1 backing holds. The pot accumulates (rounds vig +
- * demurrage); its one outflow is round pot-seeding at lock (budget-capped off the fold base — rounds.ts).
+ * gBTC (idle → pot), never mints/burns, so 1:1 backing holds. The pot accumulates (demurrage +
+ * rounds settle dust); its one outflow is round pot-seeding at lock (budget-capped off the fold base — rounds.ts).
  */
 function accrueDemurrage(view: View, nowHeight: number): void {
 	const b = view.bridge;
@@ -256,7 +257,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	// contains end-of-fold demurrage sweeps that a full fold applies only after ops, so the live pot
 	// differs mid-fold → reading it would fork. ≤10% of the finalized pot per fold; no base → 0 →
 	// seeding simply off (the same convention the removed backstop used). Safe: during a fold the
-	// live pot only grows (vig/refunds) or shrinks by these seeds, so
+	// live pot only grows (settle dust/seed returns) or shrinks by these seeds, so
 	// live pot ≥ base pot − drawn ≥ base pot − base pot/10 ≥ 0 — the pot can never go negative.
 	const roundSeed: RoundSeed = { budget: opts.base ? opts.base.bridge.pot / 10n : 0n, drawn: 0n };
 	for (const w of [...writes].sort(cmp)) {
@@ -386,7 +387,7 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			view.market.at = bornHeight; // certified height → deterministic staleness
 			// Rounds: this verified update is "the next qualifying oracle write in fold order" — it may
 			// strike the locked round (then pot-seed its thin side against the fold-base budget),
-			// settle (or refund) the closed one; vig + dust + the pot's winning seed land in the pot.
+			// settle (or refund) the closed one; the division dust + the pot's winning seed land in the pot.
 			// Pyth updates carry a real confidence interval; signed-set updates pass conf 0.
 			// NOTE: the call mutates bridge.pot itself (seed draws / seed refunds), so it must run
 			// BEFORE the `+=` — `pot += f()` reads pot first and would clobber the in-call draws.

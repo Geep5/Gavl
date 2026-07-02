@@ -1,7 +1,7 @@
 <script>
 	// Gavl Rounds — the 1-click bull/bear panel. One accepting round (two giant buttons), one live
-	// round (strike vs price, settles on a countdown), and a history strip. Odds are the parimutuel
-	// pool ratio net of the vig; everything renders from store.market.rounds (the daemon's clock).
+	// round (strike vs price, settles on a countdown), and a history strip. Odds are the pure
+	// parimutuel pool ratio (no rake); everything renders from store.market.rounds (the daemon's clock).
 	import { store, act, myGbtc } from "../lib/store.svelte.js";
 	import { api } from "../lib/api.js";
 
@@ -25,11 +25,11 @@
 	const secsTo = (boundary) => Math.max(0, (boundary - tip) * secPer - (Date.now() - tipAt) / 1000);
 	const clock = (boundary) => { void tick; const s = Math.round(secsTo(boundary)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
 
-	// ── odds: what a winning side pays per 1 staked (pool ratio, net of the vig on the losing pool) ──
+	// ── odds: what a winning side pays per 1 staked (pure pool ratio — winners take the WHOLE losing pool) ──
 	const mult = (mine, other) => {
 		const a = Number(mine), b = Number(other);
 		if (!a) return null; // empty side — first entry sets the market
-		return 1 + (b * (1 - (R?.vigBps ?? 300) / 10000)) / a;
+		return 1 + b / a;
 	};
 	const multFmt = (x) => (x == null ? "first in!" : `pays ${x.toFixed(2)}×`);
 
@@ -93,7 +93,7 @@
 			{#each presets as p}<button class="chip" class:on={stakeNum === p} onclick={() => (stake = String(p))}>{p >= 1000 ? p / 1000 + "k" : p}</button>{/each}
 			<button class="chip" onclick={() => (stake = String(bal))} disabled={bal <= 0}>MAX</button>
 		</div>
-		<div class="r-foot">one tap enters the pool · winners split the losers pro-rata · {(R.vigBps / 100).toFixed(0)}% of the losing pool feeds the liquidity pot</div>
+		<div class="r-foot">one tap enters the pool · winners split 100% of the losers pro-rata · idle balances decay into the pot that seeds thin rounds</div>
 
 		<!-- the live (locked) round -->
 		{#if live}

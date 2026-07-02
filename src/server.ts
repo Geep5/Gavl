@@ -23,7 +23,7 @@ import { dirname, join } from "node:path";
 import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
 import { genesisCommitteeKey } from "./custody/genesis-committee.ts";
 import { mark, gbtcOf, parseAmount } from "./market/btc.ts";
-import { roundIdxAt, lockBoundary, closeBoundary, entryOpen, roundsEscrowTotal, ROUND_LEN, ROUND_VIG_BPS, MIN_ROUND_STAKE } from "./market/rounds.ts";
+import { roundIdxAt, lockBoundary, closeBoundary, entryOpen, roundsEscrowTotal, ROUND_LEN, MIN_ROUND_STAKE } from "./market/rounds.ts";
 import type { RoundSide } from "./market/rounds.ts";
 import type { View } from "./market/btc.ts";
 import { totalGbtc, pendingTotal } from "./custody/bridge.ts";
@@ -261,7 +261,7 @@ function roundsInfo(view: View, me: string, tipHeight: number) {
 			else if (r.mySide === outcome) {
 				const losePool = outcome === "up" ? r.poolDown : r.poolUp;
 				const winPool = outcome === "up" ? r.poolUp : r.poolDown;
-				myPayout = r.myStake + (r.myStake * (losePool - (losePool * ROUND_VIG_BPS) / 10_000n)) / winPool;
+				myPayout = r.myStake + (r.myStake * losePool) / winPool; // pure parimutuel: the whole losing pool distributes
 			}
 		}
 		roundsHistory.unshift({ idx, strike: r.strike?.toString() ?? null, close: closeMark?.toString() ?? null, outcome, mySide: r.mySide, myStake: r.myStake.toString(), myPayout: myPayout.toString() });
@@ -272,7 +272,6 @@ function roundsInfo(view: View, me: string, tipHeight: number) {
 	const enteringIdx = roundIdxAt(tipHeight);
 	return {
 		len: ROUND_LEN,
-		vigBps: Number(ROUND_VIG_BPS),
 		minStake: MIN_ROUND_STAKE.toString(),
 		tip: tipHeight,
 		entryOpen: entryOpen(enteringIdx, tipHeight), // false during the pre-lock cutoff anchor
@@ -349,7 +348,7 @@ function serializeState() {
 		reconciled: onChainR != null ? onChainR >= view.bridge.reserves : null, // real BTC covers the ledger?
 		shortfall: onChainR != null ? (view.bridge.reserves > onChainR ? (view.bridge.reserves - onChainR).toString() : "0") : null,
 		reservesCheckedAgoMs: rsv != null ? Date.now() - rsv.at : null,
-		// ── the liquidity pot (accumulates rounds vig + demurrage sweeps; no outflow) ──
+		// ── the liquidity pot (fed by demurrage idle-sweeps + settle dust; outflow = pot-seeding at lock) ──
 		pot: view.bridge.pot.toString(),
 		// conservation breakdown (free + bonded + pending + pot + rounds == reserves)
 		free: freeV.toString(),

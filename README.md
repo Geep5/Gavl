@@ -8,8 +8,8 @@ A decentralized **1-click Bitcoin bull/bear market** on a **Proof-of-Space-Time 
 ledger**, networked over the [Reticulum](https://reticulum.network) stack.
 
 Pick **UP** or **DOWN** on Bitcoin for the next 15-minute round — parimutuel rounds priced by the
-Pyth-signed BTC feed. Winners split the losing pool pro-rata; a 3% vig feeds the shared liquidity
-pot. **There is no pool counterparty and no house** — every stake is real escrowed gBTC and the
+Pyth-signed BTC feed. Winners split the losing pool pro-rata — **all of it**: pure parimutuel, no
+rake. **There is no pool counterparty and no house** — every stake is real escrowed gBTC and the
 pools only ever redistribute it, so reserves can never be drained. PoST is the clock and the
 doorman: rounds are derived from anchor height, and every entry pays a cooldown (a proof of space
 *and* of time), so an attacker can't spin up cheap identities to flood the network. State lives in
@@ -64,15 +64,17 @@ listing op, no order book. Round *N* IS the height interval `[N·15, (N+1)·15)`
    checkpoint-resumed nodes can never disagree). A wide-confidence Pyth update is skipped and the
    next one is tried — the "clear photo" gate.
 4. **Close / settle** — one window later, the same rule sets the close. Winners split the losing
-   pool **pro-rata to stake**; a **3% vig** (plus integer dust) goes to the liquidity pot; the round
-   deletes itself.
+   pool **pro-rata to stake** — **100% of it** (pure parimutuel, no rake; only integer-division dust
+   reaches the liquidity pot); the round deletes itself.
 
 **Full round?** Admission is **top-N-by-stake**: a full round admits only a strictly-bigger stake,
 evicting (and refunding) the floor entry — squatting a slot costs real capital; ties keep the
 incumbent. **Refund edges:** a tie (close == strike), a one-sided round, or an oracle that never
 produces a qualifying strike/close (dark past a timeout) refunds every entry its stake — nobody can
-lose to a market that didn't happen. The pot also collects the **idle-balance sweep** (demurrage);
-it only accumulates — there is no outflow. Conservation is a tested invariant:
+lose to a market that didn't happen. The liquidity pot is an **idle-decay reservoir**: it is fed by
+the **idle-balance sweep** (demurrage), and its one outflow is **pot-seeding** — at lock it stakes
+the thin side of an imbalanced round (budget-capped), so what idle balances forfeit makes thin
+rounds settleable. Conservation is a tested invariant:
 `reserves == free + bonded + pending + pot + rounds` — ops only *move* gBTC, never mint.
 
 ### Pricing — named, not voted (`src/market/pyth.ts`)

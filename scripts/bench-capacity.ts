@@ -70,19 +70,17 @@ const buildRoundCanon = (n: number): unknown => ({
 const roundEntryBytes = (n1: number, n2: number): number =>
 	(enc.encode(canonicalize(buildRoundCanon(n2))).length - enc.encode(canonicalize(buildRoundCanon(n1))).length) / (n2 - n1);
 
-/** Parimutuel settle throughput: pro-rata distribution of the losing pool across n winners
- *  (bigint math per entry — the batch cost the fold pays once per round close). */
+/** Parimutuel settle throughput: pro-rata distribution of the WHOLE losing pool across n winners
+ *  (pure parimutuel, no rake — bigint math per entry, the batch cost the fold pays once per round close). */
 function settleRate(n: number, budgetMs = 500): number {
 	const entries = Array.from({ length: n }, (_, i) => ({ up: i % 2 === 0, stake: 1_000_000n + BigInt(i) }));
-	const VIG_BPS = 300n;
 	const settle = (): bigint => {
 		let winPool = 0n, losePool = 0n;
 		for (const e of entries) e.up ? (winPool += e.stake) : (losePool += e.stake);
-		const vig = (losePool * VIG_BPS) / 10_000n;
-		const dist = losePool - vig;
+		const dist = losePool; // the whole losing pool distributes
 		let paid = 0n;
 		for (const e of entries) if (e.up) paid += e.stake + (e.stake * dist) / winPool; // winner: stake back + pro-rata share
-		return vig + (dist - (paid - winPool)); // vig + integer-division dust → the pot
+		return dist - (paid - winPool); // integer-division dust → the pot
 	};
 	settle(); // warm
 	let reps = 0;

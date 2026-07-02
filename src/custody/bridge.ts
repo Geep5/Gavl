@@ -75,8 +75,9 @@ export interface BridgeState {
 	 *               regardless of how it checkpointed (a drifting reference would fork).
 	 *  - `charged` — the advancing "charged-through" boundary for the incremental −20%/day decay. */
 	chargeFrom: Map<string, { since: number; charged: number }>;
-	/** The liquidity pot: idle-balance sweeps (demurrage) and the rounds vig flow here — a pure
-	 *  conservation bucket holding real gBTC, never minted. Its one outflow is round POT-SEEDING at
+	/** The liquidity pot: idle-balance sweeps (demurrage) and rounds settle dust flow here — a pure
+	 *  conservation bucket holding real gBTC, never minted (no rake: winners keep 100% of the losing
+	 *  pool). Its one outflow is round POT-SEEDING at
 	 *  lock (budget-capped at 10% of the fold-base pot per fold — market/rounds.ts), which comes
 	 *  straight back at settle/refund as seed + winnings or stays distributed to winners. */
 	pot: bigint;
