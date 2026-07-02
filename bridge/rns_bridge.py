@@ -24,6 +24,7 @@ import os
 import sys
 import json
 import time
+import queue
 import argparse
 import threading
 import socket
@@ -127,6 +128,22 @@ def ensure_gavl_rns_config(config_dir):
             f.write(DEFAULT_GAVL_RNS_CONFIG)
 
 
+def _fatal(msg):
+    """Kill the whole sidecar NOW (all threads). Used when the control socket to the Node is gone or
+    wedged: every RNS/LXMF callback runs on a fresh thread and funnels into emit(), so a wedged
+    control path doesn't degrade — it ACCUMULATES blocked threads without bound (a live node reached
+    ~1750, enough pthread-lock contention to panic the macOS kernel with a spinlock timeout in
+    com.apple.kec.pthread). Dying fast is the safe state: the Node transport respawns the bridge and
+    our LXMF identity is on disk, so we come back with the same address. os._exit because daemon
+    threads and RNS jobs won't unwind cleanly, and lingering is exactly the failure mode."""
+    try:
+        sys.stderr.write("gavl-bridge fatal: %s\n" % msg)
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(1)
+
+
 def verify_binding(producer_hex, sig_hex, message):
     """Verify an Ed25519 producer signature over the binding message (matches det/ed25519.ts)."""
     try:
@@ -165,8 +182,18 @@ class AnnounceHandler:
 
 class Bridge:
     def __init__(self, ctrl, config_dir, storage_dir, network, propagated):
-        self.ctrl = ctrl                 # control socket back to the Node transport
-        self.ctrl_lock = threading.Lock()
+        self.ctrl = ctrl                 # control socket back to the Node transport (serve() owns the recv side)
+        # Emit path — decoupled from the socket on purpose. RNS/LXMF run EVERY callback (announce
+        # heard, message delivered, link event) on a freshly spawned thread, and they all funnel into
+        # emit(). When emit() wrote to the socket directly under a lock, a Node that stopped draining
+        # the control socket (stalled event loop, paused process) made sendall() block forever holding
+        # the lock — and every subsequent callback thread piled up behind it, unbounded. So emit()
+        # only ENQUEUES (bounded, short timeout) and this single writer thread owns the socket; if the
+        # Node truly stops draining, we exit fast (_fatal) instead of wedging, and get respawned.
+        self._emit_q = queue.Queue(maxsize=1024)
+        self._ctrl_tx = ctrl.dup()       # write-side dup: gets its own timeout without unblocking serve()'s recv
+        self._ctrl_tx.settimeout(15)
+        threading.Thread(target=self._emit_writer, daemon=True).start()
         self.network = network           # our network label; we only talk to peers on the same one
         self.display_name = GAVL_PREFIX + network
         self.propagated = propagated     # True → always route via a propagation node
@@ -222,12 +249,24 @@ class Bridge:
 
     # ── control protocol (bridge → Node) ─────────────────────────────
     def emit(self, obj):
+        # Called from RNS/LXMF callback threads — must NEVER block indefinitely (see __init__). The
+        # 10s grace absorbs a burst; a queue that stays full means the Node stopped draining, and the
+        # only safe move is to die and be respawned (silently dropping events would lose sync frames).
         line = (json.dumps(obj) + "\n").encode("utf-8")
-        with self.ctrl_lock:
+        try:
+            self._emit_q.put(line, timeout=10)
+        except queue.Full:
+            _fatal("control socket backpressure — Node stopped draining events")
+
+    def _emit_writer(self):
+        # Sole owner of the control socket's write side. A send that errors OR stalls past the socket
+        # timeout means the Node is gone or wedged — exit rather than wedge (see __init__ / _fatal).
+        while True:
+            line = self._emit_q.get()
             try:
-                self.ctrl.sendall(line)
-            except Exception:
-                pass
+                self._ctrl_tx.sendall(line)
+            except Exception as e:
+                _fatal("control socket write failed or stalled: %s" % e)
 
     def log(self, msg):
         self.emit({"ev": "log", "msg": msg})

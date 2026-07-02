@@ -107,6 +107,9 @@ export class ReticulumTransport {
 	private readonly producerToAddress = new Map<string, string>();
 	private readyResolve?: (v: void) => void;
 	private keepaliveTimer?: ReturnType<typeof setInterval>;
+	private destroyed = false;
+	private respawnTimer?: ReturnType<typeof setTimeout>;
+	private respawnDelayMs = 1_000; // doubles to 30s on repeated crashes; reset when a bridge reports ready
 	private announceIntervalSec = Number(process.env.GAVL_ANNOUNCE_INTERVAL) || 15; // gossip cadence (s) — 15s default for fast cold-start discovery; live-tunable from the UI, raise via GAVL_ANNOUNCE_INTERVAL on a large net
 
 	constructor(node: GavlNode, opts: ReticulumOptions) {
@@ -179,15 +182,33 @@ export class ReticulumTransport {
 		await new Promise<void>((resolveListen) => {
 			this.server = createServer((socket) => {
 				this.control = socket;
+				this.inbuf = ""; // a respawned bridge starts a fresh stream; drop any half-line from the old one
 				socket.setEncoding("utf8");
 				socket.on("data", (chunk: string) => this.onData(chunk));
-				socket.on("close", () => this.onControlClosed());
-				socket.on("error", () => this.onControlClosed()); // reset on teardown/exit — not fatal
+				const gone = () => {
+					// guard: a stale close from a PREVIOUS bridge's socket must not clobber the live one
+					if (this.control !== socket) return;
+					this.control = undefined;
+					this.onControlClosed();
+				};
+				socket.on("close", gone);
+				socket.on("error", gone); // reset on teardown/exit — not fatal
 			});
 			this.server.on("error", () => {});
 			this.server.listen(0, "127.0.0.1", () => resolveListen());
 		});
 
+		this.spawnBridge();
+
+		await new Promise<void>((resolve) => {
+			this.readyResolve = resolve;
+		});
+	}
+
+	/** Spawn (or respawn) the Python sidecar. The control server keeps listening across bridge
+	 *  restarts and the sidecar's LXMF identity lives on disk, so a respawned bridge reconnects with
+	 *  the SAME address and re-emits `ready` — which re-publishes our binding and re-arms keepalive. */
+	private spawnBridge(): void {
 		const port = (this.server!.address() as { port: number }).port;
 		const script = this.opts.bridgeScript ?? fileURLToPath(new URL("../../bridge/rns_bridge.py", import.meta.url));
 		const py = this.opts.python ?? process.env.GAVL_PYTHON ?? "python";
@@ -199,7 +220,7 @@ export class ReticulumTransport {
 			"-u", script,
 			"--control-port", String(port),
 			"--storage-dir", this.opts.storageDir,
-			"--network", network,
+			"--network", this.network,
 			"--config-dir", configDir,
 		];
 		// Re-announce cadence: how often we re-broadcast our gavl announce so late-joining peers discover
@@ -210,15 +231,36 @@ export class ReticulumTransport {
 		argv.push("--announce-interval", String(this.announceIntervalSec));
 		if (this.opts.propagated) argv.push("--propagated");
 
-		this.child = spawn(py, argv, {
+		const child = spawn(py, argv, {
 			stdio: ["ignore", "inherit", "inherit"],
 			env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8" },
 		});
-		this.child.on("exit", () => this.onControlClosed());
+		this.child = child;
+		// exit AND error (e.g. the python binary itself is missing) both land here; the guard dedupes
+		const gone = () => {
+			if (this.child === child) this.scheduleRespawn();
+		};
+		child.on("exit", gone);
+		child.on("error", gone);
+	}
 
-		await new Promise<void>((resolve) => {
-			this.readyResolve = resolve;
-		});
+	/** The bridge died — crashed, was killed, or fail-fasted itself because our side stopped draining
+	 *  the control socket (it exits rather than let RNS callback threads pile up; see rns_bridge.py
+	 *  emit()). Without a respawn the node silently drops off the mesh until the daemon restarts, so
+	 *  bring it back: backoff doubles to 30s (a crash-looping bridge — broken venv, bad config —
+	 *  shouldn't spin) and resets to 1s once a bridge reports ready again. */
+	private scheduleRespawn(): void {
+		this.child = undefined;
+		this.onControlClosed();
+		if (this.destroyed || this.respawnTimer) return;
+		const delay = this.respawnDelayMs;
+		this.respawnDelayMs = Math.min(this.respawnDelayMs * 2, 30_000);
+		this.report("net", `bridge sidecar exited — respawning in ${Math.round(delay / 1000)}s`);
+		this.respawnTimer = setTimeout(() => {
+			this.respawnTimer = undefined;
+			if (!this.destroyed) this.spawnBridge();
+		}, delay);
+		if (typeof this.respawnTimer.unref === "function") this.respawnTimer.unref(); // never hold the event loop open
 	}
 
 	/** Pin a known peer: warm a path and proactively greet it (the gossip sends hello over LXMF),
@@ -264,6 +306,9 @@ export class ReticulumTransport {
 	}
 
 	async destroy(): Promise<void> {
+		this.destroyed = true; // intentional teardown — the child's exit event must NOT respawn it
+		if (this.respawnTimer) clearTimeout(this.respawnTimer);
+		this.respawnTimer = undefined;
 		if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
 		this.keepaliveTimer = undefined;
 		try {
@@ -366,6 +411,7 @@ export class ReticulumTransport {
 			case "ready":
 				this.address = ev.address ?? null;
 				if (this.address) this.report("net", `online as ${ReticulumTransport.short(this.address)} on "${this.network}"`);
+				this.respawnDelayMs = 1_000; // a healthy bridge resets the crash-loop backoff
 				this.publishBinding();
 				this.startKeepalive();
 				this.readyResolve?.();
