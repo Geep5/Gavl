@@ -659,6 +659,11 @@ export class Daemon {
 		return this.account(this.wallet.active().pubHex);
 	}
 
+	/** This node's data directory (client-side files like autopilot.json live beside the wallet). */
+	dataPath(): string {
+		return this.dataDir;
+	}
+
 	createAccount(label: string): Account {
 		return this.bind(this.wallet.create(label));
 	}
