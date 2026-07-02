@@ -13,7 +13,7 @@
  *   THE TRADEOFF: the one machine that runs the setup transiently sees the whole key while it cuts the
  *   shares (a "trusted dealer"). You delete it afterward and trust that one-time setup — a standard
  *   trusted-setup assumption, fine for an operator standing up their own nodes. MAINNET keeps the live
- *   distributed DKG, where no machine ever sees the whole key; the daemon gates this off mainnet.
+ *   distributed DKG (no machine ever sees the whole key) remains a possible future upgrade; the trusted-dealer model is the production path on every network, mainnet included.
  */
 
 import { schnorr_FROST as FROST } from "@noble/curves/secp256k1.js";

@@ -1156,10 +1156,10 @@ export class Daemon {
 
 	/** TESTNET trusted-dealer committee mode: the PUBLIC group key for this network is hardcoded in the repo
 	 *  (genesis-committee.ts), and each seat's SECRET share was distributed out-of-band into <data>/custody.
-	 *  When that key is set we run NO live DKG. Off mainnet only (mainnet always runs the real ceremony).
+	 *  When that key is set we run NO live DKG. THE production custody model on every network, mainnet included (Grant, 2026-07-02): mint once locally, shares out-of-band, only the public key committed — users trust the operator ran the setup honestly.
 	 *  The repo never carries a secret — only the public key. See README "Genesis committee". */
 	private trustedCommitteeMode(): boolean {
-		return this.btcNetwork() !== "mainnet" && genesisCommitteeKey(this.currentChannel()) !== null;
+		return genesisCommitteeKey(this.currentChannel()) !== null;
 	}
 	private committeeKeyPath(): string {
 		return join(this.dataDir, "custody", "committee-key.json");
@@ -1173,7 +1173,7 @@ export class Daemon {
 		if (this.trustedCommitteeCache !== undefined) return this.trustedCommitteeCache;
 		const key = genesisCommitteeKey(this.currentChannel());
 		const share = this.committeeShare();
-		if (!key || this.btcNetwork() === "mainnet" || !share || !existsSync(this.committeeKeyPath())) return (this.trustedCommitteeCache = null);
+		if (!key || !share || !existsSync(this.committeeKeyPath())) return (this.trustedCommitteeCache = null);
 		if (toHex(share.groupPubKey) !== toHex(key)) {
 			console.warn(`  ⚠ custody: on-disk share's group key ${toHex(share.groupPubKey).slice(0, 12)}… ≠ repo's ${toHex(key).slice(0, 12)}… — REFUSING it (re-distribute the right seat bundle).`);
 			return (this.trustedCommitteeCache = null);

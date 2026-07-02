@@ -584,7 +584,7 @@ createServer((req, res) => {
 	const cu = daemon.custodyStatus();
 	if (cu.fundKeyOnChain)
 		console.log(`  custody: committee — fund ${cu.fundAddress} (key ${cu.fundKeyOnChain.slice(0, 12)}…; this node ${cu.holdsShare ? "holds a share" : "is watching"})`);
-	else if (daemon.btcNetwork() !== "mainnet" && genesisCommitteeKey(daemon.currentChannel()) !== null)
+	else if (genesisCommitteeKey(daemon.currentChannel()) !== null)
 		console.log(`  custody: trusted-dealer committee (testnet) — fund key publishing into the chain; finalizes once farming anchors it (no DKG). Repo holds only the public key.`);
 	else
 		console.log(`  custody: committee — WAITING for ≥${cu.minCommittee} farmers to run genesis DKG. No fund key yet, so minting is disabled until the committee forms — a lone node waits for peers; there is no single-key fallback.`);
