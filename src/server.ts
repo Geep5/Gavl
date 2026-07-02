@@ -22,9 +22,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
 import { genesisCommitteeKey } from "./custody/genesis-committee.ts";
-import { mark, gbtcOf, MAX_LEVERAGE, parseAmount, leverageOk } from "./market/btc.ts";
-import { escrowedInContracts } from "./market/intent.ts";
-import { roundIdxAt, lockBoundary, closeBoundary, entryOpen, ROUND_LEN, ROUND_VIG_BPS, MIN_ROUND_STAKE } from "./market/rounds.ts";
+import { mark, gbtcOf, parseAmount } from "./market/btc.ts";
+import { roundIdxAt, lockBoundary, closeBoundary, entryOpen, roundsEscrowTotal, ROUND_LEN, ROUND_VIG_BPS, MIN_ROUND_STAKE } from "./market/rounds.ts";
 import type { RoundSide } from "./market/rounds.ts";
 import type { View } from "./market/btc.ts";
 import { totalGbtc, pendingTotal } from "./custody/bridge.ts";
@@ -319,23 +318,22 @@ function serializeState() {
 	// this single height into a live countdown via the current tip. Null if the account has no balance/clock.
 	const cf = view.bridge.chargeFrom.get(me);
 	const idleDecay = cf ? { sweepAtHeight: cf.charged } : null;
-	// Conservation buckets (reserves == free + bonded + escrow + pending + pot) for the UI breakdown.
+	// Conservation buckets (reserves == free + bonded + pending + pot + rounds) for the UI breakdown.
 	// `free` is the remainder, so the five always sum to reserves regardless of how the ledger rounds.
-	const escrowV = escrowedInContracts(view.book);
+	const roundsV = roundsEscrowTotal(view.rounds);
 	const bondedV = [...view.bridge.bonds.values()].reduce((a, b) => a + b, 0n);
-	const freeV = view.bridge.reserves - bondedV - escrowV - pendingTotal(view.bridge) - view.bridge.pot;
+	const freeV = view.bridge.reserves - bondedV - pendingTotal(view.bridge) - view.bridge.pot - roundsV;
 	const market = {
 		oracle: def?.kind ?? "pyth", // mechanism: the channel name encodes the price source; updates are source-signed
 		marketInfo,
 		price: m != null ? m.toString() : null,
 		priceExpo: view.market.expo, // decimal exponent: display value = price · 10^expo
-		maxLeverage: Number(MAX_LEVERAGE),
 		// collateral = gBTC, a 1:1 claim on BTC in the custody fund
 		myGbtc: gbtcOf(view, me).toString(),
 		idleDecay, // { sweepAtHeight } | null — idle-sweep countdown for your idle gBTC (flat timeout)
 
 		reserves: view.bridge.reserves.toString(), // BTC sats in the fund
-		gbtcOutstanding: (totalGbtc(view.bridge) + escrowedInContracts(view.book)).toString(),
+		gbtcOutstanding: (totalGbtc(view.bridge) + roundsV).toString(),
 		pending: pendingTotal(view.bridge).toString(), // burned, awaiting BTC payout
 		pendingCount: view.bridge.pending.length,
 		// YOUR OWN deposit address — derived from (fund key, your pubkey), so a deposit
@@ -348,16 +346,12 @@ function serializeState() {
 		reconciled: onChainR != null ? onChainR >= view.bridge.reserves : null, // real BTC covers the ledger?
 		shortfall: onChainR != null ? (view.bridge.reserves > onChainR ? (view.bridge.reserves - onChainR).toString() : "0") : null,
 		reservesCheckedAgoMs: rsv != null ? Date.now() - rsv.at : null,
-		// ── the matched market (real counterparty, no pool) ──
-		tape: daemon.intentTape(), // live resting intents you can take the opposite of
-		myContracts: daemon.myContracts(), // your open matched positions, with live PnL
-		// ── the liquidity backstop (idle-decay pot as counterparty of last resort) ──
-		pot: view.bridge.pot.toString(), // free idle-decay capital backing the pot
-		backstopAvailable: daemon.backstopAvailable(view).toString(), // gBTC the pot can stake right now
-		// conservation breakdown (free + bonded + escrow + pending + pot == reserves)
+		// ── the liquidity pot (accumulates rounds vig + demurrage sweeps; no outflow) ──
+		pot: view.bridge.pot.toString(),
+		// conservation breakdown (free + bonded + pending + pot + rounds == reserves)
 		free: freeV.toString(),
 		bonded: bondedV.toString(),
-		escrow: escrowV.toString(),
+		roundsEscrow: roundsV.toString(),
 		// ── Gavl Rounds: the 1-click bull/bear panel (accepting + live round, odds, history) ──
 		rounds: roundsInfo(view, me, tipH),
 	};
@@ -507,37 +501,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			if (mine && mine.side !== side) throw new Error(`you're already ${mine.side.toUpperCase()} in round #${idx} — same side only (a re-entry tops up)`);
 			const id = await daemon.active().enterRound(idx, side, stake);
 			return send(res, 200, { id, idx, side, stake: stake.toString() });
-		}
-		// ── peer-to-peer matched market (the real product: no pool, real counterparty) ──
-		if (path === "/api/intent/broadcast") {
-			// Post a non-binding signed intent to the tape. Nothing is escrowed yet.
-			if (mark(daemon.view()) === null) throw new Error("this channel has no reported price yet (or isn't a market channel)");
-			const side = body.side === "short" ? "short" : "long";
-			const lev = parseAmount(String(body.leverage ?? "2"));
-			if (lev === null || !leverageOk(lev)) throw new Error(`leverage must be a whole number from 2 to ${MAX_LEVERAGE}`);
-			requireSpendable(String(body.size), "size"); // advisory: be able to back it when taken
-			// spread = the maker fee (bps) the taker pays; the pot subsidises it up to the default. Optional.
-			const offer = daemon.broadcastIntent(side, String(body.size), String(body.leverage ?? "2"), body.spread != null ? String(body.spread) : undefined);
-			return send(res, 200, { nonce: offer.nonce });
-		}
-		if (path === "/api/intent/take") {
-			// Take a specific resting intent → opens a matched contract (you get the opposite side).
-			const id = await daemon.takeIntent(String(body.nonce), body.fill != null ? String(body.fill) : undefined, body.maxSpread != null ? String(body.maxSpread) : undefined);
-			return send(res, 200, { id });
-		}
-		if (path === "/api/intent/take-position") {
-			// Easy taker: go long/short by size, sweeping the best opposite intents (+ backstop).
-			if (mark(daemon.view()) === null) throw new Error("this channel has no reported price yet (or isn't a market channel)");
-			const side = body.side === "short" ? "short" : "long";
-			requireSpendable(String(body.size), "size");
-			// maxSpread = the taker's agreement: skip offers whose maker fee exceeds it.
-			const r = await daemon.takePosition(side, String(body.size), String(body.leverage ?? "2"), body.maxSpread != null ? String(body.maxSpread) : undefined);
-			return send(res, 200, r);
-		}
-		if (path === "/api/contract/settle") {
-			// Close a matched directional swap at the current mark (any time, up to its time-lock cap).
-			await daemon.settleContract(String(body.contractId));
-			return send(res, 200, { ok: true });
 		}
 		if (path === "/api/channel") {
 			// Join a different channel by name. Each channel is its own economy (own anchor

@@ -22,11 +22,6 @@ export const api = {
 	transfer: (to, amount) => req("/transfer", "POST", { to, amount }),
 	withdraw: (amount, btcAddress, fee) => req("/withdraw", "POST", { amount, btcAddress, fee }),
 	processWithdrawals: () => req("/withdrawals/process", "POST", {}),
-	// matched market (real counterparty, no pool)
-	broadcastIntent: (side, size, leverage, spread) => req("/intent/broadcast", "POST", { side, size, leverage, spread }),
-	takeIntent: (nonce, fill, maxSpread) => req("/intent/take", "POST", { nonce, fill, maxSpread }),
-	takePosition: (side, size, maxSpread) => req("/intent/take-position", "POST", { side, size, maxSpread }),
-	settleContract: (contractId) => req("/contract/settle", "POST", { contractId }),
 	// Gavl Rounds — the 1-click bull/bear (idx optional: defaults to the currently-accepting round)
 	rounds: () => req("/rounds"),
 	enterRound: (side, stake, idx) => req("/round/enter", "POST", { side, stake, idx }),

@@ -1,14 +1,14 @@
 /**
- * Gavl state — the BTC bull/bear MATCHED market, a pure fold of the write set.
+ * Gavl state — the BTC bull/bear market, a pure fold of the write set.
  *
- *   computeView(writes) -> { bridge, oracle, custody, book }
+ *   computeView(writes) -> { bridge, market, custody, rounds }
  *
- * The whole product: peers broadcast intents to long/short BTC; a taker takes the
- * opposite side; the match escrows BOTH peers' gBTC and opens a bilateral, zero-sum,
- * fully-collateralized contract settled against the oracle mark. There is NO pool, so
- * the protocol is never a counterparty and reserves can't be drained. The intent
- * match/settle logic lives in ./intent.ts; this fold wires it (match.open / contract.
- * settle) alongside the gBTC bridge and the oracle.
+ * The whole product: Gavl Rounds — height-derived parimutuel up/down rounds on the
+ * channel's oracle price (see ./rounds.ts). Winners split the losing pool pro-rata,
+ * a small vig feeds the liquidity pot, and everything only MOVES gBTC between
+ * buckets, so the protocol is never a counterparty and reserves can't be drained.
+ * This fold wires round.enter (+ the strike/close snapshotting inside market.report)
+ * alongside the gBTC bridge and threshold custody.
  *
  * Pricing = a Pyth feed, NO reporter. A CHANNEL IS A MARKET: the channel name encodes a Pyth feed id
  * (`label::pyth::feedId`), and ANYONE may relay the latest signed update. The fold verifies it
@@ -27,11 +27,8 @@ import { verifySignedQuorum } from "./signed-feed.ts";
 import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, mintCeiling, withdrawCap, depositCap, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/slashing.ts";
-import { emptyBook, escrowedInContracts, applyMatch, applyMatchPot, applySettle, pruneExpiredOffers, settleExpired, MAX_OPEN_POSITIONS, rebuildPosCount } from "./intent.ts";
 import { emptyRounds, applyRoundEnter, roundsOnOracle, sweepDarkRounds, roundsEscrowTotal, MAX_ROUND_ENTRIES } from "./rounds.ts";
 import type { Rounds, RoundSide } from "./rounds.ts";
-import type { Side } from "./intent.ts";
-import type { MarketBook } from "./intent.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "../custody/attestation.ts";
 import { fromHex } from "../det/canonical.ts";
@@ -81,9 +78,6 @@ export interface View {
 	market: MarketPrice;
 	/** The threshold-custody fund key, announced on-chain at genesis (committee mode). */
 	custody: CustodyState;
-	/** The peer-to-peer intent market: bilateral matched contracts + offer-fill tracking.
-	 *  The matched, zero-sum, can't-deplete-reserves core (replaced the old pool). */
-	book: MarketBook;
 	/** Gavl Rounds — the 1-click bull/bear parimutuel rounds, keyed by round idx (height-derived).
 	 *  Self-clearing: a round deletes itself at settle/refund, so this holds ~2 live rounds. */
 	rounds: Rounds;
@@ -95,13 +89,13 @@ export function gbtcOf(view: View, pubkey: string): bigint {
 }
 
 /**
- * The 1:1 backing invariant: every gBTC — free, bonded, escrowed in an open matched
- * contract, held in the liquidity pot, or burned-and-pending — is backed by a satoshi in
- * reserves. Match/settle/demurrage only MOVE gBTC between these buckets, never mint, so this
- * always holds.
+ * The 1:1 backing invariant: every gBTC — free, bonded, escrowed in a live round pool,
+ * held in the liquidity pot, or burned-and-pending — is backed by a satoshi in
+ * reserves. Round entry/settle/demurrage only MOVE gBTC between these buckets, never mint,
+ * so this always holds.
  */
 export function marketConserved(view: View): boolean {
-	return view.bridge.reserves === totalGbtc(view.bridge) + bondedTotal(view.bridge) + escrowedInContracts(view.book) + pendingTotal(view.bridge) + view.bridge.pot + roundsEscrowTotal(view.rounds);
+	return view.bridge.reserves === totalGbtc(view.bridge) + bondedTotal(view.bridge) + pendingTotal(view.bridge) + view.bridge.pot + roundsEscrowTotal(view.rounds);
 }
 
 export function parseAmount(s: string): bigint | null {
@@ -154,20 +148,11 @@ export interface ViewOptions {
 	 *  checkpoint view equals folding the full history — the basis for never replaying
 	 *  from 0. Height-timed effects act on state carried in `base` (bonds live there). */
 	base?: View;
-	/** The liquidity-backstop budget, taken from the FINALIZED view (`pot` = its free pot,
-	 *  `taken` = its lifetime `potEscrowTaken`). A `match.pot` may draw against
-	 *  `(pot + taken) − currentPotEscrowTaken` — i.e. only finalized pot capital, which every node
-	 *  agrees on, so the budget is deterministic and the free pot can't go negative. Absent (pure
-	 *  folds / no finalized state yet) → budget 0 → the backstop is simply unavailable. */
-	backstop?: { pot: bigint; taken: bigint };
 	/** The channel's market definition (what backs the price). When set, `market.report` carries a
 	 *  SIGNED update anyone may relay — the fold verifies an M-of-N quorum against this def's trust
 	 *  anchor (Pyth's guardian set, or a generic signer set) and matches the feed/set. A per-channel
 	 *  constant (same for every node), so the fold is deterministic. Absent → a transfers-only channel. */
 	market?: MarketDef;
-	/** Global open-position cap. Defaults to the consensus constant MAX_OPEN_POSITIONS — override ONLY in
-	 *  tests; production folds must use the default so every node admits/rejects the same matches. */
-	maxPositions?: number;
 	/** Per-round entry cap (top-N-by-stake admission). Defaults to MAX_ROUND_ENTRIES — test-only override. */
 	maxRoundEntries?: number;
 }
@@ -189,8 +174,8 @@ export type MarketDef = { kind: "pyth"; feedId: string } | { kind: "signed"; sig
  * credit resets the clock, so an active balance is never touched, and the UI counts the grace down so the
  * sweep is never a surprise (use-it-or-lose-it). The swept gBTC goes to `bridge.pot` — a conservation
  * bucket and base-independent counter (checkpoint-pruned and full nodes agree, so no fork). It only MOVES
- * gBTC (idle → pot), never mints/burns, so 1:1 backing holds. The pot is the backstop's capital
- * (`applyMatchPot`): reclaimed idle balances become the counterparty that lets someone trade.
+ * gBTC (idle → pot), never mints/burns, so 1:1 backing holds. The pot just accumulates (rounds vig +
+ * demurrage); it has no outflow.
  */
 function accrueDemurrage(view: View, nowHeight: number): void {
 	const b = view.bridge;
@@ -210,9 +195,9 @@ function accrueDemurrage(view: View, nowHeight: number): void {
 /**
  * Deep-copy a View so a resumed fold can mutate freely without touching the cached/snapshot base.
  * A direct structural clone — Maps/Sets rebuilt, every nested value object the fold mutates in
- * place (chargeFrom's `charged`, pending/unbonding/claims/readings/contracts/offerFills) copied —
- * instead of a serialize→sort→stringify→parse round-trip. Same result, far cheaper. The
- * checkpoint-determinism tests (full fold vs base-resumed fold) guard that this copies everything
+ * place (chargeFrom's `charged`, pending/unbonding/claims/round entries) copied — instead of a
+ * serialize→sort→stringify→parse round-trip. Same result, far cheaper. The resumable-fold and
+ * checkpoint-equivalence tests (full fold vs base-resumed fold) guard that this copies everything
  * the serializer would: a dropped field would diverge the resumed viewRoot.
  */
 export function cloneView(v: View): View {
@@ -238,10 +223,8 @@ export function cloneView(v: View): View {
 		},
 		market: { ...v.market },
 		custody: { fundKey: v.custody.fundKey, epoch: v.custody.epoch },
-		book: { contracts: cp(v.book.contracts), offerFills: cp(v.book.offerFills), posCount: new Map() },
 		rounds: new Map([...v.rounds].map(([k, r]) => [k, { ...r, entries: new Map([...r.entries].map(([p, e]) => [p, { ...e }])) }])),
 	};
-	rebuildPosCount(out.book);
 	return out;
 }
 
@@ -253,41 +236,31 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 				bridge: emptyBridge(),
 				market: emptyMarket(),
 				custody: { fundKey: null, epoch: -1 },
-				book: emptyBook(),
 				rounds: emptyRounds(),
 			};
 	const nowHeight = opts.nowHeight ?? 0;
-	// Total finalized pot capital the backstop may commit (free + lifetime-drawn); a match.pot
-	// draws against this minus the live draw counter. Source, in order: an explicit budget
-	// (tests), else the CHECKPOINT BASE's pot — the finalized, network-agreed snapshot every node
-	// resumes from, so the budget is identical for full and pruned nodes and across tip/final/
-	// appRoot folds (which all share that base). No base yet (pre-first-checkpoint) → 0.
-	const backstop = opts.backstop ?? (opts.base ? { pot: opts.base.bridge.pot, taken: opts.base.bridge.potEscrowTaken } : null);
-	const backstopBudget = backstop ? backstop.pot + backstop.taken : 0n;
 	// Per-epoch custody ceiling: custodied BTC ≤ TVL_PER_BOND × the FINALIZED committee bond, read from
-	// the SAME checkpoint base the backstop budget uses (so it's identical for full and pruned nodes, and
-	// — since CHECKPOINT_EVERY == epochLength — advances exactly one epoch at a time). No base yet
-	// (pre-first-checkpoint / genesis) → bond 0 → just the bootstrap floor.
+	// the CHECKPOINT BASE — the finalized, network-agreed snapshot every node resumes from (so it's
+	// identical for full and pruned nodes, and — since CHECKPOINT_EVERY == epochLength — advances
+	// exactly one epoch at a time). No base yet (pre-first-checkpoint / genesis) → bond 0 → just the
+	// bootstrap floor.
 	const custodyCeiling = mintCeiling(opts.base ? bondedTotal(opts.base.bridge) : 0n);
-	// Vector B outflow budget (absolute, mirrors backstopBudget): from the SAME checkpoint base, the
-	// epoch may withdraw up to withdrawCap(finalized reserves); `available` per write = this minus the
-	// live withdrawnTotal. No base yet (pre-first-checkpoint / full-from-genesis) → undefined → uncapped.
+	// Vector B outflow budget (absolute): from the SAME checkpoint base, the epoch may withdraw up to
+	// withdrawCap(finalized reserves); `available` per write = this minus the live withdrawnTotal. No
+	// base yet (pre-first-checkpoint / full-from-genesis) → undefined → uncapped.
 	const withdrawBudget = opts.base ? opts.base.bridge.withdrawnTotal + withdrawCap(opts.base.bridge.reserves) : undefined;
 	const depositBudget = opts.base ? opts.base.bridge.mintedTotal + depositCap(opts.base.bridge.reserves) : undefined; // Vector B's inflow twin (per-epoch mint cap)
-	const maxPositions = opts.maxPositions ?? MAX_OPEN_POSITIONS; // global open-position cap (consensus constant unless a test overrides)
 	const maxRoundEntries = opts.maxRoundEntries ?? MAX_ROUND_ENTRIES; // per-round entry cap (top-N-by-stake)
 	for (const w of [...writes].sort(cmp)) {
 		const op = w.payload as Op | null;
 		// Effects timed by height (unbond maturity) use the write's STABLE certifying
 		// height (bornAt) so they don't drift as the global nowHeight advances; others
 		// use nowHeight (the current anchor clock).
-		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, backstopBudget, custodyCeiling, withdrawBudget, opts.market, maxPositions, depositBudget, maxRoundEntries);
+		if (isOp(op)) applyOp(view, w, op, nowHeight, opts.bornAt?.get(w.id) ?? nowHeight, custodyCeiling, withdrawBudget, opts.market, depositBudget, maxRoundEntries);
 	}
 	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
-	settleExpired(view.bridge, view.book, nowHeight); // time-locked directional swaps unwind at entry (base-independent)
 	sweepDarkRounds(view.bridge, view.rounds, nowHeight); // oracle-dark rounds refund at their (constant) deadline
-	accrueDemurrage(view, nowHeight); // idle gBTC bleeds to capital working in open contracts
-	pruneExpiredOffers(view.book, nowHeight); // drop fill-tracking for offers that can no longer be matched
+	accrueDemurrage(view, nowHeight); // idle gBTC bleeds into the liquidity pot
 	pruneStaleClaims(view.bridge, nowHeight); // retire deposit-mint requests unminted past the reclaim grace
 	return view;
 }
@@ -327,7 +300,7 @@ export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: st
 	return computeView(included, { order, nowHeight, bornAt, base, market });
 }
 
-function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, backstopBudget = 0n, custodyCeiling = 0n, withdrawBudget?: bigint, market?: MarketDef, maxPositions = MAX_OPEN_POSITIONS, depositBudget?: bigint, maxRoundEntries = MAX_ROUND_ENTRIES): void {
+function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: number, custodyCeiling = 0n, withdrawBudget?: bigint, market?: MarketDef, depositBudget?: bigint, maxRoundEntries = MAX_ROUND_ENTRIES): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized ONLY by the committee
@@ -419,38 +392,6 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			view.custody.epoch = op.epoch;
 			return;
 		}
-		case "match.open": {
-			// Take a maker's signed offer → escrow BOTH sides, open a bilateral matched
-			// contract. The taker is the write's author; the contract id is the write id.
-			// The fold re-verifies the maker's signature and that both peers can cover the
-			// stake right now — a maker who ghosted (spent the funds) simply no-ops. This is
-			// the zero-sum, protocol-is-never-counterparty path that can't deplete reserves.
-			const fill = parseAmount(op.fill);
-			// Entry = the channel's market mark, at the write's stable certified height so
-			// expiry/staleness don't drift on replay.
-			const m = mark(view, bornHeight);
-			if (fill === null || m === null) return; // stale/unpriced market → no entry
-			const bid = op.bid != null ? parseAmount(op.bid) ?? 0n : 0n; // the slot bid — a one-time entry fee → the pot
-			// The pot may subsidise the maker fee: it draws the SAME finalized budget the backstop uses,
-			// so full and checkpoint-pruned nodes agree on how much the pot can cover.
-			const subsidyBudget = backstopBudget - view.bridge.potEscrowTaken;
-			applyMatch(view.bridge, view.book, w.writer, w.id, op.offer, fill, bornHeight, m, subsidyBudget, maxPositions, bid);
-			return;
-		}
-		case "match.pot": {
-			// Open against the liquidity backstop: the pot takes the opposite side at the channel's
-			// mark, staking from finalized pot capital. available = the finalized budget minus what
-			// the pot has already drawn (deterministic; keeps the free pot ≥ 0).
-			const fill = parseAmount(op.fill);
-			const lev = parseAmount(op.leverage);
-			const m = mark(view, bornHeight);
-			if (fill === null || lev === null || m === null) return;
-			if (op.side !== "long" && op.side !== "short") return;
-			const potBid = op.bid != null ? parseAmount(op.bid) ?? 0n : 0n; // slot bid (one-time entry fee → pot)
-			const available = backstopBudget - view.bridge.potEscrowTaken;
-			applyMatchPot(view.bridge, view.book, w.writer, w.id, op.side as Side, fill, lev, bornHeight, m, available, maxPositions, potBid);
-			return;
-		}
 		case "round.enter": {
 			// 1-click bull/bear: escrow the writer's stake into round `idx`'s side pool. The idx pins
 			// the INTENDED round — a write certified outside that round's entry window is a clean no-op
@@ -459,18 +400,6 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			if (stake === null || typeof op.idx !== "number" || !Number.isInteger(op.idx) || op.idx < 0) return;
 			if (op.side !== "up" && op.side !== "down") return;
 			applyRoundEnter(view.bridge, view.rounds, w.writer, op.idx, op.side as RoundSide, stake, bornHeight, maxRoundEntries);
-			return;
-		}
-		case "contract.settle": {
-			// Permissionless close: split the 2·stake pot at the channel's mark per the directional
-			// payoff. A directional swap — either side may close any time (up to the time-lock cap); the
-			// loser can't dodge the mark by stalling (the winner just closes it).
-			if (typeof op.contractId !== "string") return;
-			const c = view.book.contracts.get(op.contractId);
-			if (!c) return;
-			const m = mark(view, bornHeight);
-			if (m === null) return; // market gone dark → can't settle at a trustworthy price (auto-unwinds at expiry)
-			applySettle(view.bridge, view.book, op.contractId, m, bornHeight);
 			return;
 		}
 		case "custody.bond": {
@@ -494,13 +423,4 @@ function applyOp(view: View, w: Write, op: Op, nowHeight: number, bornHeight: nu
 			return;
 		}
 	}
-}
-
-// ── leverage bounds (consensus constants) ────────────────────────
-export const MAX_LEVERAGE = 5n;
-/** Minimum leverage. 1× is a fully-collateralized coin flip with no upside over fees —
- *  pointless — so the floor is 2×. */
-export const MIN_LEVERAGE = 2n;
-export function leverageOk(l: bigint): boolean {
-	return l >= MIN_LEVERAGE && l <= MAX_LEVERAGE;
 }

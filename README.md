@@ -4,29 +4,30 @@
 
 # Gavl
 
-A decentralized **peer-to-peer Bitcoin bull/bear market** on a **Proof-of-Space-Time cooldown
+A decentralized **1-click Bitcoin bull/bear market** on a **Proof-of-Space-Time cooldown
 ledger**, networked over the [Reticulum](https://reticulum.network) stack.
 
-Broadcast an intent to go **long** or **short** on Bitcoin; a real peer takes the opposite side; the
-two of you escrow against *each other* and settle at the channel's market price. **There is no pool
-and no house** — every trade is a matched, zero-sum, fully-collateralized bet between two people, so
-reserves can never be drained. State lives in **RAM**, is **checkpointed into the consensus chain**
-so a node boots from committed state (never replaying from genesis), and is bounded by **cost +
-decay** rather than hard caps. Every write pays a **cooldown** (a proof of space *and* of time), so
-an attacker can't spin up cheap identities to flood the network.
+Pick **UP** or **DOWN** on Bitcoin for the next 15-minute round — parimutuel rounds priced by the
+Pyth-signed BTC feed. Winners split the losing pool pro-rata; a 3% vig feeds the shared liquidity
+pot. **There is no pool counterparty and no house** — every stake is real escrowed gBTC and the
+pools only ever redistribute it, so reserves can never be drained. PoST is the clock and the
+doorman: rounds are derived from anchor height, and every entry pays a cooldown (a proof of space
+*and* of time), so an attacker can't spin up cheap identities to flood the network. State lives in
+**RAM** and is **checkpointed into the consensus chain**, so a node boots from committed state
+(never replaying from genesis).
 
 Collateral is **gBTC** — a 1:1 claim on real Bitcoin held in a **threshold-custody fund** that only
 an M-of-N committee can spend (no single party ever holds the key).
 
 > [!WARNING]
-> **Gavl is use-it-or-lose-it — not a savings account.** gBTC is meant to be *working*: held in a
-> position or actively trading. A **free balance left idle for 7 days begins to decay** into the
-> shared liquidity pot, and is **fully reclaimed by 30 days**. Open positions and resting orders run
-> on their own timers too — nothing here is set-and-forget. **Only keep money in while you're actively
-> using it, and withdraw what you're done with.** That bound is what keeps the system spam-proof and
-> RAM-light — it is deliberately *not* a place to park BTC.
+> **Gavl is use-it-or-lose-it — not a savings account.** gBTC is meant to be *working*: staked in a
+> round or actively moving. A **free balance left idle for 7 days is swept whole** into
+> the shared liquidity pot. Rounds run on their own 15-minute clock too — nothing here is
+> set-and-forget. **Only keep money in while you're actively using it, and withdraw what you're done
+> with.** That bound is what keeps the system spam-proof and RAM-light — it is deliberately *not* a
+> place to park BTC.
 
-> **Status:** the matched market runs live; the real-BTC bridge runs end-to-end on **testnet** across
+> **Status:** Gavl Rounds runs live; the real-BTC bridge runs end-to-end on **testnet** across
 > a 3-node committee. Custody is committee-only (no single-key path on any network). Still gated on an
 > independent audit + real independent stakers — **don't put real mainnet BTC in it.**
 
@@ -50,23 +51,29 @@ is what makes "verify against your current peers" cheap and a RAM chain with no 
 possible. Real PoST (chiavdf + chiapos) is the default; `GAVL_VDF=hash GAVL_SPACE=standin` is a fast
 stand-in for tests/UI work.
 
-### Matched Directional Swaps (`src/market/`)
+### Gavl Rounds (`src/market/rounds.ts`)
 
-A fully-collateralized, zero-sum, **bounded** bet on Bitcoin's direction between two peers:
+The 1-click bull/bear: **parimutuel up/down rounds derived from anchor height** — no scheduler, no
+listing op, no order book. Round *N* IS the height interval `[N·15, (N+1)·15)`:
 
 1. **Deposit** testnet BTC to *your* fund address → mint **gBTC** 1:1.
-2. **Broadcast an intent** — "long/short *N* gBTC at *L*×" — gossiped as a signed, non-binding offer;
-   or **take** the opposite side of a peer's resting intent.
-3. **A match** is one ledger write carrying the maker's signed offer. The fold verifies the
-   signature, checks both sides can cover the stake, escrows both, and opens a bilateral contract.
-4. **Settle** by splitting the `2·stake` pot by directional PnL, each payout capped to `[0, 2·stake]`
-   — the loser never owes more than its stake. Either side may **close early** at the mark; an open
-   position **auto-settles at a ~1-month time-lock**. No funding rate, no liquidation, no house.
+2. **Enter** — while a round's window is open, anyone stakes gBTC on **UP** or **DOWN** (one write:
+   `round.enter`). Entries close one anchor before lock, so there's no last-second info sniping.
+3. **Lock / strike** — at the window's end the round locks; the strike is the first *confidence-OK*
+   oracle write at or after the boundary ("the first qualifying write in fold order", so full and
+   checkpoint-resumed nodes can never disagree). A wide-confidence Pyth update is skipped and the
+   next one is tried — the "clear photo" gate.
+4. **Close / settle** — one window later, the same rule sets the close. Winners split the losing
+   pool **pro-rata to stake**; a **3% vig** (plus integer dust) goes to the liquidity pot; the round
+   deletes itself.
 
-When no peer is on the other side, a **liquidity backstop** takes it, staked from the **idle-decay
-pot**: gBTC left idle past a grace period decays into the pot (the RAM ledger's bound turned into a
-feature), and that reclaimed capital is what lets others trade. Conservation is a tested invariant:
-`reserves == free + bonded + escrow + pending + pot` — ops only *move* gBTC, never mint.
+**Full round?** Admission is **top-N-by-stake**: a full round admits only a strictly-bigger stake,
+evicting (and refunding) the floor entry — squatting a slot costs real capital; ties keep the
+incumbent. **Refund edges:** a tie (close == strike), a one-sided round, or an oracle that never
+produces a qualifying strike/close (dark past a timeout) refunds every entry its stake — nobody can
+lose to a market that didn't happen. The pot also collects the **idle-balance sweep** (demurrage);
+it only accumulates — there is no outflow. Conservation is a tested invariant:
+`reserves == free + bonded + pending + pot + rounds` — ops only *move* gBTC, never mint.
 
 ### Pricing — named, not voted (`src/market/pyth.ts`)
 
@@ -227,19 +234,19 @@ src/
   consensus/     anchor chain, fork choice, finality, difficulty, canonical order
   sync/          Reticulum (LXMF) transport · gossip · bounded mesh · signed producer↔address bindings
   store/         durable write store (node:sqlite) + state snapshots/checkpoints + selective persist policy
-  market/        matched market: intents + bilateral contracts, btc fold, account, Pyth/signed price feeds
+  market/        Gavl Rounds (parimutuel bull/bear), btc fold, account, Pyth/signed price feeds
   custody/       real-BTC bridge: FROST threshold · DKG · Taproot · deposits · tx · watcher · reshare
-  daemon.ts      boots ledger + node + store + consensus + price relay + bridge + intent book
+  daemon.ts      boots ledger + node + store + consensus + price relay + bridge
   server.ts      localhost JSON API for the web UI
 bridge/          Python Reticulum (RNS/LXMF) networking sidecar (the only transport)
-web/             Svelte SPA — the intent tape + bull/bear trading UI
+web/             Svelte SPA — the 1-click bull/bear rounds UI
 ```
 
 ---
 
 ## Trust model
 
-**Trustless:** consensus, ordering, storage; the matched market (zero-sum, fully-collateralized,
+**Trustless:** consensus, ordering, storage; the rounds market (parimutuel, fully-collateralized,
 conservation proven); threshold signing (no one holds the fund key).
 
 **Trusted (surfaced in the UI):** the channel's **price committee** (the Wormhole guardian set for a

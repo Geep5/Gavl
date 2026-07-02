@@ -14,8 +14,6 @@ import { computeView, finalizedView, gbtcOf } from "./btc.ts";
 import type { View } from "./btc.ts";
 import { DEFAULT_WITHDRAW_FEE } from "../custody/bridge.ts";
 import type { Op } from "./ops.ts";
-import { signOffer } from "./intent.ts";
-import type { Offer, OfferCore, Side } from "./intent.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 
 function amountStr(a: bigint | number | string): string {
@@ -124,31 +122,6 @@ export class Account {
 	 *  wins and is immutable — every node + client then derives the permanent address. */
 	announceFund(groupKey: string, epoch: number): Promise<Write> {
 		return this.produce({ kind: "custody.fund", groupKey, epoch });
-	}
-
-	/** Build + sign a non-binding intent OFFER with this identity's key (to gossip over
-	 *  the mesh). Nothing is escrowed; a taker redeems it on-chain via `matchOpen`. `spread`
-	 *  (maker fee in bps) defaults to "0" (no fee) when omitted. */
-	makeOffer(core: Omit<OfferCore, "maker" | "spread"> & { spread?: string }): Offer {
-		return signOffer({ ...core, spread: core.spread ?? "0", maker: this.pubHex }, this.writer.keypair.privateKey);
-	}
-
-	/** Take the opposite side of a peer's signed offer, escrowing `fill` stake on both
-	 *  sides → a bilateral matched contract (id = this write's id). Returns the contract id. */
-	async matchOpen(offer: Offer, fill: bigint | number | string, bid: bigint | number | string = 0): Promise<string> {
-		return (await this.produce({ kind: "match.open", offer, fill: amountStr(fill), bid: amountStr(bid) })).id;
-	}
-
-	/** Open a position directly against the liquidity BACKSTOP — no peer maker needed. The pot
-	 *  (idle-decay pool) takes the opposite side at the mark, capped by its finalized budget.
-	 *  Returns the contract id (= this write's id). */
-	async takePot(side: Side, fill: bigint | number | string, leverage: bigint | number | string, bid: bigint | number | string = 0): Promise<string> {
-		return (await this.produce({ kind: "match.pot", side, fill: amountStr(fill), leverage: amountStr(leverage), bid: amountStr(bid) })).id;
-	}
-
-	/** Settle a matured matched contract at the current oracle mark (permissionless). */
-	settle(contractId: string): Promise<Write> {
-		return this.produce({ kind: "contract.settle", contractId });
 	}
 
 	/** Enter round `idx`'s UP or DOWN pool with `stake` gBTC — the 1-click bull/bear action. */

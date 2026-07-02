@@ -19,7 +19,6 @@
 import type { SyncMessage, DkgWire, SignWire, ReshareWire } from "./messages.ts";
 import type { EncKeyAnnounce } from "../custody/enckey.ts";
 import type { Deal } from "../custody/pvss.ts";
-import type { Offer } from "../market/intent.ts";
 import type { StoredSnapshot } from "../store/store.ts";
 import type { Write } from "../chain/writer.ts";
 import { Ledger } from "../ledger/ledger.ts";
@@ -60,10 +59,6 @@ export class GavlNode {
 	/** Distinct foreign genesises already warned about (plus "∅" for a peer that advertised none), so a
 	 *  mismatch logs once. Public so /api/state can surface the split instead of leaving it silent. */
 	readonly warnedGenesis = new Set<string>();
-	/** Ingest a gossiped matched-market intent; returns true if it was NEW (→ re-gossip). */
-	onIntent?: (offer: Offer) => boolean;
-	/** This node's resting offer book, sent to a peer on connect so it sees the tape. */
-	intentsToShare?: () => Offer[];
 	// ── checkpoint bootstrap (a fresh peer loads state instead of replaying history) ──
 	/** Header of my latest durable checkpoint, advertised on connect (null = full/none). */
 	snapshotHeader?: () => { anchorId: string; height: number } | null;
@@ -120,8 +115,6 @@ export class GavlNode {
 		conn.send({ t: "hello", root: this.ledger.stateRoot(), heads: this.ledger.heads(), mode: this.mode, genesis: this.genesisId });
 		const tip = this.anchorTipMsg();
 		if (tip) conn.send(tip);
-		const offers = this.intentsToShare?.();
-		if (offers && offers.length) conn.send({ t: "intents", offers }); // hand the new peer my tape
 		const snap = this.snapshotHeader?.();
 		if (snap) {
 			conn.send({ t: "snapshot-offer", anchorId: snap.anchorId, height: snap.height }); // offer a fast-bootstrap checkpoint
@@ -273,17 +266,6 @@ export class GavlNode {
 					.catch(() => {});
 				return;
 			}
-			case "intent": {
-				// Non-binding matched-market offer. Verified + deduped by the daemon; re-gossip
-				// only if it was new, so it floods the mesh once without looping.
-				if (this.onIntent?.(m.offer)) this.broadcastExcept(conn, m);
-				return;
-			}
-			case "intents": {
-				// A peer's full resting book (on connect). Ingest each; no re-broadcast storm.
-				for (const o of m.offers) this.onIntent?.(o);
-				return;
-			}
 			case "anchor-tip": {
 				if (!this.anchors || this.anchors.get(m.id)) return;
 				const myTip = this.anchors.tip();
@@ -334,12 +316,6 @@ export class GavlNode {
 				return;
 			}
 		}
-	}
-
-	// ── matched-market intent transport ─────────────────────────────
-	/** Flood a freshly-broadcast intent to all peers. */
-	gossipIntent(offer: Offer): void {
-		this.broadcast({ t: "intent", offer });
 	}
 
 	/** Tap on EVERY inbound ceremony message (dkg/sign/reshare), independent of the

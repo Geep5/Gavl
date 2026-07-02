@@ -9,8 +9,8 @@
  *
  * Determinism (the reason for every shape here):
  *   - STRIKE/CLOSE are set inside the market.report APPLY — "the first qualifying write in fold
- *     order" — so full and checkpoint-resumed nodes can never disagree (the mark-at-sweep trap that
- *     forced the perp's unwind-at-entry is structurally avoided).
+ *     order" — so full and checkpoint-resumed nodes can never disagree (the mark-at-sweep trap is
+ *     structurally avoided).
  *   - Refunds credit at write- or constant-derived heights, never the fold's moving nowHeight.
  *   - Admission is TOP-N BY STAKE: a full round admits only a strictly-bigger stake, evicting (and
  *     refunding) the floor — squatting costs real capital; ties keep the incumbent. Stake IS the bid.
@@ -199,7 +199,7 @@ export function roundsOnOracle(bridge: BridgeState, rounds: Rounds, price: bigin
 
 /** End-of-fold safety net: a round with no qualifying close this long past its boundary refunds.
  *  Credits at the DEADLINE height (a per-round constant), so every node — whatever height its fold
- *  first crossed the deadline at — writes the identical state (the settleExpired trick). */
+ *  first crossed the deadline at — writes the identical state (base-independent, no fork). */
 export function sweepDarkRounds(bridge: BridgeState, rounds: Rounds, nowHeight: number): void {
 	for (const r of [...rounds.values()]) {
 		const deadline = closeBoundary(r.idx) + ROUND_DARK_TIMEOUT;

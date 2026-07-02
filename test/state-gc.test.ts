@@ -1,8 +1,8 @@
 /**
  * State retirement rules — the structures in the View that used to grow forever now
  * get cleaned up so a snapshot can't balloon. Covers: deposit-claim markers retired on
- * mint, withdrawal broadcast markers retired on settle, stale oracle readings evicted
- * past the freshness window, and offer fill-tracking pruned once the offer expires.
+ * mint, withdrawal broadcast markers retired on settle, and stale oracle marks gated
+ * past the freshness window.
  *
  *   node --test test/state-gc.test.ts
  */
@@ -10,12 +10,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { emptyBridge, mintFromDeposit, recordClaim, recordBroadcast, completeWithdrawal, requestWithdrawal, addGbtc, pruneStaleClaims, CLAIM_RECLAIM_GRACE } from "../src/custody/bridge.ts";
-import { emptyBook, signOffer, applyMatch, pruneExpiredOffers } from "../src/market/intent.ts";
+import { emptyBridge, mintFromDeposit, recordClaim, recordBroadcast, completeWithdrawal, requestWithdrawal, pruneStaleClaims, CLAIM_RECLAIM_GRACE } from "../src/custody/bridge.ts";
 import { computeView, mark, MARKET_STALE_AFTER } from "../src/market/btc.ts";
-import { generateKeyPair } from "../src/det/ed25519.ts";
-import { toHex } from "../src/det/canonical.ts";
-import { PARAMS, K, priceBase } from "./helpers.ts";
+import { priceBase } from "./helpers.ts";
 
 test("a deposit-claim marker is retired once the deposit mints, and not re-added", () => {
 	const s = emptyBridge();
@@ -46,27 +43,6 @@ test("a withdrawal's in-flight marker is retired once it settles", () => {
 	assert.equal(s.broadcasts.size, 1);
 	completeWithdrawal(s, "w1");
 	assert.equal(s.broadcasts.size, 0, "broadcast marker retired on settle");
-});
-
-test("offer fill-tracking is pruned once the offer can no longer be matched", () => {
-	const mk = generateKeyPair();
-	const maker = toHex(mk.publicKey);
-	const taker = toHex(generateKeyPair().publicKey);
-	const bridge = emptyBridge();
-	addGbtc(bridge, maker, 1000n);
-	addGbtc(bridge, taker, 1000n);
-	const offer = signOffer({ maker, makerSide: "long", size: "500", leverage: "10", expiryHeight: 5, nonce: "x", spread: "0" }, mk.privateKey);
-	const book = emptyBook();
-
-	const c = applyMatch(bridge, book, taker, "w1", offer, 100n, 3, 61000n); // matched at height 3 (≤ expiry)
-	assert.ok(c, "match opens");
-	assert.equal(book.offerFills.get("x")?.filled, 100n);
-
-	pruneExpiredOffers(book, 5); // still within expiry → kept
-	assert.equal(book.offerFills.size, 1, "not pruned while the offer is still live");
-	pruneExpiredOffers(book, 6); // now past expiry → retired
-	assert.equal(book.offerFills.size, 0, "fill-tracking retired once the offer expires");
-	assert.equal(book.contracts.size, 1, "the contract it opened is untouched");
 });
 
 test("a market's mark goes stale once relayed updates stop refreshing", async () => {

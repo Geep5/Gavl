@@ -75,17 +75,13 @@ export interface BridgeState {
 	 *               regardless of how it checkpointed (a drifting reference would fork).
 	 *  - `charged` — the advancing "charged-through" boundary for the incremental −20%/day decay. */
 	chargeFrom: Map<string, { since: number; charged: number }>;
-	/** The liquidity pot: reclaimed idle-balance decay flows here (a conservation bucket holding real
-	 *  gBTC, never minted — so it can never owe more than it holds) and becomes the backstop's trading
-	 *  capital. This is the FREE (unescrowed) pot; capital staked as a backstop counterparty lives in
-	 *  the contract escrow until it settles. Just a counter, base-independent (= cumulative decay −
-	 *  escrow drawn + payouts back). */
+	/** The liquidity pot: idle-balance sweeps (demurrage) and the rounds vig flow here — a pure
+	 *  conservation bucket holding real gBTC, never minted, with NO outflow. Just a counter,
+	 *  base-independent (= cumulative sweeps + vig). */
 	pot: bigint;
-	/** Lifetime gBTC the pot has staked as a backstop counterparty (monotonic; += at each pot match).
-	 *  The backstop budget is `finalizedPot − (potEscrowTaken − finalizedPotEscrowTaken)`: a trade may
-	 *  only draw against pot capital that has FINALIZED, and settle-returns re-enter the budget only
-	 *  once they finalize too. Both finalized figures are agreed by every node, and this counter is
-	 *  write-driven, so the budget is deterministic — and it provably keeps the free pot ≥ 0. */
+	/** Lifetime gBTC the pot ever staked out (monotonic). A legacy counter from when the pot could be
+	 *  drawn as a counterparty/subsidy budget; nothing draws from the pot anymore, so this no longer
+	 *  advances — it stays serialized so committed state remains stable. */
 	potEscrowTaken: bigint;
 	/** Lifetime gBTC burned for withdrawal (monotonic; += at each requestWithdrawal). Vector B's
 	 *  outflow circuit breaker measures per-epoch outflow as this minus the FINALIZED base's value,

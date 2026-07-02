@@ -21,8 +21,6 @@ import type { View } from "./btc.ts";
 import { emptyBridge } from "../custody/bridge.ts";
 import type { BridgeState, PendingWithdrawal } from "../custody/bridge.ts";
 import type { MarketPrice, CustodyState } from "./btc.ts";
-import { emptyBook, rebuildPosCount } from "./intent.ts";
-import type { MarketBook, Contract } from "./intent.ts";
 import { emptyRounds } from "./rounds.ts";
 import type { Rounds, RoundSide } from "./rounds.ts";
 
@@ -44,16 +42,11 @@ export interface CanonBridge {
 	paidOut: string;
 	chargeFrom: Entry<{ since: number; charged: number }>[]; // pubkey → demurrage idle clock, sorted
 	pot: string; // the liquidity pot (idle-decay bucket), free/unescrowed
-	potEscrowTaken: string; // lifetime pot capital staked as backstop (budget counter)
+	potEscrowTaken: string; // lifetime pot capital ever drawn (legacy monotonic counter; no draws remain)
 	withdrawnTotal: string; // lifetime gBTC burned for withdrawal (Vector B outflow budget counter)
 }
 
 export type CanonMarket = { price: string | null; expo: number; seq: number; at: number };
-
-export interface CanonBook {
-	contracts: Entry<{ id: string; long: string; short: string; stake: string; entry: string; leverage: string; nonce: string; expiryHeight: number; bid: string }>[]; // sorted by id
-	offerFills: Entry<{ filled: string; expiryHeight: number }>[]; // nonce → {filled sats, expiry}, sorted
-}
 
 /** One live parimutuel round: strike (null until locked), the two pools, and the entries (key-sorted). */
 export interface CanonRound {
@@ -67,7 +60,6 @@ export interface CanonState {
 	bridge: CanonBridge;
 	market: CanonMarket; // the channel's single market price (Pyth feed id comes from the channel name)
 	custody: CustodyState; // already plain (string|null, number)
-	book: CanonBook;
 	rounds: [number, CanonRound][]; // live rounds by idx, ascending (self-clearing — only ~2 at a time)
 }
 
@@ -108,13 +100,6 @@ function serializeBridge(b: BridgeState): CanonBridge {
 	};
 }
 
-function serializeBook(book: MarketBook): CanonBook {
-	return {
-		contracts: mapEntries(book.contracts, (c) => ({ id: c.id, long: c.long, short: c.short, stake: c.stake.toString(), entry: c.entry.toString(), leverage: c.leverage.toString(), nonce: c.nonce, expiryHeight: c.expiryHeight, bid: c.bid.toString() })),
-		offerFills: mapEntries(book.offerFills, (f) => ({ filled: f.filled.toString(), expiryHeight: f.expiryHeight })),
-	};
-}
-
 function serializeRounds(rounds: Rounds): [number, CanonRound][] {
 	return [...rounds]
 		.sort((a, b) => a[0] - b[0])
@@ -126,7 +111,6 @@ export function serializeView(view: View): CanonState {
 		bridge: serializeBridge(view.bridge),
 		market: { price: view.market.price === null ? null : view.market.price.toString(), expo: view.market.expo, seq: view.market.seq, at: view.market.at },
 		custody: { fundKey: view.custody.fundKey, epoch: view.custody.epoch },
-		book: serializeBook(view.book),
 		rounds: serializeRounds(view.rounds),
 	};
 }
@@ -162,14 +146,6 @@ function deserializeMarket(m: CanonMarket): MarketPrice {
 	return { price: m.price === null ? null : BigInt(m.price), expo: m.expo ?? 0, seq: m.seq, at: m.at };
 }
 
-function deserializeBook(b: CanonBook): MarketBook {
-	const book = emptyBook();
-	for (const [id, c] of b.contracts) book.contracts.set(id, { id: c.id, long: c.long, short: c.short, stake: BigInt(c.stake), entry: BigInt(c.entry), leverage: BigInt(c.leverage), nonce: c.nonce, expiryHeight: c.expiryHeight, bid: BigInt(c.bid ?? "0") } as Contract);
-	for (const [k, f] of b.offerFills) book.offerFills.set(k, { filled: BigInt(f.filled), expiryHeight: f.expiryHeight });
-	rebuildPosCount(book);
-	return book;
-}
-
 function deserializeRounds(rs: [number, CanonRound][]): Rounds {
 	const rounds = emptyRounds();
 	for (const [idx, r] of rs) {
@@ -185,7 +161,6 @@ export function deserializeView(s: CanonState): View {
 		bridge: deserializeBridge(s.bridge),
 		market: deserializeMarket(s.market),
 		custody: { fundKey: s.custody.fundKey, epoch: s.custody.epoch },
-		book: deserializeBook(s.book),
 		rounds: deserializeRounds(s.rounds ?? []), // ?? [] → tolerate pre-rounds snapshots
 	};
 }

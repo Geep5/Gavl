@@ -7,7 +7,7 @@
  * Everything is measured against the REAL serializer (market/state.ts) and the REAL fold
  * (computeView over real Ed25519-signed writes) — no mocks — so the numbers are authentic:
  *
- *   1) committed bytes per entry (position / account / offer-fill) → the RAM-&-disk cost per cap
+ *   1) committed bytes per entry (account / round entry) → the RAM-&-disk cost per cap
  *   2) fold throughput (ops/sec) → the single-chain TPS ceiling of the state machine
  *      (PoST proof verification is a separate per-write ingest gate, not measured here)
  *
@@ -21,7 +21,6 @@ import { Account } from "../src/market/account.ts";
 import { computeView } from "../src/market/btc.ts";
 import type { View, ViewOptions } from "../src/market/btc.ts";
 import type { Write } from "../src/chain/writer.ts";
-import type { Contract } from "../src/market/intent.ts";
 import { serializeView } from "../src/market/state.ts";
 import { canonicalize, sha256Hex } from "../src/det/canonical.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
@@ -42,14 +41,6 @@ function perEntry(build: (n: number) => View, n1: number, n2: number): number {
 	return (committedBytes(build(n2)) - committedBytes(build(n1))) / (n2 - n1);
 }
 
-const buildPositions = (n: number): View => {
-	const v = computeView([]);
-	for (let i = 0; i < n; i++) {
-		const id = hx("c" + i);
-		v.book.contracts.set(id, { id, long: hx("L" + i), short: hx("S" + i), stake: 1_000_000n, entry: 5_852_013n, leverage: 3n, nonce: hx("n" + i).slice(0, 16), expiryHeight: 1_000_000 + i, bid: 0n } as Contract);
-	}
-	return v;
-};
 const buildAccounts = (n: number): View => {
 	const v = computeView([]);
 	for (let i = 0; i < n; i++) {
@@ -59,15 +50,10 @@ const buildAccounts = (n: number): View => {
 	}
 	return v;
 };
-const buildOfferFills = (n: number): View => {
-	const v = computeView([]);
-	for (let i = 0; i < n; i++) v.book.offerFills.set(hx("o" + i).slice(0, 24), { filled: 500_000n, expiryHeight: 1_000_000 + i });
-	return v;
-};
 
-// ── 1b. rounds (R0) — the PROPOSED canonical round shape: bytes per entry ──
-// Rounds don't exist in consensus yet; this measures the exact encoding R1 will commit
-// (canonicalize over the planned plain-JSON shape), the same way positions were sized.
+// ── 1b. rounds — canonical round shape: bytes per entry ──
+// Measures the exact encoding a live round commits (canonicalize over the plain-JSON shape),
+// the same way accounts are sized.
 
 const buildRoundCanon = (n: number): unknown => ({
 	idx: 123_456,
@@ -106,15 +92,15 @@ function settleRate(n: number, budgetMs = 500): number {
 	return (reps * n) / ((performance.now() - t0) / 1000);
 }
 
-function heapPerPosition(n: number): number | null {
+function heapPerAccount(n: number): number | null {
 	const g = (globalThis as { gc?: () => void }).gc;
 	if (!g) return null;
 	g();
 	const before = process.memoryUsage().heapUsed;
-	const hold = buildPositions(n); // keep a live ref so it isn't collected
+	const hold = buildAccounts(n); // keep a live ref so it isn't collected
 	g();
 	const after = process.memoryUsage().heapUsed;
-	void hold.book.contracts.size;
+	void hold.bridge.gbtc.size;
 	return (after - before) / n;
 }
 
@@ -153,39 +139,20 @@ async function transferRate(n: number): Promise<number> {
 	return foldRate(writes, { base, nowHeight: 5, bornAt });
 }
 
-async function openRate(n: number): Promise<number> {
-	const { node, mk } = setup();
-	const a = mk(); // maker, long
-	const b = mk(); // taker, short
-	const stake = 1000n;
-	for (let i = 0; i < n; i++) {
-		const offer = a.makeOffer({ makerSide: "long", size: String(stake), leverage: "3", expiryHeight: 10_000_000, nonce: "n" + i });
-		await b.matchOpen(offer, stake);
-	}
-	const writes = node.ledger.allWrites();
-	const base = withGbtc(priceBase(5_852_013n), { [a.pubHex]: stake * BigInt(n), [b.pubHex]: stake * BigInt(n) });
-	const bornAt = new Map(writes.map((w) => [w.id, 5] as [string, number]));
-	return foldRate(writes, { base, nowHeight: 5, bornAt });
-}
-
 // ── report ──
 
 async function main(): Promise<void> {
 	const line = "  " + "─".repeat(66);
 	console.log("\n  PHASE 0 — CAPACITY BENCHMARK   (real serializer + real fold)\n");
 
-	const bPos = perEntry(buildPositions, 1000, 4000);
 	const bAcc = perEntry(buildAccounts, 1000, 4000);
-	const bOff = perEntry(buildOfferFills, 1000, 4000);
 	const proj = (b: number, cap: number): string => `${fmt(cap)} → ${(b * cap / MB).toFixed(1)} MB`;
 	console.log("  COMMITTED STATE — bytes per entry (snapshot + RAM cost of one capped item)");
 	console.log(line);
-	console.log(`  open position : ${fmt(bPos)} B    ${proj(bPos, 100_000)} · ${proj(bPos, 1_000_000)}`);
 	console.log(`  account+clock : ${fmt(bAcc)} B    ${proj(bAcc, 100_000)} · ${proj(bAcc, 1_000_000)}`);
-	console.log(`  offer-fill    : ${fmt(bOff)} B`);
-	const hp = heapPerPosition(20_000);
-	if (hp != null) console.log(`  in-RAM heap/position ≈ ${fmt(hp)} B  (live JS object + Map overhead; run with --expose-gc)`);
-	else console.log(`  (run with --expose-gc for the in-RAM heap-per-position figure)`);
+	const hp = heapPerAccount(20_000);
+	if (hp != null) console.log(`  in-RAM heap/account ≈ ${fmt(hp)} B  (live JS object + Map overhead; run with --expose-gc)`);
+	else console.log(`  (run with --expose-gc for the in-RAM heap-per-account figure)`);
 
 	const bRound = roundEntryBytes(1000, 4000);
 	console.log(`  round entry   : ${fmt(bRound)} B    10,000/round → ${(bRound * 10_000 / MB * 1000).toFixed(0)} KB · 2 live rounds → ${(bRound * 20_000 / MB).toFixed(1)} MB`);
@@ -194,15 +161,13 @@ async function main(): Promise<void> {
 	console.log("\n  FOLD THROUGHPUT — ops/sec the state machine sustains, one core (excl. PoST verify)");
 	console.log(line);
 	const tT = await transferRate(1500);
-	const tO = await openRate(1500);
 	console.log(`  gbtc.transfer : ${fmt(tT)} /s   (raw per-op fold rate)`);
-	console.log(`  match.open    : ${fmt(tO)} /s   (= opening trades/sec)`);
 
 	console.log("\n  IMPLICATIONS");
 	console.log(line);
-	console.log(`  • RAM is cheap — a 1,000,000-position + 1,000,000-account cap ≈ ${((bPos + bAcc) * 1_000_000 / MB).toFixed(0)} MB committed state.`);
-	console.log(`  • The binding limit is THROUGHPUT, not memory: ~${fmt(tO)} opened positions/sec on one core.`);
-	console.log(`  • At ~60s/anchor that's ~${fmt(tO * 60)} opens per anchor before the fold saturates.`);
+	console.log(`  • RAM is cheap — a 1,000,000-account cap ≈ ${(bAcc * 1_000_000 / MB).toFixed(0)} MB committed state; a full round (10,000 entries) is ~${(bRound * 10_000 / MB).toFixed(1)} MB and self-clears at settle.`);
+	console.log(`  • The binding limit is THROUGHPUT, not memory: ~${fmt(tT)} folded ops/sec on one core.`);
+	console.log(`  • At ~60s/anchor that's ~${fmt(tT * 60)} ops per anchor before the fold saturates; a round close sweeps ${fmt(settleRate(10_000))} entries/s.`);
 	console.log("");
 }
 

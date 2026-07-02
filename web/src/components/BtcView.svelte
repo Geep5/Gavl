@@ -1,8 +1,7 @@
 <script>
-	// The new UI — a clean mobile-width Gavl app (header · live price · trade · positions ·
+	// The new UI — a clean mobile-width Gavl app (header · live price · Gavl Rounds ·
 	// add-funds · network), ported verbatim from the design mockup and wired to the real
-	// daemon. The mockup has no fee control, so a Maker-Fee section is improvised below the
-	// amount/leverage row in the same visual language.
+	// daemon.
 	import { store, act, refresh, myGbtc, short } from "../lib/store.svelte.js";
 	import { api } from "../lib/api.js";
 	import RoundsPanel from "./RoundsPanel.svelte";
@@ -13,8 +12,6 @@
 	const mkt = $derived(m?.marketInfo ?? null);
 	const priceNum = $derived(m?.price != null ? Number(m.price) * 10 ** (m.priceExpo ?? 0) : null);
 	const bal = $derived(Number(myGbtc()));
-	const tape = $derived(m?.tape ?? []);
-	const contracts = $derived(m?.myContracts ?? []);
 	const fundReady = $derived(!!m?.depositAddress);
 	const needN = $derived(cu?.minCommittee ?? 3);
 	const fmt = (v) => (v == null ? "—" : Number(v).toLocaleString());
@@ -72,85 +69,6 @@
 		if (pubHex && pubHex !== store.active) await act(() => api.setActive(pubHex));
 	}
 
-	// ── trade ──
-	let side = $state("long");
-	let amount = $state("");
-	let leverage = $state("2");
-	// Maker fee, in basis points — when this order RESTS it's the fee you EARN; when it TAKES a
-	// resting intent it's the most you'll pay. The pot subsidises the first 10 bps, so at the
-	// default a taker pays nothing. Editable; the market finds the level.
-	let fee = $state("10");
-	const feeOk = $derived(/^[0-9]+$/.test(fee.trim()) && Number(fee) >= 0 && Number(fee) <= 200);
-	let busy = $state(false);
-	// Order mode: AUTO takes if peers rest on the other side, else makes; MAKER/TAKER force the role.
-	let mode = $state("auto"); // auto · maker · taker
-	const opposite = $derived(side === "long" ? "short" : "long");
-	const fillable = $derived(tape.filter((t) => t.side === opposite && !t.mine).reduce((a, t) => a + Number(t.remaining), 0));
-	const backstop = $derived(Number(m?.backstopAvailable ?? 0));
-	const takeable = $derived(fillable + backstop); // resting peer depth + liquidity-pot backstop
-	const takerPossible = $derived(takeable > 0);
-	const role = $derived(mode === "maker" ? "maker" : mode === "taker" ? "taker" : fillable > 0 ? "taker" : "maker");
-
-	const amt = $derived(Math.floor(Number(amount)) || 0);
-	const over = $derived(amt > bal);
-	const matchNow = $derived(Math.min(amt, takeable));
-
-	// fee, made human: bps → %, and the concrete gBTC you earn (maker) or pay (taker).
-	// The fee is stake · bps / 10000 (intent.ts feeOf); the pot subsidises the first 10 bps.
-	const feeBps = $derived(Number(fee) || 0);
-	const feePct = $derived((feeBps / 100).toFixed(2)); // 10 bps → "0.10"
-	const feeBase = $derived(role === "taker" ? matchNow : amt); // fee applies to the matched stake
-	const makerEarn = $derived(Math.floor((feeBase * feeBps) / 10000)); // gBTC the maker earns when taken
-	const takerPay = $derived(Math.floor((feeBase * Math.max(0, feeBps - 10)) / 10000)); // pot covers first 10 bps
-	const feeNote = $derived.by(() => {
-		const pct = `${feePct}%`;
-		if (!amt) {
-			return role === "taker"
-				? `Taker fee ${pct} of the matched stake — the pot covers the first 0.10%, so up to 10 bps it's free to you.`
-				: `Maker rebate ${pct} — you earn it on your stake when a taker fills the intent (the pot funds the first 0.10%).`;
-		}
-		if (role === "taker") {
-			return takerPay > 0
-				? `You pay ≈ ${fmt(takerPay)} gBTC (${pct}) on ${fmt(matchNow)} gBTC matched — the pot covers the first 0.10%.`
-				: `Free to take — the pot covers the whole ${pct} fee on ${fmt(matchNow)} gBTC matched.`;
-		}
-		return makerEarn > 0
-			? `You earn ≈ ${fmt(makerEarn)} gBTC (${pct}) when your ${fmt(amt)} gBTC intent is fully taken.`
-			: `You earn ${pct} of your stake when taken — rounds below 1 gBTC at this size.`;
-	});
-	// the same value is a fee you EARN as a maker, but the MAX you'll pay as a taker — label it by role
-	const feeLabel = $derived(role === "taker" ? "MAX FEE (bps)" : "MAKER FEE (bps)");
-	const feeTitle = $derived(
-		role === "taker"
-			? "The most you'll pay, in basis points (1 bp = 0.01%). You only take offers at or below this — the pot covers the first 10 bps."
-			: "The fee you earn when your resting order is taken, in basis points (1 bp = 0.01%). The pot funds the first 10 bps for the taker.",
-	);
-	const ctaDisabled = $derived(busy || amt <= 0 || over || priceNum == null || !feeOk || (role === "taker" && !takerPossible));
-	const ctaLabel = $derived.by(() => {
-		const S = side === "long" ? "LONG" : "SHORT";
-		if (priceNum == null) return "WAITING FOR PRICE…";
-		if (busy) return "MATCHING…";
-		if (over) return "NOT ENOUGH gBTC";
-		if (role === "taker") return takerPossible ? `TAKE ${S} · ${fmt(matchNow)}` : "NOTHING TO TAKE";
-		return `BROADCAST ${S} · ${leverage}×`;
-	});
-	const roleNote = $derived.by(() => {
-		if (role === "maker") return "MAKER — rests as a signed intent on the tape; a taker opens the matched contract.";
-		if (!takerPossible) return "TAKER — nothing resting on the other side. Switch to MAKER to post your own intent.";
-		return `TAKER — matches ${fmt(matchNow)} gBTC of resting depth now${fillable > 0 ? "" : " (liquidity pot)"}.`;
-	});
-
-	function setMax() { amount = String(myGbtc()); }
-	async function place() {
-		if (ctaDisabled) return;
-		busy = true;
-		const ok = await act(() => (role === "maker" ? api.broadcastIntent(side, amount, leverage, fee) : api.takePosition(side, amount, fee)));
-		if (ok) amount = "";
-		busy = false;
-	}
-	const take = (t) => act(() => api.takeIntent(t.nonce));
-	const closeContract = (id) => act(() => api.settleContract(id));
-
 	// ── funds ──
 	let fundOpen = $state(false);
 	let depTx = $state("");
@@ -187,8 +105,6 @@
 
 	// ── network status ──
 	let netOpen = $state(false);
-	// the pro market (perp/tape) lives behind an Advanced fold — rounds are the main loop
-	let advOpen = $state(false);
 	const height = $derived(c?.tip?.height ?? null);
 	const finalized = $derived(c?.finalizedHeight ?? null);
 	const peers = $derived(c?.peers ?? 0);
@@ -257,7 +173,7 @@
 		const raw = [
 			{ label: "FREE", value: Number(m.free ?? 0), color: "var(--long)" },
 			{ label: "BONDED", value: Number(m.bonded ?? 0), color: "var(--bonded)" },
-			{ label: "ESCROW", value: Number(m.escrow ?? 0), color: "var(--ink)" },
+			{ label: "ROUNDS", value: Number(m.roundsEscrow ?? 0), color: "var(--ink)" },
 			{ label: "PENDING", value: Number(m.pending ?? 0), color: "var(--faint)" },
 			{ label: "POT", value: Number(m.pot ?? 0), color: "var(--short)" },
 		];
@@ -307,98 +223,6 @@
 
 	<!-- Gavl Rounds — the 1-click bull/bear (the main loop) -->
 	<RoundsPanel />
-
-	<!-- the pro market (perp/tape) — advanced, folded away -->
-	<section class="fold">
-		<button class="fold-h" onclick={() => (advOpen = !advOpen)}>
-			<span>⚙ ADVANCED · PRO MARKET</span><span class="fold-c">{advOpen ? "▲" : "▼"}</span>
-		</button>
-	</section>
-	{#if advOpen}
-	<!-- trade -->
-	<section class="trade">
-		<div class="toggle">
-			<button class="tg long" class:on={side === "long"} onclick={() => (side = "long")}>▲ LONG</button>
-			<button class="tg short" class:on={side === "short"} onclick={() => (side = "short")}>▼ SHORT</button>
-		</div>
-		<div class="tfields">
-			<label class="tf">
-				<span class="tf-l">AMOUNT (gBTC) <button class="maxbtn" onclick={setMax} disabled={bal <= 0}>MAX</button></span>
-				<input bind:value={amount} inputmode="numeric" placeholder="0" />
-			</label>
-			<label class="tf lev">
-				<span class="tf-l">LEVERAGE</span>
-				<select bind:value={leverage}>
-					{#each Array.from({ length: (m?.maxLeverage ?? 5) - 1 }, (_, i) => String(i + 2)) as L}<option value={L}>{L}×</option>{/each}
-				</select>
-			</label>
-		</div>
-
-		<!-- improvised: maker fee (the mockup has none) -->
-		<div class="fee">
-			<span class="fee-l" title={feeTitle}>{feeLabel}</span>
-			<span class="fee-right">
-				<span class="fee-pct">= {feePct}%</span>
-				<span class="fee-in"><input class:bad={!feeOk} bind:value={fee} inputmode="numeric" /></span>
-			</span>
-		</div>
-		<div class="fee-note">{feeNote}</div>
-
-		<div class="mode">
-			<span class="mode-l">ORDER</span>
-			<div class="mode-seg">
-				<button class:on={mode === "auto"} onclick={() => (mode = "auto")}>AUTO</button>
-				<button class:on={mode === "maker"} onclick={() => (mode = "maker")}>MAKER</button>
-				<button class:on={mode === "taker"} onclick={() => (mode = "taker")}>TAKER</button>
-			</div>
-		</div>
-
-		<button class="cta" class:long={!ctaDisabled && side === "long"} class:short={!ctaDisabled && side === "short"} class:off={ctaDisabled} onclick={place} disabled={ctaDisabled}>
-			{#if busy}<span class="spin"></span>{/if}{ctaLabel}
-		</button>
-		<div class="role-note" class:taker={role === "taker"} class:maker={role === "maker"}>{roleNote}</div>
-	</section>
-
-	<!-- the tape -->
-	<section class="tape">
-		<div class="pos-h"><span class="pos-t">THE TAPE</span><span class="pos-c">{tape.length} RESTING</span></div>
-		{#if tape.length === 0}
-			<div class="pos-empty">Nothing resting. Place a side with no opposite offer and it posts here as a maker — a peer takes the other side.</div>
-		{:else}
-			{#each tape as t}
-				<div class="pos-row">
-					<span class="pbadge {t.side}">{t.side === "long" ? "LONG" : "SHORT"}</span>
-					<div class="pmid">
-						<div class="pmain tnum">{fmt(t.remaining)} gBTC <span class="muted">{t.leverage}× · {((Number(t.spread) || 0) / 100).toFixed(2)}% fee</span></div>
-						<div class="psub">{t.mine ? "your resting intent" : "maker " + short(t.maker)}</div>
-					</div>
-					{#if t.mine}<span class="tape-yours">YOURS</span>
-					{:else}<button class="take {t.side === 'long' ? 'short' : 'long'}" onclick={() => take(t)}>TAKE {t.side === "long" ? "▼" : "▲"}</button>{/if}
-				</div>
-			{/each}
-		{/if}
-	</section>
-
-	<!-- positions -->
-	<section class="pos">
-		<div class="pos-h"><span class="pos-t">POSITIONS</span><span class="pos-c">{contracts.length} OPEN</span></div>
-		{#if contracts.length === 0}
-			<div class="pos-empty">No open positions. Pick a side above to place your first trade.</div>
-		{:else}
-			{#each contracts as p}
-				<div class="pos-row">
-					<span class="pbadge {p.side}">{p.side === "long" ? "LONG" : "SHORT"}</span>
-					<div class="pmid">
-						<div class="pmain tnum">{fmt(p.stake)} gBTC <span class="muted">{p.leverage}×</span></div>
-						<div class="psub">entry ${fmt(p.entry)} · vs {short(p.counterparty)}{#if p.expiresIn != null} · <span class="pexp" class:warn={p.expiresIn < 1440}>⏳ {fmtDays(p.expiresIn / 1440)} left</span>{/if}</div>
-					</div>
-					<span class="ppnl tnum" class:up={Number(p.pnl) > 0} class:down={Number(p.pnl) < 0}>{Number(p.pnl) > 0 ? "+" : ""}{fmt(p.pnl)}</span>
-					<button class="pclose" onclick={() => closeContract(p.id)}>CLOSE</button>
-				</div>
-			{/each}
-		{/if}
-	</section>
-	{/if}
 
 	<!-- add funds -->
 	<section class="fold">
@@ -523,7 +347,7 @@
 				<div class="card">
 					<div class="card-h">CONSERVATION <span class="ch-g">✓ BALANCED</span></div>
 					<div class="card-p">
-						<div class="eqn"><b>reserves</b> <span class="eq">==</span> free <span class="op">+</span> bonded <span class="op">+</span> escrow <span class="op">+</span> pending <span class="op">+</span> pot</div>
+						<div class="eqn"><b>reserves</b> <span class="eq">==</span> free <span class="op">+</span> bonded <span class="op">+</span> pending <span class="op">+</span> pot <span class="op">+</span> rounds</div>
 						<div class="cbar">{#each buckets as b}<div style="width:{b.pct};background:{b.color}"></div>{/each}</div>
 						<div class="bgrid">
 							{#each buckets as b}<div class="brow"><span class="bl"><span class="sw" style="background:{b.color}"></span>{b.label}</span><span class="bv tnum">{b.valueFmt}</span></div>{/each}
@@ -625,77 +449,6 @@
 	.px-big.muted { font-size: 1.8rem; }
 	.px-caret { font-family: var(--display); font-weight: 800; font-size: 1.3rem; line-height: 1; padding-bottom: 0.3rem; }
 	.px-caret.up { color: var(--long); } .px-caret.down { color: var(--short); }
-
-	/* ── trade ── */
-	.trade { padding: 1.2rem; border-bottom: 1.5px solid var(--ink); }
-	.toggle { display: grid; grid-template-columns: 1fr 1fr; border: 1.5px solid var(--ink); margin-bottom: 1rem; }
-	.tg { padding: 0.8rem; font-family: var(--display); font-weight: 800; font-size: 1rem; letter-spacing: 0.03em; border: none; background: transparent; color: var(--muted); }
-	.tg.short { border-left: 1.5px solid var(--ink); }
-	.tg.long.on { background: var(--long-soft); color: var(--long); }
-	.tg.short.on { background: var(--short-soft); color: var(--short); }
-	.tfields { display: flex; gap: 0.7rem; }
-	.tf { flex: 1; display: block; }
-	.tf.lev { flex: 0 0 5.4rem; }
-	.tf-l { display: flex; align-items: center; justify-content: space-between; font-size: 0.58rem; letter-spacing: 0.12em; color: var(--muted); margin-bottom: 0.35rem; }
-	.maxbtn { font-size: 0.54rem; letter-spacing: 0.06em; font-weight: 700; background: var(--ink); color: var(--paper); border: none; padding: 0.1rem 0.4rem; }
-	.tf input, .tf select { width: 100%; background: var(--paper-2); border: 1.5px solid var(--ink); padding: 0.65rem; font-size: 1.2rem; font-weight: 600; color: var(--ink); }
-	.tf select { padding: 0.65rem 0.45rem; cursor: pointer; }
-
-	/* ── improvised maker-fee ── */
-	.fee { margin-top: 0.9rem; display: flex; align-items: center; justify-content: space-between; gap: 0.7rem; }
-	.fee-l { font-size: 0.58rem; letter-spacing: 0.12em; color: var(--muted); cursor: help; }
-	.fee-right { display: flex; align-items: center; gap: 0.55rem; }
-	.fee-pct { font-size: 0.78rem; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; }
-	.fee-in { flex: 0 0 5.4rem; }
-	.fee-in input { width: 100%; background: var(--paper-2); border: 1.5px solid var(--ink); padding: 0.5rem; font-size: 0.95rem; font-weight: 600; color: var(--ink); text-align: right; }
-	.fee-in input.bad { border-color: var(--short); }
-	.fee-note { margin-top: 0.45rem; font-size: 0.56rem; line-height: 1.5; color: var(--muted); }
-
-	/* ── order mode (auto / maker / taker) ── */
-	.mode { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.9rem; }
-	.mode-l { font-size: 0.58rem; letter-spacing: 0.12em; color: var(--muted); }
-	.mode-seg { display: flex; flex: 1; border: 1.5px solid var(--ink); }
-	.mode-seg button { flex: 1; padding: 0.42rem; font-size: 0.6rem; font-weight: 700; letter-spacing: 0.08em; background: transparent; border: none; border-left: 1.5px solid var(--ink); color: var(--muted); }
-	.mode-seg button:first-child { border-left: none; }
-	.mode-seg button.on { background: var(--ink); color: var(--paper); }
-	.mode-seg button:hover, .mode-seg button:active { transform: none; box-shadow: none; filter: none; }
-	.mode-seg button:not(.on):hover { background: var(--paper-2); }
-	.role-note { margin-top: 0.6rem; font-size: 0.58rem; line-height: 1.5; color: var(--muted); }
-	.role-note.taker { color: var(--long); }
-	.role-note.maker { color: var(--bonded); }
-
-	/* ── the tape ── */
-	.tape { padding: 1.2rem; border-bottom: 1.5px solid var(--ink); }
-	.take { font-size: 0.6rem; font-weight: 700; letter-spacing: 0.04em; border: 1.5px solid var(--ink); padding: 0.32rem 0.55rem; color: var(--paper); }
-	.take.long { background: var(--long); }
-	.take.short { background: var(--short); color: #fff; }
-	.tape-yours { font-size: 0.58rem; font-weight: 700; color: var(--bonded); letter-spacing: 0.06em; }
-
-	/* ── cta ── */
-	.cta { width: 100%; margin-top: 1rem; padding: 0.9rem; font-family: var(--display); font-weight: 800; font-size: 1.02rem; letter-spacing: 0.02em; border: 1.5px solid var(--ink); color: var(--paper); background: var(--ink); }
-	.cta.long { background: var(--long); }
-	.cta.short { background: var(--short); color: #fff; }
-	.cta.off { background: #b8b09a; color: var(--paper); cursor: default; }
-	.spin { display: inline-block; width: 0.85rem; height: 0.85rem; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; margin-right: 0.5rem; vertical-align: -2px; }
-
-	/* ── positions ── */
-	.pos { padding: 1.2rem; flex: 1; }
-	.pos-h { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 0.2rem; }
-	.pos-t { font-family: var(--display); font-weight: 800; font-size: 0.82rem; letter-spacing: 0.02em; }
-	.pos-c { font-size: 0.58rem; letter-spacing: 0.1em; color: var(--muted); }
-	.pos-empty { font-size: 0.72rem; line-height: 1.6; color: var(--muted); padding: 1.1rem 0 0.4rem; }
-	.pos-row { display: flex; align-items: center; gap: 0.7rem; padding: 0.7rem 0; border-top: 1.5px solid var(--ink); animation: pop 0.18s ease; }
-	.pbadge { font-size: 0.56rem; font-weight: 700; letter-spacing: 0.06em; padding: 0.14rem 0.42rem; }
-	.pbadge.long { background: var(--long-soft); color: var(--long); }
-	.pbadge.short { background: var(--short-soft); color: var(--short); }
-	.pmid { flex: 1; min-width: 0; }
-	.pmain { font-size: 0.82rem; font-weight: 600; }
-	.psub { font-size: 0.6rem; color: var(--muted); margin-top: 0.1rem; word-break: break-all; }
-	.pexp { color: var(--bonded); font-weight: 700; white-space: nowrap; }
-	.pexp.warn { color: var(--short); }
-	.ppnl { font-weight: 700; font-size: 1rem; color: var(--ink); }
-	.ppnl.up { color: var(--long); } .ppnl.down { color: var(--short); }
-	.pclose { font-size: 0.6rem; font-weight: 700; letter-spacing: 0.06em; background: transparent; border: 1.5px solid var(--ink); color: var(--ink); padding: 0.36rem 0.6rem; }
 
 	/* ── collapsible folds (add funds / network) ── */
 	.fold { border-top: 1.5px solid var(--ink); }
@@ -818,6 +571,4 @@
 	.foot { display: flex; align-items: center; justify-content: center; gap: 0.5rem; padding: 0.7rem 1.2rem; background: var(--ink); color: var(--bar-dim); font-size: 0.58rem; letter-spacing: 0.1em; text-align: center; }
 	.foot .ok { color: var(--live-text); }
 
-	@keyframes spin { to { transform: rotate(360deg); } }
-	@keyframes pop { 0% { transform: scale(0.96); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
 </style>

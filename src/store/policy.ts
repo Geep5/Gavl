@@ -7,8 +7,8 @@
  * restart — making a node a light/partial node BY CHOICE. The network only stays
  * whole if some nodes archive (keep everything).
  *
- * Op set: the gBTC bridge, the oracle, threshold custody, and the matched market
- * (match.open / contract.settle).
+ * Op set: the gBTC bridge, the oracle, threshold custody, and Gavl Rounds
+ * (round.enter).
  */
 
 import type { Write } from "../chain/writer.ts";
@@ -63,8 +63,6 @@ export class MinePolicy implements PersistPolicy {
 				return this.keys.has(op.to);
 			case "bridge.withdraw":
 				return this.keys.has(write.writer);
-			case "contract.settle":
-				return true; // tiny; keep so a matched position's close is durable
 			default:
 				return false;
 		}

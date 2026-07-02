@@ -15,7 +15,6 @@ import assert from "node:assert/strict";
 
 import { serializeView, deserializeView, viewRoot } from "../src/market/state.ts";
 import { emptyBridge } from "../src/custody/bridge.ts";
-import { emptyBook } from "../src/market/intent.ts";
 import type { View } from "../src/market/btc.ts";
 
 /** Build a richly-populated View; `rev` reverses insertion order to probe order-independence. */
@@ -42,15 +41,6 @@ function makeView(rev = false): View {
 		{ id: "burn2", owner: "bb", amount: 31n, btcAddress: "bc1qbb", fee: 700n },
 	]; // pending is FIFO — order is itself state, NOT reversed
 
-	const book = emptyBook();
-	const contracts: [string, any][] = [
-		["c1", { id: "c1", long: "aa", short: "bb", stake: 100n, entry: 61000n, leverage: 10n, nonce: "n1", expiryHeight: 43205, bid: 0n }],
-		["c2", { id: "c2", long: "cc", short: "aa", stake: 5n, entry: 62000n, leverage: 5n, nonce: "n2", expiryHeight: 43210, bid: 0n }],
-	];
-	const fills: [string, { filled: bigint; expiryHeight: number }][] = [["n1", { filled: 100n, expiryHeight: 50 }], ["n2", { filled: 5n, expiryHeight: 60 }], ["n3", { filled: 250n, expiryHeight: 70 }]];
-	for (const [k, v] of order(contracts)) book.contracts.set(k, v);
-	for (const [k, v] of order(fills)) book.offerFills.set(k, v);
-
 	// a live parimutuel round (locked — strike set, not yet closed), entries in probe order
 	const rEntries: [string, { side: "up" | "down"; stake: bigint }][] = [["aa", { side: "up", stake: 500n }], ["bb", { side: "down", stake: 300n }], ["cc", { side: "up", stake: 200n }]];
 	const rounds = new Map([[7, { idx: 7, strike: 61_000n as bigint | null, poolUp: 700n, poolDown: 300n, entries: new Map(order(rEntries)) }]]);
@@ -59,7 +49,6 @@ function makeView(rev = false): View {
 		bridge,
 		market: { price: 61500n, expo: 0, seq: 3, at: 10 },
 		custody: { fundKey: "deadbeef", epoch: 0 },
-		book,
 		rounds,
 	};
 }
@@ -82,7 +71,7 @@ test("deserialize restores bigints / Maps / Sets as native types", () => {
 	assert.equal(back.bridge.gbtc.get("bb"), 250n);
 	assert.equal(typeof back.bridge.reserves, "bigint");
 	assert.ok(back.bridge.processed.has("dep1:0"));
-	assert.equal(back.book.contracts.get("c1")?.stake, 100n);
+	assert.equal(back.rounds.get(7)?.entries.get("aa")?.stake, 500n);
 	assert.equal(back.market.price, 61500n);
 	assert.equal(back.bridge.pending[0].id, "burn1", "pending FIFO order preserved");
 });
@@ -95,7 +84,7 @@ test("a single changed balance changes the root", () => {
 });
 
 test("empty view has a stable, defined root", () => {
-	const empty: View = { bridge: emptyBridge(), market: { price: null, expo: 0, seq: -1, at: 0 }, custody: { fundKey: null, epoch: -1 }, book: emptyBook(), rounds: new Map() };
+	const empty: View = { bridge: emptyBridge(), market: { price: null, expo: 0, seq: -1, at: 0 }, custody: { fundKey: null, epoch: -1 }, rounds: new Map() };
 	assert.equal(viewRoot(empty), viewRoot(empty));
 	assert.match(viewRoot(empty), /^[0-9a-f]{64}$/);
 });

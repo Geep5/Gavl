@@ -73,7 +73,7 @@ export class WriteStore {
 	}
 
 	/**
-	 * Offer a write to the store. Persists it iff the policy keeps it. Returns
+	 * Hand a write to the store. Persists it iff the policy keeps it. Returns
 	 * whether it was persisted. Safe to call on every accepted write.
 	 */
 	async persist(write: Write): Promise<boolean> {

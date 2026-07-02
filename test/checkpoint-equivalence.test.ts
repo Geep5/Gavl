@@ -59,12 +59,12 @@ test("a checkpoint-pruned node folds forward to the same state + appRoot as a fu
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 	await A.transfer(C.pubHex, 500n);
-	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "10", expiryHeight: 1_000_000, nonce: "n1" });
-	const matchId = await B.matchOpen(offer, 1000n);
+	await A.enterRound(0, "down", 1000n); // both sides escrow into round 0's pools
+	await B.enterRound(0, "up", 1000n);
 	const a1 = await mine();
 
 	// ── activity round 2, then anchors ──
-	await mk().settle(matchId); // permissionless settle
+	await B.enterRound(0, "up", 700n); // a same-side top-up
 	await A.transfer(B.pubHex, 100n);
 	await mine(); // a2
 	const a3 = await mine();

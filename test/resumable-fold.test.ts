@@ -1,8 +1,8 @@
 /**
  * Resumable fold (market/btc.ts computeView{base}) — the mechanic behind "never
  * replay from 0". Folding [later writes] onto the view of [earlier writes] must equal
- * folding the whole stream. Proven over a real write stream (deposits, transfers,
- * oracle posts, a match, a settle) split at every boundary.
+ * folding the whole stream. Proven over a real write stream (transfers + round
+ * entries) split at every boundary.
  *
  *   node --test test/resumable-fold.test.ts
  */
@@ -50,10 +50,10 @@ test("folding the tail onto the head's view equals folding the whole stream", as
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 	await A.transfer(C.pubHex, 1000n);
-	const offer = A.makeOffer({ makerSide: "long", size: "1000", leverage: "10", expiryHeight: 100, nonce: "n1" });
-	const matchId = await B.matchOpen(offer, 1000n);
-	await mk().settle(matchId);
-	await C.transfer(B.pubHex, 200n);
+	await A.enterRound(0, "down", 1000n); // round pools escrow across the split boundaries
+	await B.enterRound(0, "up", 1000n);
+	await C.enterRound(0, "up", 1000n);
+	await A.transfer(B.pubHex, 200n);
 
 	const all = [...node.ledger.allWrites()].sort(cmpWrite);
 	const full = computeView(all, { base: base() });

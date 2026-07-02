@@ -1,12 +1,10 @@
 /**
- * Gavl op vocabulary — the gBTC bridge, the oracle, threshold custody, and the
- * peer-to-peer matched market (intents → matched bilateral contracts). No pool.
+ * Gavl op vocabulary — the gBTC bridge, the oracle, threshold custody, and
+ * Gavl Rounds (the 1-click bull/bear parimutuel rounds). No pool, no house.
  *
  * Every op is carried by an Ed25519-signed write, so the actor IS write.writer.
  * Amounts/prices are decimal strings (BigInt-parsed, JSON/canonical-safe).
  */
-
-import type { Offer } from "./intent.ts";
 
 export type Op =
 	/** Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized by the bridge attestor key
@@ -37,17 +35,6 @@ export type Op =
 	 *  MARKET (`label::pyth::feedId`) and ANYONE may relay — the fold verifies the guardian quorum +
 	 *  Merkle proof, so there's no reporter to run or trust. Newer publish-time wins. */
 	| { kind: "market.report"; update: string }
-	/** Take the opposite side of a peer's signed intent: carries the maker's signed
-	 *  `offer` (gossiped, non-binding) and the stake the taker wants to `fill`. The fold
-	 *  verifies the maker's sig + that both peers can cover, escrows both, and opens a
-	 *  bilateral matched contract. The taker is the write's author; no pool, zero-sum. */
-	| { kind: "match.open"; offer: Offer; fill: string; bid?: string }
-	/** Open a position directly against the liquidity BACKSTOP — no peer maker. The pot (idle-decay
-	 *  pool) stakes matching gBTC and takes the OPPOSITE side at the mark, capped by a deterministic
-	 *  finalized budget so the pot can never be drawn insolvent. The taker is the write's author. */
-	| { kind: "match.pot"; side: "long" | "short"; fill: string; leverage: string; bid?: string }
-	/** Settle a matured matched contract at the current oracle mark — permissionless. */
-	| { kind: "contract.settle"; contractId: string }
 	/** Enter round `idx`'s UP or DOWN pool — the 1-click bull/bear primitive. `idx` pins the intended
 	 *  round (certified outside its entry window → no-op). Full round → top-N-by-stake admission:
 	 *  strictly out-stake the floor entry, which is evicted + refunded. Re-entries merge (same side). */
@@ -69,7 +56,7 @@ export type Op =
 	 *  alongside gate #4 non-public keys.) */
 	| { kind: "custody.fund"; groupKey: string; epoch: number };
 
-const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "market.report", "match.open", "match.pot", "contract.settle", "round.enter", "custody.fund", "custody.bond", "custody.unbond", "custody.slash"]);
+const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "market.report", "round.enter", "custody.fund", "custody.bond", "custody.unbond", "custody.slash"]);
 
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);
