@@ -163,7 +163,7 @@ networking sidecar (always), and for real PoST. Works on macOS, Linux, Windows.
 
 ```bash
 npm install              # once
-pip install rns lxmf     # once — the Reticulum (RNS/LXMF) networking sidecar
+pip install -r bridge/requirements.txt   # the Reticulum (RNS/LXMF) sidecar — PINNED; all nodes MUST match (version skew silently breaks large transfers + committee co-sign)
 npm run setup:chia       # once — venv + chiavdf/chiapos (prebuilt wheels; no C++ toolchain)
 npm run dev              # real-PoST daemon + web UI, then open http://localhost:5180
 ```

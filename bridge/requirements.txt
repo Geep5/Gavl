@@ -1,0 +1,16 @@
+# Reticulum networking sidecar — PINNED so every node runs the IDENTICAL RNS/LXMF.
+#
+# Why pinned: RNS's Resource protocol (how large frames — chain SYNC + the committee
+# threshold-sign ceremony — are chunked and transferred) changed across 1.3.x. With an
+# UNPINNED `pip install rns lxmf`, nodes set up on different days landed on different
+# versions (1.3.5 vs 1.3.8), and cross-version Resource transfers silently fail: small
+# packets (announces, bindings, per-anchor gossip) flow, but the big transfers die with
+# "Attempt to cancel a non-existing incoming resource" on the receiver — so a fresh node
+# can't sync and the committee can never co-sign (deposits won't mint, withdrawals won't
+# sign). Every node MUST run the same version. See bridge/rns_bridge.py `_patch_rns_zero_rtt`
+# for a sibling RNS 1.3.x Resource bug the sidecar already works around.
+#
+#   pip install -r bridge/requirements.txt
+#
+rns==1.3.5
+lxmf==1.0.1

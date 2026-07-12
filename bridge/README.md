@@ -32,7 +32,7 @@ pattern: AutoInterface with unique ports + TCP hubs).
 ## Requirements
 
 ```bash
-pip install rns lxmf
+pip install -r bridge/requirements.txt   # PINNED rns==1.3.5 lxmf==1.0.1 — all nodes MUST match (unpinned skew breaks large transfers/co-sign)
 ```
 
 ## Architecture
