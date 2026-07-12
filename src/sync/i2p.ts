@@ -188,6 +188,32 @@ function samValue(line: string, key: string): string | undefined {
 // ── connection ──────────────────────────────────────────────────────
 
 /** One Gavl peer over a live I2P stream. `peerKey` is the peer's b32 address. */
+/**
+ * A newline-delimited JSON-frame reader over a raw byte stream. Returns a `data`-event handler that
+ * accumulates RAW bytes and decodes a line only once it is COMPLETE — never `chunk.toString("utf8")`
+ * on a partial chunk, which mangles a multi-byte character split across a TCP-segment boundary (Node
+ * emits U+FFFD for the incomplete tail and the next chunk's continuation bytes → the frame fails
+ * JSON.parse and is silently dropped). It also scans each incoming chunk only ONCE for the delimiter
+ * (no re-scan of a growing bulk frame), so a multi-MB checkpoint / anchor-chain pull stays LINEAR
+ * instead of the O(n²) a `buf += chunk.toString()` + `buf.indexOf` string accumulator incurs.
+ */
+export function makeLineReader(onLine: (line: string) => void): (chunk: Buffer) => void {
+	let held: Buffer[] = []; // raw bytes of an in-progress (newline-less) line, oldest first
+	return (chunk: Buffer): void => {
+		let start = 0;
+		let nl = chunk.indexOf(0x0a);
+		while (nl >= 0) {
+			const tail = chunk.subarray(start, nl); // this chunk's slice of the completed line
+			const line = (held.length === 0 ? tail : Buffer.concat([...held, tail])).toString("utf8");
+			held = [];
+			if (line.trim()) onLine(line);
+			start = nl + 1;
+			nl = chunk.indexOf(0x0a, start);
+		}
+		if (start < chunk.length) held.push(Buffer.from(chunk.subarray(start))); // copy — held across events
+	};
+}
+
 class I2PConnection implements Connection {
 	readonly peerKey: string;
 	private readonly transport: I2PTransport;
@@ -337,7 +363,11 @@ export class I2PTransport {
 		const now = Date.now();
 		const live = new Set<string>();
 		for (const [peer, t] of this.lastFrame) if (now - t <= ms) live.add(peer);
-		for (const addr of this.committeePins) live.add(addr);
+		// A committee pin counts as live ONLY with an established stream (its handshake is real evidence
+		// it answered) — NOT merely because we dialed it. Adding every pin unconditionally was a ghost
+		// quorum: a pinned-but-unreachable member inflated the count and let custody march into a
+		// ceremony that can't complete. Honor the "no ghost quorum" invariant above.
+		for (const addr of this.committeePins) if (this.active.has(addr)) live.add(addr);
 		return [...live];
 	}
 
@@ -472,19 +502,23 @@ export class I2PTransport {
 	/** SAM connected to our forward port with an inbound peer stream. The first line is the sender's
 	 *  full destination (SILENT=false); everything after it is stream payload. */
 	private onForwardedStream(socket: Socket): void {
-		let head = "";
+		let head: Buffer[] = []; // raw bytes of the SAM dest line until its newline arrives
 		let done = false;
 		socket.setNoDelay(true);
 		const onData = (chunk: Buffer) => {
 			if (done) return;
-			head += chunk.toString("utf8");
-			const nl = head.indexOf("\n");
-			if (nl < 0) return;
+			const nlHere = chunk.indexOf(0x0a); // the dest line ends at the FIRST newline — find it in RAW bytes
+			if (nlHere < 0) {
+				head.push(Buffer.from(chunk)); // copy — held across events
+				return;
+			}
 			done = true;
 			socket.removeListener("data", onData);
 			socket.pause();
-			const destLine = head.slice(0, nl).trim();
-			const leftover = Buffer.from(head.slice(nl + 1), "utf8"); // bytes past the dest line = stream payload
+			const full = head.length === 0 ? chunk : Buffer.concat([...head, chunk]);
+			const nl = full.indexOf(0x0a);
+			const destLine = full.subarray(0, nl).toString("utf8").trim();
+			const leftover = Buffer.from(full.subarray(nl + 1)); // RAW payload bytes past the dest line (no lossy re-encode)
 			const clientDest = destLine.split(" ")[0]!;
 			if (process.env.GAVL_SYNC_DEBUG) {
 				let who = "?";
@@ -576,7 +610,6 @@ export class I2PTransport {
 	 *  then feed JSON-line frames to the gossip layer. `peerDest` is the authoritative client dest
 	 *  (SAM-supplied for both directions here); `leftover` is any stream payload already read. */
 	private adoptRawStream(socket: Socket, leftover: Buffer, peerDest: string | null, outbound: boolean, expectB32?: string): void {
-		let buf = "";
 		let peerB32: string | null = peerDest ? destToB32(peerDest) : (expectB32 ?? null);
 		let handshaken = false;
 		socket.setNoDelay(true);
@@ -656,28 +689,16 @@ export class I2PTransport {
 		};
 
 		if (process.env.GAVL_SYNC_DEBUG) console.error(`  i2p-debug: adoptStream ${outbound ? "→out" : "←in"} ${peerB32 ? I2PTransport.short(peerB32) : "?"} wrote hello (${leftover.length}b leftover)`);
-		let sawBytes = false;
-		socket.on("data", (chunk: Buffer) => {
-			if (process.env.GAVL_SYNC_DEBUG && !sawBytes) {
-				sawBytes = true;
-				console.error(`  i2p-debug: adoptStream ${peerB32 ? I2PTransport.short(peerB32) : "?"} first inbound bytes (${chunk.length}b)`);
-			}
-			buf += chunk.toString("utf8");
-			let nl: number;
-			while ((nl = buf.indexOf("\n")) >= 0) {
-				const line = buf.slice(0, nl);
-				buf = buf.slice(nl + 1);
-				if (line.trim()) onLine(line);
-			}
-		});
+		const onChunk = makeLineReader(onLine); // raw-byte framing: never decode a partial chunk (multi-byte + O(n²) safe)
+		socket.on("data", onChunk);
 		socket.on("error", () => {});
 		socket.on("close", () => {
 			if (!peerB32) return;
 			const c = this.active.get(peerB32);
 			if (c && c.socket === socket) this.deactivate(peerB32);
 		});
+		if (leftover.length > 0) onChunk(leftover); // feed the payload already read past the handshake line, IN ORDER
 		socket.resume(); // detach()/onForwardedStream paused it; the data listener is now attached
-		if (leftover.length > 0) socket.emit("data", leftover); // stream payload already read past the handshake line
 	}
 
 	/** Attach a handshaken stream to the peer's connection: reuse the existing Connection object
