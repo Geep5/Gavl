@@ -342,7 +342,11 @@ export class Daemon {
 		// checkpoint bootstrap — let a fresh peer load our latest state instead of all history.
 		this.node.snapshotHeader = () => (this.lastSnapshot ? { anchorId: this.lastSnapshot.anchorId, height: this.lastSnapshot.height } : null);
 		this.node.fullSnapshot = () => this.lastSnapshot ?? null;
-		this.node.wantSnapshot = (offer) => this.node.ledger.summary().writers === 0 && offer.height > this.lastCheckpointHeight; // only a truly fresh node bootstraps from state
+		// A node bootstraps from state while it is still effectively fresh: no folded writers, OR a
+		// genesis-only chain (every node installs hardcoded block 0 at boot, and gossiped writes can
+		// land before the offer does — neither means we hold real history worth keeping).
+		this.node.wantSnapshot = (offer) =>
+			(this.node.ledger.summary().writers === 0 || (this.node.anchors?.tip()?.height ?? 0) === 0) && offer.height > this.lastCheckpointHeight;
 		this.node.onSnapshot = (snap) => this.ingestSnapshot(snap);
 		this.node.adoptFloor = (candidates) => this.adoptFloor(candidates);
 		this.node.snapshotQuorum = this.adoptQuorum; // distinct peers required to adopt a checkpoint
@@ -394,14 +398,25 @@ export class Daemon {
 	private adoptFloor(candidates: Anchor[]): boolean {
 		const anchors = this.node.anchors;
 		const snap = this.pendingSnapshot;
-		if (!anchors || !snap || anchors.tip() !== null) return false; // only on a fresh chain, with a pulled checkpoint
+		if (!anchors || !snap || (anchors.tip() !== null && anchors.tip()!.height !== 0)) return false; // only on a fresh (or genesis-only) chain, with a pulled checkpoint
 		const floor = candidates.find((a) => a.id === snap.anchorId);
 		if (!floor) return false; // the checkpoint's anchor isn't in this suffix (yet)
 		if (!this.node.snapshotQuorumMet(snap.anchorId)) return false; // not enough distinct peers vouch for this floor
 		if (rootOfHeads(snap.heads) !== floor.stateRoot) return false; // snapshot heads must be the ones the floor PoST-committed
+		// Gather the hash-linked run directly below the floor from the same suffix (peers serve a
+		// margin below their checkpoint for exactly this) — it lets recompute windows that dip below
+		// the floor draw the real anchors instead of truncating (required when window > epoch).
+		const byId = new Map(candidates.map((a) => [a.id, a]));
+		const ancestry: Anchor[] = [];
+		for (let cur = floor; cur.prev && byId.has(cur.prev); ) {
+			const below = byId.get(cur.prev)!;
+			ancestry.push(below);
+			cur = below;
+		}
 		try {
-			anchors.adopt(floor, snap.heads); // install the trusted root (throws if unsafe — e.g. off an epoch boundary)
-		} catch {
+			anchors.adopt(floor, snap.heads, ancestry); // install the trusted root (throws if unsafe — e.g. off an epoch boundary)
+		} catch (e) {
+			if (process.env.GAVL_SYNC_DEBUG) console.error(`  sync-debug: adoptFloor failed at h=${floor.height}: ${e instanceof Error ? e.message : e}`);
 			return false;
 		}
 		return true; // ingestSnapshot (on the next tip) authenticates + seeds the state above this floor
@@ -993,9 +1008,11 @@ export class Daemon {
 			const deadline = started + graceMs;
 			while (Date.now() < deadline && !anchors.tip()) {
 				// Wait while a checkpoint could still land: one is being pulled (pendingSnapshot), or we're
-				// still in the initial discovery sweep. Otherwise stop early — there's nothing to adopt.
+				// still inside the discovery window. Discovery spans the whole grace period — over LXMF the
+				// first anchor-tip (which triggers a fresh node's snapshot-want) routinely takes 15-60s to
+				// arrive, so bailing at a few seconds guarantees a genesis restart that islands the node.
 				const checkpointInflight = this.pendingSnapshot != null;
-				const stillDiscovering = Date.now() - started < 3000;
+				const stillDiscovering = Date.now() - started < graceMs;
 				if (!checkpointInflight && !stillDiscovering) break;
 				await new Promise((r) => setTimeout(r, 400));
 			}

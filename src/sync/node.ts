@@ -233,6 +233,7 @@ export class GavlNode {
 				// checkpoint (quorum) — so a lone or sybil peer can't feed me a fabricated floor.
 				this.snapshotOffers.set(conn, { anchorId: m.anchorId, height: m.height });
 				this.snapshotHolders.set(conn, { anchorId: m.anchorId, height: m.height }); // offering implies holding
+				if (process.env.GAVL_SYNC_DEBUG) console.error(`  sync-debug: snapshot-offer h=${m.height} want=${this.wantSnapshot?.(m) ?? "n/a"} quorum=${this.snapshotQuorumMet(m.anchorId)}`);
 				if (this.wantSnapshot?.(m) && this.snapshotQuorumMet(m.anchorId)) conn.send({ t: "snapshot-want" });
 				return;
 			}
@@ -251,6 +252,9 @@ export class GavlNode {
 				return;
 			}
 			case "snapshot": {
+				// Sending the full checkpoint is at least as strong a vouch as offering it — count it
+				// toward quorum (a fresh node that had to ASK, via snapshot-want, never saw the offer).
+				this.snapshotOffers.set(conn, { anchorId: m.snap.anchorId, height: m.snap.height });
 				// Verify (appRoot against my synced anchor chain) + seed. On success, re-advertise
 				// my new heads so the peer serves me only the POST-checkpoint writes.
 				if (this.onSnapshot?.(m.snap)) {
@@ -267,11 +271,16 @@ export class GavlNode {
 				return;
 			}
 			case "anchor-tip": {
+				if (process.env.GAVL_SYNC_DEBUG) console.error(`  sync-debug: anchor-tip h=${m.height ?? "?"} w=${m.weight} known=${!!this.anchors?.get(m.id)} myTip=${this.anchors?.tip()?.height ?? "null"}`);
 				if (!this.anchors || this.anchors.get(m.id)) return;
 				const myTip = this.anchors.tip();
 				// Pull only if their chain could change my tip (heavier, or equal-weight tiebreak-relevant).
 				if (myTip === null || BigInt(m.weight) >= BigInt(myTip.weight)) {
 					conn.send({ t: "anchor-want", fromHeight: myTip ? myTip.height : 0 });
+					// Effectively fresh (no chain beyond block 0) and far behind: also ask for the peer's
+					// checkpoint outright. Offers are sent once per connection, and over a connectionless
+					// transport "the connection" long predates this boot — a fresh node can't rely on one.
+					if ((myTip === null || myTip.height === 0) && m.height > 0) conn.send({ t: "snapshot-want" });
 				}
 				return;
 			}
@@ -377,11 +386,20 @@ export class GavlNode {
 		if (!this.anchors) return;
 		const before = this.anchors.tip()?.id ?? null;
 		let gap = false;
+		const rejects = new Map<string, number>(); // GAVL_SYNC_DEBUG: tally why peer anchors don't ingest
 		for (const a of [...anchors].sort((x, y) => x.height - y.height)) {
 			const r = await this.anchors.add(a);
 			if (!r.ok && r.reason === "unknown prev anchor") gap = true;
+			if (!r.ok) rejects.set(r.reason, (rejects.get(r.reason) ?? 0) + 1);
 		}
-		if (gap && this.anchors.tip() === null) {
+		if (process.env.GAVL_SYNC_DEBUG) {
+			const hs = anchors.map((a) => a.height);
+			console.error(`  sync-debug: anchor-chain ${anchors.length} anchors [${Math.min(...hs)}..${Math.max(...hs)}] gap=${gap} tip=${this.anchors.tip()?.height ?? "null"} rejects=${JSON.stringify(Object.fromEntries(rejects))}`);
+		}
+		// A genesis-only chain is still fresh (every node installs hardcoded block 0 at boot), so a
+		// late joiner whose peers pruned below their checkpoints must also take the bootstrap path.
+		const effectivelyFresh = this.anchors.tip() === null || (this.anchors.tip()!.height === 0 && anchors.every((a) => a.height > 0));
+		if (gap && effectivelyFresh) {
 			// Fresh node: this suffix can't reach (grindable, unkept) genesis. Buffer it and try to
 			// adopt a trusted floor from a pulled checkpoint. If none is available yet we simply WAIT —
 			// the checkpoint is already being pulled (snapshot-want), and re-requesting anchors would
@@ -438,7 +456,7 @@ export class GavlNode {
 	 *  the buffered orphan suffix. If it does, the suffix links above the floor and we advance to a
 	 *  tip; the app's onTip then authenticates + seeds the matching checkpoint state. */
 	private async resolveBootstrap(): Promise<boolean> {
-		if (!this.anchors || this.anchors.tip() !== null || !this.adoptFloor || this.orphanAnchors.size === 0) return false;
+		if (!this.anchors || (this.anchors.tip() !== null && this.anchors.tip()!.height !== 0) || !this.adoptFloor || this.orphanAnchors.size === 0) return false;
 		if (!this.adoptFloor([...this.orphanAnchors.values()])) return false; // nothing trusted to adopt yet
 		for (const a of [...this.orphanAnchors.values()].sort((x, y) => x.height - y.height)) await this.anchors.add(a);
 		this.orphanAnchors.clear();

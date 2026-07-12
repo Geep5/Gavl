@@ -253,19 +253,47 @@ export class AnchorChain {
 	 * floor is locked as final. The CALLER authenticates the matching state separately (the
 	 * checkpoint's child anchor commits its appRoot); adopt() only seeds the anchor chain.
 	 *
-	 * Must be called on an empty chain. With a retarget schedule the floor must sit on an epoch
-	 * boundary and window ≤ epoch, so every difficulty recompute above the floor draws a window
-	 * that lies entirely above it (between boundaries difficulty just inherits) — otherwise a
-	 * recompute would dip into the missing ancestry and diverge from a full node. Throws if either
-	 * the integrity check or that safety condition fails, rather than adopt into a fork.
+	 * Must be called on an empty (or genesis-only) chain. With a retarget schedule the floor must
+	 * sit on an epoch boundary, and every difficulty recompute above the floor must be able to draw
+	 * its full window: either window ≤ epoch (windows never dip below the floor), or `ancestry`
+	 * supplies the hash-linked anchors directly below the floor that the deepest dip reaches —
+	 * otherwise a recompute would truncate and diverge from a full node. Throws if the integrity
+	 * check or that safety condition fails, rather than adopt into a fork.
 	 */
-	adopt(floor: Anchor, floorHeads: Heads): void {
-		if (this.tipId !== null || this.anchors.size > 0) throw new Error("adopt: chain is not empty");
+	adopt(floor: Anchor, floorHeads: Heads, ancestry: Anchor[] = []): void {
+		// A chain holding ONLY the installed genesis is still "fresh": every node installs the
+		// hardcoded block 0 at boot, so a late joiner past its peers' prune horizon must be able to
+		// swap that bare root for a trusted checkpoint floor — otherwise the peers' pruned suffix
+		// can never link ("unknown prev anchor" forever) and the node is islanded for good.
+		const genesisOnly = this.anchors.size === 1 && this.tip()?.height === 0;
+		if (this.tipId !== null && !genesisOnly) throw new Error("adopt: chain is not empty");
 		if (rootOfHeads(floorHeads) !== floor.stateRoot) throw new Error("adopt: floorHeads do not match floor.stateRoot");
-		if (this.schedule) {
-			if (this.schedule.window > this.schedule.epoch) throw new Error("adopt: retarget window exceeds epoch — cannot bound the difficulty window above the floor");
-			if (floor.height % this.schedule.epoch !== 0) throw new Error("adopt: floor must sit on an epoch boundary for deterministic retarget");
+		// `ancestry` is the hash-linked run of anchors directly below the floor (deepest last). It is
+		// exactly as trustworthy as the floor itself (each link is committed by the child's `prev`),
+		// and it's what lets a recompute window that dips below the floor draw the same anchors a
+		// full node would — so window > epoch no longer forbids adoption when ancestry covers the dip.
+		let cur = floor;
+		const linked: Anchor[] = [];
+		for (const a of ancestry) {
+			if (cur.prev !== a.id || a.height !== cur.height - 1) break; // stop at the first gap — only the linked run counts
+			linked.push(a);
+			cur = a;
 		}
+		if (this.schedule) {
+			if (floor.height % this.schedule.epoch !== 0) throw new Error("adopt: floor must sit on an epoch boundary for deterministic retarget");
+			// Deepest recompute dip above the floor: the first boundary (floor+epoch) draws `window`
+			// anchors ending at floor+epoch-1, reaching down to floor+epoch-window. Anything below the
+			// floor must be present in the linked ancestry or the recompute diverges from a full node.
+			const dip = this.schedule.window - this.schedule.epoch;
+			if (dip > 0 && linked.length < dip) throw new Error(`adopt: retarget window exceeds epoch and ancestry covers ${linked.length}/${dip} anchor(s) below the floor — cannot bound the difficulty window`);
+		}
+		if (genesisOnly) {
+			this.anchors.clear();
+			this.tipId = null;
+			this.floorId = null;
+			this.lockedId = null;
+		}
+		for (const a of linked) this.anchors.set(a.id, a); // below-floor ancestry: difficulty-window context only
 		this.anchors.set(floor.id, floor);
 		this.floorId = floor.id;
 		this.floorHeads = { ...floorHeads };

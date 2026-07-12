@@ -218,7 +218,13 @@ class Bridge:
 
         lxmf_storage = os.path.join(storage_dir, "lxmf")
         os.makedirs(lxmf_storage, exist_ok=True)
-        self.router = LXMF.LXMRouter(identity=self.identity, storagepath=lxmf_storage)
+        # delivery_limit (KB): LXMF's receiver-side cap on a single direct-delivery transfer —
+        # LXMRouter.delivery_resource_advertised REJECTS any resource above it, at DEBUG loglevel,
+        # so the sender just times out, cancels, and retries forever ("Attempt to cancel a
+        # non-existing incoming resource" on the receiver). Gavl sends a full anchor-chain pull as
+        # ONE LXMF message, so a late-joining node's history pull outgrows the 1 MB default and it
+        # can never sync. Raise the cap far above any real frame (testnet; the real fix is chunking).
+        self.router = LXMF.LXMRouter(identity=self.identity, storagepath=lxmf_storage, delivery_limit=50_000)
         self.router.PROCESSING_INTERVAL = 1
 
         self.local = self.router.register_delivery_identity(self.identity, display_name=self.display_name)
