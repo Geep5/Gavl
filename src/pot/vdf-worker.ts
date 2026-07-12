@@ -2,7 +2,7 @@
  * VDF worker thread — runs the iterated-SHA-256 cooldown OFF the main event loop.
  *
  * HashVdf's cooldown is a multi-second sequential hash chain. Run inline it blocks the daemon's
- * single event loop, which stalls the sync transport (frames stop flowing to/from the Reticulum
+ * single event loop, which stalls the sync transport (frames stop flowing to/from the I2P
  * sidecar, so peers stop hearing from us) and the HTTP API. This worker computes eval/verify on its
  * own thread using the SAME `sha256` as the
  * main thread, so outputs are byte-identical and wire-compatible — a node that offloads to a worker

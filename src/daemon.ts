@@ -6,7 +6,7 @@
  * single monotonic clock (so op timestamps are causally ordered).
  *
  * With consensus wired (the default), the node also carries an AnchorChain, the
- * daemon joins the live Reticulum mesh (gossiping writes AND anchors over LXMF),
+ * daemon joins the live I2P mesh (gossiping writes AND anchors over garlic-routed streams),
  * and runs a Producer that farms anchors over the heaviest tip. The UI can then
  * watch the real consensus advance: tip height/weight climbing, finality
  * deepening, the custody committee forming.
@@ -69,7 +69,7 @@ import { StandinSpaceProver, StandinSpaceVerifier } from "./consensus/space.ts";
 import type { SpaceVerifier, SpaceProver } from "./consensus/space.ts";
 import { ChiaSpaceProver, ChiaSpaceVerifier, ensurePlot } from "./pos/chia.ts";
 import { Plot } from "./pos/space.ts";
-import { ReticulumTransport } from "./sync/reticulum.ts";
+import { I2PTransport, destToB32 } from "./sync/i2p.ts";
 import { KnownPeers } from "./sync/known-peers.ts";
 import { generateKeyPair, keyPairFromSeed, sign } from "./det/ed25519.ts";
 import type { KeyPair } from "./det/ed25519.ts";
@@ -187,18 +187,18 @@ export interface ConsensusStatus {
 	secPerAnchor: number;
 	/** True if secPerAnchor is a live measurement; false if it's the target fallback (cold/idle). */
 	secPerAnchorMeasured: boolean;
-	/** Wire carrier: "reticulum" (LXMF) | null (mesh off). */
+	/** Wire carrier: "i2p" (SAM streams) | null (mesh off). */
 	transport: string | null;
 	/** Bounded-mesh diagnostics: connection cap, resolved producer↔address bindings, and committee
 	 *  members directly linked. */
 	maxPeers?: number;
 	bindings?: number;
 	committeeLinked?: number;
-	/** This node's LXMF address (hex). Null if mesh off. */
+	/** This node's i2p b32 address. Null if mesh off. */
 	nodeKey: string | null;
-	/** LXMF addresses of currently-connected peers. */
+	/** b32 addresses of currently-connected peers. */
 	peerKeys: string[];
-	/** LXMF addresses pinned for re-dial on every boot (eclipse resistance). */
+	/** b32 addresses pinned for re-dial on every boot (eclipse resistance). */
 	pinnedPeers: string[];
 }
 
@@ -255,7 +255,7 @@ export class Daemon {
 	private readonly accounts = new Map<string, Account>();
 	private clock = 0;
 
-	private transport?: ReticulumTransport;
+	private transport?: I2PTransport;
 	private producer?: Producer;
 	private network: string;
 	private farming = false;
@@ -905,7 +905,7 @@ export class Daemon {
 			myAnchors: recent.reduce((n, a) => n + (a.producer === myId ? 1 : 0), 0),
 			secPerAnchor: measured ?? this.targetSecPerAnchor,
 			secPerAnchorMeasured: measured != null,
-			transport: this.transport ? "reticulum" : null,
+			transport: this.transport ? "i2p" : null,
 			nodeKey: this.transport ? this.transport.nodeKeyHex : null,
 			peerKeys: this.transport ? this.transport.connectedPeerKeys() : [],
 			pinnedPeers: this.knownPeers.list(),
@@ -918,21 +918,19 @@ export class Daemon {
 	 *  Resilient to a slow/absent DHT (soft 8s cap) — falls back to local if it fails. */
 	private async joinMesh(): Promise<void> {
 		try {
-			// Gossip rides Reticulum (LXMF): store-and-forward so peers catch up across churn, announce-
-			// based discovery, signed producer↔address bindings, a bounded mesh. Runs via a Python sidecar.
-			this.transport = new ReticulumTransport(this.node, {
+			// Gossip rides I2P: garlic-routed streams via a local router's SAM bridge (no sidecar, no
+			// hub). Discovery is seeds + PEX; signed producer↔address bindings ride the stream handshake.
+			this.transport = new I2PTransport(this.node, {
 				network: this.network,
-				storageDir: join(this.dataDir, "reticulum"),
-				configDir: process.env.GAVL_RNS_CONFIG, // undefined → system ~/.reticulum
-				propagated: process.env.GAVL_RNS_PROPAGATED === "1",
+				storageDir: join(this.dataDir, "i2p"),
+				seeds: (process.env.GAVL_I2P_PEERS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
 				maxPeers: process.env.GAVL_MAX_PEERS ? Number(process.env.GAVL_MAX_PEERS) : undefined,
 				onEvent: (kind, text) => this.recordNetEvent(kind, text), // surface peer/binding/committee steps to the UI feed
 				// sign producer↔address binding so peers can address us by our consensus key
 				bindingSigner: (msg) => ({ producer: this.producerId(), sig: toHex(sign(this.producerKey().privateKey, msg)) }),
 			});
-			const joined = this.transport.join(this.network);
-			await Promise.race([joined, new Promise((r) => setTimeout(r, 8000))]);
-			// Re-dial pinned peers directly (independent of announce discovery) — eclipse resistance.
+			await this.transport.join(this.network); // resolves once the SAM session is live (address known)
+			// Re-dial pinned peers directly (independent of PEX discovery) — eclipse resistance.
 			for (const key of this.knownPeers.list()) {
 				try {
 					this.transport.dialPeer(key);
@@ -941,10 +939,13 @@ export class Daemon {
 				}
 			}
 		} catch (e) {
-			// Gavl networks ONLY over Reticulum — never silently degrade to a mesh-less "local" node.
-			console.error(`\n✗ Reticulum mesh failed to start: ${(e as Error).message}`);
-			console.error("  Refusing to run mesh-less. Check the sidecar (pip install rns lxmf) and restart,");
-			console.error("  or run an intentional local-only node with GAVL_MESH=0.\n");
+			// Gavl networks ONLY over I2P — never silently degrade to a mesh-less "local" node.
+			console.error(`\n✗ I2P mesh failed to start: ${(e as Error).message}`);
+			console.error("  Gavl needs a local I2P router with SAM enabled (default 127.0.0.1:7656).");
+			console.error("  Install + start one:   brew install i2pd && brew services start i2pd   (macOS)");
+			console.error("                         apt install i2pd && systemctl start i2pd        (Linux)");
+			console.error("  Point elsewhere with GAVL_SAM_HOST / GAVL_SAM_PORT, or run an intentional");
+			console.error("  local-only node with GAVL_MESH=0.\n");
 			process.exit(1);
 		}
 	}
@@ -1008,9 +1009,9 @@ export class Daemon {
 			const deadline = started + graceMs;
 			while (Date.now() < deadline && !anchors.tip()) {
 				// Wait while a checkpoint could still land: one is being pulled (pendingSnapshot), or we're
-				// still inside the discovery window. Discovery spans the whole grace period — over LXMF the
-				// first anchor-tip (which triggers a fresh node's snapshot-want) routinely takes 15-60s to
-				// arrive, so bailing at a few seconds guarantees a genesis restart that islands the node.
+				// still inside the discovery window. Discovery spans the whole grace period — over I2P the
+				// first anchor-tip (which triggers a fresh node's snapshot-want) can take tens of seconds
+				// to arrive (tunnel build + leaseset lookup), so bailing at a few seconds guarantees a genesis restart that islands the node.
 				const checkpointInflight = this.pendingSnapshot != null;
 				const stillDiscovering = Date.now() - started < graceMs;
 				if (!checkpointInflight && !stillDiscovering) break;
@@ -1142,7 +1143,7 @@ export class Daemon {
 	 * Stall watchdog. During BOOTSTRAP (before the committee's fund key exists) the producer sprints
 	 * empty anchors to the genesis epoch boundary, so the tip should climb every few seconds. If it
 	 * FREEZES while we still have peers, we've most likely missed a heavier chain — a dropped anchor-tip
-	 * broadcast, or a link that went silently quiet (LXMF has no disconnect signal). Re-pull from peers
+	 * broadcast, or a link that went quiet. Re-pull from peers
 	 * and re-warm committee links to reconverge. Scoped to the bootstrap window on purpose: AFTER genesis,
 	 * a frozen tip is just an idle network (the heartbeat), and must NOT trigger churn. Tunable via
 	 * GAVL_STALL_MS; 0 disables.
@@ -1559,7 +1560,7 @@ export class Daemon {
 	 * all committee members are connected. `selfId` must be this node's committee id.
 	 *
 	 * NOTE: the ceremony is proven over the in-memory transport (which mimics the
-	 * wire); running it across real Reticulum daemons is a live-deployment step. This
+	 * wire); running it across real I2P daemons is a live-deployment step. This
 	 * wires the proven coordinator onto `this.node`'s real connections.
 	 */
 	async runCommitteeDkg(opts: { session: string; selfId: string; participants: string[]; min: number }): Promise<string> {
@@ -1852,10 +1853,12 @@ export class Daemon {
 
 	// ── peer control ─────────────────────────────────────────────────
 
-	/** Dial a peer by node-key now; if `pin`, also persist it for re-dial on every boot. */
-	dialPeer(nodeKeyHex: string, pin = true): void {
-		if (pin) this.knownPeers.add(nodeKeyHex);
-		this.transport?.dialPeer(nodeKeyHex); // no-op if mesh is off; the pin still applies next boot
+	/** Dial a peer by b32 address or full i2p destination now; if `pin`, also persist it (as its
+	 *  stable b32) for re-dial on every boot. */
+	dialPeer(peerAddr: string, pin = true): void {
+		const addr = peerAddr.trim();
+		if (pin) this.knownPeers.add(addr.length > 100 ? destToB32(addr) : addr);
+		this.transport?.dialPeer(addr); // no-op if mesh is off; the pin still applies next boot
 	}
 
 	/** Unpin a known peer (stops re-dialing it on boot; doesn't drop a live connection). */

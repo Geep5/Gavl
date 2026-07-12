@@ -96,9 +96,18 @@ test("adopt refuses unsafe inputs (bad heads, non-empty chain, off-boundary floo
 	const c = new AnchorChain(PARAMS, STANDIN_VERIFIER, { finalityDepth: 2 });
 	assert.throws(() => c.adopt(built[4].a, { A: head(999) }), /floorHeads/, "heads must hash to the floor's stateRoot");
 
+	// A chain with real history refuses adoption — but a GENESIS-ONLY chain is still fresh (every
+	// node installs hardcoded block 0 at boot), so a late joiner may swap that bare root for a
+	// trusted checkpoint floor. Anything beyond genesis still refuses.
 	const used = new AnchorChain(PARAMS, STANDIN_VERIFIER, { finalityDepth: 2 });
 	await used.add(built[0].a);
-	assert.throws(() => used.adopt(built[4].a, headsOf(built, 4)), /not empty/, "can't adopt over an existing chain");
+	await used.add(built[1].a);
+	assert.throws(() => used.adopt(built[4].a, headsOf(built, 4)), /not empty/, "can't adopt over a chain with real history");
+
+	const genesisOnly = new AnchorChain(PARAMS, STANDIN_VERIFIER, { finalityDepth: 2 });
+	await genesisOnly.add(built[0].a);
+	genesisOnly.adopt(built[4].a, headsOf(built, 4)); // allowed: swaps the bare block-0 root for the floor
+	assert.equal(genesisOnly.tip()!.id, built[4].a.id, "genesis-only chain adopts the floor as its new root");
 
 	const sched = { base: PARAMS.difficulty, epoch: 4, window: 4, targetIters: 1n };
 	const scheduled = new AnchorChain(PARAMS, STANDIN_VERIFIER, { schedule: sched });

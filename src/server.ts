@@ -15,9 +15,9 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { existsSync } from "node:fs";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { homedir } from "node:os";
-import { createServer as netServer } from "node:net";
+import { createServer as netServer, connect as netConnect } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
@@ -70,17 +70,28 @@ const NETWORK = process.env.GAVL_NETWORK ?? defaultMarketChannel();
 const MESH = process.env.GAVL_MESH !== "0";
 const FARM = process.env.GAVL_FARM !== "0";
 
-// DIAGNOSTIC (2): Gavl networks ONLY over Reticulum (RNS/LXMF via a Python sidecar). Fail FAST + LOUD
-// if those modules can't be imported, instead of silently degrading to a mesh-less "local" node —
-// the exact "why won't it connect" trap. Skipped only when the mesh is intentionally off.
+// DIAGNOSTIC (2): Gavl networks ONLY over I2P (a local router's SAM bridge). Fail FAST + LOUD if
+// the SAM port doesn't answer, instead of silently degrading to a mesh-less "local" node — the
+// exact "why won't it connect" trap. Skipped only when the mesh is intentionally off.
 if (MESH) {
-	const py = process.env.GAVL_PYTHON ?? "python";
-	const probe = spawnSync(py, ["-c", "import RNS, LXMF"], { stdio: "ignore" });
-	if (probe.status !== 0) {
-		console.error(`\n✗ Reticulum networking needs the Python RNS + LXMF modules, but \`${py} -c "import RNS, LXMF"\` failed.`);
-		console.error("  Install them once:          pip install rns lxmf");
-		console.error("  Wrong Python? point at it:  GAVL_PYTHON=python3 npm run dev");
-		console.error("  Intentional local node:     GAVL_MESH=0 npm run dev\n");
+	const samHost = process.env.GAVL_SAM_HOST ?? "127.0.0.1";
+	const samPort = Number(process.env.GAVL_SAM_PORT ?? 7656);
+	const reachable = await new Promise<boolean>((resolve) => {
+		const s = netConnect({ host: samHost, port: samPort });
+		const done = (ok: boolean) => {
+			s.destroy();
+			resolve(ok);
+		};
+		s.once("connect", () => done(true));
+		s.once("error", () => done(false));
+		setTimeout(() => done(false), 4000).unref?.();
+	});
+	if (!reachable) {
+		console.error(`\n✗ I2P networking needs a local router with SAM enabled, but ${samHost}:${samPort} doesn't answer.`);
+		console.error("  Install + start one:   brew install i2pd && brew services start i2pd   (macOS)");
+		console.error("                         apt install i2pd && systemctl start i2pd        (Linux)");
+		console.error("  Elsewhere?             GAVL_SAM_HOST / GAVL_SAM_PORT");
+		console.error("  Intentional local node: GAVL_MESH=0 npm run dev\n");
 		process.exit(1);
 	}
 }
@@ -154,7 +165,6 @@ async function fleetUp(): Promise<void> {
 	const name = `node-${++fleetSeq}`;
 	const port = await freeFleetPort();
 	const env = { ...process.env };
-	delete env.GAVL_RNS_CONFIG; // each fleet node writes/uses its OWN default config in its data dir
 	env.GAVL_DATA_DIR = join(homedir(), ".gavl-nodes", name);
 	env.GAVL_PORT = String(port);
 	env.GAVL_ORACLE_PUBLISH = "0";
@@ -527,7 +537,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		}
 		// ── peer control ──
 		if (path === "/api/peers/dial") {
-			// Pin + dial a peer by its LXMF address; re-dialed every boot (eclipse resistance).
+			// Pin + dial a peer by its i2p b32 address (or full destination); re-dialed every boot (eclipse resistance).
 			daemon.dialPeer(String(body.key ?? ""), body.pin !== false);
 			return send(res, 200, { pinned: daemon.pinnedPeers() });
 		}

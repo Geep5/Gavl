@@ -111,11 +111,11 @@
 	const producers = $derived(c?.producers ?? 0);
 	const healthy = $derived(peers > 0 && !!c?.farming);
 
-	// ── transport / mesh model (Reticulum-aware) ──
+	// ── transport / mesh model (I2P-aware) ──
 	const transport = $derived(c?.transport ?? null);
-	const isReticulum = $derived(transport === "reticulum");
-	const transportLabel = $derived(transport === "reticulum" ? "RETICULUM · LXMF" : "LOCAL");
-	const maxPeers = $derived(c?.maxPeers ?? null); // bounded-mesh cap (Reticulum)
+	const isI2p = $derived(transport === "i2p");
+	const transportLabel = $derived(transport === "i2p" ? "I2P · GARLIC" : "LOCAL");
+	const maxPeers = $derived(c?.maxPeers ?? null); // bounded-mesh cap
 	const bindings = $derived(c?.bindings ?? 0); // producer↔address bindings resolved
 	const committeeLinked = $derived(c?.committeeLinked ?? 0); // committee members directly linked
 
@@ -145,7 +145,7 @@
 	let fleetSel = $state(0);
 	const fleetCur = $derived(fleetNodes.length ? fleetNodes[Math.min(fleetSel, fleetNodes.length - 1)] : null);
 	function fleetRotate(d) { const n = fleetNodes.length; if (n) fleetSel = (((fleetSel + d) % n) + n) % n; }
-	const nodeAddr = $derived(c?.nodeKey ?? ""); // our LXMF address under Reticulum
+	const nodeAddr = $derived(c?.nodeKey ?? ""); // our i2p b32 address
 
 	// ── live network activity (newest first; streamed from /api/events) ──
 	const recentEvents = $derived([...store.netEvents].slice(-80).reverse());
@@ -277,11 +277,11 @@
 				<div class="card">
 					<div class="card-h">CONNECTION <span class="ch-r" class:g={healthy}><span class="mini-dot" class:live={healthy}></span>{healthy ? "HEALTHY" : "CONNECTING"}</span></div>
 					<div class="card-g">
-						<div class="kv"><span class="k">PEERS</span><span class="v tnum">{peers}{#if isReticulum && maxPeers}<span class="muted"> / {maxPeers}</span>{/if}</span></div>
+						<div class="kv"><span class="k">PEERS</span><span class="v tnum">{peers}{#if isI2p && maxPeers}<span class="muted"> / {maxPeers}</span>{/if}</span></div>
 						<div class="kv"><span class="k">PRODUCERS</span><span class="v g tnum">{producers}/{needN}</span></div>
 						<div class="kv"><span class="k">TRANSPORT</span><span class="v sm">{transportLabel}</span></div>
 						<div class="kv"><span class="k">PROOF</span><span class="v sm">PoST</span></div>
-						{#if isReticulum}
+						{#if isI2p}
 							<div class="kv"><span class="k">BINDINGS</span><span class="v tnum">{bindings}</span></div>
 							<div class="kv"><span class="k">COMMITTEE</span><span class="v tnum">{committeeLinked} linked</span></div>
 						{/if}
@@ -290,7 +290,7 @@
 				<!-- live activity -->
 				<div class="card">
 					<div class="card-h">ACTIVITY <span class="ch-d">LIVE · {store.netEvents.length}</span></div>
-					{#if isReticulum}
+					{#if isI2p}
 						<div class="gossip-ctl">
 							<span class="gc-lbl">GOSSIP EVERY</span>
 							<input class="gc-in" type="number" min="1" max="3600" bind:value={gossipEdit} onchange={() => applyGossip()} aria-label="gossip interval in seconds" />
@@ -374,7 +374,7 @@
 						</div>
 						{#if nodeAddr}
 							<div>
-								<div class="id-l">NODE ADDRESS (LXMF)</div>
+								<div class="id-l">NODE ADDRESS (I2P B32)</div>
 								<div class="id-row"><span class="id-t">{short(nodeAddr)}</span><button class="cpbtn" title="copy" onclick={copy("addr", nodeAddr)}>{cpLbl("addr")}</button></div>
 							</div>
 						{/if}
@@ -384,7 +384,7 @@
 					</div>
 				</div>
 				<!-- local fleet (bottom): step up/down + rotate through each node's identity -->
-				{#if isReticulum}
+				{#if isI2p}
 					<div class="card">
 						<div class="card-h">LOCAL FLEET <span class="ch-d">{fleetCount} node{fleetCount === 1 ? "" : "s"}</span></div>
 						{#if fleetCur}
