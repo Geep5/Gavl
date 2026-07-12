@@ -71,6 +71,7 @@ import { ChiaSpaceProver, ChiaSpaceVerifier, ensurePlot } from "./pos/chia.ts";
 import { Plot } from "./pos/space.ts";
 import { I2PTransport, destToB32 } from "./sync/i2p.ts";
 import { KnownPeers } from "./sync/known-peers.ts";
+import { bootstrapSeeds } from "./sync/seeds.ts";
 import { generateKeyPair, keyPairFromSeed, sign } from "./det/ed25519.ts";
 import type { KeyPair } from "./det/ed25519.ts";
 import { toHex, fromHex, sha256 } from "./det/canonical.ts";
@@ -920,10 +921,13 @@ export class Daemon {
 		try {
 			// Gossip rides I2P: garlic-routed streams via a local router's SAM bridge (no sidecar, no
 			// hub). Discovery is seeds + PEX; signed producer↔address bindings ride the stream handshake.
+			// Seeds = the shipped bootstrap "phone book" (src/sync/seeds.ts) + GAVL_I2P_PEERS — untrusted
+			// cold-start introducers only; a fresh clone auto-dials them and PEX takes over after the
+			// first hello (self-address is skipped in dialPeer, so a node listing itself is a no-op).
 			this.transport = new I2PTransport(this.node, {
 				network: this.network,
 				storageDir: join(this.dataDir, "i2p"),
-				seeds: (process.env.GAVL_I2P_PEERS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+				seeds: bootstrapSeeds(),
 				maxPeers: process.env.GAVL_MAX_PEERS ? Number(process.env.GAVL_MAX_PEERS) : undefined,
 				onEvent: (kind, text) => this.recordNetEvent(kind, text), // surface peer/binding/committee steps to the UI feed
 				// sign producer↔address binding so peers can address us by our consensus key
