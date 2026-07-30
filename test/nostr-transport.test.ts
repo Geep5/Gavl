@@ -15,6 +15,7 @@ import { join } from "node:path";
 
 import { generateSecretKey, getPublicKey, finalizeEvent } from "nostr-tools/pure";
 import { NostrTransport, KIND_PRESENCE, KIND_DIRECT, MAX_CONTENT, DEFAULT_RELAYS } from "../src/sync/nostr.ts";
+import { splitPayload } from "../src/sync/chunk.ts";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
 import { generateKeyPair, sign } from "../src/det/ed25519.ts";
@@ -109,14 +110,47 @@ test("our own events are ignored (no self-connection, no echo loop)", () => {
 	assert.equal(t.connectedPeerKeys().length, 0);
 });
 
-test("an oversized frame is reported LOUDLY, never silently dropped", () => {
+test("a bulk frame arrives chunked and is delivered as ONE reassembled message", () => {
+	const { node, t } = mk();
+	const got: { t: string; snap?: { height: number; blob: string } }[] = [];
+	node.addPeer = ((c: { onMessage: (h: (m: never) => void) => void }) => c.onMessage((m) => got.push(m))) as never;
+
+	const peer = generateSecretKey();
+	const big = { t: "snapshot", snap: { height: 2624, blob: "s".repeat(60_000) } };
+	const parts = splitPayload(JSON.stringify(big), MAX_CONTENT)!;
+	assert.ok(parts.length > 4, `a real snapshot spans several frames (${parts.length})`);
+
+	parts.forEach((part, i) => {
+		if (i < parts.length - 1) assert.equal(got.length, 0, "nothing is delivered until the last chunk lands");
+		t.onWire(
+			finalizeEvent(
+				{ kind: KIND_DIRECT, created_at: nowSec(), tags: [["d", NET], ["gc", "bulk1", String(i), String(parts.length)]], content: part },
+				peer,
+			),
+		);
+	});
+	assert.equal(got.length, 1, "exactly one message, not one per chunk");
+	assert.equal(got[0]!.snap!.blob.length, 60_000, "reassembled byte-exact through the transport");
+	assert.equal(got[0]!.snap!.height, 2624);
+});
+
+test("a peer mid-transfer counts as alive (chunks are frames too)", () => {
+	const { t } = mk();
+	const peer = generateSecretKey();
+	const parts = splitPayload(JSON.stringify({ t: "snapshot", blob: "s".repeat(60_000) }), MAX_CONTENT)!;
+	// only the FIRST chunk arrives — the transfer is still in flight
+	t.onWire(finalizeEvent({ kind: KIND_DIRECT, created_at: nowSec(), tags: [["d", NET], ["gc", "b", "0", String(parts.length)]], content: parts[0]! }, peer));
+	assert.deepEqual(t.liveQuorumAddrs(), [getPublicKey(peer)], "it must not age out while sending us a big snapshot");
+});
+
+test("a message too large to chunk at all is reported LOUDLY, never silently dropped", () => {
 	const seen: string[] = [];
 	const { t } = mk({ onEvent: (k, text) => seen.push(`${k}:${text}`) });
-	const peer = getPublicKey(generateSecretKey());
-	t.publishDirect(peer, { t: "snapshot", snap: { blob: "x".repeat(MAX_CONTENT + 5_000) } } as never);
-	const warn = seen.find((s) => s.includes("too large"));
-	assert.ok(warn, "the drop is surfaced to the operator");
-	assert.match(warn!, /chunking/, "and it names the fix (N2), so it can't be mistaken for a network glitch");
+	// past MAX_PARTS × MAX_CONTENT there is no way to send it; the operator must be told.
+	t.publishDirect(getPublicKey(generateSecretKey()), { t: "snapshot", snap: { blob: "x".repeat(30_000_000) } } as never);
+	const warn = seen.find((s) => s.includes("cannot send"));
+	assert.ok(warn, "the failure is surfaced");
+	assert.match(warn!, /too large to send over relays/, "and says why, so it can't read as a network glitch");
 });
 
 test("the peer set is bounded, and pinned peers survive eviction", () => {

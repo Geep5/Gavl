@@ -30,6 +30,7 @@ import { SimplePool } from "nostr-tools/pool";
 import type { SubCloser } from "nostr-tools/pool";
 import type { Connection, GavlNode } from "./node.ts";
 import type { SyncMessage } from "./messages.ts";
+import { splitPayload, Reassembler, CHUNK_TAG } from "./chunk.ts";
 import { verify } from "../det/ed25519.ts";
 
 /** Suggested public relays — every one VERIFIED live (publish→subscriber round-trip + a 32 KB write
@@ -62,8 +63,12 @@ export const KIND_DIRECT = 20778;
  *  not inflate the live-quorum count (the lobby gates consensus on it). */
 export const PRESENCE_TTL_MS = 10 * 60_000;
 /** Max serialized frame we will publish. Relays accept ~32 KB; leave headroom for JSON escaping,
- *  tags and signature. Above this → chunking (N2). */
+ *  tags and signature. Anything larger is chunked across events (see ./chunk.ts). */
 export const MAX_CONTENT = 16 * 1024;
+/** Gap between chunk publishes. The N0 spike pushed 20 × 32 KB with zero rejections, so relays are
+ *  not fragile here — but a multi-hundred-chunk snapshot is worth spreading out rather than
+ *  hammering ten relays flat out. */
+const CHUNK_STAGGER_MS = 25;
 
 const enc = new TextEncoder();
 
@@ -152,6 +157,12 @@ export class NostrTransport {
 	private readonly lastFrame = new Map<string, number>(); // pubkey → last frame FROM it (liveness)
 	private readonly producerToAddress = new Map<string, string>(); // producer hex → nostr pubkey
 	private readonly committeePins = new Set<string>();
+
+	// ── bulk frames: split on send, rebuilt on receive (./chunk.ts) ──
+	private readonly reasm = new Reassembler();
+	/** Per-boot random prefix + counter → a message id that can't collide with a previous boot's. */
+	private readonly idPrefix = Math.floor(Math.random() * 0xffffff).toString(36) + "-";
+	private msgSeq = 0;
 
 	// ── relay health (measured: relays fail, gate writes, or accept-and-never-forward) ──
 	private readonly relayUp = new Set<string>();
@@ -333,15 +344,31 @@ export class NostrTransport {
 	/** @internal (test seam) */
 	onWire(ev: NostrEvent): void {
 		if (this.destroyed || ev.pubkey === this.myPubkey) return;
-		let msg: SyncMessage;
-		try {
-			msg = JSON.parse(ev.content) as SyncMessage;
-		} catch {
-			return; // malformed frame — drop it, the stream is stateless so nothing to resync
-		}
+
+		// Liveness credit first: a CHUNK is still a frame from that peer, so a node in the middle of
+		// sending us a big snapshot must count as alive rather than ageing out mid-transfer.
 		const now = Date.now();
 		this.lastFrame.set(ev.pubkey, now);
 		if (!this.seen.has(ev.pubkey)) this.seen.set(ev.pubkey, { at: now }); // heard before its presence
+
+		let json: string;
+		const gc = ev.tags.find((t) => t[0] === CHUNK_TAG);
+		if (gc) {
+			// [CHUNK_TAG, msgId, index, total] — Number() of a missing/garbage field yields NaN, which
+			// the reassembler rejects, so a malformed header can never allocate.
+			const done = this.reasm.accept(ev.pubkey, gc[1] ?? "", Number(gc[2]), Number(gc[3]), ev.content, now);
+			if (done === null) return; // still waiting on siblings (or the chunk was rejected)
+			json = done;
+		} else {
+			json = ev.content;
+		}
+
+		let msg: SyncMessage;
+		try {
+			msg = JSON.parse(json) as SyncMessage;
+		} catch {
+			return; // malformed frame — drop it, the stream is stateless so nothing to resync
+		}
 		const conn = this.activate(ev.pubkey);
 		conn?.deliver(msg);
 	}
@@ -351,28 +378,50 @@ export class NostrTransport {
 	publishDirect(toPubkey: string, msg: SyncMessage): void {
 		if (this.destroyed) return;
 		const content = JSON.stringify(msg);
-		// Size is checked BEFORE connectivity on purpose: an oversized frame is a property of the
-		// MESSAGE, not of the pool, so it must be reported even when no relay is attached yet.
-		// LOUD by design — a silently-dropped bulk frame is the exact failure that killed the two
-		// previous transports; N2's chunker removes this path entirely.
-		if (content.length > MAX_CONTENT) {
-			this.report("log", `frame too large for a relay (${msg.t}, ${(content.length / 1024).toFixed(0)} KB > ${MAX_CONTENT / 1024} KB) — needs chunking (N2)`);
+
+		// Sizing is decided BEFORE connectivity on purpose: whether a frame is deliverable is a
+		// property of the MESSAGE, so a message we can never send must be reported even when no relay
+		// is attached yet — never swallowed.
+		let parts: string[] | null;
+		try {
+			parts = splitPayload(content, MAX_CONTENT);
+		} catch (e) {
+			this.report("log", `cannot send ${msg.t}: ${(e as Error).message}`);
 			return;
 		}
 		if (!this.pool) return;
-		this.publish(
-			finalizeEvent(
-				{
-					kind: KIND_DIRECT,
-					created_at: Math.floor(Date.now() / 1000),
-					tags: [
-						["p", toPubkey],
-						["d", this.network],
-					],
-					content,
-				},
-				this.sk,
-			),
+
+		if (!parts) {
+			this.publish(this.buildDirect(toPubkey, content)); // fits in one frame — the common path
+			return;
+		}
+		// Bulk frame (snapshot / anchor-chain): split across events, paced so a long run doesn't
+		// hammer every relay at once. The receiver rebuilds it byte-exactly (./chunk.ts).
+		const id = this.idPrefix + ++this.msgSeq;
+		const total = parts.length;
+		parts.forEach((part, i) => {
+			const ev = this.buildDirect(toPubkey, part, [[CHUNK_TAG, id, String(i), String(total)]]);
+			if (i === 0) {
+				this.publish(ev);
+				return;
+			}
+			const t = setTimeout(() => {
+				if (!this.destroyed) this.publish(ev);
+			}, i * CHUNK_STAGGER_MS);
+			if (typeof t.unref === "function") t.unref(); // a pending chunk must not hold the process open
+		});
+	}
+
+	/** One p-tagged direct event (plus any transport tags, e.g. the chunk header). */
+	private buildDirect(toPubkey: string, content: string, extraTags: string[][] = []): NostrEvent {
+		return finalizeEvent(
+			{
+				kind: KIND_DIRECT,
+				created_at: Math.floor(Date.now() / 1000),
+				tags: [["p", toPubkey], ["d", this.network], ...extraTags],
+				content,
+			},
+			this.sk,
 		);
 	}
 
