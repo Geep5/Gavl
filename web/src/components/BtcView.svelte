@@ -374,7 +374,7 @@
 						</div>
 						{#if nodeAddr}
 							<div>
-								<div class="id-l">NODE ADDRESS (I2P B32)</div>
+								<div class="id-l">NODE ADDRESS (NOSTR PUBKEY)</div>
 								<div class="id-row"><span class="id-t">{short(nodeAddr)}</span><button class="cpbtn" title="copy" onclick={copy("addr", nodeAddr)}>{cpLbl("addr")}</button></div>
 							</div>
 						{/if}
