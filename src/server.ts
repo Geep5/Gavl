@@ -17,7 +17,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
-import { createServer as netServer, connect as netConnect } from "node:net";
+import { createServer as netServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
@@ -70,31 +70,8 @@ const NETWORK = process.env.GAVL_NETWORK ?? defaultMarketChannel();
 const MESH = process.env.GAVL_MESH !== "0";
 const FARM = process.env.GAVL_FARM !== "0";
 
-// DIAGNOSTIC (2): Gavl networks ONLY over I2P (a local router's SAM bridge). Fail FAST + LOUD if
-// the SAM port doesn't answer, instead of silently degrading to a mesh-less "local" node — the
-// exact "why won't it connect" trap. Skipped only when the mesh is intentionally off.
-if (MESH) {
-	const samHost = process.env.GAVL_SAM_HOST ?? "127.0.0.1";
-	const samPort = Number(process.env.GAVL_SAM_PORT ?? 7656);
-	const reachable = await new Promise<boolean>((resolve) => {
-		const s = netConnect({ host: samHost, port: samPort });
-		const done = (ok: boolean) => {
-			s.destroy();
-			resolve(ok);
-		};
-		s.once("connect", () => done(true));
-		s.once("error", () => done(false));
-		setTimeout(() => done(false), 4000).unref?.();
-	});
-	if (!reachable) {
-		console.error(`\n✗ I2P networking needs a local router with SAM enabled, but ${samHost}:${samPort} doesn't answer.`);
-		console.error("  Install + start one:   brew install i2pd && brew services start i2pd   (macOS)");
-		console.error("                         apt install i2pd && systemctl start i2pd        (Linux)");
-		console.error("  Elsewhere?             GAVL_SAM_HOST / GAVL_SAM_PORT");
-		console.error("  Intentional local node: GAVL_MESH=0 npm run dev\n");
-		process.exit(1);
-	}
-}
+// Networking is Nostr over public relays: outbound WSS only, so there is no local port to probe and
+// nothing to install. The daemon fails LOUD (and exits) if it can't reach any relay — see joinMesh.
 
 // Threshold custody — there is ONLY one mode: an M-of-N committee. A DKG at genesis, reshare each
 // epoch, and NO node ever holds the key. A node won't custody until ≥minCommittee farmers form the
@@ -537,7 +514,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		}
 		// ── peer control ──
 		if (path === "/api/peers/dial") {
-			// Pin + dial a peer by its i2p b32 address (or full destination); re-dialed every boot (eclipse resistance).
+			// Pin a peer by its nostr pubkey (hex); re-pinned every boot (eclipse resistance).
 			daemon.dialPeer(String(body.key ?? ""), body.pin !== false);
 			return send(res, 200, { pinned: daemon.pinnedPeers() });
 		}

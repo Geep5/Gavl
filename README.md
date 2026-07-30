@@ -5,7 +5,7 @@
 # Gavl
 
 A decentralized **1-click Bitcoin bull/bear market** on a **Proof-of-Space-Time cooldown
-ledger**, networked over [I2P](https://geti2p.net) (garlic-routed streams; node IPs stay hidden).
+ledger**, networked over [Nostr](https://nostr.com) (public relays; nothing to install, nothing to host).
 
 Pick **UP** or **DOWN** on Bitcoin for the next 15-minute round — parimutuel rounds priced by the
 Pyth-signed BTC feed. Winners split the losing pool pro-rata — **all of it**: pure parimutuel, no
@@ -141,21 +141,28 @@ serving committed *state* rather than history. Everything that lives in RAM is b
 it costs something to create and it decays or expires — so a node's footprint is bounded by the real
 economy, not by spam. (`docs/` has the detail: weak-subjectivity, durability, scaling.)
 
-### Networking — I2P (`src/sync/`)
+### Networking — Nostr (`src/sync/`)
 
-Gossip rides [I2P](https://geti2p.net): every peer link is a **garlic-routed stream** through a
-local I2P router, spoken **natively from the daemon** via the router's SAM v3 bridge — no sidecar
-process, no hub, and node IPs are hidden from each other and from observers (which raises the
-capture cost of the custody committee). A Gavl sync frame is one JSON line on the stream; bulk
-transfers (anchor-chain pulls, checkpoint snapshots) are just bytes on a reliable stream.
+Gossip rides [Nostr](https://nostr.com): peers exchange **signed ephemeral events through public
+relays**, spoken natively from the daemon over plain WebSockets — no sidecar process, no local
+router, no hub to host, and **no inbound port**, so a node behind any NAT or firewall just works.
+Relays are **untrusted and disposable**: they can withhold or censor, never forge, because every
+write carries its own Ed25519 signature + PoST proof and every anchor is verified locally. We
+publish to *all* configured relays and treat each as unreliable — measured reality is that some
+refuse connections, some gate writes behind a web-of-trust, and some accept a publish and never
+forward it. Overlapping on **one** working relay is enough for two nodes to talk.
 
-Discovery is **seeds + peer exchange**: dial one known peer (`GAVL_I2P_PEERS`, or the UI's dial
-box) and the mesh gossips the rest transitively. Every stream handshake carries a **signed
-producer↔address binding**, so any node can address a consensus-roster member directly. The mesh
-is **bounded** (`GAVL_MAX_PEERS`, default 16) so per-node space stays manageable at any network
-size; committee members are linked directly via their bindings. A node's stable address is its
-**b32** (printed at boot and shown in the UI's Network panel — share it once with a peer and
-you're meshed).
+Discovery is a **relay query**, so there are no seeds and no peer-exchange to bootstrap: every node
+publishes a replaceable **presence** event on the channel, so "who is on this network" is a single
+subscription. That presence carries a **signed producer↔address binding**, so any node can address
+a consensus-roster member directly. The mesh is **bounded** (`GAVL_MAX_PEERS`, default 16);
+committee members are pinned via their bindings. A node's stable address is its **Nostr pubkey**
+(printed at boot and shown in the UI's Network panel).
+
+Bulk frames (anchor-chain pulls, checkpoint snapshots) exceed what relays accept (~32 KB in
+practice, whatever NIP-11 advertises), so they are **chunked** across events and reassembled
+byte-exactly — base64 so a multi-byte character can never be split, with a bounded, TTL'd
+reassembly buffer that a hostile peer can't grow (`src/sync/chunk.ts`).
 
 Sync is epidemic: nodes compare a `stateRoot`, diff-pull what's missing, and re-advertise when they
 learn something. Offline catch-up is the **checkpoint bootstrap** (a rejoining node adopts the
@@ -165,28 +172,24 @@ network's finalized checkpoint and pulls committed state, never a message backlo
 
 ## Run
 
-Needs **Node ≥ 23.6** (native TypeScript — no build step), **Python ≥ 3.9** (real PoST only), and a
-local **I2P router with SAM** (i2pd is lightest). Works on macOS, Linux, Windows.
+Needs **Node ≥ 23.6** (native TypeScript — no build step) and **Python ≥ 3.9** (real PoST only).
+Works on macOS, Linux, Windows. **Nothing to install for networking** — no router, no relay of your
+own, no ports to open.
 
 ```bash
 npm install              # once
-brew install i2pd && brew services start i2pd    # once — the I2P router (SAM is on by default)
-                                                 #   Linux: apt install i2pd && systemctl start i2pd
 npm run setup:chia       # once — venv + chiavdf/chiapos (prebuilt wheels; no C++ toolchain)
 npm run dev              # real-PoST daemon + web UI, then open http://localhost:5180
 ```
 
-`npm run dev` runs **real Proof-of-Space-Time** (chiavdf + chiapos) over **I2P**, plus price relay
+`npm run dev` runs **real Proof-of-Space-Time** (chiavdf + chiapos) over **Nostr**, plus price relay
 and the web UI. No Python for the proofs? `npm run dev:hash` swaps in the fast stand-ins
-(`GAVL_VDF=hash GAVL_SPACE=standin`) — it still networks over I2P, so it still needs the router.
+(`GAVL_VDF=hash GAVL_SPACE=standin`).
 
-A fresh router **reseeds** into the I2P network on first start — give it a couple of minutes
-before the first `npm run dev`. The daemon fails fast and loud if the SAM port (default
-`127.0.0.1:7656`; `GAVL_SAM_HOST`/`GAVL_SAM_PORT`) doesn't answer.
+Peers find each other automatically through the shipped default relays; point at your own with
+`GAVL_RELAYS=wss://a,wss://b`. The daemon fails fast and loud if it can't reach any relay.
 
-> **Windows / browser:** open `http://localhost:5180` (the UI binds IPv6), not `127.0.0.1`.
-
-### Multi-node (the committee)
+## Multi-node (the committee)
 
 Custody needs **≥3 nodes actually FARMING** (a merely-connected node doesn't count). On every machine:
 
@@ -195,11 +198,11 @@ npm install && npm run setup:chia
 npm run dev          # all nodes must use the SAME backend (all real-PoST or all dev:hash, never mixed)
 ```
 
-Leave `GAVL_NETWORK` unset so all nodes share the default `BTC-USD` channel. **Mesh them once**:
-each node prints its i2p **b32 address** at boot (also in the UI's Network panel) — on one node,
-dial any other via the UI's dial box or `GAVL_I2P_PEERS=<b32>`, and peer exchange gossips the rest
-(dialed peers are pinned + re-dialed every boot). To run more than one node on one machine, give
-each its own `GAVL_DATA_DIR` **and** `GAVL_PORT` (they share the one local router). Watch the
+Leave `GAVL_NETWORK` unset so all nodes share the default `BTC-USD` channel. **They mesh
+themselves** — each node announces its presence on the channel and discovers the others through the
+relays, so there is nothing to dial (a node's Nostr pubkey is printed at boot and shown in the UI's
+Network panel if you want to pin one explicitly). To run more than one node on one machine, give
+each its own `GAVL_DATA_DIR` **and** `GAVL_PORT`. Watch the
 daemon log for `checkpoint: height N … K writer(s)` — `K` is how many nodes are *producing anchors*
 and must reach your node count; when ≥3 produce, the genesis DKG runs and the Custody panel flips
 to "M-of-N committee."
@@ -213,9 +216,9 @@ curl -s localhost:6440/api/state | jq '.consensus | {farming, vdf, space, tip, p
 Want `farming: true`, `vdf: "chiavdf-wesolowski-1024"` + `space: "chiapos"` (real PoST; stand-ins show
 `hash-vdf-v0` / `standin`), `tip` climbing, and `peers` ≥ 2.
 
-There is no hub and no rendezvous server to run: each node's router participates in the global I2P
-network, and Gavl peers find each other via the seed you dial plus peer exchange. The only
-"infrastructure" is one locally-running i2pd per machine.
+There is no hub, no rendezvous server, and no relay of your own to run: nodes meet on public
+relays that already exist. Relays are a **default, not an authority** — swap them freely with
+`GAVL_RELAYS`, and two nodes only need one relay in common. The infrastructure is *nothing*.
 
 ### Other scripts & env
 
@@ -230,9 +233,8 @@ Key env vars: `GAVL_VDF=chia|hash` · `GAVL_SPACE=chiapos|standin`
 · `GAVL_K=<n>` (plot size; default 18 for chiapos) · `GAVL_MAX_PEERS=<n>` (bounded mesh; default 16) ·
 `GAVL_PERSIST=all|mine|off` · `GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_DATA_DIR` / `GAVL_PORT`
 (isolate a node) · `GAVL_NETWORK=<channel>` (`label::pyth::feedId` is a market; a plain name is
-transfers-only) · `GAVL_I2P_PEERS=<b32,b32,…>` (seed peers to dial at boot) · `GAVL_SAM_HOST` /
-`GAVL_SAM_PORT` (the local router's SAM bridge; default `127.0.0.1:7656`) ·
-`GAVL_PEX_INTERVAL=<seconds>` (peer-exchange/redial cadence; default 15). Real PoST needs the `setup:chia` venv; choosing `GAVL_VDF=chia` without it throws
+transfers-only) · `GAVL_RELAYS=<wss://…,wss://…>` (override the default relay set) ·
+`GAVL_ANNOUNCE_INTERVAL=<seconds>` (presence refresh cadence; default 30). Real PoST needs the `setup:chia` venv; choosing `GAVL_VDF=chia` without it throws
 (never a silent downgrade). Moving a *live* channel from stand-ins to real PoST is a coordinated
 upgrade — see [`docs/real-post-cutover.md`](docs/real-post-cutover.md).
 
@@ -246,7 +248,7 @@ src/
   pot/  pos/     proof of time (chiavdf) · proof of space (chiapos) + stand-ins
   ledger/        multi-writer RAM ledger + stateRoot
   consensus/     anchor chain, fork choice, finality, difficulty, canonical order
-  sync/          I2P (SAM v3) transport · gossip · bounded mesh · signed producer↔address bindings
+  sync/          Nostr transport · chunked bulk frames · gossip · signed producer↔address bindings
   store/         durable write store (node:sqlite) + state snapshots/checkpoints + selective persist policy
   market/        Gavl Rounds (parimutuel bull/bear), btc fold, account, Pyth/signed price feeds
   custody/       real-BTC bridge: FROST threshold · DKG · Taproot · deposits · tx · watcher · reshare

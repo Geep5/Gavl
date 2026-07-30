@@ -7,9 +7,8 @@
  * and re-dialing them directly (`transport.dialPeer`) every boot, independent of
  * announce-based discovery, is the standard mitigation. This file persists that set.
  *
- * A peer is identified by its I2P b32 address (SHA-256 of its destination → 52-char base32,
- * the same string i2pd resolves as <b32>.b32.i2p). Stored at ~/.gavl/known-peers.json as a
- * flat array. Per-node (not per-channel).
+ * A peer is identified by its Nostr public key (64-char hex) — the same identity its events
+ * are signed with. Stored at ~/.gavl/known-peers.json as a flat array. Per-node (not per-channel).
  */
 
 import { homedir } from "node:os";
@@ -26,7 +25,7 @@ export class KnownPeers {
 		if (existsSync(this.path)) {
 			try {
 				const arr = JSON.parse(readFileSync(this.path, "utf8"));
-				if (Array.isArray(arr)) this.keys = arr.filter((k) => typeof k === "string" && /^[a-z2-7]{52}$/.test(k));
+				if (Array.isArray(arr)) this.keys = arr.filter((k) => typeof k === "string" && /^[0-9a-f]{64}$/.test(k));
 			} catch {
 				/* corrupt file → start empty */
 			}
@@ -40,7 +39,7 @@ export class KnownPeers {
 	/** Add a pinned peer (idempotent). Returns true if newly added. */
 	add(nodeKeyHex: string): boolean {
 		const clean = nodeKeyHex.trim().toLowerCase();
-		if (!/^[a-z2-7]{52}$/.test(clean)) throw new Error("peer address must be a 52-char i2p b32 address");
+		if (!/^[0-9a-f]{64}$/.test(clean)) throw new Error("peer address must be a 64-char hex nostr pubkey");
 		if (this.keys.includes(clean)) return false;
 		this.keys.push(clean);
 		this.save();

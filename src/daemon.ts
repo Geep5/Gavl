@@ -6,7 +6,7 @@
  * single monotonic clock (so op timestamps are causally ordered).
  *
  * With consensus wired (the default), the node also carries an AnchorChain, the
- * daemon joins the live I2P mesh (gossiping writes AND anchors over garlic-routed streams),
+ * daemon joins the live Nostr mesh (gossiping writes AND anchors over public relays),
  * and runs a Producer that farms anchors over the heaviest tip. The UI can then
  * watch the real consensus advance: tip height/weight climbing, finality
  * deepening, the custody committee forming.
@@ -69,9 +69,8 @@ import { StandinSpaceProver, StandinSpaceVerifier } from "./consensus/space.ts";
 import type { SpaceVerifier, SpaceProver } from "./consensus/space.ts";
 import { ChiaSpaceProver, ChiaSpaceVerifier, ensurePlot } from "./pos/chia.ts";
 import { Plot } from "./pos/space.ts";
-import { I2PTransport, destToB32 } from "./sync/i2p.ts";
+import { NostrTransport } from "./sync/nostr.ts";
 import { KnownPeers } from "./sync/known-peers.ts";
-import { bootstrapSeeds } from "./sync/seeds.ts";
 import { generateKeyPair, keyPairFromSeed, sign } from "./det/ed25519.ts";
 import type { KeyPair } from "./det/ed25519.ts";
 import { toHex, fromHex, sha256 } from "./det/canonical.ts";
@@ -188,18 +187,18 @@ export interface ConsensusStatus {
 	secPerAnchor: number;
 	/** True if secPerAnchor is a live measurement; false if it's the target fallback (cold/idle). */
 	secPerAnchorMeasured: boolean;
-	/** Wire carrier: "i2p" (SAM streams) | null (mesh off). */
+	/** Wire carrier: "nostr" (public relays) | null (mesh off). */
 	transport: string | null;
 	/** Bounded-mesh diagnostics: connection cap, resolved producer↔address bindings, and committee
 	 *  members directly linked. */
 	maxPeers?: number;
 	bindings?: number;
 	committeeLinked?: number;
-	/** This node's i2p b32 address. Null if mesh off. */
+	/** This node's nostr pubkey (hex). Null if mesh off. */
 	nodeKey: string | null;
-	/** b32 addresses of currently-connected peers. */
+	/** nostr pubkeys of currently-connected peers. */
 	peerKeys: string[];
-	/** b32 addresses pinned for re-dial on every boot (eclipse resistance). */
+	/** nostr pubkeys pinned for re-dial on every boot (eclipse resistance). */
 	pinnedPeers: string[];
 }
 
@@ -256,7 +255,7 @@ export class Daemon {
 	private readonly accounts = new Map<string, Account>();
 	private clock = 0;
 
-	private transport?: I2PTransport;
+	private transport?: NostrTransport;
 	private producer?: Producer;
 	private network: string;
 	private farming = false;
@@ -906,7 +905,7 @@ export class Daemon {
 			myAnchors: recent.reduce((n, a) => n + (a.producer === myId ? 1 : 0), 0),
 			secPerAnchor: measured ?? this.targetSecPerAnchor,
 			secPerAnchorMeasured: measured != null,
-			transport: this.transport ? "i2p" : null,
+			transport: this.transport ? "nostr" : null,
 			nodeKey: this.transport ? this.transport.nodeKeyHex : null,
 			peerKeys: this.transport ? this.transport.connectedPeerKeys() : [],
 			pinnedPeers: this.knownPeers.list(),
@@ -919,21 +918,19 @@ export class Daemon {
 	 *  Resilient to a slow/absent DHT (soft 8s cap) — falls back to local if it fails. */
 	private async joinMesh(): Promise<void> {
 		try {
-			// Gossip rides I2P: garlic-routed streams via a local router's SAM bridge (no sidecar, no
-			// hub). Discovery is seeds + PEX; signed producer↔address bindings ride the stream handshake.
-			// Seeds = the shipped bootstrap "phone book" (src/sync/seeds.ts) + GAVL_I2P_PEERS — untrusted
-			// cold-start introducers only; a fresh clone auto-dials them and PEX takes over after the
-			// first hello (self-address is skipped in dialPeer, so a node listing itself is a no-op).
-			this.transport = new I2PTransport(this.node, {
+			// Gossip rides NOSTR: ephemeral events over public relays. No local daemon, no sidecar, no
+			// NAT concerns — the node only makes OUTBOUND connections. Discovery is a relay query
+			// (presence events), so there are no seeds and no PEX; relays are untrusted, plural and
+			// individually unreliable, so we publish to all of them and treat each as disposable.
+			this.transport = new NostrTransport(this.node, {
 				network: this.network,
-				storageDir: join(this.dataDir, "i2p"),
-				seeds: bootstrapSeeds(),
+				storageDir: join(this.dataDir, "nostr"),
 				maxPeers: process.env.GAVL_MAX_PEERS ? Number(process.env.GAVL_MAX_PEERS) : undefined,
 				onEvent: (kind, text) => this.recordNetEvent(kind, text), // surface peer/binding/committee steps to the UI feed
 				// sign producer↔address binding so peers can address us by our consensus key
 				bindingSigner: (msg) => ({ producer: this.producerId(), sig: toHex(sign(this.producerKey().privateKey, msg)) }),
 			});
-			await this.transport.join(this.network); // resolves once the SAM session is live (address known)
+			await this.transport.join(this.network); // resolves once our identity + subscriptions are live
 			// Re-dial pinned peers directly (independent of PEX discovery) — eclipse resistance.
 			for (const key of this.knownPeers.list()) {
 				try {
@@ -943,13 +940,10 @@ export class Daemon {
 				}
 			}
 		} catch (e) {
-			// Gavl networks ONLY over I2P — never silently degrade to a mesh-less "local" node.
-			console.error(`\n✗ I2P mesh failed to start: ${(e as Error).message}`);
-			console.error("  Gavl needs a local I2P router with SAM enabled (default 127.0.0.1:7656).");
-			console.error("  Install + start one:   brew install i2pd && brew services start i2pd   (macOS)");
-			console.error("                         apt install i2pd && systemctl start i2pd        (Linux)");
-			console.error("  Point elsewhere with GAVL_SAM_HOST / GAVL_SAM_PORT, or run an intentional");
-			console.error("  local-only node with GAVL_MESH=0.\n");
+			// Gavl networks ONLY over Nostr — never silently degrade to a mesh-less "local" node.
+			console.error(`\n✗ Nostr mesh failed to start: ${(e as Error).message}`);
+			console.error("  Gavl needs to reach at least one public Nostr relay (outbound WSS).");
+			console.error("  Check connectivity, or pick your own relays with GAVL_RELAYS=wss://a,wss://b");
 			process.exit(1);
 		}
 	}
@@ -1013,7 +1007,7 @@ export class Daemon {
 			const deadline = started + graceMs;
 			while (Date.now() < deadline && !anchors.tip()) {
 				// Wait while a checkpoint could still land: one is being pulled (pendingSnapshot), or we're
-				// still inside the discovery window. Discovery spans the whole grace period — over I2P the
+				// still inside the discovery window. Discovery spans the whole grace period — the
 				// first anchor-tip (which triggers a fresh node's snapshot-want) can take tens of seconds
 				// to arrive (tunnel build + leaseset lookup), so bailing at a few seconds guarantees a genesis restart that islands the node.
 				const checkpointInflight = this.pendingSnapshot != null;
@@ -1564,7 +1558,7 @@ export class Daemon {
 	 * all committee members are connected. `selfId` must be this node's committee id.
 	 *
 	 * NOTE: the ceremony is proven over the in-memory transport (which mimics the
-	 * wire); running it across real I2P daemons is a live-deployment step. This
+	 * wire); running it across real networked daemons is a live-deployment step. This
 	 * wires the proven coordinator onto `this.node`'s real connections.
 	 */
 	async runCommitteeDkg(opts: { session: string; selfId: string; participants: string[]; min: number }): Promise<string> {
@@ -1857,11 +1851,10 @@ export class Daemon {
 
 	// ── peer control ─────────────────────────────────────────────────
 
-	/** Dial a peer by b32 address or full i2p destination now; if `pin`, also persist it (as its
-	 *  stable b32) for re-dial on every boot. */
+	/** Pin a peer by its nostr pubkey (hex); if `pin`, also persist it for re-dial on every boot. */
 	dialPeer(peerAddr: string, pin = true): void {
-		const addr = peerAddr.trim();
-		if (pin) this.knownPeers.add(addr.length > 100 ? destToB32(addr) : addr);
+		const addr = peerAddr.trim().toLowerCase();
+		if (pin) this.knownPeers.add(addr);
 		this.transport?.dialPeer(addr); // no-op if mesh is off; the pin still applies next boot
 	}
 
