@@ -1,6 +1,6 @@
 /**
- * Slashing fraud proofs (gate #3) — turn ceremony equivocation into a self-contained,
- * permissionlessly-verifiable proof that burns the culprit's bond.
+ * Fault proofs — turn ceremony equivocation into a self-contained, permissionlessly-
+ * verifiable proof that EXCLUDES the culprit from every future custody committee.
  *
  * In an honest ceremony a member emits exactly ONE message per slot — one DKG round-1
  * commitment, one signing nonce-commitment, one reshare verifying-share. Emitting TWO

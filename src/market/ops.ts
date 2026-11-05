@@ -30,16 +30,11 @@ export type Op =
 	/** Mark a withdrawal's BTC payout confirmed (reserves drop). Attestor key (seed) OR
 	 *  a committee threshold signature over the settle digest (committee mode, `sig`). */
 	| { kind: "bridge.settle"; withdrawalId: string; sig?: string }
-	/** Lock gBTC as a custody-committee BOND — your committee selection WEIGHT, and
-	 *  SLASHABLE on a proven fault. Bonded gBTC is locked (unspendable) but still backed. */
-	| { kind: "custody.bond"; amount: string }
-	/** Begin releasing bonded gBTC (matures after a delay; still slashable meanwhile). */
-	| { kind: "custody.unbond"; amount: string }
-	/** Slash a committee member's bond with a fraud proof: two conflicting ceremony
-	 *  messages (`a`, `b`) it signed for the same slot. Permissionless — the fold verifies
-	 *  the proof and awards the bond to the submitter. No authority needed; a forged proof
+	/** Record a committee FAULT with a proof: two conflicting ceremony messages (`a`, `b`) the
+	 *  culprit signed for the same slot. Permissionless — the fold verifies the proof and
+	 *  excludes the culprit from every later committee. No authority needed; a forged proof
 	 *  does nothing. */
-	| { kind: "custody.slash"; a: unknown; b: unknown }
+	| { kind: "custody.fault"; a: unknown; b: unknown }
 	/** Announce the threshold-custody fund's group key on-chain, established by the
 	 *  epoch-0 genesis DKG. FIRST write wins and is IMMUTABLE — so every node + client
 	 *  learns the one permanent fund address, and rotations never change it. (v1 trusts
@@ -47,7 +42,7 @@ export type Op =
 	 *  alongside gate #4 non-public keys.) */
 	| { kind: "custody.fund"; groupKey: string; epoch: number };
 
-const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "custody.fund", "custody.bond", "custody.unbond", "custody.slash"]);
+const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "custody.fund", "custody.fault"]);
 
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);

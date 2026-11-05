@@ -1,6 +1,7 @@
 /**
- * Custody epoch derivation (gate #2) — the committee + beacon are a deterministic
- * function of the finalized anchor chain, so every node agrees with no coordination.
+ * Custody epoch derivation — the committee + beacon are a deterministic function of the
+ * finalized anchor chain, so every node agrees with no coordination. The committee is
+ * min(eligible, K_MAX), eligibility is a recent window, and proven faults are excluded.
  *
  *   node --test test/custody-epoch.test.ts
  */
@@ -8,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { committeeForEpoch, committeeEpochsFor, epochOf, epochBoundary, thresholdFor } from "../src/custody/epoch.ts";
+import { committeeForEpoch, committeeEpochsFor, epochOf, epochBoundary, thresholdFor, eligibilityWindow, DEFAULT_COMMITTEE_MAX } from "../src/custody/epoch.ts";
 import type { AnchorView } from "../src/custody/epoch.ts";
 import { committeeTopic } from "../src/custody/committee.ts";
 
@@ -78,13 +79,41 @@ test("membership is weighted by anchors produced (space-time), and only eligible
 	assert.ok(p0.weight > p1.weight, "p0 weighted higher (produced far more)");
 });
 
-test("the lookback window ages out long-departed producers", () => {
+test("the lookback window ages out long-departed producers (default: two epochs)", () => {
 	// "old" produces only the first 8 anchors; "new" produces the rest.
 	const c = chain(40, (h) => (h < 8 ? "old" : "new"));
-	const windowed = committeeForEpoch(c, 4, { epochLength: 8, size: 4, windowAnchors: 16 })!; // boundary 32, window [16,32)
-	assert.ok(!windowed.members.some((m) => m.id === "old"), "old farmer aged out of the window");
-	const unbounded = committeeForEpoch(c, 4, { epochLength: 8, size: 4 })!;
-	assert.ok(unbounded.members.some((m) => m.id === "old"), "without a window, old still counts");
+	assert.equal(eligibilityWindow({ epochLength: 8 }), 16, "default window = 2 × epochLength");
+	const dflt = committeeForEpoch(c, 4, { epochLength: 8, size: 4 })!; // boundary 32, default window [16,32)
+	assert.ok(!dflt.members.some((m) => m.id === "old"), "old farmer aged out of the default window");
+	const wide = committeeForEpoch(c, 4, { epochLength: 8, size: 4, windowAnchors: 32 })!; // window [0,32)
+	assert.ok(wide.members.some((m) => m.id === "old"), "a wider explicit window still counts old");
+});
+
+test("the committee grows with the network: min(eligible producers, K_MAX)", () => {
+	assert.equal(DEFAULT_COMMITTEE_MAX, 31);
+	// 10 producers → the whole eligible set is seated (below the cap).
+	const small = committeeForEpoch(chain(24, (h) => "p" + (h % 10)), 2, { epochLength: 8, size: DEFAULT_COMMITTEE_MAX })!;
+	assert.equal(small.committee.length, 10, "every eligible producer seated while below K_MAX");
+	assert.equal(small.min, thresholdFor(10));
+	// 60 producers in the window → capped at K_MAX, threshold 2/3 of that.
+	const big = committeeForEpoch(chain(130, (h) => "p" + (h % 60)), 2, { epochLength: 60, size: DEFAULT_COMMITTEE_MAX })!;
+	assert.equal(big.members.length, 60, "all 60 recent producers are eligible");
+	assert.equal(big.committee.length, DEFAULT_COMMITTEE_MAX, "seats capped at K_MAX");
+	assert.equal(big.min, thresholdFor(DEFAULT_COMMITTEE_MAX));
+	assert.equal(new Set(big.committee).size, DEFAULT_COMMITTEE_MAX, "no member takes two seats");
+});
+
+test("a faulted producer is excluded from epochs whose boundary is past the fault height", () => {
+	const c = chain(40, (h) => "p" + (h % 5));
+	const opts = { epochLength: 8, size: 5 };
+	const excluded = new Map([["p2", 20]]); // fault recorded at height 20 (inside epoch 2)
+	const e2 = committeeForEpoch(c, 2, { ...opts, excluded })!; // boundary 16 ≤ 20 → already derived, unchanged
+	assert.ok(e2.members.some((m) => m.id === "p2"), "an epoch whose boundary precedes the fault is unchanged");
+	assert.deepEqual(e2.committee, committeeForEpoch(c, 2, opts)!.committee, "earlier epochs never shift after the fact");
+	const e3 = committeeForEpoch(c, 3, { ...opts, excluded })!; // boundary 24 > 20 → excluded
+	assert.ok(!e3.members.some((m) => m.id === "p2"), "the faulted producer is not eligible next epoch");
+	assert.ok(!e3.committee.includes("p2"));
+	assert.equal(e3.committee.length, 4, "the rest are still seated");
 });
 
 test("committeeEpochsFor reports exactly the epochs a node is on the committee for", () => {
@@ -104,58 +133,3 @@ test("committeeTopic is deterministic and distinct per network/epoch", () => {
 	assert.notEqual(committeeTopic("gavl", 7), committeeTopic("other", 7), "different network → different topic");
 });
 
-test("minBond (gate #4): producers bonded below the per-seat floor are ineligible", () => {
-	// 4 producers all farm equally (so all are liveness-eligible); they differ only by bond.
-	const c = chain(24, (h) => "p" + (h % 4)); // p0..p3 each produce anchors below boundary 16
-	const bonds = new Map<string, bigint>([
-		["p0", 1000n], // above floor
-		["p1", 500n], // exactly the floor
-		["p2", 499n], // dust — below floor
-		["p3", 0n], // unbonded (already excluded by weight > 0)
-	]);
-	const floored = committeeForEpoch(c, 2, { epochLength: 8, size: 4, bonds, minBond: 500n })!;
-	const ids = floored.members.map((m) => m.id).sort();
-	assert.deepEqual(ids, ["p0", "p1"], "only producers bonded ≥ minBond are eligible");
-
-	// Without a floor, every bonded producer (weight > 0) is eligible — p2's dust counts.
-	const open = committeeForEpoch(c, 2, { epochLength: 8, size: 4, bonds })!;
-	assert.deepEqual(open.members.map((m) => m.id).sort(), ["p0", "p1", "p2"], "no floor → dust still eligible");
-
-	// The floor is denominated in gBTC, so it's a no-op under anchor-count weighting (no bonds).
-	const counted = committeeForEpoch(c, 2, { epochLength: 8, size: 4, minBond: 500n })!;
-	assert.equal(counted.members.length, 4, "minBond does not apply when selection is by anchor count");
-});
-
-test("maxGrowthPct (gate #2): a sudden bonded-stake influx is throttled, oldest-first", () => {
-	// h0,h1 farm from genesis (senior); attackers a0..a3 appear at heights 8..11 with huge bonds.
-	const av: AnchorView[] = [];
-	for (let h = 0; h < 8; h++) av.push({ height: h, producer: "h" + (h % 2), time: { output: "vdf-" + h } });
-	for (let h = 8; h < 12; h++) av.push({ height: h, producer: "a" + (h - 8), time: { output: "vdf-" + h } });
-	av.push({ height: 12, producer: "h0", time: { output: "vdf-12" } }); // epoch-3 boundary anchor (the beacon)
-
-	const bonds = new Map<string, bigint>([
-		["h0", 1000n],
-		["h1", 1000n], // honest baseline total = 2000
-		["a0", 100000n],
-		["a1", 100000n],
-		["a2", 100000n],
-		["a3", 100000n], // attacker flood, each dwarfs the baseline
-	]);
-	const base = { epochLength: 4, size: 10, bonds };
-
-	// Without the cap: the flood dominates — every attacker is fully eligible (catastrophe).
-	const open = committeeForEpoch(av, 3, base)!; // boundary 12, window covers heights 0..11
-	const openW = new Map(open.members.map((m) => [m.id, m.weight] as const));
-	assert.equal(open.members.length, 6, "uncapped: all 6 producers eligible");
-	assert.equal(openW.get("a0"), 100000n, "uncapped: attacker holds its full bond");
-
-	// With a 5%/epoch cap: prior admitted total was 2000, so this epoch's ceiling is 2100.
-	const capped = committeeForEpoch(av, 3, { ...base, maxGrowthPct: 5 })!;
-	const cw = new Map(capped.members.map((m) => [m.id, m.weight] as const));
-	const total = capped.members.reduce((s, m) => s + m.weight, 0n);
-	assert.equal(total, 2100n, "total eligible weight capped at +5% (2000 → 2100)");
-	assert.equal(cw.get("h0"), 1000n, "senior incumbents keep full weight");
-	assert.equal(cw.get("h1"), 1000n, "senior incumbents keep full weight");
-	assert.equal(cw.get("a0"), 100n, "the oldest newcomer takes only the 100 of headroom left");
-	assert.ok(!cw.has("a1") && !cw.has("a2") && !cw.has("a3"), "the rest of the flood is shut out this epoch");
-});

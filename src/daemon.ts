@@ -44,14 +44,14 @@ import { assembleReshare } from "./custody/reshare-blob.ts";
 import { groupKeyOf } from "./custody/pvss.ts";
 import { schnorr_FROST as FROST } from "@noble/curves/secp256k1.js";
 import type { CeremonyAuth } from "./custody/ceremony-auth.ts";
-import { committeeEpochsFor, committeeForEpoch, epochOf } from "./custody/epoch.ts";
+import { committeeEpochsFor, committeeForEpoch, eligibilityWindow, epochOf, DEFAULT_COMMITTEE_MAX } from "./custody/epoch.ts";
 import type { AnchorView } from "./custody/epoch.ts";
 import { fid, quorumForRound } from "./custody/committee.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "./custody/attestation.ts";
 import { isCeremonyTimeout } from "./custody/ceremony.ts";
 import { Esplora } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, confirmations, MIN_CONFIRMATIONS, txPaysWithdrawal } from "./custody/watcher.ts";
-import { pendingClaims, inFlightWithdrawals, slashable } from "./custody/bridge.ts";
+import { pendingClaims, inFlightWithdrawals } from "./custody/bridge.ts";
 import type { PendingWithdrawal } from "./custody/bridge.ts";
 import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
@@ -125,7 +125,8 @@ export interface DaemonOptions {
 	custody?: {
 		/** Anchors per custody epoch (default 16). */
 		epochLength?: number;
-		/** Target committee size, clamped to eligible producers (default 5). */
+		/** Max committee size K_MAX: the committee is min(eligible producers, size), so it grows
+		 *  with the network up to this cap (default DEFAULT_COMMITTEE_MAX = 31). Consensus-critical. */
 		size?: number;
 		/** Genesis committee size — small so the n-of-n DKG completes; grown to `size` by the first
 		 *  reshare (default: minCommittee). */
@@ -134,23 +135,9 @@ export interface DaemonOptions {
 		minCommittee?: number;
 		/** Per-ceremony timeout in ms (default 30s). */
 		ceremonyTimeoutMs?: number;
-		/** Membership lookback in anchors (default: all). */
+		/** Membership lookback in anchors (default 2 × epochLength): only producers of recent
+		 *  finalized anchors are eligible, so long-gone farmers drop out. Consensus-critical. */
 		windowAnchors?: number;
-		/** Gate #3: stake-weight committee selection by bonded gBTC (only bonded producers
-		 *  are eligible). Off → weight by anchors produced (the pre-bonding model). */
-		bonded?: boolean;
-		/** Gate #4: per-seat minimum bond (gBTC sats). Producers bonded below this are ineligible,
-		 *  so a capital-rich attacker can't field many dust-bonded Sybil identities — each seat costs
-		 *  at least this much real, slashable stake. Consensus-critical: every node must share it.
-		 *  Only applies when `bonded` is on (default 0n → no floor). */
-		minBond?: bigint;
-		/** Gate #2: cap on how many percent the total eligible committee weight may grow per epoch.
-		 *  A sudden influx of freshly-bonded stake is admitted oldest-first up to this much above last
-		 *  epoch's total, so the committee can't be captured faster than the network can react (e.g. 5
-		 *  → ≤5%/epoch). Consensus-critical. Defaults to DEFAULT_MAX_GROWTH_PCT (5) when `bonded` is
-		 *  on; override with any positive value (a large one effectively uncaps). Ignored when
-		 *  `bonded` is off (the cap is only meaningful for stake weight). */
-		maxGrowthPct?: number;
 	};
 }
 
@@ -206,13 +193,6 @@ const CHECKPOINT_EVERY = Number(process.env.GAVL_CHECKPOINT_EVERY ?? "16");
  *  windows (the only backward walks that reach below the checkpoint); the daemon takes the
  *  max with those windows. Bounds the anchor chain to a constant suffix instead of forever. */
 const ANCHOR_KEEP_MARGIN = Number(process.env.GAVL_ANCHOR_MARGIN ?? "256");
-
-/** Default per-epoch committee-weight growth cap (gate #2) applied whenever stake-weighted custody
- *  (`bonded`) is on: the total eligible weight may rise ≤5%/epoch, so a sudden bonded-stake influx
- *  can't seize a threshold before the network reacts. Consensus-critical — both committee-derivation
- *  call sites must resolve to the SAME value, so they share this constant. Set `custody.maxGrowthPct`
- *  to override. */
-const DEFAULT_MAX_GROWTH_PCT = 5;
 
 export class Daemon {
 	readonly node: GavlNode;
@@ -422,17 +402,10 @@ export class Daemon {
 		const tip = anchors?.tip();
 		if (!anchors || !tip) return;
 		const chain = anchors.chainTo(tip) as AnchorView[];
-		const epochLength = this.custodyOpts.epochLength ?? 16;
-		const finEpoch = epochOf(anchors.finalized(this.finalityDepth)?.height ?? 0, epochLength);
-		const optEpoch = epochOf(tip.height, epochLength);
-		const opts = {
-			epochLength,
-			size: this.custodyOpts.size ?? 5,
-			windowAnchors: this.custodyOpts.windowAnchors,
-			bonds: this.custodyOpts.bonded ? this.finalView().bridge.bonds : undefined,
-			minBond: this.custodyOpts.minBond,
-			maxGrowthPct: this.custodyOpts.bonded ? (this.custodyOpts.maxGrowthPct ?? DEFAULT_MAX_GROWTH_PCT) : undefined, // gate #2: default-on under stake weighting
-		};
+		const params = this.committeeParams();
+		const finEpoch = epochOf(anchors.finalized(this.finalityDepth)?.height ?? 0, params.epochLength);
+		const optEpoch = epochOf(tip.height, params.epochLength);
+		const opts = { ...params, excluded: this.finalizedFaults() };
 		const mine = committeeEpochsFor(chain, this.producerId(), [finEpoch, optEpoch], { ...opts, minCommittee: this.custodyOpts.minCommittee ?? 3 });
 		// Connect to my co-committee members DIRECTLY via the producer↔address binding (no rendezvous;
 		// works on a bounded mesh). Resolve the rosters for the epochs I'm in and link them.
@@ -687,7 +660,7 @@ export class Daemon {
 		}
 		let r = this.appRootCache.get(prevId);
 		if (r === undefined) {
-			r = viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, prevId, this.checkpointBase));
+			r = viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, prevId, this.checkpointBase, this.faultLookback()));
 			this.appRootCache.set(prevId, r);
 		}
 		return r;
@@ -735,7 +708,7 @@ export class Daemon {
 		if (!ckpt || ckpt.height !== target) return; // the boundary anchor isn't reachable yet → wait
 		const heads = anchors.headsAt(ckpt.id);
 		if (Object.keys(heads).length === 0) return; // nothing certified yet
-		const view = viewAtAnchor(this.node.ledger.allWrites(), anchors, ckpt.id, this.checkpointBase); // state at the boundary
+		const view = viewAtAnchor(this.node.ledger.allWrites(), anchors, ckpt.id, this.checkpointBase, this.faultLookback()); // state at the boundary
 		this.lastCheckpointHeight = ckpt.height;
 		this.checkpointBase = view;
 		const snap: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(view) };
@@ -749,7 +722,7 @@ export class Daemon {
 		// suffix below the checkpoint that still covers the retarget + committee windows, so
 		// every backward walk (difficulty, finality, committee selection, heads) stays intact.
 		const anchorsBefore = anchors.size;
-		const margin = Math.max(ANCHOR_KEEP_MARGIN, this.schedule?.window ?? 0, this.custodyOpts.windowAnchors ?? 0);
+		const margin = Math.max(ANCHOR_KEEP_MARGIN, this.schedule?.window ?? 0, this.faultLookback()); // ≥ the eligibility window too
 		anchors.prune(ckpt.height - margin); // keep a margin below the CHECKPOINT (not the tip) so it stays serveable
 		this.viewCache = undefined;
 		this.finalCache = undefined;
@@ -766,7 +739,7 @@ export class Daemon {
 		if (!this.node.anchors) return this.checkpointBase ? computeView([], { base: this.checkpointBase }) : computeView([]);
 		const finId = this.node.anchors.finalized(this.finalityDepth)?.id ?? null;
 		if (this.finalCache && this.finalCache.id === finId) return this.finalCache.view;
-		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase);
+		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase, this.faultLookback());
 		this.finalCache = { id: finId, view };
 		return view;
 	}
@@ -788,8 +761,7 @@ export class Daemon {
 		committee: string[] | null;
 		threshold: number | null;
 		minCommittee: number;
-		bonded: boolean;
-		myBond: string;
+		committeeMax: number;
 		encKeysKnown: number;
 		lastReshare?: { epoch: number; ok: boolean; detail: string };
 	} {
@@ -806,22 +778,33 @@ export class Daemon {
 			committee: cs?.participants ?? null,
 			threshold: cs?.min ?? null,
 			minCommittee: this.custodyOpts.minCommittee ?? 3, // farmers needed to bootstrap genesis custody
-			bonded: !!this.custodyOpts.bonded, // stake-weighted selection on?
-			myBond: (this.view().bridge.bonds.get(id) ?? 0n).toString(),
+			committeeMax: this.committeeParams().size, // K_MAX: seats the committee grows to as producers join
 			encKeysKnown: this.encKeys.size(), // verified peer encryption keys (phase-1 announce liveness)
 			lastReshare: this.lastReshare, // latest per-epoch reshare outcome (for the UI indicator)
 		};
 	}
 
-	/** Lock `amount` gBTC at THIS node's committee identity as a bond (stake-weighted
-	 *  selection; slashable). The gBTC must already sit at producerId() — fund it with a
-	 *  gbtc.transfer first. Returns the bond write id. */
-	async bondCustody(amount: bigint): Promise<string> {
-		return (await this.custodyAccount().bond(amount)).id;
+	/** The consensus-critical committee-derivation shape (epoch length, K_MAX, eligibility window),
+	 *  resolved ONCE so every derivation site — the roster pre-connect and the rotation loop — uses
+	 *  identical values. Pair with finalizedFaults() for the exclusion set. */
+	private committeeParams(): { epochLength: number; size: number; windowAnchors: number } {
+		const epochLength = this.custodyOpts.epochLength ?? 16;
+		return { epochLength, size: this.custodyOpts.size ?? DEFAULT_COMMITTEE_MAX, windowAnchors: eligibilityWindow({ epochLength, windowAnchors: this.custodyOpts.windowAnchors }) };
 	}
-	/** Release `amount` of this node's bond back to spendable gBTC. */
-	async unbondCustody(amount: bigint): Promise<string> {
-		return (await this.custodyAccount().unbond(amount)).id;
+
+	/** How far back (anchors) a custody.fault's culprit must have produced for the fold to record it:
+	 *  the eligibility window plus the two epochs a member can still serve after its boundary (its own
+	 *  epoch + handing off as the old committee). Consensus-critical — every fold site passes this, and
+	 *  the anchor-pruning margin covers it so the lookup never reaches pruned anchors. */
+	private faultLookback(): number {
+		const { epochLength, windowAnchors } = this.committeeParams();
+		return windowAnchors + 2 * epochLength;
+	}
+
+	/** Proven committee faults (producer → fault height) from FINALIZED state — the same value at
+	 *  every derivation site, so all nodes exclude identically. */
+	private finalizedFaults(): ReadonlyMap<string, number> {
+		return this.finalView().custody.excluded;
 	}
 
 	consensus(): ConsensusStatus {
@@ -1193,15 +1176,11 @@ export class Daemon {
 		this.rotation = new CommitteeRotation({
 			node: this.node,
 			selfId: this.producerId(),
-			epochLength: this.custodyOpts.epochLength ?? 16,
-			size: this.custodyOpts.size ?? 5,
+			...this.committeeParams(), // epochLength, K_MAX size, eligibility window — shared with maintainCommittee
 			genesisSize: this.custodyOpts.genesisSize ?? this.custodyOpts.minCommittee ?? 3, // small n-of-n genesis, grown after
 			minCommittee: this.custodyOpts.minCommittee ?? 3,
 			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
-			windowAnchors: this.custodyOpts.windowAnchors,
-			bonds: this.custodyOpts.bonded ? () => this.finalView().bridge.bonds : undefined, // stake-weighted selection
-			minBond: this.custodyOpts.minBond, // gate #4: per-seat bond floor
-			maxGrowthPct: this.custodyOpts.bonded ? (this.custodyOpts.maxGrowthPct ?? DEFAULT_MAX_GROWTH_PCT) : undefined, // gate #2: default-on under stake weighting
+			excluded: () => this.finalizedFaults(), // proven faults → skipped by committee selection
 			auth: this.ceremonyAuth(),
 			ceremonySeed: () => this.producerKey().privateKey, // deterministic DKG material across retries
 
@@ -1228,13 +1207,13 @@ export class Daemon {
 			reshareViaBlob: process.env.GAVL_PVSS_RESHARE ? (p) => this.reshareViaBlob(p) : undefined, // CUTOVER (opt-in): the blob path IS the reshare, with the live ceremony as fallback
 		});
 
-		// Auto-slashing: watch every ceremony message this node sees; when a committee
-		// member equivocates (two conflicting signed messages for one slot), file the
-		// fraud proof — but only if the culprit has stake to lose (else it's a wasted write).
+		// Auto fault-reporting: watch every ceremony message this node sees; when a committee
+		// member equivocates (two conflicting signed messages for one slot), file the fault
+		// proof so the fold excludes it from later committees — unless it's already excluded.
 		this.equivWatcher = new EquivocationWatcher((a, b, culprit) => {
-			if (slashable(this.view().bridge, culprit) <= 0n) return;
-			console.log(`[custody] equivocation by ${culprit.slice(0, 16)}… → submitting slash`);
-			void this.custodyAccount().slash(a, b).catch(() => {});
+			if (this.finalView().custody.excluded.has(culprit)) return;
+			console.log(`[custody] equivocation by ${culprit.slice(0, 16)}… → submitting fault proof`);
+			void this.custodyAccount().reportFault(a, b).catch(() => {});
 		});
 		this.node.onCeremonyMessage = (m) => this.equivWatcher!.observe(m);
 
@@ -1251,7 +1230,8 @@ export class Daemon {
 		clearInterval(this.encKeyTimer);
 		this.encKeyTimer = setInterval(() => this.node.encKeyBroadcast(myAnnounce), 15_000);
 
-		console.log(`  custody: committee mode (epochLength ${this.custodyOpts.epochLength ?? 16}, size ${this.custodyOpts.size ?? 5}); id ${this.producerId().slice(0, 16)}…`);
+		const cp = this.committeeParams();
+		console.log(`  custody: committee mode (epochLength ${cp.epochLength}, max size ${cp.size}, window ${cp.windowAnchors}); id ${this.producerId().slice(0, 16)}…`);
 	}
 
 	/** SHADOW reshare (verifiable encrypted resharing, phase 2): build + publicly verify a PVSS blob

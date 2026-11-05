@@ -4,7 +4,7 @@
  * Each epoch the signing committee is sampled:
  *   - SEEDED by the VDF heartbeat output (unbiasable, unpredictable-until-revealed,
  *     ungrindable) → an attacker cannot predict, grind toward, or target selection.
- *   - WEIGHTED by bonded space-time / stake, NEVER by node count → an attacker's
+ *   - WEIGHTED by space-time won (anchors produced), NEVER by node count → an attacker's
  *     fraction is pinned to real resources, so honest growth dilutes them. This is
  *     the load-bearing rule: count-weighting would make bigger = LESS secure.
  *   - DETERMINISTIC → every node computes the identical committee from the same
@@ -24,7 +24,7 @@ import { sha256, concatBytes, u32be, fromHex } from "../det/canonical.ts";
 export interface Member {
 	/** identity (pubkey hex). */
 	id: string;
-	/** bonded weight (space-time / stake). Must be > 0 to be eligible. */
+	/** selection weight (space-time won). Must be > 0 to be eligible. */
 	weight: bigint;
 }
 

@@ -25,7 +25,6 @@ impl GavlApp {
         let custody = self.snapshot.custody.clone().unwrap_or_default();
         let formed = custody.fund_key_on_chain.is_some() && !custody.committee.is_empty();
         let fund = custody.fund_address.clone().or_else(|| self.snapshot.bridge.as_ref().and_then(|b| b.fund_address.clone()));
-        let my_bond = api::amount(&custody.my_bond);
 
         if !formed {
             return section(
@@ -65,7 +64,7 @@ impl GavlApp {
                         .child(stat("Signing rule", format!("{} of {}", custody.threshold, custody.committee.len()), cx))
                         .child(stat("Epoch", if custody.epoch < 0 { "Genesis".into() } else { custody.epoch.to_string() }, cx))
                         .child(stat("This node", if custody.holds_share { "Holds a key share" } else { "Not a signer" }, cx))
-                        .child(stat("Your bond", format::gbtc(my_bond), cx)),
+                        .child(stat("Max seats", custody.committee_max.to_string(), cx)),
                 )
                 .child(v_flex().children(seats))
                 .when_some(fund, |this, fund| this.child(row("Fund address", copyable("copy-fund", &fund, cx), cx))),
@@ -80,9 +79,8 @@ impl GavlApp {
         let reserves = api::amount(&m.reserves);
         let buckets = [
             ("Free balances", api::amount(&m.free), cx.theme().chart_1),
-            ("Bonded by signers", api::amount(&m.bonded), cx.theme().chart_2),
-            ("Pending withdrawals", api::amount(&m.pending), cx.theme().chart_3),
-            ("Shared pot", api::amount(&m.pot), cx.theme().chart_4),
+            ("Pending withdrawals", api::amount(&m.pending), cx.theme().chart_2),
+            ("Shared pot", api::amount(&m.pot), cx.theme().chart_3),
         ];
         let sum: u128 = buckets.iter().map(|b| b.1).sum();
         let balanced = sum == reserves;
@@ -103,7 +101,7 @@ impl GavlApp {
             .gap_1()
             .child(muted(
                 if balanced {
-                    "Balanced: the four buckets add up exactly to reserves.".to_string()
+                    "Balanced: the three buckets add up exactly to reserves.".to_string()
                 } else {
                     format!("Out of balance by {} — report this.", format::gbtc(sum.abs_diff(reserves)))
                 },

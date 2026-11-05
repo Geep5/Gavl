@@ -3,7 +3,7 @@
  * custody committee each epoch without ever changing the fund key/address.
  *
  * SELECTION is deterministic: every node samples the same committee from the anchor
- * VDF beacon (unbiasable, unpredictable) weighted by stake (custody/sampling.ts), so
+ * VDF beacon (unbiasable, unpredictable) weighted by space-time won (custody/sampling.ts), so
  * all nodes agree on who holds shares this epoch with no coordination.
  *
  * RESHARING redistributes the SAME secret to the new committee: a participating
@@ -48,7 +48,7 @@ export function fidScalar(pid: string): bigint {
 	return BigInt("0x" + fid(pid));
 }
 
-/** Deterministically select this epoch's committee from the VDF beacon (stake-weighted,
+/** Deterministically select this epoch's committee from the VDF beacon (weighted by space-time,
  *  no replacement). Every node computes the identical set — see sampling.ts. */
 export function selectCommittee(members: Member[], vdfBeaconHex: string, size: number): Member[] {
 	return sampleCommittee(members, vdfBeaconHex, size);

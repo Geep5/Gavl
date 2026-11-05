@@ -1,154 +1,109 @@
-# Scaling threshold custody — "bigger network = more secure" BTC bridge
+# Custody — a signing committee that grows with the network
 
-Status: **design note — not implemented.** This is the most security-critical and
-highest-risk subsystem ever proposed for Gavl (it holds real BTC, with a
-catastrophic failure mode). Doc-first by necessity. Read the *Ceiling* section
-before believing any "trustless" claim.
+Status: **design, partly implemented.** Threshold signing (FROST over secp256k1 → a BIP340
+Taproot key-path spend), VDF-seeded committee sampling, and epoch resharing with failover exist.
+This document fixes the model they're wired into. It holds real coins; read *Limits* before
+believing any security claim.
 
 ## Goal
 
-A bridge where real BTC enters a single Gavl-controlled reserve ("the global
-fund"), gBTC is minted 1:1 as a claim, and redemptions pay out from the fund —
-such that **attacking the fund costs ≈ a majority of the whole network's real
-bonded space-time, and that cost GROWS as the network grows.**
+Coins deposited into Gavl (BTC now, LTC next) sit in a vault whose key **no single party holds**.
+Withdrawals need a threshold of a committee drawn from the people running the network, and the
+committee gets **larger and harder to capture as the network grows**. No bonds, no value caps, no
+withdrawal-rate limit: security comes from the cost of controlling the network's space-time, not
+from staked collateral.
 
-Most threshold custody does *not* have this property: a fixed committee means
-adding nodes changes nothing. The design below makes the committee a
-**fast-rotating, unpredictably-sampled, stake-weighted delegate of the honest
-majority**, so growth genuinely dilutes attackers.
-
-## The core invariant
+## The invariant
 
 ```
-gBTC in circulation  ==  BTC in the fund     (always 1:1)
+gBTC outstanding == BTC in the vault    (likewise gLTC == LTC)
 ```
-Mint only on a verified deposit; redeem only by burning gBTC. Everything else
-exists to keep this true and to keep the fund's signing power honest.
 
-## The four ingredients (three already exist in Gavl)
+Mint only on a committee-attested, confirmed deposit; redeem only by burning, with the payout
+built from the finalized burn. Concretely the fold checks
+`reserves == free balances + pending withdrawals + pot` per asset.
 
-### 1. VDF heartbeat = unbiasable random beacon  *(exists)*
-Each anchor's VDF output is sequential, ungrindable, unpredictable-until-revealed.
-Use it as the seed to **sample the signing committee each epoch**. Consequence: an
-attacker **cannot predict, grind toward, or target** committee selection. This is
-the keystone — most chains' committee randomness is manipulable; Gavl's isn't.
+## How it works
 
-### 2. Stake/PoST-weighted sampling — NEVER by node count  *(PoST exists)*
-Sample committee seats weighted by **bonded space-time**, not by number of nodes.
-This is the load-bearing rule for "bigger = more secure":
-- Weight by node count → attacker spins up nodes → their share rises with network
-  size → bigger = *less* secure. **Wrong.**
-- Weight by real bonded stake/space → attacker's fraction `f` is pinned to their
-  *real resources*; honest growth shrinks `f` → bigger = *more* secure. **Right.**
+1. **Eligibility = recent farming.** A node is eligible for an epoch if it produced finalized
+   anchors in the recent window (default: the last 2 epochs). Seats are weighted by anchors
+   produced — i.e. by proven space-time — never by node count, so splitting one disk across many
+   identities gains nothing, and farmers who left age out.
+2. **Size scales with the network.** `k = min(eligible farmers, K_MAX)`; threshold
+   `M = max(2, ceil(2k/3))`. Three farmers → 2-of-3. Hundreds of farmers → a K_MAX-seat committee.
+   K_MAX is chosen by measurement (see *Testing*), starting at 31.
+3. **Random, unpredictable selection.** Each epoch's committee is sampled with the boundary
+   anchor's VDF output as the seed. The VDF can't be ground or predicted before it's computed,
+   so an attacker can't steer seats to themselves.
+4. **Rotation every epoch.** The outgoing committee reshares the *same* secret to the incoming
+   one (proactive secret sharing). The group key — and therefore every deposit address — never
+   changes; old shares become useless. To steal, an attacker must hold ≥ M seats of one randomly
+   drawn committee *within one epoch*.
+5. **One key, every coin.** BTC and LTC both verify BIP340 Schnorr over secp256k1 and both support
+   Taproot, so one committee key backs both vaults. Deposit tweaks and attestation digests carry
+   an asset tag so a signature for one coin can never be replayed for another.
+6. **No trusted setup.** The first committee creates the key by DKG; no machine ever sees the
+   whole key. (Testnet currently uses a one-time trusted dealer; that is being removed.)
+7. **Everyone watches.** Every node verifies that the committee only ever co-signs payouts that
+   match finalized burns. A provable fault (signing two conflicting ceremony messages) is posted
+   as a `custody.fault` op; the fold verifies the proof and **excludes** that producer from all
+   future committees. There is no stake to slash — exclusion plus a public alarm is the response.
 
-### 3. Heartbeat-driven proactive resharing  *(new; uses the existing clock)*
-Each epoch, the committee **reshares** its key shares to a freshly-sampled
-committee — the *fund key stays the same*, the *shares rotate* (Proactive Secret
-Sharing). An attacker must therefore corrupt a threshold **within one epoch
-window**; stale shares are useless. The slow Gavl clock is an *asset* here:
-minutes/epoch is ample time to run a reshare round (fast chains can't fit this).
+```mermaid
+flowchart LR
+  A[Epoch boundary anchor finalized] --> B[Sample k farmers, seeded by its VDF output]
+  B --> C[Old committee reshares to new committee]
+  C -->|completes| D[New committee signs withdrawals this epoch]
+  C -->|too many offline| E[Old committee keeps its shares; retry next epoch]
+  D --> A
+  E --> A
+```
 
-### 4. Everyone-not-signing still works — scale amplifies  *(gossip exists)*
-Non-committee nodes (the vast majority) do three scaling jobs:
-- **Watchtowers** — every node verifies the committee only signs Gavl-*finalized*
-  payouts; any single node can publish a fraud proof → **slash** the committee's
-  bond. More nodes = more eyes = faster catch, harsher punishment.
-- **Candidate pool** — more bonded nodes → lower attacker fraction `f` next draw.
-- **Relay mesh** — gossip carries the committee's signing-round messages, so a
-  denser mesh makes signing *more* reliable even though relays don't sign.
+## Why bigger is safer
 
-## Why "bigger = more secure" actually holds (math intuition)
+An attacker controlling a fraction `f` of the network's space-time captures a committee only if
+the sample gives them ≥ M of k seats. Per-epoch capture probability:
 
-Attacker controls fraction `f` of bonded space-time. Sample `k` signers per epoch,
-threshold `M`. Theft requires ≥`M` of `k` seats. When `M/k > f`, capture
-probability **drops exponentially in `k`** (Chernoff). Growth helps on *two*
-levers at once: more honest stake **lowers `f`**, and a bigger network lets you
-afford a **larger `k`** — both widen the `M/k − f` margin. Rotation (#3) forces the
-attacker to win that exponentially-unlikely lottery **fresh every epoch and finish
-before the reshare**. Compounded, per-epoch capture probability is astronomically
-small, and shrinks with participation.
+| k | M | f = 10% | f = 25% | f = 33% | f = 45% |
+|---|---|---|---|---|---|
+| 3 | 2 | 2.8e-2 | 1.6e-1 | 2.6e-1 | 4.3e-1 |
+| 7 | 5 | 1.8e-4 | 1.3e-2 | 4.3e-2 | 1.5e-1 |
+| 15 | 10 | 1.9e-7 | 8.0e-4 | 7.9e-3 | 7.7e-2 |
+| 31 | 21 | 1.6e-14 | 6.7e-7 | 8.0e-5 | 9.0e-3 |
+| 63 | 42 | 3.2e-27 | 4.1e-12 | 4.8e-8 | 4.3e-4 |
+| 101 | 68 | 1.4e-43 | 4.5e-19 | 1.9e-12 | 5.0e-6 |
 
-One-line articulation: *the fund is guarded not by a club but by an unpredictable,
-fast-rotating, stake-sampled, bonded, universally-watched delegation of the honest
-majority — attacking it ≈ attacking a majority of the network's total real
-space-time, which gets harder as the network grows.*
+Growth helps twice: more honest farmers lower `f`, and more farmers allow a larger `k`.
 
-## End-to-end flows
+## Limits — what this is not
 
-**Deposit (BTC in):**
-1. User sends BTC to the fund's current address (x402 is just the deposit UX/
-   doorway — never the authority).
-2. Deposit is proven to Gavl (quorum-attested in v1; light-client SPV later).
-3. Gavl consensus verifies + mints `gBTC` 1:1 to the depositor. Every node folds
-   this identically.
+- **Theft is possible; it's expensive, not impossible.** The cost of an attack is controlling
+  ~2/3 of the network's space-time for an epoch — buying or renting disk — not losing a bond. If
+  the vault is worth more than that, theft pays. In a small network that rent is cheap: keep only
+  what you can afford to lose in the vault until the network is large. There is no withdrawal-rate
+  limit, so a captured committee can take everything in one epoch.
+- **Small committees are weak.** At k = 3 (three farmers), an attacker with a third of the space
+  wins the draw about a quarter of the time. The guarantees in the table only arrive with many
+  independent farmers.
+- **Funds can freeze.** If more than a third of a committee vanishes before handing off, nobody
+  can sign until enough return. Larger committees and the recent-activity window reduce this;
+  a failed reshare leaves the old committee in charge and retries next epoch. Resharing under
+  churn is where systems like this break in practice, so it gets the heaviest testing.
+- **Practical size ceiling.** DKG and resharing cost roughly k² point-to-point messages per epoch
+  over Nostr relays; signing costs roughly k per withdrawal. The usable K_MAX is measured, not
+  assumed.
+- **Still a bridge.** Coins on Gavl are claims on a vault guarded by a sampled majority of the
+  network. That trust is spread thin and rotated, but it is not zero.
 
-**Trade:** gBTC is a native Gavl coin — trades/positions are fully trustless from
-here (no bridge involvement).
+## Testing (gates, in order)
 
-**Redeem (BTC out):**
-1. User burns gBTC on Gavl; consensus *finalizes* the burn.
-2. The current epoch committee sees the finalized burn and runs a **threshold
-   signing round** (from shares — full key never assembled) over a Bitcoin tx
-   paying the user.
-3. Watchtowers verify it matches a finalized burn; honest signers refuse anything
-   else. BTC moves on Bitcoin.
-
-## The Ceiling — what this is NOT (do not skip)
-
-- **A captured epoch-committee CAN still steal.** Rotation + size + bonds make it
-  astronomically improbable and *always* punishable — but each epoch is a fresh
-  (wildly loaded) dice roll, not an impossibility. Security is **probabilistic +
-  economic (bond > fund value)**, never cryptographically absolute. Real BTC + a
-  required signature can never be zero-trust. This pushes trust as thin as it goes;
-  it does not reach zero.
-- **Resharing-under-churn is the real failure mode.** If too many of the old
-  committee vanish before handoff: frozen funds (liveness loss) or a botched
-  reshare. PSS handles it but is complex and assumption-laden — **this is where
-  this class of system actually breaks in practice, not the signing math.**
-- **Liveness vs safety tension:** high `M` = hard to steal, easy to freeze; low `M`
-  = live, easier to capture. Must be tuned to observed churn.
-- **Still a bridge with a (heavily diluted) trusted layer.** The **native
-  synthetic perp** remains the only *zero*-trust path and needs none of this.
-
-## Implementation overview (phased; each phase gated on the prior)
-
-**Phase 0 — feasibility spikes (no Gavl wiring, no real BTC):**
-- Threshold ECDSA over secp256k1 (BTC's curve): pick/eval a library (e.g. a
-  GG20/FROST-style lib); confirm a `k`-of-`n` signing round produces a valid
-  Bitcoin signature.
-- Proactive resharing (PSS) round between two committees — the riskiest piece —
-  proven in isolation, including the "some old members offline" path.
-- Determinism check: committee sampling from a VDF seed must be byte-identical on
-  every node (lives in/near the consensus fold; same discipline as `det/`).
-
-**Phase 1 — selection + watchtower (testnet BTC, tiny fund):**
-- Epoch committee sortition: VDF-seeded, stake-weighted, deterministic.
-- Bonding + slashing ops in `state.ts` (stake to be eligible; provable misbehavior
-  burns bond) — consensus-critical conservation, held to the coin bar.
-- Watchtower verification: every node checks committee signatures against
-  finalized burns; fraud-proof op.
-
-**Phase 2 — custody lifecycle (testnet):**
-- DKG for the fund key across the genesis committee.
-- Deposit attestation → mint gBTC (1:1 invariant enforced in the fold).
-- Redeem → finalized burn → threshold signing round → BTC out.
-- Per-epoch proactive reshare driven by the heartbeat.
-
-**Phase 3 — hardening before any real value:**
-- Solvency rule: gBTC claims can NEVER exceed BTC reserves — bounded leverage +
-  insurance fund so no position loses more than its posted margin (the same
-  solvency rule the perp needs; the fund is only as solvent as liquidation is
-  timely).
-- Liveness recovery: timeout/fallback paths if a reshare or signing round stalls.
-- Economic calibration: bond-per-seat, `k`, `M`, epoch length vs measured churn so
-  bonded value > fund value with margin.
-- Independent review / audit. This subsystem holds real money; nothing ships
-  unaudited.
-
-## Recommendation
-
-This is real and well-motivated, and the "bigger = more secure" property genuinely
-falls out of the heartbeat + PoST. **But it is a large, dangerous, separate epic.**
-Build the **native, trustless core first** (needs none of this); treat
-this bridge as a later track gated on the Phase-0 spikes — especially the
-resharing-under-churn spike, which is the make-or-break.
+1. **Unit:** sampling is byte-identical across nodes; a proven fault excludes the producer; a bogus
+   fault proof is rejected; conservation holds through mint, withdraw, idle fee.
+2. **Regtest acceptance:** committee-signed Taproot spends are accepted by real `bitcoind` and
+   `litecoind` (`npm run test:regtest`).
+3. **Churn:** 10–30 local nodes on regtest; random members are killed and restarted across many
+   epochs. Pass = every epoch's reshare completes or cleanly retries, withdrawals keep being
+   accepted by the regtest node, and the vault address never changes.
+4. **K_MAX:** the churn run at k = 31, 63, 101; pick the largest k whose reshares complete
+   reliably over Nostr.
+5. **Public testnets** across independent machines.

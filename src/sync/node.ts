@@ -302,7 +302,7 @@ export class GavlNode {
 				// Hand the ceremony message to the registered coordinator, WITH the
 				// connection it arrived on — so the coordinator can reply point-to-point
 				// (round-2 secret shares ride the sender's own encrypted connection).
-				this.onCeremonyMessage?.(m.m); // watch for equivocation (auto-slashing)
+				this.onCeremonyMessage?.(m.m); // watch for equivocation (auto fault-reporting)
 				this.onDkg?.(conn, m.m);
 				return;
 			}
@@ -328,7 +328,7 @@ export class GavlNode {
 	}
 
 	/** Tap on EVERY inbound ceremony message (dkg/sign/reshare), independent of the
-	 *  coordinators — registered by the equivocation watcher for auto-slashing. */
+	 *  coordinators — registered by the equivocation watcher for auto fault-reporting. */
 	onCeremonyMessage?: (m: DkgWire | SignWire | ReshareWire) => void;
 
 	// ── DKG ceremony transport (used by custody/dkg-coordinator) ─────

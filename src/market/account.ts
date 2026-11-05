@@ -88,20 +88,10 @@ export class Account {
 		return this.produce({ kind: "bridge.broadcast", withdrawalId, txid });
 	}
 
-	/** Lock gBTC as a custody-committee bond (selection weight; slashable). */
-	bond(amount: bigint | number | string): Promise<Write> {
-		return this.produce({ kind: "custody.bond", amount: amountStr(amount) });
-	}
-
-	/** Begin releasing bonded gBTC (matures after a delay; slashable until then). */
-	unbond(amount: bigint | number | string): Promise<Write> {
-		return this.produce({ kind: "custody.unbond", amount: amountStr(amount) });
-	}
-
-	/** Submit a slashing fraud proof: two conflicting ceremony messages a committee member
-	 *  signed for the same slot. The culprit's bond is awarded to this account. */
-	slash(a: unknown, b: unknown): Promise<Write> {
-		return this.produce({ kind: "custody.slash", a, b });
+	/** Submit a fault proof: two conflicting ceremony messages a committee member signed for
+	 *  the same slot. The fold verifies it and excludes the culprit from future committees. */
+	reportFault(a: unknown, b: unknown): Promise<Write> {
+		return this.produce({ kind: "custody.fault", a, b });
 	}
 
 	/** Mark a withdrawal's BTC payout confirmed. `sig` (committee threshold sig over the

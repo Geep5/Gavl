@@ -46,7 +46,7 @@ export interface RotationConfig {
 	node: GavlNode;
 	selfId: string; // this node's stable producer pubkey hex (its committee id)
 	epochLength: number; // anchors per epoch
-	size: number; // target committee size (clamped to eligible count)
+	size: number; // max committee size K_MAX (clamped to eligible count)
 	timeoutMs: number; // per-ceremony budget
 	/** GENESIS committee size — small so the n-of-n DKG actually completes (any dropout aborts it).
 	 *  Defaults to `minCommittee`. After genesis, the next reshare grows the committee to `size`.
@@ -59,18 +59,10 @@ export interface RotationConfig {
 	/** Minimum committee size to activate committee custody (default 3). Below this,
 	 *  threshold custody is meaningless, so the loop waits for more farmers. */
 	minCommittee?: number;
-	/** Membership lookback in anchors (default: all below the boundary). */
+	/** Membership lookback in anchors (default: eligibilityWindow → 2 × epochLength). */
 	windowAnchors?: number;
-	/** Finalized committee bonds (pubkey → bonded gBTC). When set, selection is
-	 *  STAKE-weighted (gate #3): only bonded producers are eligible, weighted by bond. */
-	bonds?: () => Map<string, bigint>;
-	/** Per-seat minimum bond (gate #4): producers bonded below this are ineligible, so the
-	 *  eligible set can't be flooded with dust-bonded Sybil identities. Stake-weighted only. */
-	minBond?: bigint;
-	/** Max % the total eligible weight may grow per epoch (gate #2): a sudden influx of fresh
-	 *  stake is trimmed newest-first, so the committee can't be captured faster than the network
-	 *  can react. Undefined → uncapped. */
-	maxGrowthPct?: number;
+	/** Proven faults from FINALIZED state (producer → fault height): excluded from selection. */
+	excluded?: () => ReadonlyMap<string, number>;
 	/** Authenticates ceremony messages (signs as this node's committee id, verifies peers'). */
 	auth?: CeremonyAuth;
 	/** This node's stable SECRET (e.g. its producer private key) — seeds DETERMINISTIC DKG material
@@ -138,7 +130,7 @@ export class CommitteeRotation {
 	}
 
 	private epochCommittee(finalized: AnchorView[], epoch: number, size = this.c.size): EpochCommittee | null {
-		return committeeForEpoch(finalized, epoch, { epochLength: this.c.epochLength, size, windowAnchors: this.c.windowAnchors, bonds: this.c.bonds?.(), minBond: this.c.minBond, maxGrowthPct: this.c.maxGrowthPct });
+		return committeeForEpoch(finalized, epoch, { epochLength: this.c.epochLength, size, windowAnchors: this.c.windowAnchors, excluded: this.c.excluded?.() });
 	}
 
 	/** Committee size for `epoch`: the small genesis set AT the genesis epoch, the full target size

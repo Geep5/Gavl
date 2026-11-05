@@ -37,30 +37,39 @@ impl GavlApp {
 
     fn render_balance(&self, cx: &App) -> impl IntoElement + use<> {
         let balance = self.balance();
-        let sweep_in = self
+        let fee_in = self
             .snapshot
             .bridge
             .as_ref()
             .and_then(|m| m.idle_decay.as_ref())
             .filter(|_| balance > 0)
-            .map(|d| d.sweep_at_height.saturating_sub(self.height()));
+            .map(|d| d.fee_from_height.saturating_sub(self.height()));
         v_flex()
             .gap_3()
             .child(
                 h_flex()
                     .gap_10()
                     .child(stat("Balance", format::gbtc(balance), cx))
-                    .when_some(sweep_in, |this, blocks| {
-                        this.child(stat("Idle sweep in", idle_left(blocks), cx))
+                    .when_some(fee_in, |this, blocks| {
+                        if blocks == 0 {
+                            this.child(stat("Idle fee", "1% per 30 days", cx))
+                        } else {
+                            this.child(stat("Idle fee starts in", idle_left(blocks), cx))
+                        }
                     }),
             )
-            .child(match sweep_in {
-                Some(blocks) if blocks < BLOCKS_PER_DAY => Alert::warning(
-                    "idle-urgent",
-                    format!("Your idle balance is swept to the shared pot in {}. Transfer or withdraw it to keep it.", idle_left(blocks)),
+            .child(match fee_in {
+                Some(0) => muted(
+                    "This balance has been idle for over 7 days, so it pays a small idle fee (1% per 30 days) to the shared pot. Receiving gBTC resets the clock.",
+                    cx,
                 )
                 .into_any_element(),
-                _ => muted("Gavl isn't a savings account: a balance left idle for 7 days is swept to the shared pot.", cx).into_any_element(),
+                Some(blocks) if blocks < BLOCKS_PER_DAY => Alert::info(
+                    "idle-soon",
+                    format!("In {} your idle balance starts paying a small idle fee (1% per 30 days) to the shared pot.", idle_left(blocks)),
+                )
+                .into_any_element(),
+                _ => muted("Gavl isn't a savings account: after 7 idle days a balance pays a small idle fee (1% per 30 days) to the shared pot.", cx).into_any_element(),
             })
     }
 

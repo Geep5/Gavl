@@ -4,7 +4,7 @@
  *   computeView(writes) -> { bridge, custody }
  *
  * gBTC is a 1:1 claim on real BTC held by threshold custody. The fold wires the bridge
- * (deposit/claim/withdraw/settle), transfers, committee bonds/slashing and the custody fund
+ * (deposit/claim/withdraw/settle), transfers, committee fault records and the custody fund
  * announce. There is no price oracle: every op only MOVES gBTC between buckets, so reserves
  * always equal the gBTC they back.
  */
@@ -14,9 +14,10 @@ import type { Op } from "./ops.ts";
 import { isOp } from "./ops.ts";
 import { finalizedOrdering, orderingFor } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
-import { emptyBridge, gbtcOf as bridgeGbtcOf, addGbtc, totalGbtc, bondedTotal, pendingTotal, mintFromDeposit, mintCeiling, withdrawCap, depositCap, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, bond, requestUnbond, releaseMatured, slash, pruneStaleClaims, DEMURRAGE_DAY, DEMURRAGE_GRACE_DAYS } from "../custody/bridge.ts";
+import type { Anchor } from "../consensus/anchor.ts";
+import { emptyBridge, gbtcOf as bridgeGbtcOf, totalGbtc, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, pruneStaleClaims, settleIdleFee } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
-import { equivocationCulprit } from "../custody/slashing.ts";
+import { equivocationCulprit } from "../custody/fault-proof.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "../custody/attestation.ts";
 import { fromHex } from "../det/canonical.ts";
@@ -27,6 +28,9 @@ export interface CustodyState {
 	fundKey: string | null;
 	/** The epoch the fund was established in (−1 until announced). */
 	epoch: number;
+	/** Committee producers with a PROVEN fault (custody.fault) → the height the fault was recorded.
+	 *  Committee derivation skips them for every epoch whose boundary is past that height. Permanent. */
+	excluded: Map<string, number>;
 }
 
 export interface View {
@@ -43,12 +47,12 @@ export function gbtcOf(view: View, pubkey: string): bigint {
 }
 
 /**
- * The 1:1 backing invariant: every gBTC — free, bonded, held in the liquidity pot, or
- * burned-and-pending — is backed by a satoshi in reserves. Transfers/bonds/demurrage only
- * MOVE gBTC between these buckets, never mint, so this always holds.
+ * The 1:1 backing invariant: every gBTC — free, held in the liquidity pot, or burned-and-pending —
+ * is backed by a satoshi in reserves. Transfers/demurrage only MOVE gBTC between these buckets,
+ * never mint, so this always holds.
  */
 export function marketConserved(view: View): boolean {
-	return view.bridge.reserves === totalGbtc(view.bridge) + bondedTotal(view.bridge) + pendingTotal(view.bridge) + view.bridge.pot;
+	return view.bridge.reserves === totalGbtc(view.bridge) + pendingTotal(view.bridge) + view.bridge.pot;
 }
 
 export function parseAmount(s: string): bigint | null {
@@ -90,48 +94,51 @@ function attestationAuthorized(view: View, _w: Write, digest: Uint8Array, sig: s
 
 export interface ViewOptions {
 	order?: (a: Write, b: Write) => number;
-	/** Anchor-clock "now" — drives height-timed effects (unbond maturity, demurrage, claim expiry). */
+	/** Anchor-clock "now" — drives height-timed effects (demurrage, claim expiry). */
 	nowHeight?: number;
 	/** Per-write certifying-anchor height (from finalizedOrdering) — the STABLE height a
-	 *  write happened at, used for height-timed effects (unbond maturity) that must not
-	 *  drift as the fold's global `nowHeight` advances. */
+	 *  write happened at (credit clocks, claim/fault heights), which must not drift as the
+	 *  fold's global `nowHeight` advances. */
 	bornAt?: Map<string, number>;
 	/** Resume from this state (a checkpoint): the fold starts from a DEEP COPY of `base`
 	 *  and applies only `writes` on top. Folding [post-checkpoint writes] onto the
 	 *  checkpoint view equals folding the full history — the basis for never replaying
-	 *  from 0. Height-timed effects act on state carried in `base` (bonds live there). */
+	 *  from 0. Height-timed effects act on state carried in `base`. */
 	base?: View;
+	/** Fault-record gate: true iff `id` produced a certified anchor within the fault lookback ending
+	 *  at `height` (the fault write's certified height). Built from the certifying chain by
+	 *  finalizedView/viewAtAnchor; absent (an anchor-less optimistic fold) → custody.fault records
+	 *  nothing, since the producer set can't be checked. */
+	isRecentProducer?: (id: string, height: number) => boolean;
+}
+
+/** The fault-record gate over a certifying chain: did `id` produce an anchor at a height in
+ *  [height − lookback, height]? Depends only on the write's certified height (never the fold's), so
+ *  every fold path agrees. Evaluated lazily — only when a custody.fault is folded. */
+export function producedWithin(chain: readonly Pick<Anchor, "height" | "producer">[], lookback: number): (id: string, height: number) => boolean {
+	return (id, height) => {
+		for (let i = chain.length - 1; i >= 0 && chain[i].height >= height - lookback; i--) if (chain[i].height <= height && chain[i].producer === id) return true;
+		return false;
+	};
 }
 
 /**
- * Demurrage — the RAM ledger's "balances can't sit idle forever" rule, turned into liquidity. State
- * lives in RAM, so an abandoned balance is just an unbounded entry. Each balance carries an idle clock
- * (`chargeFrom.charged` = last-credit + grace); once the fold height reaches it, the WHOLE balance is
- * swept into the liquidity POT in one go — a flat TIMEOUT, not a decay curve (no time-scaling knob). A
- * credit resets the clock, so an active balance is never touched, and the UI counts the grace down so the
- * sweep is never a surprise (use-it-or-lose-it). The swept gBTC goes to `bridge.pot` — a conservation
- * bucket and base-independent counter (checkpoint-pruned and full nodes agree, so no fork). It only MOVES
- * gBTC (idle → pot), never mints/burns, so 1:1 backing holds. Nothing draws from the pot.
+ * Demurrage — the RAM ledger's "balances can't sit idle forever" rule, turned into liquidity. Inside
+ * the ~1-week grace nothing is charged; past it, an idle balance pays a gentle LINEAR fee of 1% per 30
+ * days, per WHOLE elapsed day, into `bridge.pot`. The fee owed is a pure function of the balance's idle
+ * clock and the height (see IdleClock), and every write that touches a balance settles it at its own
+ * certified height first — so settling every balance again at the fold's end changes nothing about the
+ * total: any split of the history into folds yields the same state. O(1) per balance. Only MOVES gBTC
+ * (idle → pot), never mints/burns, so 1:1 backing holds. Nothing draws from the pot.
  */
 function accrueDemurrage(view: View, nowHeight: number): void {
-	const b = view.bridge;
-	for (const [k, bal] of [...b.gbtc]) {
-		const e = b.chargeFrom.get(k);
-		if (e === undefined) {
-			b.chargeFrom.set(k, { since: nowHeight, charged: nowHeight + DEMURRAGE_GRACE_DAYS * DEMURRAGE_DAY }); // unstamped → grace from now
-			continue;
-		}
-		if (nowHeight >= e.charged) {
-			b.pot += bal; // past the grace deadline → sweep the WHOLE idle balance to the pot (flat timeout)
-			addGbtc(b, k, -bal); // (deletes the entry + its clock)
-		}
-	}
+	for (const k of view.bridge.gbtc.keys()) settleIdleFee(view.bridge, k, nowHeight);
 }
 
 /**
  * Deep-copy a View so a resumed fold can mutate freely without touching the cached/snapshot base.
  * A direct structural clone — Maps/Sets rebuilt, every nested value object the fold mutates in
- * place (chargeFrom's `charged`, pending/unbonding/claims) copied — instead of a
+ * place (chargeFrom's `charged`, pending/claims) copied — instead of a
  * serialize→sort→stringify→parse round-trip. Same result, far cheaper. The resumable-fold and
  * checkpoint-equivalence tests (full fold vs base-resumed fold) guard that this copies everything
  * the serializer would: a dropped field would diverge the resumed viewRoot.
@@ -148,15 +155,12 @@ export function cloneView(v: View): View {
 			depositors: new Set(b.depositors),
 			claims: cp(b.claims),
 			broadcasts: new Map(b.broadcasts),
-			bonds: new Map(b.bonds),
-			unbonding: cp(b.unbonding),
 			mintedTotal: b.mintedTotal,
 			paidOut: b.paidOut,
 			chargeFrom: cp(b.chargeFrom),
 			pot: b.pot,
-			withdrawnTotal: b.withdrawnTotal,
 		},
-		custody: { fundKey: v.custody.fundKey, epoch: v.custody.epoch },
+		custody: { fundKey: v.custody.fundKey, epoch: v.custody.epoch, excluded: new Map(v.custody.excluded) },
 	};
 	return out;
 }
@@ -165,28 +169,15 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	const cmp = opts.order ?? cmpWrite;
 	const view: View = opts.base
 		? cloneView(opts.base) // deep copy so the cached/snapshot base isn't mutated
-		: { bridge: emptyBridge(), custody: { fundKey: null, epoch: -1 } };
+		: { bridge: emptyBridge(), custody: { fundKey: null, epoch: -1, excluded: new Map() } };
 	const nowHeight = opts.nowHeight ?? 0;
-	// Per-epoch custody ceiling: custodied BTC ≤ TVL_PER_BOND × the FINALIZED committee bond, read from
-	// the CHECKPOINT BASE — the finalized, network-agreed snapshot every node resumes from (so it's
-	// identical for full and pruned nodes, and — since CHECKPOINT_EVERY == epochLength — advances
-	// exactly one epoch at a time). No base yet (pre-first-checkpoint / genesis) → bond 0 → just the
-	// bootstrap floor.
-	const custodyCeiling = mintCeiling(opts.base ? bondedTotal(opts.base.bridge) : 0n);
-	// Vector B outflow budget (absolute): from the SAME checkpoint base, the epoch may withdraw up to
-	// withdrawCap(finalized reserves); `available` per write = this minus the live withdrawnTotal. No
-	// base yet (pre-first-checkpoint / full-from-genesis) → undefined → uncapped.
-	const withdrawBudget = opts.base ? opts.base.bridge.withdrawnTotal + withdrawCap(opts.base.bridge.reserves) : undefined;
-	const depositBudget = opts.base ? opts.base.bridge.mintedTotal + depositCap(opts.base.bridge.reserves) : undefined; // Vector B's inflow twin (per-epoch mint cap)
 	for (const w of [...writes].sort(cmp)) {
 		const op = w.payload as Op | null;
-		// Effects timed by height (unbond maturity) use the write's STABLE certifying
-		// height (bornAt) so they don't drift as the global nowHeight advances; others
-		// use nowHeight (the current anchor clock).
-		if (isOp(op)) applyOp(view, w, op, opts.bornAt?.get(w.id) ?? nowHeight, custodyCeiling, withdrawBudget, depositBudget);
+		// Effects timed by height (credit clocks, claim/fault heights) use the write's STABLE
+		// certifying height (bornAt) so they don't drift as the global nowHeight advances.
+		if (isOp(op)) applyOp(view, w, op, opts.bornAt?.get(w.id) ?? nowHeight, opts.isRecentProducer);
 	}
-	releaseMatured(view.bridge, nowHeight); // matured unbonds → free gBTC (on the anchor clock)
-	accrueDemurrage(view, nowHeight); // idle gBTC bleeds into the liquidity pot
+	accrueDemurrage(view, nowHeight); // idle gBTC pays a linear fee into the liquidity pot
 	pruneStaleClaims(view.bridge, nowHeight); // retire deposit-mint requests unminted past the reclaim grace
 	return view;
 }
@@ -194,12 +185,14 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 /**
  * Finality-bound view: fold only what the anchor `k` deep certifies, in the
  * PoST-bound order. Composes the pure consensus ordering with this app fold —
- * consensus never imports app state; the app calls consensus.
+ * consensus never imports app state; the app calls consensus. `faultLookback` (anchors) scopes
+ * which producers a custody.fault may exclude; omitted → faults record nothing. Consensus-critical:
+ * every node must pass the same value.
  */
-export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, base?: View): View {
-	const { included, order, bornAt, nowHeight } = finalizedOrdering(writes, anchors, k);
+export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, base?: View, faultLookback?: number): View {
+	const { included, order, bornAt, nowHeight, chain } = finalizedOrdering(writes, anchors, k);
 	if (nowHeight === null) return computeView([], { base });
-	return computeView(included, { order, nowHeight, bornAt, base });
+	return computeView(included, { order, nowHeight, bornAt, base, isRecentProducer: faultLookback === undefined ? undefined : producedWithin(chain, faultLookback) });
 }
 
 /**
@@ -208,15 +201,16 @@ export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, 
  * anchor's `appRoot` is `viewRoot()` of; the producer computes it when mining and a
  * verifier recomputes it to accept the anchor. Optionally resumes from a checkpoint
  * `base` (a pruned node folds forward from its snapshot instead of from genesis).
+ * `faultLookback` as in finalizedView.
  */
-export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: string, base?: View): View {
+export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: string, base?: View, faultLookback?: number): View {
 	const anchor = anchors.get(anchorId);
-	const { included, order, bornAt, nowHeight } = orderingFor(writes, anchors, anchor ?? null);
+	const { included, order, bornAt, nowHeight, chain } = orderingFor(writes, anchors, anchor ?? null);
 	if (nowHeight === null) return computeView([], { base });
-	return computeView(included, { order, nowHeight, bornAt, base });
+	return computeView(included, { order, nowHeight, bornAt, base, isRecentProducer: faultLookback === undefined ? undefined : producedWithin(chain, faultLookback) });
 }
 
-function applyOp(view: View, w: Write, op: Op, bornHeight: number, custodyCeiling = 0n, withdrawBudget?: bigint, depositBudget?: bigint): void {
+function applyOp(view: View, w: Write, op: Op, bornHeight: number, isRecentProducer?: (id: string, height: number) => boolean): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized ONLY by the committee
@@ -225,8 +219,7 @@ function applyOp(view: View, w: Write, op: Op, bornHeight: number, custodyCeilin
 			const amt = parseAmount(op.amount);
 			if (amt === null || typeof op.depositId !== "string" || typeof op.depositor !== "string") return;
 			if (!attestationAuthorized(view, w, depositAttestationDigest({ depositId: op.depositId, depositor: op.depositor, amount: amt }), op.sig)) return;
-			const dAvail = depositBudget === undefined ? undefined : depositBudget - view.bridge.mintedTotal; // this epoch's remaining mint allowance
-			mintFromDeposit(view.bridge, { depositId: op.depositId, depositor: op.depositor, amount: amt }, bornHeight, custodyCeiling, dAvail);
+			mintFromDeposit(view.bridge, { depositId: op.depositId, depositor: op.depositor, amount: amt }, bornHeight);
 			return;
 		}
 		case "gbtc.transfer": {
@@ -242,9 +235,7 @@ function applyOp(view: View, w: Write, op: Op, bornHeight: number, custodyCeilin
 			const amt = parseAmount(op.amount);
 			const fee = parseAmount(op.fee);
 			if (amt === null || fee === null || typeof op.btcAddress !== "string") return;
-			// Vector B: gate against this epoch's remaining outflow allowance (undefined → uncapped).
-			const available = withdrawBudget === undefined ? undefined : withdrawBudget - view.bridge.withdrawnTotal;
-			requestWithdrawal(view.bridge, { id: w.id, owner: w.writer, amount: amt, btcAddress: op.btcAddress, fee }, available);
+			requestWithdrawal(view.bridge, { id: w.id, owner: w.writer, amount: amt, btcAddress: op.btcAddress, fee }, bornHeight);
 			return;
 		}
 		case "bridge.claim": {
@@ -279,24 +270,14 @@ function applyOp(view: View, w: Write, op: Op, bornHeight: number, custodyCeilin
 			view.custody.epoch = op.epoch;
 			return;
 		}
-		case "custody.bond": {
-			// Lock the writer's free gBTC as a committee bond (its selection weight, slashable).
-			const amt = parseAmount(op.amount);
-			if (amt !== null) bond(view.bridge, w.writer, amt);
-			return;
-		}
-		case "custody.unbond": {
-			// Begin releasing bonded gBTC. Matures at the request's CERTIFIED height +
-			// UNBOND_DELAY (stable across replays); slashable until then.
-			const amt = parseAmount(op.amount);
-			if (amt !== null) requestUnbond(view.bridge, w.writer, amt, bornHeight);
-			return;
-		}
-		case "custody.slash": {
-			// Permissionless: verify the equivocation proof, then award the culprit's bond
-			// to the submitter (a bounty). A forged/invalid proof is a no-op.
+		case "custody.fault": {
+			// Permissionless: verify the equivocation proof IN-FOLD, then record the culprit as
+			// excluded from every committee whose epoch boundary lies past this (certified) height.
+			// Only a culprit that PRODUCED a certified anchor within the fault lookback is recorded —
+			// throwaway keys can't grow the excluded set. First record wins (the earliest height).
+			// A forged/invalid proof, or no producer gate (anchor-less fold), is a no-op.
 			const culprit = equivocationCulprit(op.a, op.b);
-			if (culprit) slash(view.bridge, culprit, w.writer);
+			if (culprit && !view.custody.excluded.has(culprit) && isRecentProducer?.(culprit, bornHeight)) view.custody.excluded.set(culprit, bornHeight);
 			return;
 		}
 	}

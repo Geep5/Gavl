@@ -14,8 +14,11 @@
  * a signature share is useless without a full quorum's worth. (Contrast DKG round-2,
  * which sends SECRET shares point-to-point.)
  *
- * SCOPE: happy-path ceremony over a connected quorum. Timeouts, dropouts, and
- * choosing which quorum signs are the next increments.
+ * LIVENESS: members start a ceremony at slightly different moments (each node advances failover
+ * rounds on its own timer, and a node routes `onSign` only to its CURRENT coordinator), so a one-shot
+ * broadcast can land on a peer still running the previous round and be dropped. Each coordinator
+ * therefore re-broadcasts its own commitment (and its own share, once sent) on an interval until it
+ * settles or times out — every resend is idempotent on the receiver.
  */
 
 import { schnorr_FROST as FROST } from "@noble/curves/secp256k1.js";
@@ -39,6 +42,9 @@ export class SignCoordinator {
 	private sentShare = false;
 	private settled = false;
 	private timer: ReturnType<typeof setTimeout> | null = null;
+	private resendTimer: ReturnType<typeof setInterval> | undefined;
+	private commitMsg: SignWire | null = null; // our nonce commitment, resent until settle
+	private shareMsg: SignWire | null = null; // our signature share (once sent), resent until settle
 	private resolve!: (sig: Uint8Array) => void;
 	private reject!: (e: Error) => void;
 
@@ -66,7 +72,17 @@ export class SignCoordinator {
 			const c = FROST.commit(this.opts.share);
 			this.nonces = c.nonces;
 			this.commits.set(this.selfFid, c.commitments);
-			this.node.signBroadcast(this.stamp({ s: "commit", sign: this.opts.signId, from: this.opts.selfId, commit: enc(c.commitments) }));
+			this.commitMsg = this.stamp<SignWire>({ s: "commit", sign: this.opts.signId, from: this.opts.selfId, commit: enc(c.commitments) });
+			this.node.signBroadcast(this.commitMsg);
+			// Resend loop until settled: a peer whose coordinator for this signId registers AFTER our
+			// one-shot broadcast (it was still on the previous round/input) would otherwise never see
+			// our commitment and could never sign — the round stalls until timeout.
+			const everyMs = this.opts.timeoutMs ? Math.max(250, Math.floor(this.opts.timeoutMs / 12)) : 600;
+			this.resendTimer = setInterval(() => {
+				if (this.settled) return this.stopRebroadcast();
+				if (this.commitMsg) this.node.signBroadcast(this.commitMsg);
+				if (this.shareMsg) this.node.signBroadcast(this.shareMsg);
+			}, everyMs);
 			this.maybeSignShare();
 		});
 	}
@@ -81,9 +97,15 @@ export class SignCoordinator {
 		return out;
 	}
 
+	private stopRebroadcast(): void {
+		clearInterval(this.resendTimer);
+		this.resendTimer = undefined;
+	}
+
 	private fail(): void {
 		if (this.settled) return;
 		this.settled = true;
+		this.stopRebroadcast();
 		this.reject(new CeremonyTimeout("sign", this.missing()));
 	}
 
@@ -117,7 +139,8 @@ export class SignCoordinator {
 		this.sentShare = true;
 		const sigShare = FROST.signShare(this.opts.share, this.opts.pub, this.nonces!, this.commitmentList() as never, this.opts.message);
 		this.shares.set(this.selfFid, sigShare);
-		this.node.signBroadcast(this.stamp({ s: "share", sign: this.opts.signId, from: this.opts.selfId, share: enc(sigShare) }));
+		this.shareMsg = this.stamp<SignWire>({ s: "share", sign: this.opts.signId, from: this.opts.selfId, share: enc(sigShare) });
+		this.node.signBroadcast(this.shareMsg);
 		this.maybeAggregate();
 	}
 
@@ -127,6 +150,7 @@ export class SignCoordinator {
 		for (const [fid, s] of this.shares) sigShares[fid] = s as Uint8Array;
 		const sig = FROST.aggregate(this.opts.pub, this.commitmentList() as never, this.opts.message, sigShares);
 		this.settled = true;
+		this.stopRebroadcast();
 		if (this.timer) clearTimeout(this.timer);
 		this.resolve(sig);
 	}

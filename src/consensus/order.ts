@@ -57,6 +57,8 @@ export interface FinalOrdering {
 	order: (a: Write, b: Write) => number;
 	bornAt: Map<string, number>;
 	nowHeight: number | null;
+	/** The certifying anchor chain (oldest retained → the anchor), for height-scoped lookups. */
+	chain: Anchor[];
 }
 
 export function finalizedOrdering(writes: Write[], anchors: AnchorChain, k: number): FinalOrdering {
@@ -69,7 +71,7 @@ export function finalizedOrdering(writes: Write[], anchors: AnchorChain, k: numb
  * the view of exactly the writes that anchor's heads certify, in its chain-induced order.
  */
 export function orderingFor(writes: Write[], anchors: AnchorChain, anchor: Anchor | null): FinalOrdering {
-	if (!anchor) return { included: [], order: () => 0, bornAt: new Map(), nowHeight: null };
+	if (!anchor) return { included: [], order: () => 0, bornAt: new Map(), nowHeight: null, chain: [] };
 
 	const chain = anchors.chainTo(anchor); // genesis → anchor, in height order
 	const heads = anchors.headsAt(anchor.id); // full heads reconstructed from deltas
@@ -87,5 +89,5 @@ export function orderingFor(writes: Write[], anchors: AnchorChain, anchor: Ancho
 		if (a.writer !== b.writer) return a.writer < b.writer ? -1 : 1;
 		return a.seq - b.seq;
 	};
-	return { included, order, bornAt: epoch, nowHeight: anchor.height };
+	return { included, order, bornAt: epoch, nowHeight: anchor.height, chain };
 }

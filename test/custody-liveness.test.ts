@@ -12,6 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
@@ -130,6 +131,28 @@ test("withdrawal fails over to a working quorum when one committee member is dow
 	// against the fund key inside the ceremony; convergence + a 64-char txid confirm it.
 	assert.equal(signed[0].txid.length, 64);
 	assert.ok(/^[0-9a-f]+$/.test(signed[0].hex), "valid tx hex");
+});
+
+test("a failover round completes even when one member enters it late (clock skew)", async () => {
+	const ids = ["a", "b", "c"]; // 2-of-3; "a" down → round 0 {a,b} fails, round 1 {b,c} must sign
+	const min = 2;
+	const { nodes, keys, groupPubKey, pub } = await dkgFund(ids, min);
+	const shareOf = Object.fromEntries(ids.map((id, i) => [id, keys[i].share]));
+	const fundView = { groupPubKey, pub, shares: {}, min, max: 3 } as FundKey;
+	const mkUnsigned = () => buildWithdrawalTx(fundView, { inputs: [{ txid: "cd".repeat(32), index: 0, amount: 500_000n }], outputs: [{ address: RECIPIENT, amount: 495_000n }] });
+	const run = (id: string) => signWithdrawalWithFailover(mkUnsigned, { node: nodes[id], signIdBase: "wd-skew", selfId: id, committee: ids, min, pub, groupPubKey, share: shareOf[id], timeoutMs: 1000, maxRounds: 2 });
+
+	// Force the skew: c starts 200 ms before b, so c's round-1 coordinator (and its one-shot commit)
+	// goes live while b's node still routes `onSign` to its round-0 coordinator — that commit is
+	// dropped. Only the re-broadcast lets b ever learn it; without it b can't sign and round 1 stalls.
+	// Real time on purpose: the failover loop advances rounds on real per-round timeouts.
+	const c = run("c");
+	await sleep(200);
+	const b = run("b");
+	const [rb, rc] = await Promise.all([b, c]);
+	assert.ok(rb && rc, "both live members complete round 1 despite the skew");
+	assert.equal(rb.txid, rc.txid, "converged on the same tx");
+	assert.equal(rb.hex, rc.hex, "byte-identical signed tx");
 });
 
 test("reshare fails over to a working OLD quorum when an old-quorum member is down", async () => {

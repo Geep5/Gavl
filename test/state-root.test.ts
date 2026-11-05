@@ -21,16 +21,14 @@ import type { View } from "../src/market/btc.ts";
 function makeView(rev = false): View {
 	const bridge = emptyBridge();
 	const gbtc: [string, bigint][] = [["aa", 100n], ["bb", 250n], ["cc", 7n]];
-	const bonds: [string, bigint][] = [["bb", 50n], ["dd", 9n]];
 	const claims: [string, { depositor: string; height: number }][] = [["dep1:0", { depositor: "aa", height: 3 }], ["dep2:1", { depositor: "cc", height: 7 }]];
 	const broadcasts: [string, string][] = [["w1", "txa"], ["w2", "txb"]];
-	const unb: [string, { amount: bigint; releaseHeight: number }][] = [["ee", { amount: 4n, releaseHeight: 20 }], ["ff", { amount: 8n, releaseHeight: 33 }]];
 	const order = <T>(xs: T[]) => (rev ? [...xs].reverse() : xs);
 	for (const [k, v] of order(gbtc)) bridge.gbtc.set(k, v);
-	for (const [k, v] of order(bonds)) bridge.bonds.set(k, v);
 	for (const [k, v] of order(claims)) bridge.claims.set(k, v);
 	for (const [k, v] of order(broadcasts)) bridge.broadcasts.set(k, v);
-	for (const [k, v] of order(unb)) bridge.unbonding.set(k, v);
+	const excluded = new Map<string, number>();
+	for (const [k, h] of order<[string, number]>([["ee", 20], ["ff", 33]])) excluded.set(k, h);
 	for (const d of order(["aa", "cc", "zz"])) bridge.depositors.add(d);
 	for (const p of order(["dep1:0", "dep2:1"])) bridge.processed.add(p);
 	bridge.reserves = 357n;
@@ -41,7 +39,7 @@ function makeView(rev = false): View {
 		{ id: "burn1", owner: "aa", amount: 12n, btcAddress: "bc1qaa", fee: 500n },
 		{ id: "burn2", owner: "bb", amount: 31n, btcAddress: "bc1qbb", fee: 700n },
 	]; // pending is FIFO — order is itself state, NOT reversed
-	return { bridge, custody: { fundKey: "deadbeef", epoch: 0 } };
+	return { bridge, custody: { fundKey: "deadbeef", epoch: 0, excluded } };
 }
 
 test("viewRoot is independent of Map/Set insertion order", () => {
@@ -62,7 +60,7 @@ test("deserialize restores bigints / Maps / Sets as native types", () => {
 	assert.equal(back.bridge.gbtc.get("bb"), 250n);
 	assert.equal(typeof back.bridge.reserves, "bigint");
 	assert.ok(back.bridge.processed.has("dep1:0"));
-	assert.equal(back.bridge.unbonding.get("ee")?.amount, 4n);
+	assert.equal(back.custody.excluded.get("ee"), 20);
 	assert.equal(back.bridge.pot, 11n);
 	assert.equal(back.bridge.pending[0].id, "burn1", "pending FIFO order preserved");
 });
@@ -75,7 +73,7 @@ test("a single changed balance changes the root", () => {
 });
 
 test("empty view has a stable, defined root", () => {
-	const empty: View = { bridge: emptyBridge(), custody: { fundKey: null, epoch: -1 } };
+	const empty: View = { bridge: emptyBridge(), custody: { fundKey: null, epoch: -1, excluded: new Map() } };
 	assert.equal(viewRoot(empty), viewRoot(empty));
 	assert.match(viewRoot(empty), /^[0-9a-f]{64}$/);
 });

@@ -145,13 +145,12 @@ pub struct Bridge {
     pub shortfall: Option<String>,
     pub pot: String,
     pub free: String,
-    pub bonded: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct IdleDecay {
-    pub sweep_at_height: u64,
+    pub fee_from_height: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -201,8 +200,7 @@ pub struct Custody {
     pub committee: Vec<String>,
     pub threshold: u32,
     pub min_committee: u32,
-    pub bonded: bool,
-    pub my_bond: String,
+    pub committee_max: u32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

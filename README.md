@@ -11,7 +11,7 @@ over [Nostr](https://nostr.com) (public relays; nothing to install, nothing to h
 committee can spend (no single party ever holds the key). There is **no price oracle**: nothing in
 the state machine reads an external price, and every op only *moves* gBTC between buckets, so
 reserves always equal what they back. A per-anchor **batch auction** for trading is planned but not
-built yet; today the ledger supports deposits, transfers, withdrawals, and committee bonds.
+built yet; today the ledger supports deposits, transfers, and withdrawals.
 
 PoST is the clock and the doorman: every write pays a cooldown (a proof of space *and* of time), so
 an attacker can't spin up cheap identities to flood the network. State lives in **RAM** and is
@@ -19,14 +19,14 @@ an attacker can't spin up cheap identities to flood the network. State lives in 
 from genesis).
 
 > [!WARNING]
-> **Gavl is use-it-or-lose-it — not a savings account.** A **free gBTC balance left idle for 7 days
-> is swept whole** into the shared liquidity pot. **Only keep money in while you're actively using
-> it, and withdraw what you're done with.** That bound is what keeps the system spam-proof and
-> RAM-light — it is deliberately *not* a place to park BTC.
+> **Gavl is not a savings account.** A **free gBTC balance left idle past a 7-day grace pays a small
+> idle fee** — 1% per 30 days, charged per whole idle day — into the shared liquidity pot. Receiving
+> gBTC resets the clock. **Keep money in while you're using it, and withdraw what you're done with.**
+> That pressure is what keeps the system RAM-light — it is deliberately *not* a place to park BTC.
 
 > **Status:** the real-BTC bridge runs end-to-end on **testnet** across a 3-node committee. Custody
-> is committee-only (no single-key path on any network). Still gated on an independent audit + real
-> independent stakers — **don't put real mainnet BTC in it.**
+> is committee-only (no single-key path on any network). Still gated on an independent audit + a
+> large, independent farmer set — **don't put real mainnet BTC in it.**
 
 ---
 
@@ -52,9 +52,12 @@ stand-in for tests/UI work.
 
 The application state is a pure fold of the write set: the gBTC bridge (`bridge.deposit`,
 `bridge.claim`, `bridge.withdraw`, `bridge.broadcast`, `bridge.settle`), `gbtc.transfer`, and
-custody ops (`custody.fund`, `custody.bond`, `custody.unbond`, `custody.slash`). The liquidity pot
-is fed only by the **idle-balance sweep** (demurrage); nothing draws from it. Conservation is a
-tested invariant: `reserves == free + bonded + pending + pot` — ops only *move* gBTC, never mint.
+custody ops (`custody.fund`, `custody.fault`). The liquidity pot is fed only by the **idle-balance
+fee** (demurrage); nothing draws from it. Conservation is a tested invariant:
+`reserves == free + pending + pot` — ops only *move* gBTC, never mint. There are no value caps on
+deposits, withdrawals, or custodied total; the only bridge limits are standing *count* caps on the
+outstanding backlog (1,024 pending withdrawals, 1,024 unminted claims) so the committee's signing
+queue can't be buried.
 
 ### Real-BTC bridge + committee custody (`src/custody/`)
 
@@ -63,8 +66,16 @@ Schnorr** (Taproot-compatible, BIP340-valid spends). The fund key is **DKG'd acr
 farmers** — each node only ever holds its own share — and the committee **reshares every epoch
 without moving the fund address**. Deposits go to per-identity fund-derived addresses (verified
 on-chain via Esplora before minting); withdrawals are threshold-signed and broadcast as real BTC
-txs. Committee membership is VDF-sampled (PoST-weighted, or stake-weighted with
-`GAVL_CUSTODY_BONDED=1`) with bonding + slashing.
+txs.
+
+Security comes from the committee itself, not from collateral: each epoch a fresh committee is
+**VDF-sampled, PoST-weighted** (by anchors won) from the producers of finalized anchors in a recent
+window (default 2 epochs, so long-gone farmers drop out). Its size is **min(eligible producers,
+K_MAX)** — it grows with the network up to K_MAX (default 31, `GAVL_COMMITTEE_MAX`) — with a 2/3
+signing threshold. A member caught **equivocating** (two conflicting signed ceremony messages) is
+reported automatically with a `custody.fault` proof the fold verifies; if the culprit produced an
+anchor recently (within the eligibility window + 2 epochs), it is **excluded** from every later
+committee. No bonding, nothing to slash.
 
 Custody is **committee-only**: it needs **≥3 nodes actually farming** to run the genesis DKG. Until
 then a node holds no fund key and can't mint — it waits for peers. Mainnet additionally refuses
@@ -213,7 +224,8 @@ Key env vars: `GAVL_VDF=chia|hash` · `GAVL_SPACE=chiapos|standin`
 · `GAVL_K=<n>` (plot size; default 18 for chiapos) · `GAVL_MAX_PEERS=<n>` (bounded mesh; default 16) ·
 `GAVL_PERSIST=all|mine|off` · `GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_DATA_DIR` / `GAVL_PORT`
 (isolate a node) · `GAVL_NETWORK=<label>` (channel name; default `gavl-testnet`) ·
-`GAVL_RELAYS=<wss://…,wss://…>` (override the default relay set) ·
+`GAVL_RELAYS=<wss://…,wss://…>` (override the default relay set) · `GAVL_COMMITTEE_MAX=<n>` (custody
+committee cap K_MAX; default 31 — consensus-critical, every node must agree) ·
 `GAVL_ANNOUNCE_INTERVAL=<seconds>` (presence refresh cadence; default 30). Real PoST needs the `setup:chia` venv; choosing `GAVL_VDF=chia` without it throws
 (never a silent downgrade). Moving a *live* channel from stand-ins to real PoST is a coordinated
 upgrade — see [`docs/real-post-cutover.md`](docs/real-post-cutover.md).
@@ -244,12 +256,12 @@ desktop/         native Rust client (GPUI Kit + GPUI Fast) — the Gavl app
 **Trustless:** consensus, ordering, storage; the gBTC ledger (fully-collateralized, conservation
 proven); threshold signing (no one holds the fund key). No price oracle anywhere.
 
-**Trusted (surfaced in the UI):** the **bridge committee's honest-majority assumption** (bonding
-raises its capture cost) plus a single Esplora chain view per node. Each channel is its own
-sandboxed economy.
+**Trusted (surfaced in the UI):** the **bridge committee's honest-majority assumption** (capture
+requires a 2/3 threshold of a VDF-sampled, PoST-weighted committee that grows with the network)
+plus a single Esplora chain view per node. Each channel is its own sandboxed economy.
 
-Before any mainnet satoshi: an **independent audit** (the largest open blocker) and **real
-independent bonded stakers** (slashing only bites when the stakers aren't all one operator).
+Before any mainnet satoshi: an **independent audit** (the largest open blocker) and a **large,
+independent farmer set** (sampling only protects when the space-time isn't all one operator's).
 Distributed DKG and non-public keys are already done. Until then it's testnet-only.
 
 ## TODO / not yet built

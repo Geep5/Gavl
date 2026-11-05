@@ -13,7 +13,6 @@
  *   POST /api/withdraw            {amount,btcAddress,fee}
  *   POST /api/deposit/claim       {txid}
  *   POST /api/withdrawals/process
- *   POST /api/custody/bond|unbond {amount}
  *   POST /api/channel             {name}    → switch channel
  *   POST /api/identity/reroll|import|export, /api/peers/dial|unpin, /api/gossip-interval, /api/fleet/up|down
  */
@@ -29,7 +28,7 @@ import { dirname, join } from "node:path";
 import { Daemon } from "./daemon.ts";
 import { genesisCommitteeKey } from "./custody/genesis-committee.ts";
 import { gbtcOf, parseAmount } from "./market/btc.ts";
-import { totalGbtc, pendingTotal } from "./custody/bridge.ts";
+import { totalGbtc, pendingTotal, demurrageChargeFrom } from "./custody/bridge.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
@@ -107,10 +106,9 @@ const daemon = new Daemon({
 	replicationTarget: Number(process.env.GAVL_REPLICATION_TARGET ?? "1"),
 	custody: {
 		epochLength: Number(process.env.GAVL_CUSTODY_EPOCH ?? "16"),
-		size: Number(process.env.GAVL_CUSTODY_SIZE ?? "5"),
+		size: process.env.GAVL_COMMITTEE_MAX ? Number(process.env.GAVL_COMMITTEE_MAX) : undefined, // K_MAX (default DEFAULT_COMMITTEE_MAX = 31)
 		minCommittee: Number(process.env.GAVL_CUSTODY_MIN ?? "3"),
 		ceremonyTimeoutMs: Number(process.env.GAVL_CUSTODY_TIMEOUT_MS ?? "30000"),
-		bonded: process.env.GAVL_CUSTODY_BONDED === "1", // gate #3: stake-weight selection by bonded gBTC
 	},
 });
 
@@ -200,19 +198,18 @@ function serializeState() {
 	const consensus = daemon.consensus();
 	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)
 	const onChainR = rsv != null ? rsv.sats : null;
-	// Idle-SWEEP (demurrage) countdown for the active account: a free balance is swept WHOLE to the pot
-	// at its idle deadline (`charged` = last-credit + grace) — a flat timeout, not a decay. The UI turns
-	// this single height into a live countdown via the current tip. Null if the account has no balance/clock.
+	// Idle-fee (demurrage) clock for the active account: no fee until `feeFromHeight` (last credit +
+	// grace); past it the idle balance pays 1% per 30 days, pro-rated per whole day. The UI turns this
+	// height into a live countdown via the current tip. Null if the account has no balance/clock.
 	const cf = view.bridge.chargeFrom.get(me);
-	const idleDecay = cf ? { sweepAtHeight: cf.charged } : null;
-	// Conservation buckets (reserves == free + bonded + pending + pot) for the UI breakdown.
-	// `free` is the remainder, so the four always sum to reserves.
-	const bondedV = [...view.bridge.bonds.values()].reduce((a, b) => a + b, 0n);
-	const freeV = view.bridge.reserves - bondedV - pendingTotal(view.bridge) - view.bridge.pot;
+	const idleDecay = cf ? { feeFromHeight: demurrageChargeFrom(cf.since) } : null;
+	// Conservation buckets (reserves == free + pending + pot) for the UI breakdown.
+	// `free` is the remainder, so the three always sum to reserves.
+	const freeV = view.bridge.reserves - pendingTotal(view.bridge) - view.bridge.pot;
 	const bridge = {
 		// collateral = gBTC, a 1:1 claim on BTC in the custody fund
 		myGbtc: gbtcOf(view, me).toString(),
-		idleDecay, // { sweepAtHeight } | null — idle-sweep countdown for your idle gBTC (flat timeout)
+		idleDecay, // { feeFromHeight } | null — when your idle gBTC starts paying the gentle idle fee
 
 		reserves: view.bridge.reserves.toString(), // BTC sats in the fund
 		gbtcOutstanding: totalGbtc(view.bridge).toString(),
@@ -228,11 +225,10 @@ function serializeState() {
 		reconciled: onChainR != null ? onChainR >= view.bridge.reserves : null, // real BTC covers the ledger?
 		shortfall: onChainR != null ? (view.bridge.reserves > onChainR ? (view.bridge.reserves - onChainR).toString() : "0") : null,
 		reservesCheckedAgoMs: rsv != null ? Date.now() - rsv.at : null,
-		// ── the liquidity pot (fed by demurrage idle-sweeps) ──
+		// ── the liquidity pot (fed by demurrage idle fees) ──
 		pot: view.bridge.pot.toString(),
-		// conservation breakdown (free + bonded + pending + pot == reserves)
+		// conservation breakdown (free + pending + pot == reserves)
 		free: freeV.toString(),
-		bonded: bondedV.toString(),
 	};
 
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));
@@ -340,18 +336,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			// Build + threshold-sign + broadcast the pending withdrawals as one BTC tx.
 			const txid = await daemon.processWithdrawals();
 			return send(res, 200, { txid });
-		}
-		if (path === "/api/custody/bond") {
-			// Lock gBTC at THIS node's committee identity as a bond (gate #3 stake weight).
-			// Fund producerId() with a gbtc.transfer first.
-			const amt = parseAmount(String(body.amount));
-			if (amt === null) throw new Error("amount must be a positive integer");
-			return send(res, 200, { id: await daemon.bondCustody(amt) });
-		}
-		if (path === "/api/custody/unbond") {
-			const amt = parseAmount(String(body.amount));
-			if (amt === null) throw new Error("amount must be a positive integer");
-			return send(res, 200, { id: await daemon.unbondCustody(amt) });
 		}
 		if (path === "/api/channel") {
 			// Join a different channel by name. Each channel is its own economy (own anchor

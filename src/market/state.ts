@@ -20,7 +20,6 @@ import { sha256Hex, canonicalize } from "../det/canonical.ts";
 import type { View } from "./btc.ts";
 import { emptyBridge } from "../custody/bridge.ts";
 import type { BridgeState, PendingWithdrawal } from "../custody/bridge.ts";
-import type { CustodyState } from "./btc.ts";
 
 // ── canonical (plain-JSON) shape ─────────────────────────────────
 
@@ -34,18 +33,22 @@ export interface CanonBridge {
 	depositors: string[]; // sorted
 	claims: Entry<{ depositor: string; height: number }>[]; // depositId → {depositor, request height}, sorted
 	broadcasts: Entry<string>[]; // withdrawalId → txid, sorted
-	bonds: Entry<string>[]; // pubkey → sats, sorted
-	unbonding: Entry<{ amount: string; releaseHeight: number }>[]; // pubkey → ..., sorted
 	mintedTotal: string;
 	paidOut: string;
-	chargeFrom: Entry<{ since: number; charged: number }>[]; // pubkey → demurrage idle clock, sorted
-	pot: string; // the liquidity pot (idle-decay bucket)
-	withdrawnTotal: string; // lifetime gBTC burned for withdrawal (Vector B outflow budget counter)
+	chargeFrom: Entry<{ since: number; from: number; base: string; days: number }>[]; // pubkey → demurrage idle clock, sorted
+	pot: string; // the liquidity pot (idle-fee bucket)
+}
+
+/** Plain-JSON custody state: the fund key/epoch plus the excluded (faulted) producers. */
+export interface CanonCustody {
+	fundKey: string | null;
+	epoch: number;
+	excluded: Entry<number>[]; // producer → fault height, sorted
 }
 
 export interface CanonState {
 	bridge: CanonBridge;
-	custody: CustodyState; // already plain (string|null, number)
+	custody: CanonCustody;
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -74,20 +77,17 @@ function serializeBridge(b: BridgeState): CanonBridge {
 		depositors: sortedSet(b.depositors),
 		claims: mapEntries(b.claims, (c) => ({ depositor: c.depositor, height: c.height })),
 		broadcasts: mapEntries(b.broadcasts, (v) => v),
-		bonds: mapEntries(b.bonds, (v) => v.toString()),
-		unbonding: mapEntries(b.unbonding, (u) => ({ amount: u.amount.toString(), releaseHeight: u.releaseHeight })),
 		mintedTotal: b.mintedTotal.toString(),
 		paidOut: b.paidOut.toString(),
-		chargeFrom: mapEntries(b.chargeFrom, (e) => ({ since: e.since, charged: e.charged })),
+		chargeFrom: mapEntries(b.chargeFrom, (e) => ({ since: e.since, from: e.from, base: e.base.toString(), days: e.days })),
 		pot: b.pot.toString(),
-		withdrawnTotal: b.withdrawnTotal.toString(),
 	};
 }
 
 export function serializeView(view: View): CanonState {
 	return {
 		bridge: serializeBridge(view.bridge),
-		custody: { fundKey: view.custody.fundKey, epoch: view.custody.epoch },
+		custody: { fundKey: view.custody.fundKey, epoch: view.custody.epoch, excluded: mapEntries(view.custody.excluded, (h) => h) },
 	};
 }
 
@@ -107,19 +107,16 @@ function deserializeBridge(b: CanonBridge): BridgeState {
 	for (const d of b.depositors) s.depositors.add(d);
 	for (const [k, c] of b.claims) s.claims.set(k, { depositor: c.depositor, height: c.height });
 	for (const [k, v] of b.broadcasts) s.broadcasts.set(k, v);
-	for (const [k, v] of b.bonds) s.bonds.set(k, BigInt(v));
-	for (const [k, u] of b.unbonding) s.unbonding.set(k, { amount: BigInt(u.amount), releaseHeight: u.releaseHeight });
 	s.mintedTotal = BigInt(b.mintedTotal);
 	s.paidOut = BigInt(b.paidOut);
-	for (const [k, e] of b.chargeFrom) s.chargeFrom.set(k, { since: e.since, charged: e.charged });
+	for (const [k, e] of b.chargeFrom) s.chargeFrom.set(k, { since: e.since, from: e.from, base: BigInt(e.base), days: e.days });
 	s.pot = BigInt(b.pot);
-	s.withdrawnTotal = BigInt(b.withdrawnTotal ?? "0"); // ?? 0 → tolerate pre-Vector-B snapshots
 	return s;
 }
 
 export function deserializeView(s: CanonState): View {
 	return {
 		bridge: deserializeBridge(s.bridge),
-		custody: { fundKey: s.custody.fundKey, epoch: s.custody.epoch },
+		custody: { fundKey: s.custody.fundKey, epoch: s.custody.epoch, excluded: new Map(s.custody.excluded) },
 	};
 }

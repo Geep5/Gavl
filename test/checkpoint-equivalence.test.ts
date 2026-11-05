@@ -21,7 +21,11 @@ import type { Heads } from "../src/ledger/ledger.ts";
 import { computeView, viewAtAnchor, marketConserved } from "../src/market/btc.ts";
 import { viewRoot } from "../src/market/state.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
+import { makeCeremonyAuth } from "../src/custody/ceremony-auth.ts";
+import { toHex } from "../src/det/canonical.ts";
 import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
+
+const LOOKBACK = 64; // fault lookback (anchors) — the daemon's windowAnchors + 2 × epochLength at defaults
 
 test("a checkpoint-pruned node folds forward to the same state + appRoot as a full node", async () => {
 	const node = new GavlNode(new Ledger(PARAMS));
@@ -57,12 +61,18 @@ test("a checkpoint-pruned node folds forward to the same state + appRoot as a fu
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 	await A.transfer(C.pubHex, 500n);
-	await A.bond(1000n); // both lock committee bonds
-	await B.bond(1000n);
+	await A.withdraw(1000n, "tb1qexamplexxxxxxxxxxxxxxxxxxxxxxxxxxxx"); // a pending withdrawal
+	// The anchor producer equivocates → a fault record (it produced within the lookback, so it counts);
+	// a throwaway non-producer key's equally valid proof is ignored.
+	for (const cheat of [kp, generateKeyPair()]) {
+		const auth = makeCeremonyAuth(cheat.privateKey);
+		const from = toHex(cheat.publicKey);
+		await B.reportFault(auth.stamp({ s: "commit", sign: "w", from, commit: { $u8: "01" } }), auth.stamp({ s: "commit", sign: "w", from, commit: { $u8: "02" } }));
+	}
 	const a1 = await mine();
 
 	// ── activity round 2, then anchors ──
-	await B.unbond(700n); // an unbond request (height-timed maturity)
+	await B.withdraw(700n, "tb1qexamplexxxxxxxxxxxxxxxxxxxxxxxxxxxx");
 	await A.transfer(B.pubHex, 100n);
 	await mine(); // a2
 	const a3 = await mine();
@@ -70,24 +80,25 @@ test("a checkpoint-pruned node folds forward to the same state + appRoot as a fu
 	const allWrites = node.ledger.allWrites();
 
 	// FULL node: state at the latest anchor, folding all history.
-	const full = viewAtAnchor(allWrites, chain, a3.id, seeded());
+	const full = viewAtAnchor(allWrites, chain, a3.id, seeded(), LOOKBACK);
+	assert.deepEqual([...full.custody.excluded.keys()], [toHex(kp.publicKey)], "only the producer's fault is recorded");
 	assert.ok(marketConserved(full), "full-node state conserves");
 
 	// PRUNED node: checkpoint at a1. It keeps a1's committed state as the base and only the
 	// writes ABOVE a1's certified heads; it has dropped everything a1 covered.
 	const ckptHeads: Heads = chain.headsAt(a1.id);
-	const base = viewAtAnchor(allWrites, chain, a1.id, seeded());
+	const base = viewAtAnchor(allWrites, chain, a1.id, seeded(), LOOKBACK);
 	const tail = allWrites.filter((w) => {
 		const h = ckptHeads[w.writer];
 		return h === undefined || w.seq > h.seq; // strictly post-checkpoint
 	});
 	assert.ok(tail.length < allWrites.length, "checkpoint must actually drop some writes");
 
-	const pruned = viewAtAnchor(tail, chain, a3.id, base);
+	const pruned = viewAtAnchor(tail, chain, a3.id, base, LOOKBACK);
 
 	assert.equal(viewRoot(pruned), viewRoot(full), "pruned node's state root diverged from the full node");
 	assert.ok(marketConserved(pruned), "pruned-node state conserves");
 
 	// And at the checkpoint anchor's child too (appRoot is lag-by-parent → exercises a3's appRoot).
-	assert.equal(viewRoot(viewAtAnchor(tail, chain, anchors[1].id, base)), viewRoot(viewAtAnchor(allWrites, chain, anchors[1].id, seeded())), "pruned == full at the intermediate anchor as well");
+	assert.equal(viewRoot(viewAtAnchor(tail, chain, anchors[1].id, base, LOOKBACK)), viewRoot(viewAtAnchor(allWrites, chain, anchors[1].id, seeded(), LOOKBACK)), "pruned == full at the intermediate anchor as well");
 });

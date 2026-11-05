@@ -1,8 +1,8 @@
 /**
  * Resumable fold (market/btc.ts computeView{base}) — the mechanic behind "never
  * replay from 0". Folding [later writes] onto the view of [earlier writes] must equal
- * folding the whole stream. Proven over a real write stream (transfers + bonds)
- * split at every boundary.
+ * folding the whole stream. Proven over a real write stream (transfers + withdrawals +
+ * a fault record) split at every boundary.
  *
  *   node --test test/resumable-fold.test.ts
  */
@@ -15,6 +15,9 @@ import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
 import { computeView, marketConserved } from "../src/market/btc.ts";
 import { viewRoot } from "../src/market/state.ts";
+import { makeCeremonyAuth } from "../src/custody/ceremony-auth.ts";
+import { generateKeyPair } from "../src/det/ed25519.ts";
+import { toHex } from "../src/det/canonical.ts";
 import { PARAMS, K, withGbtc } from "./helpers.ts";
 
 function setup() {
@@ -48,13 +51,18 @@ test("folding the tail onto the head's view equals folding the whole stream", as
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 	await A.transfer(C.pubHex, 1000n);
-	await A.bond(1000n); // bonds lock gBTC across the split boundaries
-	await B.bond(1000n);
-	await C.bond(500n);
+	await A.withdraw(1000n, "tb1qexamplexxxxxxxxxxxxxxxxxxxxxxxxxxxx"); // pending withdrawals ride across the splits
+	await B.withdraw(1000n, "tb1qexamplexxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+	const kp = generateKeyPair(); // a committee member that equivocates → a fault record in custody state
+	const auth = makeCeremonyAuth(kp.privateKey);
+	const from = toHex(kp.publicKey);
+	await C.reportFault(auth.stamp({ d: "round1", session: "g", from, pkg: { $u8: "01" } }), auth.stamp({ d: "round1", session: "g", from, pkg: { $u8: "02" } }));
 	await A.transfer(B.pubHex, 200n);
 
 	const all = [...node.ledger.allWrites()].sort(cmpWrite);
-	const full = computeView(all, { base: base() });
+	const isRecentProducer = (id: string) => id === from; // the equivocator is a recent producer → its fault records
+	const full = computeView(all, { base: base(), isRecentProducer });
+	assert.equal(full.custody.excluded.size, 1, "the fault is part of the folded state");
 	assert.ok(marketConserved(full), "full fold conserves");
 	const fullRoot = viewRoot(full);
 
@@ -62,8 +70,8 @@ test("folding the tail onto the head's view equals folding the whole stream", as
 	for (let i = 0; i <= all.length; i++) {
 		const prefix = all.slice(0, i);
 		const rest = all.slice(i);
-		const prefixView = computeView(prefix, { base: base() });
-		const resumed = computeView(rest, { base: prefixView });
+		const prefixView = computeView(prefix, { base: base(), isRecentProducer });
+		const resumed = computeView(rest, { base: prefixView, isRecentProducer });
 		assert.equal(viewRoot(resumed), fullRoot, `resume at split ${i} diverged`);
 		assert.ok(marketConserved(resumed), `resume at split ${i} broke conservation`);
 	}

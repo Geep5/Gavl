@@ -12,7 +12,7 @@
  *
  * Timeout means "couldn't finish in time," NOT "these members are malicious" — a slow
  * link looks the same as a dead node. The `missing` list is a liveness hint for
- * choosing whom to try next, never grounds for slashing (that needs a provable fault).
+ * choosing whom to try next, never grounds for exclusion (that needs a provable fault).
  */
 
 /** Thrown (as the `start()` rejection) when a ceremony can't complete in time. */

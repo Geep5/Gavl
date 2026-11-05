@@ -1,11 +1,11 @@
 /**
- * Auto-slashing (gate #3) — the watcher that turns slashing from "possible if someone
+ * Auto fault-reporting — the watcher that turns fault exclusion from "possible if someone
  * files a proof" into "fires automatically." It observes ceremony messages and, when a
  * member equivocates (two conflicting signed messages for one slot), hands the proof to a
- * callback (the daemon submits custody.slash). Critically, it must NOT flag legitimate
+ * callback (the daemon submits custody.fault). Critically, it must NOT flag legitimate
  * point-to-point traffic (one round-2 share per recipient).
  *
- *   node --test test/custody-auto-slash.test.ts
+ *   node --test test/custody-auto-fault.test.ts
  */
 
 import { test } from "node:test";
