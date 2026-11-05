@@ -1019,8 +1019,38 @@ export class Daemon {
 				console.log(`  consensus: adopted a checkpoint (height ${anchors.tip()!.height}) — joined the existing heaviest network`);
 				return;
 			}
+			// Rooting at genesis on a mesh: a checkpoint loaded from our own disk can't be on this chain.
+			const discarded = await this.discardOffChainCheckpoint();
+			this.installGenesisRoot();
+			if (discarded) this.node.resync(); // re-pull peers' chains + writes now that block 0 is in place
+			return;
 		}
 		this.installGenesisRoot(); // nothing to join → seed the deterministic genesis
+	}
+
+	/**
+	 * A checkpoint loaded from this node's own disk only means something on the chain it was cut from.
+	 * Anchors aren't persisted, so when no peer re-offers that chain and the node roots at the hardcoded
+	 * genesis instead, the stored checkpoint — and the writes replayed on top of it — belong to a chain
+	 * this node is no longer on. Folding them in makes every appRoot here differ from any peer that
+	 * doesn't hold the identical stale base: each side rejects the other's block 1 ("appRoot ≠ folded
+	 * state") and farms a private fork forever. So drop that channel state (RAM + disk) and start the
+	 * genesis chain from the same empty base as everyone else; anything still live re-syncs from peers.
+	 * Mesh-only: a lone node has nobody to disagree with and keeps its state across restarts.
+	 * Returns true if state was discarded.
+	 */
+	private async discardOffChainCheckpoint(): Promise<boolean> {
+		if (this.lastCheckpointHeight < 0) return false;
+		const writes = this.node.ledger.summary().writes;
+		console.warn(`  storage: saved checkpoint (height ${this.lastCheckpointHeight}) isn't on the chain this node is joining — discarding it and ${writes} stale write(s), starting from genesis`);
+		this.node.ledger.reset();
+		this.checkpointBase = undefined;
+		this.lastCheckpointHeight = -1;
+		this.lastSnapshot = undefined;
+		this.viewCache = undefined;
+		this.finalCache = undefined;
+		await this.store?.clear();
+		return true;
 	}
 
 	/** The DETERMINISTIC genesis for this node's network — a pure function of the network label + base

@@ -169,6 +169,14 @@ export class Ledger {
 		}
 	}
 
+	/** Forget every writer chain and buffered write — back to an empty ledger. Used when the state
+	 *  replayed from disk turns out to belong to a chain this node is no longer on. */
+	reset(): void {
+		this.chains.clear();
+		this.pending.clear();
+		this.tick = 0;
+	}
+
 	/** Every applied write across all writers (the input to state computation). */
 	allWrites(): Write[] {
 		const out: Write[] = [];

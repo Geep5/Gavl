@@ -130,6 +130,14 @@ export class WriteStore {
 		return cleared;
 	}
 
+	/** Delete every persisted write and checkpoint — the channel's on-disk state belonged to a chain
+	 *  this node is no longer on. Returns the number of writes deleted. */
+	async clear(): Promise<number> {
+		const cleared = Number(this.db.prepare("DELETE FROM writes").run().changes ?? 0);
+		this.db.exec("DELETE FROM snapshots");
+		return cleared;
+	}
+
 	stats(): { kept: number; seen: number; policy: string } {
 		return { kept: this.kept, seen: this.seen, policy: this.policy.describe() };
 	}
