@@ -10,10 +10,8 @@
  * is therefore a normal P2TR address (`bc1p…`); only a min-of-max quorum can move
  * its coins, and the private key is never assembled.
  *
- * v0 uses trusted-dealer keys, which are UNTWEAKED — the Taproot output key is the
- * group key itself (a valid, spendable P2TR output). Production uses DKG, whose
- * keys are auto-tweaked with the BIP-341 empty merkle root (provably no script
- * path); the address/spend flow here is identical either way.
+ * The fund key comes from the committee's distributed key generation (DKG); the
+ * Taproot output key is the group key itself (a valid, spendable P2TR output).
  *
  * NOT YET: building the real BIP-341 sighash from a UTXO set, witness assembly,
  * and broadcast (next increment — needs tx serialization). Here a `sighash` is the
@@ -25,8 +23,8 @@ import { bech32m } from "@scure/base";
 import { thresholdSign } from "./threshold.ts";
 import type { FundKey, PublicPackage, Share } from "./threshold.ts";
 
-export type Network = "mainnet" | "testnet" | "regtest";
-const HRP: Record<Network, string> = { mainnet: "bc", testnet: "tb", regtest: "bcrt" };
+export type Network = "mainnet" | "testnet" | "signet" | "regtest";
+const HRP: Record<Network, string> = { mainnet: "bc", testnet: "tb", signet: "tb", regtest: "bcrt" };
 
 /** The fund's x-only Taproot output key (32 bytes) from the FROST group key.
  *  v0: untweaked (output key == group key). DKG keys arrive already tweaked. */

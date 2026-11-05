@@ -43,7 +43,7 @@ built from the finalized burn. Concretely the fold checks
    Taproot, so one committee key backs both vaults. Deposit tweaks and attestation digests carry
    an asset tag so a signature for one coin can never be replayed for another.
 6. **No trusted setup.** The first committee creates the key by DKG; no machine ever sees the
-   whole key. (Testnet currently uses a one-time trusted dealer; that is being removed.)
+   whole key. This holds on every network, testnet included.
 7. **Everyone watches.** Every node verifies that the committee only ever co-signs payouts that
    match finalized burns. A provable fault (signing two conflicting ceremony messages) is posted
    as a `custody.fault` op; the fold verifies the proof and **excludes** that producer from all

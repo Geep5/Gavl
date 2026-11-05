@@ -81,34 +81,17 @@ Custody is **committee-only**: it needs **≥3 nodes actually farming** to run t
 then a node holds no fund key and can't mint — it waits for peers. Mainnet additionally refuses
 in-memory storage (`GAVL_PERSIST=off`).
 
-#### Genesis committee — a deliberate testnet/mainnet split (a tradeoff, *not* a bug)
+#### Genesis — the fund key is DKG'd live, on every network
 
-The genesis DKG above is the secure path, but it is a **live multi-node ceremony** that must complete on
-the wire before custody works — and it is brittle to bootstrap: it is *n-of-n* for key generation, so a
-single non-completing member **wedges it**. That is a real failure mode you hit *regardless* of how clean
-the mesh is. So for **testnet/dev** we sidestep the live ceremony with a **trusted-dealer setup** that keeps
-the repo clean:
-
-1. `npm run committee:setup` mints a 2-of-3 committee **once, on one machine, with fresh randomness**, prints
-   the **public group key**, and writes one secret bundle per seat (its share + committee keypair).
-2. You paste **only the public group key** into [`genesis-committee.ts`](src/custody/genesis-committee.ts)
-   (or set `GAVL_COMMITTEE_PUBKEY`), and copy each seat bundle into that node's `<data>/custody/`
-   **out-of-band — the secret shares never touch git.**
-3. On boot a node loads its share, **verifies it against the repo's public key** (refusing a mismatch),
-   announces the key into consensus state, and signs. No DKG, nothing to wedge.
-
-A fresh clone of the repo has the fund **address and no way to spend** — a public key can't sign and can't be
-reversed into the private key. The secret shares live only on the nodes.
-
-**The tradeoff, and why it is testnet-only:** the machine that runs the one-time setup transiently sees the
-whole key while it cuts the shares (a "trusted dealer"). You delete the output afterward and trust that
-one-time setup — a standard trusted-setup assumption, fine for an operator standing up their own nodes, but
-*not* trustless. **Mainnet keeps the live distributed DKG**, where no machine ever sees the whole key; the
-daemon gates the trusted-dealer path off mainnet.
-
-**This split is intentional — do not "fix" it by deleting one side.** The trusted-dealer setup unblocks
-dev/testnet without a flaky ceremony; the live DKG is the trustless production path. Its bootstrap-robustness
-(timeout-and-exclude / qualified-set, so one bad member can't wedge it) is a *separate, tracked* concern.
+There is no trusted setup and no committed key: every network (testnet, signet, regtest, mainnet)
+mints its fund key the same way. Once an epoch boundary is finalized with **≥`minCommittee` (default
+3) distinct producers** in its eligibility window, every node derives the same genesis committee
+(the *first* such epoch, sampled at `genesisSize`, default `minCommittee`), its members run a
+distributed DKG over the mesh, and each publishes the resulting group key as `custody.fund` (first
+write wins; all members post the same key). Every later epoch reshares the same key to that epoch's
+committee — grown to `K_MAX` — so the address never moves. The genesis DKG is *n-of-n*: a member that
+never completes it times out the ceremony (`GAVL_CUSTODY_TIMEOUT_MS`), and the members retry the same
+genesis epoch at the next epoch boundary.
 
 ### Consensus + bounded RAM (`src/consensus/`)
 
@@ -222,7 +205,9 @@ npm run desktop          # desktop app only (expects a daemon on :6440)
 
 Key env vars: `GAVL_VDF=chia|hash` · `GAVL_SPACE=chiapos|standin`
 · `GAVL_K=<n>` (plot size; default 18 for chiapos) · `GAVL_MAX_PEERS=<n>` (bounded mesh; default 16) ·
-`GAVL_PERSIST=all|mine|off` · `GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_DATA_DIR` / `GAVL_PORT`
+`GAVL_PERSIST=all|mine|off` · `GAVL_BTC_NET=testnet|signet|regtest|mainnet` (regtest → `bcrt1…`
+addresses) · `GAVL_ESPLORA_URL=<url,url>` (Esplora REST roots for the bridge, tried in order; overrides
+the public defaults, required for regtest) · `GAVL_DATA_DIR` / `GAVL_PORT`
 (isolate a node) · `GAVL_NETWORK=<label>` (channel name; default `gavl-testnet`) ·
 `GAVL_RELAYS=<wss://…,wss://…>` (override the default relay set) · `GAVL_COMMITTEE_MAX=<n>` (custody
 committee cap K_MAX; default 31 — consensus-critical, every node must agree) ·
@@ -268,14 +253,10 @@ Distributed DKG and non-public keys are already done. Until then it's testnet-on
 
 Tracked custody gaps — listed so they aren't rediscovered or "fixed" by accident:
 
-- [x] **Genesis-committee verify guard** (testnet committee) — *done*. A node refuses an on-disk share whose
-  group key doesn't equal the repo's hardcoded public key, so it won't run a committee that disagrees with the
-  public identity. Built alongside the trusted-dealer setup (which replaced the old seed-derived committee —
-  the seed is gone, so the repo carries no secret). [`src/custody/genesis-committee.ts`](src/custody/genesis-committee.ts).
-- [ ] **Live-DKG bootstrap robustness** (mainnet committee). The genesis DKG is *n-of-n*, so one
-  non-completing member wedges it; add timeout-and-exclude / a qualified-set so the committee forms among
-  the responsive ≥threshold members and a stale node can't block it. The dev committee sidesteps this for
-  testnet; mainnet still needs it.
+- [ ] **Live-DKG bootstrap robustness**. The genesis DKG is *n-of-n*, so one non-completing member
+  wedges it (every retry targets the same deterministic genesis epoch and committee); add
+  timeout-and-exclude / a qualified-set so the committee forms among the responsive ≥threshold members
+  and a stale node can't block it.
 - [ ] **Autonomous signing trigger** (custody ops). Each seat must independently detect a
   deposit/withdrawal and join the 2-of-3 signing round; coordinating *when* to sign is the piece to
   finish before real BTC moves in or out.

@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { Esplora } from "../src/custody/esplora.ts";
+import { Esplora, btcNetFromEnv, esploraBasesFromEnv } from "../src/custody/esplora.ts";
 
 const TX = { txid: "ab".repeat(32), vout: [{ value: 1234 }], status: { confirmed: true, block_height: 5 } };
 
@@ -68,4 +68,26 @@ test("a 404 is a real answer from a healthy endpoint — no failover", async () 
 test("all endpoints dead → one descriptive error naming them", async () => {
 	const es = new Esplora({ net: "testnet", bases: ["http://127.0.0.1:1", "http://127.0.0.1:2"], timeoutMs: 2_000 });
 	await assert.rejects(() => es.getTx(TX.txid), /all endpoints failed/);
+});
+
+test("GAVL_BTC_NET: regtest/signet/mainnet explicit, anything else is testnet", () => {
+	assert.equal(btcNetFromEnv("regtest"), "regtest");
+	assert.equal(btcNetFromEnv("signet"), "signet");
+	assert.equal(btcNetFromEnv("mainnet"), "mainnet");
+	assert.equal(btcNetFromEnv(undefined), "testnet");
+	assert.equal(btcNetFromEnv("bogus"), "testnet", "mainnet is never selected implicitly");
+});
+
+test("GAVL_ESPLORA_URL: comma-separated bases, trimmed, trailing slash dropped; unset → defaults", async () => {
+	assert.deepEqual(esploraBasesFromEnv(" http://127.0.0.1:3002/ ,http://h:1/api//,"), ["http://127.0.0.1:3002", "http://h:1/api"]);
+	assert.equal(esploraBasesFromEnv(undefined), undefined);
+	assert.equal(esploraBasesFromEnv(" , "), undefined);
+	const live = await mock();
+	const es = new Esplora({ net: "regtest", bases: esploraBasesFromEnv(`${live.url}/`) });
+	assert.equal((await es.getTx(TX.txid))?.txid, TX.txid, "the override base is the one queried");
+	live.close();
+});
+
+test("regtest has no public explorer — without an override it fails loudly", async () => {
+	await assert.rejects(() => new Esplora({ net: "regtest" }).tipHeight(), /no endpoint for regtest — set GAVL_ESPLORA_URL/);
 });

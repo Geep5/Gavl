@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 
 import { generateFundKey, quorumOf } from "../src/custody/threshold.ts";
 import { taprootOutputKey, taprootAddress, taprootScriptPubKey, fundAddress, signWithdrawal, verifyWithdrawal } from "../src/custody/bitcoin.ts";
+import { buildWithdrawalTx } from "../src/custody/btctx.ts";
 import { sha256 } from "@noble/hashes/sha2.js";
 
 test("bech32m P2TR encoding matches the BIP341 test vector", () => {
@@ -23,11 +24,21 @@ test("fund key → a real Taproot address (deterministic, network-aware)", () =>
 	assert.ok(addr.startsWith("bc1p"), "mainnet P2TR address");
 	assert.equal(addr, fundAddress(key, "mainnet"), "deterministic for the same key");
 	assert.ok(fundAddress(key, "testnet").startsWith("tb1p"), "testnet HRP");
+	assert.ok(fundAddress(key, "signet").startsWith("tb1p"), "signet shares testnet's HRP");
+	assert.ok(fundAddress(key, "regtest").startsWith("bcrt1p"), "regtest HRP");
 	// scriptPubKey is OP_1 push32 <key>
 	const spk = taprootScriptPubKey(taprootOutputKey(key.groupPubKey));
 	assert.equal(spk.length, 34);
 	assert.equal(spk[0], 0x51); // OP_1
 	assert.equal(spk[1], 0x20); // push 32
+});
+
+test("regtest: a withdrawal can pay a bcrt1 address (regtest network object, not testnet's)", () => {
+	const key = generateFundKey(2, 3);
+	const to = fundAddress(generateFundKey(2, 3), "regtest");
+	const w = buildWithdrawalTx(key, { inputs: [{ txid: "11".repeat(32), index: 0, amount: 10_000n }], outputs: [{ address: to, amount: 9_000n }], network: "regtest" });
+	assert.equal(w.fee, 1_000n);
+	assert.throws(() => buildWithdrawalTx(key, { inputs: [{ txid: "11".repeat(32), index: 0, amount: 10_000n }], outputs: [{ address: to, amount: 9_000n }], network: "testnet" }), "a bcrt1 address is invalid on testnet");
 });
 
 test("a quorum's withdrawal signature is BITCOIN-VALID (BIP340)", () => {

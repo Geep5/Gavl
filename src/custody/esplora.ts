@@ -8,13 +8,32 @@
  *
  * Defaults to mempool.space's Esplora-compatible API. TESTNET by default — real
  * Bitcoin protocol, zero financial risk. Mainnet is gated on an audit (see the
- * custody docs), so it must be selected explicitly.
+ * custody docs), so it must be selected explicitly. REGTEST has no public explorer:
+ * point `GAVL_ESPLORA_URL` at a local Esplora-compatible server.
  *
  * No deps (fetch). Network I/O, so it lives outside the deterministic fold; the
  * verification LOGIC it feeds (watcher.ts) is pure and tested.
  */
 
-export type EsploraNet = "mainnet" | "testnet" | "signet";
+import type { Network } from "./bitcoin.ts";
+
+export type EsploraNet = Network;
+
+/** The bridge's Bitcoin network from `GAVL_BTC_NET` (mainnet | testnet | signet | regtest); anything
+ *  else (incl. unset) is testnet — mainnet is never selected implicitly. */
+export function btcNetFromEnv(v: string | undefined = process.env.GAVL_BTC_NET): EsploraNet {
+	return v === "mainnet" || v === "signet" || v === "regtest" ? v : "testnet";
+}
+
+/** Explorer bases from `GAVL_ESPLORA_URL` (comma-separated Esplora REST roots, e.g.
+ *  `http://127.0.0.1:3002`), or undefined when unset → the network's DEFAULT_BASES. */
+export function esploraBasesFromEnv(v: string | undefined = process.env.GAVL_ESPLORA_URL): string[] | undefined {
+	const bases = (v ?? "")
+		.split(",")
+		.map((b) => b.trim().replace(/\/+$/, ""))
+		.filter((b) => b.length > 0);
+	return bases.length > 0 ? bases : undefined;
+}
 
 /** Esplora-compatible endpoints per network, tried IN ORDER (failover). A custody bridge must not
  *  hang off a single provider: deposits can't verify and the committee can't co-sign while the one
@@ -25,6 +44,7 @@ const DEFAULT_BASES: Record<EsploraNet, string[]> = {
 	mainnet: ["https://mempool.space/api", "https://blockstream.info/api"],
 	testnet: ["https://mempool.space/testnet/api", "https://blockstream.info/testnet/api"],
 	signet: ["https://mempool.space/signet/api", "https://blockstream.info/signet/api"],
+	regtest: [], // local chain only — needs GAVL_ESPLORA_URL
 };
 
 export interface EsploraStatus {
@@ -55,7 +75,7 @@ export class Esplora {
 
 	constructor(opts: { net?: EsploraNet; base?: string; bases?: string[]; timeoutMs?: number } = {}) {
 		this.net = opts.net ?? "testnet";
-		this.bases = opts.base ? [opts.base] : opts.bases ?? DEFAULT_BASES[this.net];
+		this.bases = opts.base ? [opts.base] : opts.bases?.length ? opts.bases : DEFAULT_BASES[this.net];
 		this.timeoutMs = opts.timeoutMs ?? 10_000;
 	}
 
@@ -65,6 +85,7 @@ export class Esplora {
 	 *  identical raw tx is idempotent on Bitcoin (same txid), so retrying POST /tx elsewhere can't
 	 *  double-spend. */
 	private async req(path: string, init?: RequestInit): Promise<Response> {
+		if (this.bases.length === 0) throw new Error(`esplora: no endpoint for ${this.net} — set GAVL_ESPLORA_URL`);
 		let lastErr: unknown = null;
 		for (let i = 0; i < this.bases.length; i++) {
 			const at = (this.preferred + i) % this.bases.length;

@@ -26,7 +26,7 @@ import { createServer as netServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Daemon } from "./daemon.ts";
-import { genesisCommitteeKey } from "./custody/genesis-committee.ts";
+import { btcNetFromEnv } from "./custody/esplora.ts";
 import { gbtcOf, parseAmount } from "./market/btc.ts";
 import { totalGbtc, pendingTotal, demurrageChargeFrom } from "./custody/bridge.ts";
 
@@ -80,12 +80,12 @@ const FARM = process.env.GAVL_FARM !== "0";
 // custody secrets — REQUIRED to run several nodes on one box.
 if (process.env.GAVL_CUSTODY && process.env.GAVL_CUSTODY !== "committee")
 	console.warn(`  note: GAVL_CUSTODY=${process.env.GAVL_CUSTODY} ignored — committee is the only custody mode (solo/seed was removed; a lone node waits for peers).`);
-const BTC_NET = process.env.GAVL_BTC_NET === "mainnet" ? "mainnet" : process.env.GAVL_BTC_NET === "signet" ? "signet" : "testnet";
+const BTC_NET = btcNetFromEnv(); // GAVL_BTC_NET: mainnet | testnet (default) | signet | regtest
 const DATA_DIR = process.env.GAVL_DATA_DIR; // undefined → ~/.gavl
 
 // Mainnet safety-lock: custody is already committee-only (no single-key path can arise), but real BTC
 // must also never live only in RAM — a restart would erase who owns which BTC. Refuse in-memory on
-// mainnet. Testnet/signet are free to do as they like.
+// mainnet. Testnet/signet/regtest are free to do as they like.
 if (BTC_NET === "mainnet" && PERSIST === "off")
 	throw new Error("mainnet refuses in-memory storage (GAVL_PERSIST=off) — a restart would erase who owns which BTC. Use GAVL_PERSIST=all on durable disk.");
 
@@ -413,8 +413,6 @@ createServer((req, res) => {
 	const cu = daemon.custodyStatus();
 	if (cu.fundKeyOnChain)
 		console.log(`  custody: committee — fund ${cu.fundAddress} (key ${cu.fundKeyOnChain.slice(0, 12)}…; this node ${cu.holdsShare ? "holds a share" : "is watching"})`);
-	else if (genesisCommitteeKey(daemon.currentChannel()) !== null)
-		console.log(`  custody: trusted-dealer committee (testnet) — fund key publishing into the chain; finalizes once farming anchors it (no DKG). Repo holds only the public key.`);
 	else
 		console.log(`  custody: committee — WAITING for ≥${cu.minCommittee} farmers to run genesis DKG. No fund key yet, so minting is disabled until the committee forms — a lone node waits for peers; there is no single-key fallback.`);
 });

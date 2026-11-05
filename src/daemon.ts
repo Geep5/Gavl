@@ -28,7 +28,6 @@ import type { Heads } from "./ledger/ledger.ts";
 import type { FundKey } from "./custody/threshold.ts";
 import { DkgCoordinator } from "./custody/dkg-coordinator.ts";
 import { saveShare, loadShare } from "./custody/share-store.ts";
-import { genesisCommitteeKey } from "./custody/genesis-committee.ts";
 import type { StoredShare } from "./custody/share-store.ts";
 import { fundAddress as deriveFundAddress } from "./custody/bitcoin.ts";
 import { depositAddress } from "./custody/deposit.ts";
@@ -49,7 +48,8 @@ import type { AnchorView } from "./custody/epoch.ts";
 import { fid, quorumForRound } from "./custody/committee.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "./custody/attestation.ts";
 import { isCeremonyTimeout } from "./custody/ceremony.ts";
-import { Esplora } from "./custody/esplora.ts";
+import { Esplora, btcNetFromEnv, esploraBasesFromEnv } from "./custody/esplora.ts";
+import type { EsploraNet } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, confirmations, MIN_CONFIRMATIONS, txPaysWithdrawal } from "./custody/watcher.ts";
 import { pendingClaims, inFlightWithdrawals } from "./custody/bridge.ts";
 import type { PendingWithdrawal } from "./custody/bridge.ts";
@@ -397,7 +397,6 @@ export class Daemon {
 	 */
 	private maintainCommittee(): void {
 		if (!this.transport) return;
-		if (this.trustedCommitteeMode()) return; // trusted-dealer committee is static — no sampled roster, no DKG to drive
 		const anchors = this.node.anchors;
 		const tip = anchors?.tip();
 		if (!anchors || !tip) return;
@@ -1067,9 +1066,6 @@ export class Daemon {
 		});
 	}
 
-	/** Stand up the autonomous custody loop: it watches finality (via node.onTip →
-	 *  driveRotation) and runs genesis DKG / per-epoch reshare across the PoST-weighted
-	 *  committee sampled from the chain. The fund key is published on-chain at genesis. */
 	/** DIAGNOSTIC (3): a node that's farming but never produces an anchor (a small plot, a stalled VDF
 	 *  worker, or a forgotten venv) silently never joins the committee. Warn once after a grace period. */
 	private startHealthWatch(): void {
@@ -1126,53 +1122,11 @@ export class Daemon {
 		this.stallTimer = undefined;
 	}
 
-	/** TESTNET trusted-dealer committee mode: the PUBLIC group key for this network is hardcoded in the repo
-	 *  (genesis-committee.ts), and each seat's SECRET share was distributed out-of-band into <data>/custody.
-	 *  When that key is set we run NO live DKG. THE production custody model on every network, mainnet included (Grant, 2026-07-02): mint once locally, shares out-of-band, only the public key committed — users trust the operator ran the setup honestly.
-	 *  The repo never carries a secret — only the public key. See README "Genesis committee". */
-	private trustedCommitteeMode(): boolean {
-		return genesisCommitteeKey(this.currentChannel()) !== null;
-	}
-	private committeeKeyPath(): string {
-		return join(this.dataDir, "custody", "committee-key.json");
-	}
-
-	/** This node's loaded committee seat — its out-of-band share + committee keypair — or null if it isn't a
-	 *  member. REFUSES a share whose group key doesn't equal the repo's hardcoded one (the derive-and-verify
-	 *  guard: a node won't run a committee that disagrees with the public identity in the repo). */
-	private trustedCommitteeCache?: { secretKey: Uint8Array; groupPubKey: Uint8Array } | null;
-	private genesisCommittee(): { secretKey: Uint8Array; groupPubKey: Uint8Array } | null {
-		if (this.trustedCommitteeCache !== undefined) return this.trustedCommitteeCache;
-		const key = genesisCommitteeKey(this.currentChannel());
-		const share = this.committeeShare();
-		if (!key || !share || !existsSync(this.committeeKeyPath())) return (this.trustedCommitteeCache = null);
-		if (toHex(share.groupPubKey) !== toHex(key)) {
-			console.warn(`  ⚠ custody: on-disk share's group key ${toHex(share.groupPubKey).slice(0, 12)}… ≠ repo's ${toHex(key).slice(0, 12)}… — REFUSING it (re-distribute the right seat bundle).`);
-			return (this.trustedCommitteeCache = null);
-		}
-		try {
-			const secretKey = fromHex(JSON.parse(readFileSync(this.committeeKeyPath(), "utf8")).secretKey);
-			return (this.trustedCommitteeCache = { secretKey, groupPubKey: share.groupPubKey });
-		} catch (e) {
-			console.warn(`  ⚠ custody: committee-key.json unreadable (${(e as Error).message}) — not signing.`);
-			return (this.trustedCommitteeCache = null);
-		}
-	}
-
-	/** Announce the out-of-band-installed committee's group key into consensus state so the fund activates
-	 *  (gate #4). The share is already on disk; nothing secret is generated or persisted here. */
-	private installGenesisCommittee(hc: { groupPubKey: Uint8Array }): void {
-		if (this.view().custody.fundKey === null) void this.custodyAccount().announceFund(toHex(hc.groupPubKey), 0).catch(() => {});
-		console.warn(`  custody: trusted-dealer committee — share loaded, fund key ${toHex(hc.groupPubKey).slice(0, 12)}… publishing into the chain (no DKG). Repo holds only the public key.`);
-	}
-
+	/** Stand up the autonomous custody loop — the ONLY custody path, on every network: it watches
+	 *  finality (node.onTip → driveRotation) and runs the genesis DKG, then a per-epoch reshare, across
+	 *  the PoST-weighted committee sampled from the chain. The fund key is published on-chain at genesis. */
 	private startCommitteeCustody(): void {
 		if (this.rotation) return;
-		if (this.trustedCommitteeMode()) {
-			const hc = this.genesisCommittee();
-			if (hc) this.installGenesisCommittee(hc); // member → announce the group key; non-member just learns it from the chain
-			return; // trusted-dealer committee is static — no live DKG / rotation
-		}
 		this.rotation = new CommitteeRotation({
 			node: this.node,
 			selfId: this.producerId(),
@@ -1372,12 +1326,7 @@ export class Daemon {
 	 *  pubkey) and verifies peers' — so an impersonator on the committee topic is dropped. */
 	private ceremonyAuthCache?: CeremonyAuth;
 	private ceremonyAuth(): CeremonyAuth {
-		if (!this.ceremonyAuthCache) {
-			// Trusted-dealer committee: sign ceremony messages as the seat's committee keypair (the out-of-band
-			// secret), not this node's producer key. Falls back to the producer key for the live-DKG path.
-			const hc = this.genesisCommittee();
-			this.ceremonyAuthCache = makeCeremonyAuth(hc ? hc.secretKey : this.producerKey().privateKey);
-		}
+		if (!this.ceremonyAuthCache) this.ceremonyAuthCache = makeCeremonyAuth(this.producerKey().privateKey);
 		return this.ceremonyAuthCache;
 	}
 
@@ -1433,15 +1382,19 @@ export class Daemon {
 		saveShare(this.sharePath(), { ...result, session: opts.session, selfId: opts.selfId, participants: opts.participants, min: opts.min });
 		return deriveFundAddress({ groupPubKey: result.groupPubKey, pub: result.pub, shares: {}, min: opts.min, max: opts.participants.length }, this.btcNetwork());
 	}
-	private esploraCache?: Esplora;
+	private esploraCache?: { key: string; client: Esplora };
+	/** The bridge's explorer client: network from GAVL_BTC_NET, endpoints from GAVL_ESPLORA_URL
+	 *  (comma-separated Esplora roots) or the network's public defaults. */
 	private esplora(): Esplora {
-		const net = process.env.GAVL_BTC_NET === "signet" ? "signet" : process.env.GAVL_BTC_NET === "mainnet" ? "mainnet" : "testnet";
-		if (!this.esploraCache || this.esploraCache.net !== net) this.esploraCache = new Esplora({ net });
-		return this.esploraCache;
+		const net = this.btcNetwork();
+		const bases = esploraBasesFromEnv();
+		const key = `${net}|${bases?.join(",") ?? ""}`;
+		if (this.esploraCache?.key !== key) this.esploraCache = { key, client: new Esplora({ net, bases }) };
+		return this.esploraCache.client;
 	}
-	/** Which Bitcoin network the bridge is on (testnet by default). */
-	btcNetwork(): "mainnet" | "testnet" | "signet" {
-		return this.esplora().net;
+	/** Which Bitcoin network the bridge is on (GAVL_BTC_NET; testnet by default). */
+	btcNetwork(): EsploraNet {
+		return btcNetFromEnv();
 	}
 	/** The base fund address (change + legacy + consolidation). Per-user deposits go to
 	 *  `depositAddressFor` instead — see the front-running fix. NULL pre-genesis (no committee
@@ -1792,6 +1745,8 @@ export class Daemon {
 	async stop(): Promise<void> {
 		this.farming = false;
 		clearInterval(this.encKeyTimer);
+		clearInterval(this.reserveTimer);
+		this.reserveTimer = undefined;
 		this.producer?.stop();
 		this.stopHealthWatch();
 		this.stopStallWatch();

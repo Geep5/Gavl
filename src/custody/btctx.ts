@@ -26,7 +26,9 @@ import type { Network } from "./bitcoin.ts";
 import { depositOutputKey, depositScriptPubKey, signDepositSpend } from "./deposit.ts";
 import type { FundKey, Share } from "./threshold.ts";
 
-const NET: Record<Network, typeof btc.NETWORK> = { mainnet: btc.NETWORK, testnet: btc.TEST_NETWORK, regtest: btc.TEST_NETWORK };
+/** Regtest = testnet's version bytes with the `bcrt` bech32 HRP (btc-signer ships no regtest constant). */
+const REGTEST_NETWORK: typeof btc.NETWORK = { ...btc.TEST_NETWORK, bech32: "bcrt" };
+const NET: Record<Network, typeof btc.NETWORK> = { mainnet: btc.NETWORK, testnet: btc.TEST_NETWORK, signet: btc.TEST_NETWORK, regtest: REGTEST_NETWORK };
 
 /** A fund UTXO to spend. `owner` = the depositor whose per-user deposit address holds
  *  it (signed with that user's tweak); undefined = the base fund address. */
