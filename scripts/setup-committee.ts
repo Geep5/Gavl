@@ -49,7 +49,7 @@ console.log(`\n  ✅ Minted a ${min}-of-${max} committee with fresh randomness �
 console.log(`${line}`);
 console.log(`  1) PASTE this into src/custody/genesis-committee.ts → GENESIS_COMMITTEE_PUBKEY:\n`);
 console.log(`       "<network label>": "${groupHex}",\n`);
-console.log(`     (network label = the channel string, e.g. "BTC-USD::pyth::e62df6c8…")`);
+console.log(`     (network label = the channel string, e.g. "gavl-testnet")`);
 console.log(`${line}`);
 console.log(`  2) DISTRIBUTE the seats out-of-band (SECRET — never commit):\n`);
 for (let i = 0; i < c.members.length; i++) {

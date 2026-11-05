@@ -7,7 +7,7 @@
  * Everything is measured against the REAL serializer (market/state.ts) and the REAL fold
  * (computeView over real Ed25519-signed writes) — no mocks — so the numbers are authentic:
  *
- *   1) committed bytes per entry (account / round entry) → the RAM-&-disk cost per cap
+ *   1) committed bytes per entry (account) → the RAM-&-disk cost per cap
  *   2) fold throughput (ops/sec) → the single-chain TPS ceiling of the state machine
  *      (PoST proof verification is a separate per-write ingest gate, not measured here)
  *
@@ -24,7 +24,7 @@ import type { Write } from "../src/chain/writer.ts";
 import { serializeView } from "../src/market/state.ts";
 import { canonicalize, sha256Hex } from "../src/det/canonical.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, priceBase, withGbtc } from "../test/helpers.ts";
+import { PARAMS, K, withGbtc } from "../test/helpers.ts";
 
 const enc = new TextEncoder();
 const MB = 1048576;
@@ -50,47 +50,6 @@ const buildAccounts = (n: number): View => {
 	}
 	return v;
 };
-
-// ── 1b. rounds — canonical round shape: bytes per entry ──
-// Measures the exact encoding a live round commits (canonicalize over the plain-JSON shape),
-// the same way accounts are sized.
-
-const buildRoundCanon = (n: number): unknown => ({
-	idx: 123_456,
-	strike: "6004300000000", // integer Pyth price (expo applied at display)
-	close: null, // still live
-	poolUp: "123456789012",
-	poolDown: "98765432101",
-	seedUp: "0", // the pot's lock-time thin-side seed — two pool-level fields per round
-	seedDown: "12345678901",
-	settled: false,
-	// entries: pubkey → {side, stake}, key-sorted like every other canonical map
-	entries: Array.from({ length: n }, (_, i) => [hx("player" + i), { side: i % 2 ? "up" : "down", stake: "1000000" }] as [string, unknown]).sort((a, b) => ((a[0] as string) < (b[0] as string) ? -1 : 1)),
-});
-const roundEntryBytes = (n1: number, n2: number): number =>
-	(enc.encode(canonicalize(buildRoundCanon(n2))).length - enc.encode(canonicalize(buildRoundCanon(n1))).length) / (n2 - n1);
-
-/** Parimutuel settle throughput: pro-rata distribution of the WHOLE losing pool across n winners
- *  (pure parimutuel, no rake — bigint math per entry, the batch cost the fold pays once per round close). */
-function settleRate(n: number, budgetMs = 500): number {
-	const entries = Array.from({ length: n }, (_, i) => ({ up: i % 2 === 0, stake: 1_000_000n + BigInt(i) }));
-	const settle = (): bigint => {
-		let winPool = 0n, losePool = 0n;
-		for (const e of entries) e.up ? (winPool += e.stake) : (losePool += e.stake);
-		const dist = losePool; // the whole losing pool distributes
-		let paid = 0n;
-		for (const e of entries) if (e.up) paid += e.stake + (e.stake * dist) / winPool; // winner: stake back + pro-rata share
-		return dist - (paid - winPool); // integer-division dust → the pot
-	};
-	settle(); // warm
-	let reps = 0;
-	const t0 = performance.now();
-	while (performance.now() - t0 < budgetMs) {
-		settle();
-		reps++;
-	}
-	return (reps * n) / ((performance.now() - t0) / 1000);
-}
 
 function heapPerAccount(n: number): number | null {
 	const g = (globalThis as { gc?: () => void }).gc;
@@ -134,7 +93,7 @@ async function transferRate(n: number): Promise<number> {
 	const sink = hx("sink");
 	for (let i = 0; i < n; i++) await c.transfer(sink, 1n);
 	const writes = node.ledger.allWrites();
-	const base = withGbtc(priceBase(5_852_013n), { [c.pubHex]: BigInt(n) + 1n });
+	const base = withGbtc(computeView([]), { [c.pubHex]: BigInt(n) + 1n });
 	const bornAt = new Map(writes.map((w) => [w.id, 5] as [string, number]));
 	return foldRate(writes, { base, nowHeight: 5, bornAt });
 }
@@ -154,10 +113,6 @@ async function main(): Promise<void> {
 	if (hp != null) console.log(`  in-RAM heap/account ≈ ${fmt(hp)} B  (live JS object + Map overhead; run with --expose-gc)`);
 	else console.log(`  (run with --expose-gc for the in-RAM heap-per-account figure)`);
 
-	const bRound = roundEntryBytes(1000, 4000);
-	console.log(`  round entry   : ${fmt(bRound)} B    10,000/round → ${(bRound * 10_000 / MB * 1000).toFixed(0)} KB · 2 live rounds → ${(bRound * 20_000 / MB).toFixed(1)} MB`);
-	console.log(`  settle sweep  : ${fmt(settleRate(10_000))} entries/s   (parimutuel pro-rata, bigint; one batch per round close)`);
-
 	console.log("\n  FOLD THROUGHPUT — ops/sec the state machine sustains, one core (excl. PoST verify)");
 	console.log(line);
 	const tT = await transferRate(1500);
@@ -165,9 +120,9 @@ async function main(): Promise<void> {
 
 	console.log("\n  IMPLICATIONS");
 	console.log(line);
-	console.log(`  • RAM is cheap — a 1,000,000-account cap ≈ ${(bAcc * 1_000_000 / MB).toFixed(0)} MB committed state; a full round (10,000 entries) is ~${(bRound * 10_000 / MB).toFixed(1)} MB and self-clears at settle.`);
+	console.log(`  • RAM is cheap — a 1,000,000-account cap ≈ ${(bAcc * 1_000_000 / MB).toFixed(0)} MB committed state.`);
 	console.log(`  • The binding limit is THROUGHPUT, not memory: ~${fmt(tT)} folded ops/sec on one core.`);
-	console.log(`  • At ~60s/anchor that's ~${fmt(tT * 60)} ops per anchor before the fold saturates; a round close sweeps ${fmt(settleRate(10_000))} entries/s.`);
+	console.log(`  • At ~60s/anchor that's ~${fmt(tT * 60)} ops per anchor before the fold saturates.`);
 	console.log("");
 }
 

@@ -5,11 +5,17 @@
  * Writes pay the PoST cooldown, so action endpoints are async and can take a
  * few hundred ms.
  *
- *   GET  /api/state                       → { accounts, active, coins, balances }
- *   POST /api/accounts        {label}      → create + activate an identity
- *   POST /api/accounts/active {pubHex}     → switch the active identity
- *   POST /api/coins           {name,symbol,supply}        → deploy a coin
- *   POST /api/transfer        {token,to,amount}
+ *   GET  /api/state                         → { accounts, active, gbtc, bridge, consensus, custody, storage, fleet }
+ *   GET  /api/events?since=N                → network/diagnostic log page
+ *   POST /api/accounts            {label}   → create + activate an identity
+ *   POST /api/accounts/active     {pubHex}  → switch the active identity
+ *   POST /api/transfer            {to,amount}
+ *   POST /api/withdraw            {amount,btcAddress,fee}
+ *   POST /api/deposit/claim       {txid}
+ *   POST /api/withdrawals/process
+ *   POST /api/custody/bond|unbond {amount}
+ *   POST /api/channel             {name}    → switch channel
+ *   POST /api/identity/reroll|import|export, /api/peers/dial|unpin, /api/gossip-interval, /api/fleet/up|down
  */
 
 import { createServer } from "node:http";
@@ -20,12 +26,9 @@ import { homedir } from "node:os";
 import { createServer as netServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { Daemon, parseChannel, defaultMarketChannel } from "./daemon.ts";
+import { Daemon } from "./daemon.ts";
 import { genesisCommitteeKey } from "./custody/genesis-committee.ts";
-import { mark, gbtcOf, parseAmount } from "./market/btc.ts";
-import { roundIdxAt, lockBoundary, closeBoundary, entryOpen, roundsEscrowTotal, ROUND_LEN, MIN_ROUND_STAKE } from "./market/rounds.ts";
-import type { RoundSide } from "./market/rounds.ts";
-import type { View } from "./market/btc.ts";
+import { gbtcOf, parseAmount } from "./market/btc.ts";
 import { totalGbtc, pendingTotal } from "./custody/bridge.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
@@ -62,11 +65,9 @@ const HEARTBEAT_MS = Number(process.env.GAVL_HEARTBEAT_MS ?? "60000");
 //   GAVL_PERSIST=mine            → keep only writes touching my wallet keys + their coins
 const PERSIST = process.env.GAVL_PERSIST ?? "all";
 
-// Channel/network: the name IS the address. GAVL_NETWORK sets the initial channel; the UI can
-// switch at runtime. MESH/FARM gate consensus. Default is the shipped BTC-USD market channel (name
-// encodes a Pyth feed id), so the app prices + trades out of the box; a plain GAVL_NETWORK name = a
-// transfers-only channel.
-const NETWORK = process.env.GAVL_NETWORK ?? defaultMarketChannel();
+// Channel/network: the name IS the address (a plain label). GAVL_NETWORK sets the initial channel;
+// the UI can switch at runtime. MESH/FARM gate consensus.
+const NETWORK = process.env.GAVL_NETWORK ?? "gavl-testnet";
 const MESH = process.env.GAVL_MESH !== "0";
 const FARM = process.env.GAVL_FARM !== "0";
 
@@ -144,7 +145,6 @@ async function fleetUp(): Promise<void> {
 	const env = { ...process.env };
 	env.GAVL_DATA_DIR = join(homedir(), ".gavl-nodes", name);
 	env.GAVL_PORT = String(port);
-	env.GAVL_ORACLE_PUBLISH = "0";
 	const child = spawn(process.execPath, [join(REPO_ROOT, "src", "server.ts")], { cwd: REPO_ROOT, stdio: "ignore", windowsHide: true, env });
 	const entry = { name, port, child, startedAt: Date.now() };
 	const drop = () => { const i = fleet.indexOf(entry); if (i >= 0) fleet.splice(i, 1); };
@@ -187,119 +187,17 @@ process.on("exit", killFleet);
 process.on("SIGINT", () => { killFleet(); process.exit(0); });
 process.on("SIGTERM", () => { killFleet(); process.exit(0); });
 
-// ── Gavl Rounds → JSON (the 1-click bull/bear panel + agent API) ──
-
-/** A round as the client sees it. Synthesized from the height geometry even when nobody has entered
- *  yet (a round with no entries doesn't exist in consensus state — but the CLOCK always does). */
-interface RoundInfo {
-	idx: number;
-	locksAt: number; // strike boundary (anchor height)
-	closesAt: number; // settle boundary
-	strike: string | null;
-	poolUp: string; // TOTAL depth: entry stakes + the pot's lock-time seed (odds/payouts run on totals)
-	poolDown: string;
-	seeded: string; // the pot's seed in this round (seedUp + seedDown) — 0 until lock, badge-able
-	entries: number;
-	mySide: RoundSide | null;
-	myStake: string;
-}
-
-/** Recently-ended rounds (the history strip): kept by this server process by diffing polls — a
- *  best-effort UI nicety (resets on restart; the chain is the authority). `close` = the mark at
- *  detection; payouts recompute exactly from the cached pools. */
-const roundsHistory: { idx: number; strike: string | null; close: string | null; outcome: "up" | "down" | "refund"; mySide: RoundSide | null; myStake: string; myPayout: string }[] = [];
-let lastRoundsSeen = new Map<number, { strike: bigint | null; poolUp: bigint; poolDown: bigint; mySide: RoundSide | null; myStake: bigint }>();
-
-function roundInfoOf(view: View, me: string, idx: number): RoundInfo {
-	const r = view.rounds.get(idx);
-	const mine = r?.entries.get(me);
-	return {
-		idx,
-		locksAt: lockBoundary(idx),
-		closesAt: closeBoundary(idx),
-		strike: r?.strike?.toString() ?? null,
-		poolUp: ((r?.poolUp ?? 0n) + (r?.seedUp ?? 0n)).toString(), // totals — real settleable depth
-		poolDown: ((r?.poolDown ?? 0n) + (r?.seedDown ?? 0n)).toString(),
-		seeded: ((r?.seedUp ?? 0n) + (r?.seedDown ?? 0n)).toString(),
-		entries: r?.entries.size ?? 0,
-		mySide: mine?.side ?? null,
-		myStake: (mine?.stake ?? 0n).toString(),
-	};
-}
-
-/** The rounds block: the accepting round, the live (locked) one, constants, and recent history. */
-function roundsInfo(view: View, me: string, tipHeight: number) {
-	// Track endings: a cached round that vanished from state settled (or refunded). Outcome derives
-	// from its strike vs the current mark; payouts recompute exactly from the cached pools.
-	const nowSeen = new Map<number, { strike: bigint | null; poolUp: bigint; poolDown: bigint; mySide: RoundSide | null; myStake: bigint }>();
-	for (const [idx, r] of view.rounds) {
-		const mine = r.entries.get(me);
-		// Cache TOTAL pools (stakes + pot seed) — settle runs on totals, so the payout recompute stays exact.
-		nowSeen.set(idx, { strike: r.strike, poolUp: r.poolUp + r.seedUp, poolDown: r.poolDown + r.seedDown, mySide: mine?.side ?? null, myStake: mine?.stake ?? 0n });
-	}
-	const closeMark = view.market.price;
-	for (const [idx, r] of lastRoundsSeen) {
-		if (nowSeen.has(idx)) continue;
-		const refunded = r.strike === null || r.poolUp === 0n || r.poolDown === 0n || closeMark === null || closeMark === r.strike;
-		const outcome: "up" | "down" | "refund" = refunded ? "refund" : closeMark! > r.strike! ? "up" : "down";
-		let myPayout = 0n;
-		if (r.myStake > 0n) {
-			if (outcome === "refund") myPayout = r.myStake;
-			else if (r.mySide === outcome) {
-				const losePool = outcome === "up" ? r.poolDown : r.poolUp;
-				const winPool = outcome === "up" ? r.poolUp : r.poolDown;
-				myPayout = r.myStake + (r.myStake * losePool) / winPool; // pure parimutuel: the whole losing pool distributes
-			}
-		}
-		roundsHistory.unshift({ idx, strike: r.strike?.toString() ?? null, close: closeMark?.toString() ?? null, outcome, mySide: r.mySide, myStake: r.myStake.toString(), myPayout: myPayout.toString() });
-	}
-	if (roundsHistory.length > 20) roundsHistory.length = 20;
-	lastRoundsSeen = nowSeen;
-
-	const enteringIdx = roundIdxAt(tipHeight);
-	return {
-		len: ROUND_LEN,
-		minStake: MIN_ROUND_STAKE.toString(),
-		tip: tipHeight,
-		entryOpen: entryOpen(enteringIdx, tipHeight), // false during the pre-lock cutoff anchor
-		entering: roundInfoOf(view, me, enteringIdx),
-		live: enteringIdx > 0 ? roundInfoOf(view, me, enteringIdx - 1) : null, // closes exactly when `entering` locks
-		history: roundsHistory.slice(0, 12),
-	};
-}
-
 // ── View → JSON (Maps + BigInts → plain, string amounts) ─────────
 
 function serializeState() {
 	const view = daemon.view(); // optimistic tip — reflects actions immediately
 	const me = daemon.wallet.active().pubHex;
-	const m = mark(view); // this channel's market price, null until a Pyth update is relayed
 
 	// gBTC balances: { pubkey: amount } (1:1 claims on BTC in the custody fund)
 	const gbtc: Record<string, string> = {};
 	for (const [pubkey, amt] of view.bridge.gbtc) gbtc[pubkey] = amt.toString();
 
-	// A CHANNEL IS A MARKET, named by its price source: `label::pyth::feedId` (a Wormhole-attested Pyth
-	// feed, 13-of-19 guardians) or `label::signed::setHash` (any M-of-N Ed25519 signer set you stand up).
-	// Either way ANYONE may relay a quorum-signed update — the fold verifies the quorum, so there's no
-	// reporter to trust and no single signer can forge. Each channel is its own sandboxed economy.
-	const def = parseChannel(daemon.currentChannel());
-	const live = def ? daemon.oracleSource() : null;
-	const marketInfo = def
-		? {
-				channel: daemon.currentChannel(),
-				kind: def.kind, // "pyth" | "signed"
-				label: def.label,
-				feedId: def.kind === "pyth" ? def.feedId : null, // Pyth feed id (pyth markets)
-				signerSet: def.kind === "signed" ? def.signerSet : null, // committed signer-set hash (signed markets)
-				price: m != null ? m.toString() : null,
-				iAmRelaying: !!live, // this node is relaying the feed (anyone may; the quorum signature is the authority)
-				source: live ? { method: live.method, ageMs: Date.now() - live.at, feeds: live.readings.map((r) => ({ endpoint: r.endpoint, key: r.key, raw: r.raw, value: r.value != null ? r.value.toString() : null, error: r.error ?? null })) } : null,
-			}
-		: null;
-
-	const consensus = daemon.consensus(); // hoisted: the rounds clock needs the tip height
-	const tipH = Number(consensus?.tip?.height ?? 0);
+	const consensus = daemon.consensus();
 	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)
 	const onChainR = rsv != null ? rsv.sats : null;
 	// Idle-SWEEP (demurrage) countdown for the active account: a free balance is swept WHOLE to the pot
@@ -307,22 +205,17 @@ function serializeState() {
 	// this single height into a live countdown via the current tip. Null if the account has no balance/clock.
 	const cf = view.bridge.chargeFrom.get(me);
 	const idleDecay = cf ? { sweepAtHeight: cf.charged } : null;
-	// Conservation buckets (reserves == free + bonded + pending + pot + rounds) for the UI breakdown.
-	// `free` is the remainder, so the five always sum to reserves regardless of how the ledger rounds.
-	const roundsV = roundsEscrowTotal(view.rounds);
+	// Conservation buckets (reserves == free + bonded + pending + pot) for the UI breakdown.
+	// `free` is the remainder, so the four always sum to reserves.
 	const bondedV = [...view.bridge.bonds.values()].reduce((a, b) => a + b, 0n);
-	const freeV = view.bridge.reserves - bondedV - pendingTotal(view.bridge) - view.bridge.pot - roundsV;
-	const market = {
-		oracle: def?.kind ?? "pyth", // mechanism: the channel name encodes the price source; updates are source-signed
-		marketInfo,
-		price: m != null ? m.toString() : null,
-		priceExpo: view.market.expo, // decimal exponent: display value = price · 10^expo
+	const freeV = view.bridge.reserves - bondedV - pendingTotal(view.bridge) - view.bridge.pot;
+	const bridge = {
 		// collateral = gBTC, a 1:1 claim on BTC in the custody fund
 		myGbtc: gbtcOf(view, me).toString(),
 		idleDecay, // { sweepAtHeight } | null — idle-sweep countdown for your idle gBTC (flat timeout)
 
 		reserves: view.bridge.reserves.toString(), // BTC sats in the fund
-		gbtcOutstanding: (totalGbtc(view.bridge) + roundsV).toString(),
+		gbtcOutstanding: totalGbtc(view.bridge).toString(),
 		pending: pendingTotal(view.bridge).toString(), // burned, awaiting BTC payout
 		pendingCount: view.bridge.pending.length,
 		// YOUR OWN deposit address — derived from (fund key, your pubkey), so a deposit
@@ -335,18 +228,15 @@ function serializeState() {
 		reconciled: onChainR != null ? onChainR >= view.bridge.reserves : null, // real BTC covers the ledger?
 		shortfall: onChainR != null ? (view.bridge.reserves > onChainR ? (view.bridge.reserves - onChainR).toString() : "0") : null,
 		reservesCheckedAgoMs: rsv != null ? Date.now() - rsv.at : null,
-		// ── the liquidity pot (fed by demurrage idle-sweeps + settle dust; outflow = pot-seeding at lock) ──
+		// ── the liquidity pot (fed by demurrage idle-sweeps) ──
 		pot: view.bridge.pot.toString(),
-		// conservation breakdown (free + bonded + pending + pot + rounds == reserves)
+		// conservation breakdown (free + bonded + pending + pot == reserves)
 		free: freeV.toString(),
 		bonded: bondedV.toString(),
-		roundsEscrow: roundsV.toString(),
-		// ── Gavl Rounds: the 1-click bull/bear panel (accepting + live round, odds, history) ──
-		rounds: roundsInfo(view, me, tipH),
 	};
 
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));
-	return { accounts, active: me, gbtc, market, consensus, custody: daemon.custodyStatus(), storage: daemon.storeStats(), fleet: fleetStatus() };
+	return { accounts, active: me, gbtc, bridge, consensus, custody: daemon.custodyStatus(), storage: daemon.storeStats(), fleet: fleetStatus() };
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -400,11 +290,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		return send(res, 200, serializeState());
 	}
 
-	if (method === "GET" && path === "/api/rounds") {
-		// The agent-facing rounds endpoint: same block the UI gets, without the rest of the state.
-		return send(res, 200, roundsInfo(daemon.view(), daemon.wallet.active().pubHex, Number(daemon.consensus()?.tip?.height ?? 0)));
-	}
-
 	if (method === "GET" && path === "/api/events") {
 		const since = Number(url.searchParams.get("since") ?? "0") || 0;
 		return send(res, 200, daemon.events(since));
@@ -421,7 +306,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			daemon.wallet.setActive(String(body.pubHex));
 			return send(res, 200, { active: body.pubHex });
 		}
-		// ── BTC bull/bear (gBTC collateral) ──
+		// ── gBTC ──
 		if (path === "/api/transfer") {
 			if (!String(body.to ?? "").trim()) throw new Error("recipient pubkey required");
 			requireSpendable(String(body.amount), "amount");
@@ -468,32 +353,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			if (amt === null) throw new Error("amount must be a positive integer");
 			return send(res, 200, { id: await daemon.unbondCustody(amt) });
 		}
-		if (path === "/api/market/test") {
-			// Fetch-test a candidate Pyth feed before creating the market: fetch its latest update from
-			// Hermes and verify the guardian-attested quorum + Merkle proof, returning the decoded price.
-			const r = await daemon.testPythFeed(String(body.feedId ?? ""));
-			return send(res, 200, r);
-		}
-		// ── Gavl Rounds: the 1-click bull/bear ──
-		if (path === "/api/round/enter") {
-			// Enter the current round's UP or DOWN pool (idx optional — agents may pin one). These are
-			// UX guards only; the fold is authoritative and rejects the same conditions deterministically.
-			const side = body.side === "up" ? "up" : body.side === "down" ? "down" : null;
-			if (!side) throw new Error('side must be "up" or "down"');
-			const stake = requireSpendable(String(body.stake), "stake");
-			const tip = Number(daemon.consensus()?.tip?.height ?? 0);
-			const idx = body.idx != null ? Number(body.idx) : roundIdxAt(tip);
-			if (!Number.isInteger(idx) || idx < 0) throw new Error("idx must be a non-negative integer");
-			if (!entryOpen(idx, tip)) throw new Error(`round #${idx} isn't accepting entries right now — entries close 1 anchor before lock; the next round opens at height ${lockBoundary(idx)}`);
-			const mine = daemon.view().rounds.get(idx)?.entries.get(daemon.wallet.active().pubHex);
-			if (!mine && stake < MIN_ROUND_STAKE) throw new Error(`minimum first entry is ${MIN_ROUND_STAKE} gBTC`);
-			if (mine && mine.side !== side) throw new Error(`you're already ${mine.side.toUpperCase()} in round #${idx} — same side only (a re-entry tops up)`);
-			const id = await daemon.active().enterRound(idx, side, stake);
-			return send(res, 200, { id, idx, side, stake: stake.toString() });
-		}
 		if (path === "/api/channel") {
 			// Join a different channel by name. Each channel is its own economy (own anchor
-			// chain + market state); your wallet/identity is shared. Returns once the switch lands.
+			// chain + ledger state); your wallet/identity is shared. Returns once the switch lands.
 			const name = String(body.name ?? "").trim();
 			if (!name) return send(res, 400, { error: "channel name required" });
 			await daemon.switchChannel(name);
@@ -561,11 +423,7 @@ createServer((req, res) => {
 		console.log(`  storage: in-memory only (GAVL_PERSIST=off) — writes are lost on restart`);
 	}
 
-	// Pricing: this node RELAYS the channel's Wormhole-attested Pyth feed (no reporter — anyone may;
-	// the fold re-verifies). Opt out of relaying with GAVL_ORACLE_PUBLISH=0 (e.g. a node with no
-	// internet); it then just consumes whatever peers relay.
-	const publishOracle = process.env.GAVL_ORACLE_PUBLISH === "0" ? undefined : { everyMs: Number(process.env.GAVL_ORACLE_MS ?? "5000") };
-	await daemon.startConsensus({ network: NETWORK, mesh: MESH, farm: FARM, publishOracle });
+	await daemon.startConsensus({ network: NETWORK, mesh: MESH, farm: FARM });
 	const c = daemon.consensus();
 	console.log(`  → mesh ${c.mesh ? "joined" : "off"}, ${c.peers} peer(s), farming ${c.farming ? "live" : "off"}`);
 	const cu = daemon.custodyStatus();

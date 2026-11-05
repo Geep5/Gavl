@@ -10,7 +10,7 @@ use gpui_kit::component::StyledExt;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
-use super::{copyable, copyable_as, mono, muted, page, row, section};
+use super::{copyable, mono, muted, page, row, section};
 use crate::app::{Busy, GavlApp};
 use crate::format;
 use crate::status;
@@ -23,7 +23,6 @@ impl GavlApp {
 
     fn render_identity(&self, cx: &App) -> impl IntoElement + use<> {
         let consensus = self.snapshot.consensus.clone().unwrap_or_default();
-        let info = self.snapshot.market.as_ref().and_then(|m| m.market_info.clone()).unwrap_or_default();
         let active = self.snapshot.active.clone().unwrap_or_default();
         let transport = match consensus.transport.as_deref() {
             Some("nostr") => match (consensus.relays_up, consensus.relays_total) {
@@ -33,18 +32,13 @@ impl GavlApp {
             Some(other) => other.to_string(),
             None => "Local only".into(),
         };
-        let channel = if info.channel.is_empty() { consensus.network.clone() } else { info.channel.clone() };
-        // The channel id is `label::source::feed`; the label is what people recognise, the full id is what peers must match.
-        let channel_label = channel.split("::").next().unwrap_or_default().to_owned();
-
         let body = v_flex()
             .child(row("Daemon", mono(self.client.base().to_owned(), cx), cx))
             .child(row("Account key", copyable("copy-account", &active, cx), cx))
             .when_some(consensus.node_key.clone(), |this, key| {
                 this.child(row("Node address", copyable("copy-node", &key, cx), cx))
             })
-            .child(row("Network", copyable_as("copy-channel", &channel_label, &channel, cx), cx))
-            .when_some(info.feed_id.clone(), |this, feed| this.child(row("Pyth price feed", copyable("copy-feed", &feed, cx), cx)))
+            .child(row("Network", copyable("copy-channel", &consensus.network, cx), cx))
             .child(row("Proofs", div().text_sm().child(status::proof_mode(&consensus)), cx))
             .child(row("Transport", div().text_sm().child(transport), cx));
         section("Identity", Some("Share the node address with other computers so they can pin this node."), body, cx)

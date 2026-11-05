@@ -34,23 +34,14 @@ function makeView(rev = false): View {
 	for (const d of order(["aa", "cc", "zz"])) bridge.depositors.add(d);
 	for (const p of order(["dep1:0", "dep2:1"])) bridge.processed.add(p);
 	bridge.reserves = 357n;
+	bridge.pot = 11n;
 	bridge.mintedTotal = 400n;
 	bridge.paidOut = 43n;
 	bridge.pending = [
 		{ id: "burn1", owner: "aa", amount: 12n, btcAddress: "bc1qaa", fee: 500n },
 		{ id: "burn2", owner: "bb", amount: 31n, btcAddress: "bc1qbb", fee: 700n },
 	]; // pending is FIFO — order is itself state, NOT reversed
-
-	// a live parimutuel round (locked — strike set, not yet closed, thin side pot-seeded), entries in probe order
-	const rEntries: [string, { side: "up" | "down"; stake: bigint }][] = [["aa", { side: "up", stake: 500n }], ["bb", { side: "down", stake: 300n }], ["cc", { side: "up", stake: 200n }]];
-	const rounds = new Map([[7, { idx: 7, strike: 61_000n as bigint | null, poolUp: 700n, poolDown: 300n, seedUp: 0n, seedDown: 400n, entries: new Map(order(rEntries)) }]]);
-
-	return {
-		bridge,
-		market: { price: 61500n, expo: 0, seq: 3, at: 10 },
-		custody: { fundKey: "deadbeef", epoch: 0 },
-		rounds,
-	};
+	return { bridge, custody: { fundKey: "deadbeef", epoch: 0 } };
 }
 
 test("viewRoot is independent of Map/Set insertion order", () => {
@@ -71,8 +62,8 @@ test("deserialize restores bigints / Maps / Sets as native types", () => {
 	assert.equal(back.bridge.gbtc.get("bb"), 250n);
 	assert.equal(typeof back.bridge.reserves, "bigint");
 	assert.ok(back.bridge.processed.has("dep1:0"));
-	assert.equal(back.rounds.get(7)?.entries.get("aa")?.stake, 500n);
-	assert.equal(back.market.price, 61500n);
+	assert.equal(back.bridge.unbonding.get("ee")?.amount, 4n);
+	assert.equal(back.bridge.pot, 11n);
 	assert.equal(back.bridge.pending[0].id, "burn1", "pending FIFO order preserved");
 });
 
@@ -84,7 +75,7 @@ test("a single changed balance changes the root", () => {
 });
 
 test("empty view has a stable, defined root", () => {
-	const empty: View = { bridge: emptyBridge(), market: { price: null, expo: 0, seq: -1, at: 0 }, custody: { fundKey: null, epoch: -1 }, rounds: new Map() };
+	const empty: View = { bridge: emptyBridge(), custody: { fundKey: null, epoch: -1 } };
 	assert.equal(viewRoot(empty), viewRoot(empty));
 	assert.match(viewRoot(empty), /^[0-9a-f]{64}$/);
 });

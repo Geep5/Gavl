@@ -4,32 +4,29 @@
 
 # Gavl
 
-A decentralized **1-click Bitcoin bull/bear market** on a **Proof-of-Space-Time cooldown
-ledger**, networked over [Nostr](https://nostr.com) (public relays; nothing to install, nothing to host).
+A decentralized **no-oracle gBTC exchange** on a **Proof-of-Space-Time cooldown ledger**, networked
+over [Nostr](https://nostr.com) (public relays; nothing to install, nothing to host).
 
-Pick **UP** or **DOWN** on Bitcoin for the next 15-minute round — parimutuel rounds priced by the
-Pyth-signed BTC feed. Winners split the losing pool pro-rata — **all of it**: pure parimutuel, no
-rake. **There is no pool counterparty and no house** — every stake is real escrowed gBTC and the
-pools only ever redistribute it, so reserves can never be drained. PoST is the clock and the
-doorman: rounds are derived from anchor height, and every entry pays a cooldown (a proof of space
-*and* of time), so an attacker can't spin up cheap identities to flood the network. State lives in
-**RAM** and is **checkpointed into the consensus chain**, so a node boots from committed state
-(never replaying from genesis).
+**gBTC** is a 1:1 claim on real Bitcoin held in a **threshold-custody fund** that only an M-of-N
+committee can spend (no single party ever holds the key). There is **no price oracle**: nothing in
+the state machine reads an external price, and every op only *moves* gBTC between buckets, so
+reserves always equal what they back. A per-anchor **batch auction** for trading is planned but not
+built yet; today the ledger supports deposits, transfers, withdrawals, and committee bonds.
 
-Collateral is **gBTC** — a 1:1 claim on real Bitcoin held in a **threshold-custody fund** that only
-an M-of-N committee can spend (no single party ever holds the key).
+PoST is the clock and the doorman: every write pays a cooldown (a proof of space *and* of time), so
+an attacker can't spin up cheap identities to flood the network. State lives in **RAM** and is
+**checkpointed into the consensus chain**, so a node boots from committed state (never replaying
+from genesis).
 
 > [!WARNING]
-> **Gavl is use-it-or-lose-it — not a savings account.** gBTC is meant to be *working*: staked in a
-> round or actively moving. A **free balance left idle for 7 days is swept whole** into
-> the shared liquidity pot. Rounds run on their own 15-minute clock too — nothing here is
-> set-and-forget. **Only keep money in while you're actively using it, and withdraw what you're done
-> with.** That bound is what keeps the system spam-proof and RAM-light — it is deliberately *not* a
-> place to park BTC.
+> **Gavl is use-it-or-lose-it — not a savings account.** A **free gBTC balance left idle for 7 days
+> is swept whole** into the shared liquidity pot. **Only keep money in while you're actively using
+> it, and withdraw what you're done with.** That bound is what keeps the system spam-proof and
+> RAM-light — it is deliberately *not* a place to park BTC.
 
-> **Status:** Gavl Rounds runs live; the real-BTC bridge runs end-to-end on **testnet** across
-> a 3-node committee. Custody is committee-only (no single-key path on any network). Still gated on an
-> independent audit + real independent stakers — **don't put real mainnet BTC in it.**
+> **Status:** the real-BTC bridge runs end-to-end on **testnet** across a 3-node committee. Custody
+> is committee-only (no single-key path on any network). Still gated on an independent audit + real
+> independent stakers — **don't put real mainnet BTC in it.**
 
 ---
 
@@ -51,41 +48,13 @@ is what makes "verify against your current peers" cheap and a RAM chain with no 
 possible. Real PoST (chiavdf + chiapos) is the default; `GAVL_VDF=hash GAVL_SPACE=standin` is a fast
 stand-in for tests/UI work.
 
-### Gavl Rounds (`src/market/rounds.ts`)
+### Ledger (`src/market/btc.ts`)
 
-The 1-click bull/bear: **parimutuel up/down rounds derived from anchor height** — no scheduler, no
-listing op, no order book. Round *N* IS the height interval `[N·15, (N+1)·15)`:
-
-1. **Deposit** testnet BTC to *your* fund address → mint **gBTC** 1:1.
-2. **Enter** — while a round's window is open, anyone stakes gBTC on **UP** or **DOWN** (one write:
-   `round.enter`). Entries close one anchor before lock, so there's no last-second info sniping.
-3. **Lock / strike** — at the window's end the round locks; the strike is the first *confidence-OK*
-   oracle write at or after the boundary ("the first qualifying write in fold order", so full and
-   checkpoint-resumed nodes can never disagree). A wide-confidence Pyth update is skipped and the
-   next one is tried — the "clear photo" gate.
-4. **Close / settle** — one window later, the same rule sets the close. Winners split the losing
-   pool **pro-rata to stake** — **100% of it** (pure parimutuel, no rake; only integer-division dust
-   reaches the liquidity pot); the round deletes itself.
-
-**Full round?** Admission is **top-N-by-stake**: a full round admits only a strictly-bigger stake,
-evicting (and refunding) the floor entry — squatting a slot costs real capital; ties keep the
-incumbent. **Refund edges:** a tie (close == strike), a one-sided round, or an oracle that never
-produces a qualifying strike/close (dark past a timeout) refunds every entry its stake — nobody can
-lose to a market that didn't happen. The liquidity pot is an **idle-decay reservoir**: it is fed by
-the **idle-balance sweep** (demurrage), and its one outflow is **pot-seeding** — at lock it stakes
-the thin side of an imbalanced round (budget-capped), so what idle balances forfeit makes thin
-rounds settleable. Conservation is a tested invariant:
-`reserves == free + bonded + pending + pot + rounds` — ops only *move* gBTC, never mint.
-
-### Pricing — named, not voted (`src/market/pyth.ts`)
-
-A market is a channel whose name encodes its price source: `label::pyth::feedId`. Every **Pyth** price
-is signed by a 2/3+1 quorum (13-of-19) of the **Wormhole guardian set** over a Merkle root of all
-feeds, so **anyone relays** the latest signed update and every node verifies the guardian quorum +
-Merkle proof *locally* — there's no reporter to run or trust. The guardian set is a pinned
-weak-subjectivity trust anchor (currently **set index 7**); if Wormhole rotates it, refresh
-`WORMHOLE_GUARDIANS` from the core bridge's `getGuardianSet(uint32)` on-chain. (A channel can also
-name `label::signed::setHash` — your own M-of-N Ed25519 signer set; `src/market/signed-feed.ts`.)
+The application state is a pure fold of the write set: the gBTC bridge (`bridge.deposit`,
+`bridge.claim`, `bridge.withdraw`, `bridge.broadcast`, `bridge.settle`), `gbtc.transfer`, and
+custody ops (`custody.fund`, `custody.bond`, `custody.unbond`, `custody.slash`). The liquidity pot
+is fed only by the **idle-balance sweep** (demurrage); nothing draws from it. Conservation is a
+tested invariant: `reserves == free + bonded + pending + pot` — ops only *move* gBTC, never mint.
 
 ### Real-BTC bridge + committee custody (`src/custody/`)
 
@@ -183,8 +152,8 @@ npm run setup:chia       # once — venv + chiavdf/chiapos (prebuilt wheels; no 
 npm run dev              # real-PoST daemon + the desktop app
 ```
 
-`npm run dev` runs **real Proof-of-Space-Time** (chiavdf + chiapos) over **Nostr**, plus price relay
-and the desktop app (the first launch compiles it, a few minutes). Closing the window leaves the
+`npm run dev` runs **real Proof-of-Space-Time** (chiavdf + chiapos) over **Nostr**, plus the
+desktop app (the first launch compiles it, a few minutes). Closing the window leaves the
 node running; Ctrl-C stops both. No Python for the proofs? `npm run dev:hash` swaps in the fast
 stand-ins (`GAVL_VDF=hash GAVL_SPACE=standin`).
 
@@ -194,8 +163,8 @@ Peers find each other automatically through the shipped default relays; point at
 ### Desktop app (`desktop/`)
 
 The default UI: a native client for the daemon API, built with [GPUI Kit](https://gpui-kit.com) on
-[GPUI Fast](https://github.com/longbridge/gpui-fast). Five pages: **Rounds · Wallet · Network ·
-Custody · Node**; the network's health stays in the title bar, and block/peer details sit in the
+[GPUI Fast](https://github.com/longbridge/gpui-fast). Four pages: **Wallet · Network · Custody ·
+Node**; the network's health stays in the title bar, and block/peer details sit in the
 status bar. `npm run desktop` starts it alone against an already-running daemon (stable Rust, pinned
 by `desktop/rust-toolchain.toml`); `GAVL_API=http://host:port` points it at a daemon other than
 `http://127.0.0.1:6440`.
@@ -209,7 +178,7 @@ npm install && npm run setup:chia
 npm run dev          # all nodes must use the SAME backend (all real-PoST or all dev:hash, never mixed)
 ```
 
-Leave `GAVL_NETWORK` unset so all nodes share the default `BTC-USD` channel. **They mesh
+Leave `GAVL_NETWORK` unset so all nodes share the default `gavl-testnet` channel. **They mesh
 themselves** — each node announces its presence on the channel and discovers the others through the
 relays, so there is nothing to dial (a node's Nostr pubkey is printed at boot and shown in the UI's
 Network panel if you want to pin one explicitly). To run more than one node on one machine, give
@@ -243,8 +212,8 @@ npm run desktop          # desktop app only (expects a daemon on :6440)
 Key env vars: `GAVL_VDF=chia|hash` · `GAVL_SPACE=chiapos|standin`
 · `GAVL_K=<n>` (plot size; default 18 for chiapos) · `GAVL_MAX_PEERS=<n>` (bounded mesh; default 16) ·
 `GAVL_PERSIST=all|mine|off` · `GAVL_BTC_NET=testnet|signet|mainnet` · `GAVL_DATA_DIR` / `GAVL_PORT`
-(isolate a node) · `GAVL_NETWORK=<channel>` (`label::pyth::feedId` is a market; a plain name is
-transfers-only) · `GAVL_RELAYS=<wss://…,wss://…>` (override the default relay set) ·
+(isolate a node) · `GAVL_NETWORK=<label>` (channel name; default `gavl-testnet`) ·
+`GAVL_RELAYS=<wss://…,wss://…>` (override the default relay set) ·
 `GAVL_ANNOUNCE_INTERVAL=<seconds>` (presence refresh cadence; default 30). Real PoST needs the `setup:chia` venv; choosing `GAVL_VDF=chia` without it throws
 (never a silent downgrade). Moving a *live* channel from stand-ins to real PoST is a coordinated
 upgrade — see [`docs/real-post-cutover.md`](docs/real-post-cutover.md).
@@ -261,9 +230,9 @@ src/
   consensus/     anchor chain, fork choice, finality, difficulty, canonical order
   sync/          Nostr transport · chunked bulk frames · gossip · signed producer↔address bindings
   store/         durable write store (node:sqlite) + state snapshots/checkpoints + selective persist policy
-  market/        Gavl Rounds (parimutuel bull/bear), btc fold, account, Pyth/signed price feeds
+  market/        gBTC ledger fold, op vocabulary, account, state serialization
   custody/       real-BTC bridge: FROST threshold · DKG · Taproot · deposits · tx · watcher · reshare
-  daemon.ts      boots ledger + node + store + consensus + price relay + bridge
+  daemon.ts      boots ledger + node + store + consensus + bridge
   server.ts      localhost JSON API for the desktop app
 desktop/         native Rust client (GPUI Kit + GPUI Fast) — the Gavl app
 ```
@@ -272,13 +241,12 @@ desktop/         native Rust client (GPUI Kit + GPUI Fast) — the Gavl app
 
 ## Trust model
 
-**Trustless:** consensus, ordering, storage; the rounds market (parimutuel, fully-collateralized,
-conservation proven); threshold signing (no one holds the fund key).
+**Trustless:** consensus, ordering, storage; the gBTC ledger (fully-collateralized, conservation
+proven); threshold signing (no one holds the fund key). No price oracle anywhere.
 
-**Trusted (surfaced in the UI):** the channel's **price committee** (the Wormhole guardian set for a
-Pyth feed, or your own committed Ed25519 set — a fixed public committee, not a reporter), and the
-**bridge committee's honest-majority assumption** (bonding raises its capture cost) plus a single
-Esplora chain view per node. A malicious market is sandboxed to its own channel.
+**Trusted (surfaced in the UI):** the **bridge committee's honest-majority assumption** (bonding
+raises its capture cost) plus a single Esplora chain view per node. Each channel is its own
+sandboxed economy.
 
 Before any mainnet satoshi: an **independent audit** (the largest open blocker) and **real
 independent bonded stakers** (slashing only bites when the stakers aren't all one operator).

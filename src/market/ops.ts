@@ -1,9 +1,8 @@
 /**
- * Gavl op vocabulary — the gBTC bridge, the oracle, threshold custody, and
- * Gavl Rounds (the 1-click bull/bear parimutuel rounds). No pool, no house.
+ * Gavl op vocabulary — the gBTC bridge, transfers, and threshold custody.
  *
  * Every op is carried by an Ed25519-signed write, so the actor IS write.writer.
- * Amounts/prices are decimal strings (BigInt-parsed, JSON/canonical-safe).
+ * Amounts are decimal strings (BigInt-parsed, JSON/canonical-safe).
  */
 
 export type Op =
@@ -31,14 +30,6 @@ export type Op =
 	/** Mark a withdrawal's BTC payout confirmed (reserves drop). Attestor key (seed) OR
 	 *  a committee threshold signature over the settle digest (committee mode, `sig`). */
 	| { kind: "bridge.settle"; withdrawalId: string; sig?: string }
-	/** Relay THIS channel's market price: a Wormhole-attested Pyth update blob (hex). A CHANNEL IS A
-	 *  MARKET (`label::pyth::feedId`) and ANYONE may relay — the fold verifies the guardian quorum +
-	 *  Merkle proof, so there's no reporter to run or trust. Newer publish-time wins. */
-	| { kind: "market.report"; update: string }
-	/** Enter round `idx`'s UP or DOWN pool — the 1-click bull/bear primitive. `idx` pins the intended
-	 *  round (certified outside its entry window → no-op). Full round → top-N-by-stake admission:
-	 *  strictly out-stake the floor entry, which is evicted + refunded. Re-entries merge (same side). */
-	| { kind: "round.enter"; idx: number; side: "up" | "down"; stake: string }
 	/** Lock gBTC as a custody-committee BOND — your committee selection WEIGHT, and
 	 *  SLASHABLE on a proven fault. Bonded gBTC is locked (unspendable) but still backed. */
 	| { kind: "custody.bond"; amount: string }
@@ -56,7 +47,7 @@ export type Op =
 	 *  alongside gate #4 non-public keys.) */
 	| { kind: "custody.fund"; groupKey: string; epoch: number };
 
-const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "market.report", "round.enter", "custody.fund", "custody.bond", "custody.unbond", "custody.slash"]);
+const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "custody.fund", "custody.bond", "custody.unbond", "custody.slash"]);
 
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);

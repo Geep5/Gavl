@@ -97,13 +97,13 @@ lib is installed. So:
    deterministically inside a Node fold. Pure feasibility check, no Gavl wiring.
 2. **Shielded transfer:** the simplest private op — confidential coin transfer
    (commitment + nullifier), folded blind. Validates the whole pipeline.
-3. **Private positions:** extend to the perp (private margin/side/size).
+3. **Private trading:** extend to the gBTC exchange (private side/size).
 
 ## The honest recommendation
 
-Build the **native, trustless, oracle-free perp in plaintext first** (the position
-model already scoped) — it's real, in-spirit, and shippable. Treat ZK blind-work
+Build the **native, trustless gBTC exchange in plaintext first** — it's real,
+in-spirit, and shippable. Treat ZK blind-work
 as a **separate, later epic** gated on the Phase-1 verifier spike, because it is
 the heaviest and most dangerous code in the system and it is *additive* (privacy
-on top of a working perp), not a prerequisite. Privacy is a powerful upgrade to a
+on top of a working exchange), not a prerequisite. Privacy is a powerful upgrade to a
 working market — not the foundation to build the market on.

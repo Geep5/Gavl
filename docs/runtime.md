@@ -2,14 +2,14 @@
 
 Status: **proposal — not yet implemented.** Hard fork: new genesis, new state format, new
 `appRoot`. Supersedes the asset-facet sketch in [`composable-assets.md`](composable-assets.md)
-(its oracle/content ideas survive here as kernel feeds and app storage).
+(its content idea survives here as app storage; its external-value-feed facet was dropped when
+Gavl became a gBTC exchange with no external price input).
 
 ## Goal
 
 Gavl becomes a **trust layer for apps with built-in value**. A developer writes an app; the
-network — not the developer's server — runs the part that moves money. Bull/bear rounds stop
-being *the* product and become the **reference app**, built only from public primitives that
-any other app can use.
+network — not the developer's server — runs the part that moves money, built only from public
+primitives that any other app can use.
 
 The developer's promise, in one line:
 
@@ -24,12 +24,11 @@ layer" (`src/chain/writer.ts`). Everything above that is one hardcoded app:
 
 | Today | Where | Problem for a runtime |
 |---|---|---|
-| `View = { bridge, market, custody, rounds }` | `src/market/btc.ts` | one fixed state shape |
-| `applyOp` — one 12-case `switch` | `src/market/btc.ts` | adding an app = editing consensus code |
+| `View = { bridge, custody }` | `src/market/btc.ts` | one fixed state shape |
+| `applyOp` — one 10-case `switch` | `src/market/btc.ts` | adding an app = editing consensus code |
 | `KINDS` op whitelist | `src/market/ops.ts` | closed vocabulary |
 | `viewRoot` = one hash over everything | `src/market/state.ts` | no per-app proofs for light clients |
-| channel name = one price feed (`label::pyth::feedId`) | `daemon.ts` `parseChannel` | one market per network; custody committee per channel |
-| rounds settle inside `market.report` | `btc.ts` → `roundsOnOracle` | the app is wired into the kernel's oracle op |
+| channel = a plain network label (e.g. `gavl-testnet`) | `daemon.ts` | custody committee per channel |
 
 What stays untouched: `chain/`, `pot/`, `pos/`, `consensus/` (ordering, finality, anchors),
 `sync/` (Nostr transport), `det/`, and the custody cryptography in `custody/`.
@@ -46,9 +45,9 @@ flowchart TB
   subgraph Node["Every Gavl node (trusted by verification)"]
     API["Node API"]
     subgraph Runtime
-      K["Kernel: accounts · escrow · custody/bridge · feeds · clock · timers"]
+      K["Kernel: accounts · escrow · custody/bridge · clock · timers"]
       VM["App sandbox (WASM, metered)"]
-      A1["app: rounds (bull/bear)"]
+      A1["app: example"]
       A2["app: yours"]
       VM --- A1
       VM --- A2
@@ -68,8 +67,8 @@ Three tiers:
 1. **Consensus (unchanged).** PoST-cooldown writes, anchor chain, finality depth `k`,
    checkpointed state. Decides *order* only.
 2. **Kernel (native, fixed, audited once).** Owns everything with real-world value or
-   real-world trust: gBTC balances, the BTC bridge and custody committee, verified price
-   feeds, the clock, timers. Small, closed vocabulary.
+   real-world trust: gBTC balances, the BTC bridge and custody committee, the clock, timers.
+   Small, closed vocabulary.
 3. **Apps (sandboxed, permissionless).** Content-addressed WASM deployed by a write.
    Holds app state plus **one escrow account**. Can only touch value through the host API.
 
@@ -84,7 +83,7 @@ access to balances.
 | **Apps can't mint.** | No host call creates gBTC. Value enters an app only as `attach` on a user's call. |
 | **Apps spend only their own escrow.** | `pay(to, amt)` fails if `amt > escrow(app)`. Apps can't read another account's spendable balance as authority, or debit it. |
 | **Calls are atomic.** | Each call runs on a storage + value overlay. Trap, out-of-fuel or `abort()` → the overlay is discarded and `attach` stays with the caller. |
-| **No nondeterminism.** | Host exposes only fold-derived inputs (caller, certified height, write id, verified feed data, anchor seed). No wall clock, no I/O, no floats (see Execution). |
+| **No nondeterminism.** | Host exposes only fold-derived inputs (caller, certified height, write id, anchor seed). No wall clock, no I/O, no floats (see Execution). |
 | **Bounded RAM.** | Per-app storage quota paid with refundable bonded gBTC; per-call fuel cap; capped timers. |
 
 What an app **can** do wrong: misallocate the funds users sent it (that is what auditing an
@@ -98,24 +97,20 @@ Kernel ops (carried in `Write.payload`, actor = `write.writer` unless noted):
 |---|---|---|
 | `transfer { to, amount }` | move gBTC | was `gbtc.transfer` |
 | `bridge.*`, `custody.*` | deposit/withdraw/settle, bond/unbond/slash, fund key | unchanged semantics; **one committee per network** instead of per channel |
-| `feed.create { kind: "pyth", feedId } \| { kind: "signed", signerSet }` | register a price feed | id = content address; replaces "channel = market" |
-| `feed.report { feed, update }` | relay a signed update | anyone relays; fold verifies the quorum (`pyth.ts`, `signed-feed.ts`), monotonic by publish time |
 | `app.deploy { code, manifest, storageBond }` | publish an app | id = `sha256(code ‖ manifest)`; code size capped; immutable |
 | `app.call { app, method, args, attach? }` | run an app method | `attach` moves gBTC caller → app escrow before the call, back on failure |
 
-**Clock:** the certified height of the write (`bornHeight`). Rounds, deadlines and timeouts are
-written in heights, exactly as `rounds.ts` does today.
+**Clock:** the certified height of the write (`bornHeight`). Deadlines and timeouts are
+written in heights, exactly as the fold's height-timed effects (unbond maturity, demurrage,
+claim expiry) are today.
 
 **Timers:** `schedule(height, tag)` → the kernel calls the app's `onTimer(tag)` when the fold
 crosses `height`, in deterministic (height, app id, tag) order. Replaces bespoke end-of-fold
-sweeps like `sweepDarkRounds`.
-
-**Feed subscriptions:** `subscribe(feedId)` → `onFeed(update)` for each verified update in fold
-order. This is how rounds strike and settle; the kernel no longer calls `roundsOnOracle`.
+sweeps.
 
 **Demurrage** stays a kernel rule for **user** balances (it keeps the RAM ledger bounded).
-Swept gBTC goes to a kernel **commons** account. Its destination is an open question below.
-It is no longer hard-wired to rounds pot-seeding.
+Swept gBTC goes to a kernel **commons** account (today: `bridge.pot`, which nothing draws
+from). Its destination is an open question below.
 
 ## Host API (what app code sees)
 
@@ -140,12 +135,8 @@ interface Host {
   escrow(): bigint;
   pay(to: string, amount: bigint): void;   // traps if amount > escrow()
 
-  // kernel reads
-  feed(id: string): { price: bigint; conf: bigint; expo: number; publishTime: number; height: number } | null;
-
   // scheduling + output
   schedule(height: number, tag: Uint8Array): void;
-  subscribe(feedId: string): void;
   emit(topic: string, data: Uint8Array): void;   // events for clients/indexers; not state
   abort(reason: string): never;
 }
@@ -155,41 +146,9 @@ interface App {
   init?(host: Host, args: Uint8Array): void;            // once, at deploy
   call(host: Host, method: string, args: Uint8Array): void;
   onTimer?(host: Host, tag: Uint8Array): void;
-  onFeed?(host: Host, feedId: string): void;            // read the update via host.feed()
   view?(host: Host, query: Uint8Array): Uint8Array;     // read-only; off-consensus
 }
 ```
-
-## The reference app: bull/bear on the primitives
-
-`rounds.ts` today is ~270 lines that manipulate `BridgeState` directly. On the runtime it
-uses only the host API:
-
-```ts
-// enter(side): stake = attached gBTC, already in escrow
-call("enter", { idx, side }):
-  if (!entryOpen(idx, host.height())) abort("window closed")   // refunds attach
-  if (host.attached() < MIN_ROUND_STAKE) abort("dust")
-  store entry (caller, side, stake); bump pool
-  first entry of round idx → host.schedule(closeBoundary(idx) + ROUND_DARK_TIMEOUT, darkTag(idx))
-
-onFeed(BTC):
-  u = host.feed(BTC); if (!confOk(u.price, u.conf)) return
-  round locking at u.height and no strike → set strike
-  round closed at u.height with strike → settle: host.pay(winner, share) for each; dust stays in escrow
-
-onTimer(darkTag(idx)):
-  round still open → refund every entry with host.pay
-```
-
-Behavior changes the port forces (decisions, not accidents):
-
-- **Pot-seeding from demurrage goes away.** An app can't take kernel commons. Rounds may
-  seed thin sides from its own escrow dust, or it may not seed at all.
-- **Top-N eviction refunds** become `host.pay` from escrow (same economics).
-- **The entry cap** stays an app constant; per-app storage quota bounds it as well.
-
-The point of the port: if bull/bear can be built without privileges, any app like it can.
 
 ## Execution model (phase 2: WASM)
 
@@ -201,8 +160,8 @@ The point of the port: if bull/bear can be built without privileges, any app lik
   the instrumenter is consensus code.
 - **No gas token.** Every write already pays a PoST cooldown (space + time), so per-anchor
   compute is bounded by writes-per-anchor × the per-call fuel cap. Gavl's version of "gas" is
-  the cooldown, plus a flat fuel ceiling per call. Timers and feed hooks get a fixed fuel
-  budget per anchor per app; past it, delivery defers to the next anchor (deterministically).
+  the cooldown, plus a flat fuel ceiling per call. Timers get a fixed fuel budget per anchor
+  per app; past it, delivery defers to the next anchor (deterministically).
 - **Storage** is bounded by a refundable bond: `storageBond` gBTC per byte, locked from the
   deployer (NEAR's storage-staking model). It is counted in conservation as bonded.
 - **Languages:** AssemblyScript template first (TypeScript developers), Rust via the same ABI.
@@ -212,7 +171,6 @@ The point of the port: if bull/bear can be built without privileges, any app lik
 ```
 appRoot = merkle( "kernel/accounts" → root,
                   "kernel/bridge"   → root,
-                  "kernel/feeds"    → root,
                   "app/<id>"        → merkle(sorted KV of that app) , … )
 ```
 
@@ -225,7 +183,7 @@ serialize the same namespaces, so pruned-node bootstrap keeps working.
 
 Every write today needs the writer's **own plot plus a VDF cooldown**. So every user of every
 app must run a Gavl node. That suits operators and committee members, but it doesn't work for
-"a user opens my app and clicks UP".
+"a user opens my app and clicks a button".
 
 Proposal: **signed actions relayed by anyone.**
 
@@ -270,9 +228,9 @@ change outcomes. Users can verify that by reading app state with proofs.
 
 | Phase | Ships | Exit criterion |
 |---|---|---|
-| **R1 — Kernel split** | Kernel/app boundary in native TS. Host API. Namespaced state + Merkle `appRoot`. Feeds as kernel objects; one custody committee per network; channels → plain network names. Rounds ported to the host API as a **native** app. Generic node API (`/api/apps/:id/call`, `/state`, `/events`). New genesis. | Full test suite green; rounds' economic tests pass through the host API; conservation tested across kernel + app escrow. |
-| **R2 — Relayed actions** | Signed actions, nonces/expiry, `relay` carrier op, SDK signing. | A user with no plot enters a round from the browser. |
-| **R3 — WASM apps** | `app.deploy`, validator, fuel + stack instrumentation, storage bonds, AssemblyScript template. Rounds recompiled to WASM and run as an ordinary deployed app. | Two nodes with different Node versions agree on `appRoot` across a fuzzed call corpus. |
+| **R1 — Kernel split** | Kernel/app boundary in native TS. Host API. Namespaced state + Merkle `appRoot`. One custody committee per network. An example app on the host API as a **native** app. Generic node API (`/api/apps/:id/call`, `/state`, `/events`). New genesis. | Full test suite green; the example app's tests pass through the host API; conservation tested across kernel + app escrow. |
+| **R2 — Relayed actions** | Signed actions, nonces/expiry, `relay` carrier op, SDK signing. | A user with no plot calls an app from the browser. |
+| **R3 — WASM apps** | `app.deploy`, validator, fuel + stack instrumentation, storage bonds, AssemblyScript template. The example app recompiled to WASM and run as an ordinary deployed app. | Two nodes with different Node versions agree on `appRoot` across a fuzzed call corpus. |
 | **R4 — Developer kit** | `gavl` CLI (new/test/devnet/deploy), `@gavl/sdk` with proof-verified reads, docs + a second example app. | Someone outside the repo ships an app using only the docs. |
 
 R1 is useful on its own, because the codebase gets the same shape the runtime will have.
@@ -281,14 +239,12 @@ R3 is the riskiest step, because determinism and metering become consensus-criti
 ## Honest caveats
 
 - **Kernel trust is unchanged.** gBTC is only as good as the custody committee's honest
-  majority; feeds are only as good as their signer quorum. Apps inherit both.
+  majority. Apps inherit it.
 - **Randomness from the anchor seed is biasable by withholding.** An anchor producer can
   decline to publish an anchor whose seed it dislikes, at the cost of that anchor's reward
   and weight. Apps that stake large amounts on randomness should commit-reveal.
 - **App code is law.** Immutable by content hash. A bug is fixed by deploying a new app and
   migrating users. Admin/upgrade keys are an opt-in manifest field the UI must surface.
-- **Feed fan-out.** Each verified update may wake every subscriber. The per-anchor hook budget
-  bounds the cost, but heavy subscription can delay delivery.
 - **R3 determinism** depends on our validator and instrumenter, not V8. Pin them and fuzz
   them across engine versions before mainnet.
 

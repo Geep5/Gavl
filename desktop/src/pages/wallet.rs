@@ -37,8 +37,10 @@ impl GavlApp {
 
     fn render_balance(&self, cx: &App) -> impl IntoElement + use<> {
         let balance = self.balance();
-        let market = self.snapshot.market.as_ref();
-        let sweep_in = market
+        let sweep_in = self
+            .snapshot
+            .bridge
+            .as_ref()
             .and_then(|m| m.idle_decay.as_ref())
             .filter(|_| balance > 0)
             .map(|d| d.sweep_at_height.saturating_sub(self.height()));
@@ -55,7 +57,7 @@ impl GavlApp {
             .child(match sweep_in {
                 Some(blocks) if blocks < BLOCKS_PER_DAY => Alert::warning(
                     "idle-urgent",
-                    format!("Your idle balance is swept to the shared pot in {}. Enter a round or withdraw to keep it.", idle_left(blocks)),
+                    format!("Your idle balance is swept to the shared pot in {}. Transfer or withdraw it to keep it.", idle_left(blocks)),
                 )
                 .into_any_element(),
                 _ => muted("Gavl isn't a savings account: a balance left idle for 7 days is swept to the shared pot.", cx).into_any_element(),
@@ -90,12 +92,12 @@ impl GavlApp {
                         .into_any_element()
                 })
         });
-        section("Accounts", Some("Entries, deposits and withdrawals use the active account."), v_flex().children(rows), cx)
+        section("Accounts", Some("Transfers, deposits and withdrawals use the active account."), v_flex().children(rows), cx)
     }
 
     fn render_deposit(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let market = self.snapshot.market.clone().unwrap_or_default();
-        let Some(address) = market.deposit_address.clone() else {
+        let bridge = self.snapshot.bridge.clone().unwrap_or_default();
+        let Some(address) = bridge.deposit_address.clone() else {
             return section(
                 "Deposit",
                 None,
@@ -113,7 +115,7 @@ impl GavlApp {
         let txid = self.deposit_txid.read(cx).value().trim().to_string();
         let txid_ok = txid.len() == 64 && txid.bytes().all(|b| b.is_ascii_hexdigit());
         let claiming = self.busy.contains(&Busy::Claim);
-        let network = if market.btc_network.is_empty() { "testnet".to_string() } else { market.btc_network.clone() };
+        let network = if bridge.btc_network.is_empty() { "testnet".to_string() } else { bridge.btc_network.clone() };
 
         let body = card(cx).child(
             v_flex()
@@ -169,8 +171,8 @@ impl GavlApp {
     }
 
     fn render_withdraw(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let market = self.snapshot.market.clone().unwrap_or_default();
-        if market.deposit_address.is_none() {
+        let bridge = self.snapshot.bridge.clone().unwrap_or_default();
+        if bridge.deposit_address.is_none() {
             return div().into_any_element();
         }
         let custody = self.snapshot.custody.clone().unwrap_or_default();
@@ -238,7 +240,7 @@ impl GavlApp {
                                 })),
                         ),
                 )
-                .when(market.pending_count > 0, |this| {
+                .when(bridge.pending_count > 0, |this| {
                     this.child(
                         h_flex()
                             .gap_3()
@@ -250,9 +252,9 @@ impl GavlApp {
                             .child(muted(
                                 format!(
                                     "{} withdrawal{} ({}) waiting for the committee to sign and broadcast.",
-                                    market.pending_count,
-                                    if market.pending_count == 1 { "" } else { "s" },
-                                    format::gbtc(api::amount(&market.pending))
+                                    bridge.pending_count,
+                                    if bridge.pending_count == 1 { "" } else { "s" },
+                                    format::gbtc(api::amount(&bridge.pending))
                                 ),
                                 cx,
                             ))

@@ -42,11 +42,6 @@ impl Client {
         self.post("/api/accounts/active", json!({ "pubHex": pub_hex }))
     }
 
-    /// Long-running: the daemon answers once the PoST-cooled write is produced.
-    pub fn enter_round(&self, side: Side, stake: u128, idx: Option<u64>) -> Result<Value> {
-        self.post_slow("/api/round/enter", json!({ "side": side.wire(), "stake": stake.to_string(), "idx": idx }))
-    }
-
     pub fn claim_deposit(&self, txid: &str) -> Result<Value> {
         self.post_slow("/api/deposit/claim", json!({ "txid": txid }))
     }
@@ -113,29 +108,6 @@ pub fn amount(s: &str) -> u128 {
     s.trim().parse().unwrap_or(0)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Side {
-    Up,
-    Down,
-}
-
-impl Side {
-    pub fn wire(self) -> &'static str {
-        match self {
-            Side::Up => "up",
-            Side::Down => "down",
-        }
-    }
-
-    pub fn from_wire(s: &str) -> Option<Self> {
-        match s {
-            "up" => Some(Side::Up),
-            "down" => Some(Side::Down),
-            _ => None,
-        }
-    }
-}
-
 // ── /api/state ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -143,7 +115,7 @@ impl Side {
 pub struct Snapshot {
     pub accounts: Vec<AccountRef>,
     pub active: Option<String>,
-    pub market: Option<Market>,
+    pub bridge: Option<Bridge>,
     pub consensus: Option<Consensus>,
     pub custody: Option<Custody>,
     pub fleet: Option<Fleet>,
@@ -158,10 +130,7 @@ pub struct AccountRef {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub struct Market {
-    pub market_info: Option<MarketInfo>,
-    pub price: Option<String>,
-    pub price_expo: i32,
+pub struct Bridge {
     pub my_gbtc: String,
     pub idle_decay: Option<IdleDecay>,
     pub reserves: String,
@@ -177,63 +146,12 @@ pub struct Market {
     pub pot: String,
     pub free: String,
     pub bonded: String,
-    pub rounds_escrow: String,
-    pub rounds: Option<Rounds>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct MarketInfo {
-    pub channel: String,
-    pub kind: String,
-    pub label: String,
-    pub feed_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct IdleDecay {
     pub sweep_at_height: u64,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct Rounds {
-    pub len: u64,
-    pub min_stake: String,
-    pub tip: u64,
-    pub entry_open: bool,
-    pub entering: Option<Round>,
-    pub live: Option<Round>,
-    pub history: Vec<RoundResult>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct Round {
-    pub idx: u64,
-    pub locks_at: u64,
-    pub closes_at: u64,
-    pub strike: Option<String>,
-    pub pool_up: String,
-    pub pool_down: String,
-    pub seeded: String,
-    pub entries: u64,
-    pub my_side: Option<String>,
-    pub my_stake: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct RoundResult {
-    pub idx: u64,
-    pub strike: Option<String>,
-    pub close: Option<String>,
-    /// "up" | "down" | "refund"
-    pub outcome: String,
-    pub my_side: Option<String>,
-    pub my_stake: String,
-    pub my_payout: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

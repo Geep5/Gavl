@@ -18,10 +18,10 @@ import { mineAnchor } from "../src/consensus/anchor.ts";
 import type { Anchor } from "../src/consensus/anchor.ts";
 import { AnchorChain } from "../src/consensus/chain.ts";
 import type { Heads } from "../src/ledger/ledger.ts";
-import { viewAtAnchor, marketConserved } from "../src/market/btc.ts";
+import { computeView, viewAtAnchor, marketConserved } from "../src/market/btc.ts";
 import { viewRoot } from "../src/market/state.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver, priceBase, withGbtc } from "./helpers.ts";
+import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
 
 test("a checkpoint-pruned node folds forward to the same state + appRoot as a full node", async () => {
 	const node = new GavlNode(new Ledger(PARAMS));
@@ -31,7 +31,7 @@ test("a checkpoint-pruned node folds forward to the same state + appRoot as a fu
 	const mk = (kp?: any) => new Account({ node, params: PARAMS, k: K, now, keypair: kp });
 	// gBTC seeded into the shared fold base (withGbtc) — minting is committee-gated now, but this test
 	// is about full-vs-pruned fold equivalence, not mint authorization. Both folds resume from the same
-	// priced() base, so the seeded balances are byte-identical on both sides.
+	// seeded() base, so the seeded balances are byte-identical on both sides.
 	const balances: Record<string, bigint> = {};
 	const fund = (a: Account, amt: bigint) => (balances[a.pubHex] = (balances[a.pubHex] ?? 0n) + amt);
 
@@ -50,21 +50,19 @@ test("a checkpoint-pruned node folds forward to the same state + appRoot as a fu
 	const B = mk();
 	const C = mk();
 
-	// The market mark lives in the fold base (a price enters consensus only via an attested Pyth
-	// update; both the full and pruned folds start from the same agreed base, which is the point).
-	// The seeded gBTC rides in the same base, so full and pruned fold from byte-identical state.
-	const priced = () => withGbtc(priceBase(61000n), balances);
+	// The seeded gBTC rides in the fold base, so full and pruned fold from byte-identical state.
+	const seeded = () => withGbtc(computeView([]), balances);
 
 	// ── activity round 1, then an anchor ──
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 	await A.transfer(C.pubHex, 500n);
-	await A.enterRound(0, "down", 1000n); // both sides escrow into round 0's pools
-	await B.enterRound(0, "up", 1000n);
+	await A.bond(1000n); // both lock committee bonds
+	await B.bond(1000n);
 	const a1 = await mine();
 
 	// ── activity round 2, then anchors ──
-	await B.enterRound(0, "up", 700n); // a same-side top-up
+	await B.unbond(700n); // an unbond request (height-timed maturity)
 	await A.transfer(B.pubHex, 100n);
 	await mine(); // a2
 	const a3 = await mine();
@@ -72,13 +70,13 @@ test("a checkpoint-pruned node folds forward to the same state + appRoot as a fu
 	const allWrites = node.ledger.allWrites();
 
 	// FULL node: state at the latest anchor, folding all history.
-	const full = viewAtAnchor(allWrites, chain, a3.id, priced());
+	const full = viewAtAnchor(allWrites, chain, a3.id, seeded());
 	assert.ok(marketConserved(full), "full-node state conserves");
 
 	// PRUNED node: checkpoint at a1. It keeps a1's committed state as the base and only the
 	// writes ABOVE a1's certified heads; it has dropped everything a1 covered.
 	const ckptHeads: Heads = chain.headsAt(a1.id);
-	const base = viewAtAnchor(allWrites, chain, a1.id, priced());
+	const base = viewAtAnchor(allWrites, chain, a1.id, seeded());
 	const tail = allWrites.filter((w) => {
 		const h = ckptHeads[w.writer];
 		return h === undefined || w.seq > h.seq; // strictly post-checkpoint
@@ -91,5 +89,5 @@ test("a checkpoint-pruned node folds forward to the same state + appRoot as a fu
 	assert.ok(marketConserved(pruned), "pruned-node state conserves");
 
 	// And at the checkpoint anchor's child too (appRoot is lag-by-parent → exercises a3's appRoot).
-	assert.equal(viewRoot(viewAtAnchor(tail, chain, anchors[1].id, base)), viewRoot(viewAtAnchor(allWrites, chain, anchors[1].id, priced())), "pruned == full at the intermediate anchor as well");
+	assert.equal(viewRoot(viewAtAnchor(tail, chain, anchors[1].id, base)), viewRoot(viewAtAnchor(allWrites, chain, anchors[1].id, seeded())), "pruned == full at the intermediate anchor as well");
 });

@@ -24,7 +24,7 @@ impl GavlApp {
     fn render_committee(&self, cx: &App) -> impl IntoElement + use<> {
         let custody = self.snapshot.custody.clone().unwrap_or_default();
         let formed = custody.fund_key_on_chain.is_some() && !custody.committee.is_empty();
-        let fund = custody.fund_address.clone().or_else(|| self.snapshot.market.as_ref().and_then(|m| m.fund_address.clone()));
+        let fund = custody.fund_address.clone().or_else(|| self.snapshot.bridge.as_ref().and_then(|b| b.fund_address.clone()));
         let my_bond = api::amount(&custody.my_bond);
 
         if !formed {
@@ -74,16 +74,15 @@ impl GavlApp {
     }
 
     fn render_reserves(&self, cx: &App) -> impl IntoElement + use<> {
-        let Some(m) = self.snapshot.market.clone() else {
+        let Some(m) = self.snapshot.bridge.clone() else {
             return section("Reserves", None, muted("Unavailable while the daemon is offline.", cx), cx).into_any_element();
         };
         let reserves = api::amount(&m.reserves);
         let buckets = [
             ("Free balances", api::amount(&m.free), cx.theme().chart_1),
             ("Bonded by signers", api::amount(&m.bonded), cx.theme().chart_2),
-            ("Staked in rounds", api::amount(&m.rounds_escrow), cx.theme().chart_3),
-            ("Pending withdrawals", api::amount(&m.pending), cx.theme().chart_4),
-            ("Shared pot", api::amount(&m.pot), cx.theme().chart_5),
+            ("Pending withdrawals", api::amount(&m.pending), cx.theme().chart_3),
+            ("Shared pot", api::amount(&m.pot), cx.theme().chart_4),
         ];
         let sum: u128 = buckets.iter().map(|b| b.1).sum();
         let balanced = sum == reserves;
@@ -104,7 +103,7 @@ impl GavlApp {
             .gap_1()
             .child(muted(
                 if balanced {
-                    "Balanced: the five buckets add up exactly to reserves.".to_string()
+                    "Balanced: the four buckets add up exactly to reserves.".to_string()
                 } else {
                     format!("Out of balance by {} — report this.", format::gbtc(sum.abs_diff(reserves)))
                 },

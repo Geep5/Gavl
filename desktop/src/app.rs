@@ -2,7 +2,7 @@
 //! the shell (title bar · sidebar · page · status bar). Pages live in `pages/`.
 
 use std::collections::{HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme, ThemeMode, TitleBar, WindowExt,
@@ -28,7 +28,6 @@ const POLL_EVERY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
-    Rounds,
     Wallet,
     Network,
     Custody,
@@ -36,11 +35,10 @@ pub enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 5] = [Page::Rounds, Page::Wallet, Page::Network, Page::Custody, Page::Node];
+    pub const ALL: [Page; 4] = [Page::Wallet, Page::Network, Page::Custody, Page::Node];
 
     fn label(self) -> &'static str {
         match self {
-            Page::Rounds => "Rounds",
             Page::Wallet => "Wallet",
             Page::Network => "Network",
             Page::Custody => "Custody",
@@ -50,7 +48,6 @@ impl Page {
 
     fn icon(self) -> Icon {
         match self {
-            Page::Rounds => Icon::new(gpui_kit::assets::IconName::TrendingUp),
             Page::Wallet => Icon::new(gpui_kit::assets::IconName::Wallet),
             Page::Network => Icon::new(IconName::Network),
             Page::Custody => Icon::new(gpui_kit::assets::IconName::ShieldCheck),
@@ -62,7 +59,6 @@ impl Page {
 /// An action that can be in flight; buttons show `loading` and refuse double-submits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Busy {
-    Enter(api::Side),
     Claim,
     Withdraw,
     ProcessPayouts,
@@ -86,13 +82,8 @@ pub struct GavlApp {
     pub events: VecDeque<NetEvent>,
     events_cursor: u64,
     fetching: bool,
-    /// Last tip height and when we first saw it — countdowns tick locally between blocks.
-    tip_seen: (u64, Instant),
-    /// Previous price, for the up/down caret.
-    price_prev: Option<(String, i8)>,
     pub busy: HashSet<Busy>,
 
-    pub stake: Entity<InputState>,
     pub deposit_txid: Entity<InputState>,
     pub withdraw_amount: Entity<InputState>,
     pub withdraw_address: Entity<InputState>,
@@ -100,13 +91,11 @@ pub struct GavlApp {
     pub claim_result: Option<String>,
 
     _poll: Task<()>,
-    _tick: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl GavlApp {
     pub fn new(client: Client, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let stake = cx.new(|cx| InputState::new(window, cx).placeholder("Stake").default_value("1000"));
         let deposit_txid = cx.new(|cx| InputState::new(window, cx).placeholder("Deposit transaction id (64 hex characters)"));
         let withdraw_amount = cx.new(|cx| InputState::new(window, cx).placeholder("Amount"));
         let withdraw_address = cx.new(|cx| InputState::new(window, cx).placeholder("Bitcoin address (tb1…)"));
@@ -114,7 +103,7 @@ impl GavlApp {
 
         // Re-render on edits so derived validation and summaries stay current.
         let mut subscriptions = Vec::new();
-        for input in [&stake, &deposit_txid, &withdraw_amount, &withdraw_address, &withdraw_fee] {
+        for input in [&deposit_txid, &withdraw_amount, &withdraw_address, &withdraw_fee] {
             subscriptions.push(cx.observe(input, |_, _, cx| cx.notify()));
         }
 
@@ -126,35 +115,22 @@ impl GavlApp {
                 cx.background_executor().timer(POLL_EVERY).await;
             }
         });
-        // Countdowns are derived from the last tip + elapsed time; repaint once a second.
-        let tick = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
-                    break;
-                }
-            }
-        });
 
         Self {
             client,
-            page: Page::Rounds,
+            page: Page::Wallet,
             snapshot: Snapshot::default(),
             connection: Connection::Connecting,
             events: VecDeque::new(),
             events_cursor: 0,
             fetching: false,
-            tip_seen: (0, Instant::now()),
-            price_prev: None,
             busy: HashSet::new(),
-            stake,
             deposit_txid,
             withdraw_amount,
             withdraw_address,
             withdraw_fee,
             claim_result: None,
             _poll: poll,
-            _tick: tick,
             _subscriptions: subscriptions,
         }
     }
@@ -195,18 +171,6 @@ impl GavlApp {
     }
 
     fn apply_snapshot(&mut self, state: Snapshot) {
-        let height = state.consensus.as_ref().and_then(|c| c.tip.as_ref()).map_or(0, |t| t.height);
-        if height != self.tip_seen.0 {
-            self.tip_seen = (height, Instant::now());
-        }
-        if let Some(price) = state.market.as_ref().and_then(|m| m.price.clone()) {
-            let dir = match &self.price_prev {
-                Some((prev, dir)) if *prev == price => *dir,
-                Some((prev, _)) => (api::amount(&price) as i128 - api::amount(prev) as i128).signum() as i8,
-                None => 0,
-            };
-            self.price_prev = Some((price, dir));
-        }
         self.snapshot = state;
     }
 
@@ -262,42 +226,11 @@ impl GavlApp {
     // ── derived reads shared by pages ──
 
     pub fn height(&self) -> u64 {
-        self.tip_seen.0
-    }
-
-    pub fn sec_per_block(&self) -> f64 {
-        self.snapshot.consensus.as_ref().map(|c| c.sec_per_anchor).filter(|s| *s > 0.0).unwrap_or(60.0)
-    }
-
-    /// Estimated seconds until the chain reaches `height`, ticking down between blocks.
-    pub fn secs_until(&self, height: u64) -> u64 {
-        let blocks = height.saturating_sub(self.tip_seen.0) as f64;
-        let elapsed = self.tip_seen.1.elapsed().as_secs_f64();
-        (blocks * self.sec_per_block() - elapsed).max(0.0).round() as u64
+        self.snapshot.consensus.as_ref().and_then(|c| c.tip.as_ref()).map_or(0, |t| t.height)
     }
 
     pub fn balance(&self) -> u128 {
-        self.snapshot.market.as_ref().map_or(0, |m| api::amount(&m.my_gbtc))
-    }
-
-    pub fn price_text(&self) -> Option<String> {
-        let m = self.snapshot.market.as_ref()?;
-        format::usd(m.price.as_deref()?, m.price_expo)
-    }
-
-    /// -1 / 0 / +1 versus the previous price.
-    pub fn price_direction(&self) -> i8 {
-        self.price_prev.as_ref().map_or(0, |(_, d)| *d)
-    }
-
-    pub fn market_label(&self) -> String {
-        self.snapshot
-            .market
-            .as_ref()
-            .and_then(|m| m.market_info.as_ref())
-            .map(|i| i.label.clone())
-            .filter(|l| !l.is_empty())
-            .unwrap_or_else(|| "BTC-USD".into())
+        self.snapshot.bridge.as_ref().map_or(0, |b| api::amount(&b.my_gbtc))
     }
 
     pub fn min_committee(&self) -> u32 {
@@ -338,13 +271,14 @@ impl GavlApp {
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let summary = self.summary();
         let dark = cx.theme().is_dark();
+        let network = self.snapshot.consensus.as_ref().map(|c| c.network.clone()).unwrap_or_default();
         TitleBar::new()
             .child(
                 h_flex()
                     .gap_2()
                     .items_center()
                     .child(div().font_semibold().child("Gavl"))
-                    .child(div().text_color(cx.theme().muted_foreground).child(self.market_label())),
+                    .child(div().text_color(cx.theme().muted_foreground).child(network)),
             )
             .child(
                 h_flex()
@@ -408,15 +342,11 @@ impl GavlApp {
             }
             _ => bar = bar.left("Connecting…"),
         }
-        if let Some(price) = self.price_text() {
-            bar = bar.right(format!("{} {price}", self.market_label()));
-        }
         bar.into_any_element()
     }
 
     fn render_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.page {
-            Page::Rounds => self.render_rounds(window, cx),
             Page::Wallet => self.render_wallet(window, cx),
             Page::Network => self.render_network(window, cx),
             Page::Custody => self.render_custody(window, cx),

@@ -110,23 +110,10 @@ export class Account {
 		return this.produce({ kind: "bridge.settle", withdrawalId, sig });
 	}
 
-	/** Relay a SIGNED market update to this channel — a Pyth blob (`label::pyth::feedId`) or a generic
-	 *  signed reading (`label::signed::sourcePubkey`). ANYONE may relay: the fold verifies the source
-	 *  signature against the channel's committed key, so there's no reporter to trust. `update` is the
-	 *  wire form for the channel's kind (Pyth blob hex, or `JSON.stringify(SignedUpdate)`). */
-	reportMarketUpdate(update: string): Promise<Write> {
-		return this.produce({ kind: "market.report", update });
-	}
-
 	/** Announce the threshold-custody fund's group key on-chain (genesis). First write
 	 *  wins and is immutable — every node + client then derives the permanent address. */
 	announceFund(groupKey: string, epoch: number): Promise<Write> {
 		return this.produce({ kind: "custody.fund", groupKey, epoch });
-	}
-
-	/** Enter round `idx`'s UP or DOWN pool with `stake` gBTC — the 1-click bull/bear action. */
-	async enterRound(idx: number, side: "up" | "down", stake: bigint | number | string): Promise<string> {
-		return (await this.produce({ kind: "round.enter", idx, side, stake: amountStr(stake) })).id;
 	}
 
 	view(): View {

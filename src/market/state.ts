@@ -12,7 +12,7 @@
  *
  * CONSENSUS-CRITICAL: every node must compute the SAME root for the SAME logical
  * state, regardless of Map insertion order. All map/set encodings are key-sorted;
- * arrays whose order is itself state (pending withdrawals FIFO, disclosed sources)
+ * arrays whose order is itself state (pending withdrawals FIFO)
  * are kept in fold order. Round-trips are tested to be lossless.
  */
 
@@ -20,9 +20,7 @@ import { sha256Hex, canonicalize } from "../det/canonical.ts";
 import type { View } from "./btc.ts";
 import { emptyBridge } from "../custody/bridge.ts";
 import type { BridgeState, PendingWithdrawal } from "../custody/bridge.ts";
-import type { MarketPrice, CustodyState } from "./btc.ts";
-import { emptyRounds } from "./rounds.ts";
-import type { Rounds, RoundSide } from "./rounds.ts";
+import type { CustodyState } from "./btc.ts";
 
 // ── canonical (plain-JSON) shape ─────────────────────────────────
 
@@ -41,29 +39,13 @@ export interface CanonBridge {
 	mintedTotal: string;
 	paidOut: string;
 	chargeFrom: Entry<{ since: number; charged: number }>[]; // pubkey → demurrage idle clock, sorted
-	pot: string; // the liquidity pot (idle-decay bucket), free/unescrowed
-	potEscrowTaken: string; // lifetime pot capital ever drawn (legacy monotonic counter; no draws remain)
+	pot: string; // the liquidity pot (idle-decay bucket)
 	withdrawnTotal: string; // lifetime gBTC burned for withdrawal (Vector B outflow budget counter)
-}
-
-export type CanonMarket = { price: string | null; expo: number; seq: number; at: number };
-
-/** One live parimutuel round: strike (null until locked), the two pools, the pot's lock-time
- *  thin-side seeds (pool-level, not entries), and the entries (key-sorted). */
-export interface CanonRound {
-	strike: string | null;
-	poolUp: string;
-	poolDown: string;
-	seedUp: string;
-	seedDown: string;
-	entries: Entry<{ side: string; stake: string }>[]; // pubkey → {side, stake}, sorted by pubkey
 }
 
 export interface CanonState {
 	bridge: CanonBridge;
-	market: CanonMarket; // the channel's single market price (Pyth feed id comes from the channel name)
 	custody: CustodyState; // already plain (string|null, number)
-	rounds: [number, CanonRound][]; // live rounds by idx, ascending (self-clearing — only ~2 at a time)
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -98,23 +80,14 @@ function serializeBridge(b: BridgeState): CanonBridge {
 		paidOut: b.paidOut.toString(),
 		chargeFrom: mapEntries(b.chargeFrom, (e) => ({ since: e.since, charged: e.charged })),
 		pot: b.pot.toString(),
-		potEscrowTaken: b.potEscrowTaken.toString(),
 		withdrawnTotal: b.withdrawnTotal.toString(),
 	};
-}
-
-function serializeRounds(rounds: Rounds): [number, CanonRound][] {
-	return [...rounds]
-		.sort((a, b) => a[0] - b[0])
-		.map(([idx, r]) => [idx, { strike: r.strike === null ? null : r.strike.toString(), poolUp: r.poolUp.toString(), poolDown: r.poolDown.toString(), seedUp: r.seedUp.toString(), seedDown: r.seedDown.toString(), entries: mapEntries(r.entries, (e) => ({ side: e.side, stake: e.stake.toString() })) }]);
 }
 
 export function serializeView(view: View): CanonState {
 	return {
 		bridge: serializeBridge(view.bridge),
-		market: { price: view.market.price === null ? null : view.market.price.toString(), expo: view.market.expo, seq: view.market.seq, at: view.market.at },
 		custody: { fundKey: view.custody.fundKey, epoch: view.custody.epoch },
-		rounds: serializeRounds(view.rounds),
 	};
 }
 
@@ -140,30 +113,13 @@ function deserializeBridge(b: CanonBridge): BridgeState {
 	s.paidOut = BigInt(b.paidOut);
 	for (const [k, e] of b.chargeFrom) s.chargeFrom.set(k, { since: e.since, charged: e.charged });
 	s.pot = BigInt(b.pot);
-	s.potEscrowTaken = BigInt(b.potEscrowTaken);
 	s.withdrawnTotal = BigInt(b.withdrawnTotal ?? "0"); // ?? 0 → tolerate pre-Vector-B snapshots
 	return s;
-}
-
-function deserializeMarket(m: CanonMarket): MarketPrice {
-	return { price: m.price === null ? null : BigInt(m.price), expo: m.expo ?? 0, seq: m.seq, at: m.at };
-}
-
-function deserializeRounds(rs: [number, CanonRound][]): Rounds {
-	const rounds = emptyRounds();
-	for (const [idx, r] of rs) {
-		const entries = new Map<string, { side: RoundSide; stake: bigint }>();
-		for (const [k, e] of r.entries) entries.set(k, { side: e.side as RoundSide, stake: BigInt(e.stake) });
-		rounds.set(idx, { idx, strike: r.strike === null ? null : BigInt(r.strike), poolUp: BigInt(r.poolUp), poolDown: BigInt(r.poolDown), seedUp: BigInt(r.seedUp ?? "0"), seedDown: BigInt(r.seedDown ?? "0"), entries }); // ?? "0" → tolerate pre-seeding snapshots
-	}
-	return rounds;
 }
 
 export function deserializeView(s: CanonState): View {
 	return {
 		bridge: deserializeBridge(s.bridge),
-		market: deserializeMarket(s.market),
 		custody: { fundKey: s.custody.fundKey, epoch: s.custody.epoch },
-		rounds: deserializeRounds(s.rounds ?? []), // ?? [] → tolerate pre-rounds snapshots
 	};
 }

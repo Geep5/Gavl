@@ -3,7 +3,6 @@
 mod custody;
 mod network;
 mod node;
-mod rounds;
 mod wallet;
 
 use gpui_kit::component::{ActiveTheme, StyledExt, WindowExt, clipboard::Clipboard, h_flex, scroll::ScrollableElement, v_flex};
@@ -74,15 +73,10 @@ pub fn mono(text: impl Into<SharedString>, cx: &App) -> Div {
 
 /// A key/address shown in full with a copy button; it wraps instead of truncating.
 pub fn copyable(id: impl Into<ElementId>, value: &str, cx: &App) -> Div {
-    copyable_as(id, value, value, cx)
-}
-
-/// Like [`copyable`], but shows `display` while copying the full `value`.
-pub fn copyable_as(id: impl Into<ElementId>, display: &str, value: &str, cx: &App) -> Div {
     h_flex()
         .gap_2()
         .items_center()
-        .child(mono(display.to_owned(), cx).min_w_0())
+        .child(mono(value.to_owned(), cx).min_w_0())
         .child(
             Clipboard::new(id)
                 .value(value.to_owned())

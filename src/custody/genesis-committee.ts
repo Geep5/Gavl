@@ -36,7 +36,7 @@ export const GENESIS_COMMITTEE_MIN = 2;
  */
 export const GENESIS_COMMITTEE_PUBKEY: Record<string, string> = {
 	// Fresh 2-of-3 trusted-dealer committee (re-dealt 2026-07-12; shares distributed out-of-band, seats 0/1/2).
-	"BTC-USD::pyth::e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43":
+	"gavl-testnet":
 		"03958a5fc6a0bdac1be5fe4b42261b34925cc50f9cc0e15441e8048f3a92a8bb70",
 };
 

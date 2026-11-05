@@ -7,7 +7,6 @@ import { Plot } from "../src/pos/space.ts";
 import { StandinSpaceProver, StandinSpaceVerifier } from "../src/consensus/space.ts";
 import type { SpaceProver } from "../src/consensus/space.ts";
 import type { KeyPair } from "../src/det/ed25519.ts";
-import { computeView, cloneView } from "../src/market/btc.ts";
 import type { View } from "../src/market/btc.ts";
 import { mintFromDeposit } from "../src/custody/bridge.ts";
 import { generateFundKeyDKG, thresholdSign, quorumOf } from "../src/custody/threshold.ts";
@@ -15,25 +14,6 @@ import type { FundKey } from "../src/custody/threshold.ts";
 import { depositAttestationDigest } from "../src/custody/attestation.ts";
 import { toHex } from "../src/det/canonical.ts";
 import type { Account } from "../src/market/account.ts";
-
-/** A fold base carrying a market price — the test stand-in for a relayed Pyth update. Every market is
- *  now a Pyth market: the only way a price enters consensus is a Wormhole-guardian-attested update,
- *  which a unit test can't forge (it needs 13/19 real guardian signatures). The real verify+fold path
- *  is covered by test/pyth.test.ts against a captured live update; the economic tests just need a
- *  mark in the view, so they seed it directly as the fold's resume base. `at` drives mark staleness. */
-export function priceBase(price: bigint, seq = 0, at = 0): View {
-	const v = computeView([]);
-	v.market = { price, expo: 0, seq, at };
-	return v;
-}
-
-/** Clone a view with a changed market price — for tests that move the mark mid-stream (open at one
- *  price, settle at another). Fold the next write segment with `{ base: repriced(view, p) }`. */
-export function repriced(view: View, price: bigint, seq = view.market.seq + 1, at = view.market.at): View {
-	const v = cloneView(view);
-	v.market = { price, expo: 0, seq, at };
-	return v;
-}
 
 /** Seed gBTC balances directly into a fold base. Minting is committee-gated now (a threshold sig
  *  over the group key — see TestFund), but economic/consensus tests only need balances to EXIST,

@@ -75,21 +75,13 @@ export interface BridgeState {
 	 *               regardless of how it checkpointed (a drifting reference would fork).
 	 *  - `charged` — the advancing "charged-through" boundary for the incremental −20%/day decay. */
 	chargeFrom: Map<string, { since: number; charged: number }>;
-	/** The liquidity pot: idle-balance sweeps (demurrage) and rounds settle dust flow here — a pure
-	 *  conservation bucket holding real gBTC, never minted (no rake: winners keep 100% of the losing
-	 *  pool). Its one outflow is round POT-SEEDING at
-	 *  lock (budget-capped at 10% of the fold-base pot per fold — market/rounds.ts), which comes
-	 *  straight back at settle/refund as seed + winnings or stays distributed to winners. */
+	/** The liquidity pot: idle-balance sweeps (demurrage) flow here — a pure conservation bucket
+	 *  holding real gBTC, never minted. Nothing draws from it. */
 	pot: bigint;
-	/** Lifetime gBTC the pot ever staked out (monotonic). A legacy counter from when the pot could be
-	 *  drawn as a counterparty/subsidy budget; nothing draws from the pot anymore, so this no longer
-	 *  advances — it stays serialized so committed state remains stable. */
-	potEscrowTaken: bigint;
 	/** Lifetime gBTC burned for withdrawal (monotonic; += at each requestWithdrawal). Vector B's
 	 *  outflow circuit breaker measures per-epoch outflow as this minus the FINALIZED base's value,
 	 *  capping how fast custodied BTC can leave — a captured (or buggy) committee can't drain the
-	 *  whole fund in one epoch. Write-driven + read off the checkpoint base ⇒ deterministic, exactly
-	 *  like potEscrowTaken. */
+	 *  whole fund in one epoch. Write-driven + read off the checkpoint base ⇒ deterministic. */
 	withdrawnTotal: bigint;
 }
 
@@ -158,7 +150,7 @@ export function demurrageChargeFrom(creditHeight: number): number {
 }
 
 export function emptyBridge(): BridgeState {
-	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), unbonding: new Map(), mintedTotal: 0n, paidOut: 0n, chargeFrom: new Map(), pot: 0n, potEscrowTaken: 0n, withdrawnTotal: 0n };
+	return { gbtc: new Map(), reserves: 0n, processed: new Set(), pending: [], depositors: new Set(), claims: new Map(), broadcasts: new Map(), bonds: new Map(), unbonding: new Map(), mintedTotal: 0n, paidOut: 0n, chargeFrom: new Map(), pot: 0n, withdrawnTotal: 0n };
 }
 
 export function gbtcOf(s: BridgeState, pubkey: string): bigint {
@@ -335,7 +327,7 @@ export function requestWithdrawal(s: BridgeState, w: PendingWithdrawal, availabl
 	if (s.pending.some((p) => p.id === w.id)) return false;
 	addG(s, w.owner, -w.amount); // burn gBTC
 	s.pending.push({ ...w }); // now owed as BTC (still backed by reserves)
-	s.withdrawnTotal += w.amount; // count toward this epoch's outflow budget (monotonic, like potEscrowTaken)
+	s.withdrawnTotal += w.amount; // count toward this epoch's outflow budget (monotonic)
 	return true;
 }
 

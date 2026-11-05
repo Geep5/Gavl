@@ -25,7 +25,6 @@ import { computeView, viewAtAnchor } from "../src/market/btc.ts";
 import { serializeView, viewRoot } from "../src/market/state.ts";
 import type { View } from "../src/market/btc.ts";
 import type { StoredSnapshot } from "../src/store/store.ts";
-import { oracleKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
 import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
 
@@ -35,7 +34,7 @@ async function buildCheckpoint(): Promise<{ snapshot: StoredSnapshot; full: { wr
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node: S, params: PARAMS, k: K, now, keypair: kp });
-	const oracle = mk(oracleKeyPair());
+	const poster = mk();
 	const balances: Record<string, bigint> = {};
 	const fund = (a: Account, amt: bigint) => (balances[a.pubHex] = (balances[a.pubHex] ?? 0n) + amt);
 	const base = () => withGbtc(computeView([]), balances);
@@ -50,7 +49,7 @@ async function buildCheckpoint(): Promise<{ snapshot: StoredSnapshot; full: { wr
 	};
 	const acctA = mk();
 	const acctB = mk();
-	await oracle.noop();
+	await poster.noop();
 	fund(acctA, 5000n);
 	fund(acctB, 5000n);
 	await acctA.transfer(acctB.pubHex, 700n);

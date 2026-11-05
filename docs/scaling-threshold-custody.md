@@ -149,6 +149,6 @@ here (no bridge involvement).
 
 This is real and well-motivated, and the "bigger = more secure" property genuinely
 falls out of the heartbeat + PoST. **But it is a large, dangerous, separate epic.**
-Build the **native, trustless, oracle-free perp first** (needs none of this); treat
+Build the **native, trustless core first** (needs none of this); treat
 this bridge as a later track gated on the Phase-0 spikes — especially the
 resharing-under-churn spike, which is the make-or-break.

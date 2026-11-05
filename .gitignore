@@ -11,3 +11,4 @@ plots/
 *.plot
 .test-plots/
 __pycache__/
+.regtest-bin/

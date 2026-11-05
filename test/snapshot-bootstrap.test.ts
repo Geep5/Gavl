@@ -22,7 +22,6 @@ import { computeView, viewAtAnchor } from "../src/market/btc.ts";
 import { serializeView, deserializeView, viewRoot } from "../src/market/state.ts";
 import type { View } from "../src/market/btc.ts";
 import type { StoredSnapshot } from "../src/store/store.ts";
-import { oracleKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
 import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
 
@@ -32,7 +31,7 @@ test("a fresh peer bootstraps from a pruned peer's checkpoint and converges with
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node: A, params: PARAMS, k: K, now, keypair: kp });
-	const oracle = mk(oracleKeyPair());
+	const poster = mk();
 	// gBTC seeded into the fold base (withGbtc) — minting is committee-gated now, but this test is about
 	// trustless checkpoint bootstrap, not mint authorization. Every fold (the anchors' appRoot, A's full
 	// view, the snapshot state, and B's reconstruction) resumes from the same base() so the seeded
@@ -54,13 +53,13 @@ test("a fresh peer bootstraps from a pruned peer's checkpoint and converges with
 
 	const acctA = mk();
 	const acctB = mk();
-	await oracle.noop(); // a write from the oracle account (price now enters only via attested Pyth updates)
+	await poster.noop(); // a write from a third account
 	await fund(acctA, 5000n);
 	await fund(acctB, 5000n);
 	await acctA.transfer(acctB.pubHex, 700n);
 	await mineOn(A); // a0 buries round 1
 	const F = await mineOn(A); // a1 → finalized(1) = a0 once a1 is tip; F's child exists
-	await oracle.noop();
+	await poster.noop();
 	await acctA.transfer(acctB.pubHex, 50n);
 	await mineOn(A); // a2 (so a1 is now finalized and has a child)
 	await mineOn(A); // a3

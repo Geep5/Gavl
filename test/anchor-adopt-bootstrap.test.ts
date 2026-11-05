@@ -22,7 +22,6 @@ import { computeView, viewAtAnchor } from "../src/market/btc.ts";
 import { serializeView, deserializeView, viewRoot } from "../src/market/state.ts";
 import type { View } from "../src/market/btc.ts";
 import type { StoredSnapshot } from "../src/store/store.ts";
-import { oracleKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
 import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
 
@@ -32,7 +31,7 @@ test("a fresh peer bootstraps genesis-free by adopting a pruned peer's checkpoin
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node: A, params: PARAMS, k: K, now, keypair: kp });
-	const oracle = mk(oracleKeyPair());
+	const poster = mk();
 	// gBTC is committee-gated now, so balances live in the fold base (withGbtc), not a sig-less deposit
 	// write. This test is about genesis-free adoption, not mint authorization: the gBTC just has to
 	// EXIST in the SAME base that A's appRoot, the checkpoint state, and B's reconstruction fold from.
@@ -53,13 +52,13 @@ test("a fresh peer bootstraps genesis-free by adopting a pruned peer's checkpoin
 
 	const acctA = mk();
 	const acctB = mk();
-	await oracle.noop(); // a write from the oracle account (price now enters only via attested Pyth updates)
+	await poster.noop(); // a write from a third account
 	fund(acctA, 5000n);
 	fund(acctB, 5000n);
 	await acctA.transfer(acctB.pubHex, 700n);
 	await mineOn(A);
 	await mineOn(A);
-	await oracle.noop();
+	await poster.noop();
 	await acctA.transfer(acctB.pubHex, 50n);
 	await mineOn(A);
 	await mineOn(A);

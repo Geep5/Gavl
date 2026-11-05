@@ -22,7 +22,6 @@ import { computeView, viewAtAnchor } from "../src/market/btc.ts";
 import { serializeView, deserializeView, viewRoot } from "../src/market/state.ts";
 import type { View } from "../src/market/btc.ts";
 import type { StoredSnapshot } from "../src/store/store.ts";
-import { oracleKeyPair } from "../src/market/oracle.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
 import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
 
@@ -33,7 +32,7 @@ async function buildServer(): Promise<{ snapshot: StoredSnapshot; full: { writes
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node: S, params: PARAMS, k: K, now, keypair: kp });
-	const oracle = mk(oracleKeyPair());
+	const poster = mk();
 	// gBTC is committee-gated now, so balances live in the fold base (withGbtc), not in a sig-less
 	// deposit write. This test is about adoption/appRoot, not mint authorization — it just needs the
 	// gBTC to EXIST in the SAME base the appRoot, snapshot state, and B's reconstruction all fold from.
@@ -51,7 +50,7 @@ async function buildServer(): Promise<{ snapshot: StoredSnapshot; full: { writes
 	};
 	const acctA = mk();
 	const acctB = mk();
-	await oracle.noop(); // a write from the oracle account (price now enters only via attested Pyth updates)
+	await poster.noop(); // a write from a third account
 	fund(acctA, 5000n);
 	fund(acctB, 5000n);
 	await acctA.transfer(acctB.pubHex, 700n);

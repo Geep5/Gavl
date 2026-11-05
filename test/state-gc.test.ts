@@ -1,8 +1,7 @@
 /**
  * State retirement rules — the structures in the View that used to grow forever now
  * get cleaned up so a snapshot can't balloon. Covers: deposit-claim markers retired on
- * mint, withdrawal broadcast markers retired on settle, and stale oracle marks gated
- * past the freshness window.
+ * mint and withdrawal broadcast markers retired on settle.
  *
  *   node --test test/state-gc.test.ts
  */
@@ -11,8 +10,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { emptyBridge, mintFromDeposit, recordClaim, recordBroadcast, completeWithdrawal, requestWithdrawal, pruneStaleClaims, CLAIM_RECLAIM_GRACE } from "../src/custody/bridge.ts";
-import { computeView, mark, MARKET_STALE_AFTER } from "../src/market/btc.ts";
-import { priceBase } from "./helpers.ts";
 
 test("a deposit-claim marker is retired once the deposit mints, and not re-added", () => {
 	const s = emptyBridge();
@@ -43,13 +40,4 @@ test("a withdrawal's in-flight marker is retired once it settles", () => {
 	assert.equal(s.broadcasts.size, 1);
 	completeWithdrawal(s, "w1");
 	assert.equal(s.broadcasts.size, 0, "broadcast marker retired on settle");
-});
-
-test("a market's mark goes stale once relayed updates stop refreshing", async () => {
-	// A price enters consensus only via an attested Pyth update relayed at some height; here it
-	// landed at height 0 (market.at = 0), so the staleness clock runs from there.
-	const v = computeView([], { base: priceBase(61000n, 0, 0) });
-	assert.equal(mark(v, MARKET_STALE_AFTER - 1), 61000n, "fresh within the staleness window");
-	assert.equal(mark(v, MARKET_STALE_AFTER), null, "stale once updates stop past the bound");
-	assert.equal(mark(v), 61000n, "no staleness gate when nowHeight is omitted (last known price)");
 });

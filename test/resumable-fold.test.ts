@@ -1,8 +1,8 @@
 /**
  * Resumable fold (market/btc.ts computeView{base}) — the mechanic behind "never
  * replay from 0". Folding [later writes] onto the view of [earlier writes] must equal
- * folding the whole stream. Proven over a real write stream (transfers + round
- * entries) split at every boundary.
+ * folding the whole stream. Proven over a real write stream (transfers + bonds)
+ * split at every boundary.
  *
  *   node --test test/resumable-fold.test.ts
  */
@@ -15,7 +15,7 @@ import { GavlNode } from "../src/sync/node.ts";
 import { Account } from "../src/market/account.ts";
 import { computeView, marketConserved } from "../src/market/btc.ts";
 import { viewRoot } from "../src/market/state.ts";
-import { PARAMS, K, priceBase, withGbtc } from "./helpers.ts";
+import { PARAMS, K, withGbtc } from "./helpers.ts";
 
 function setup() {
 	const node = new GavlNode(new Ledger(PARAMS));
@@ -28,7 +28,7 @@ function setup() {
 	const fund = (acct: Account, amount: bigint) => (balances[acct.pubHex] = (balances[acct.pubHex] ?? 0n) + amount);
 	// A FRESH base each call (withGbtc mutates the View it's given): both the full fold and every
 	// resumed fold must start from a byte-identical base, so build it the same way on both sides.
-	const base = () => withGbtc(priceBase(61000n), balances);
+	const base = () => withGbtc(computeView([]), balances);
 	return { node, mk, fund, base };
 }
 
@@ -45,14 +45,12 @@ test("folding the tail onto the head's view equals folding the whole stream", as
 	const B = mk();
 	const C = mk();
 
-	// The mark lives in the fold base (a price enters consensus only via an attested Pyth update,
-	// which a unit test can't forge); resumability of that base is itself the property under test.
 	await fund(A, 5000n);
 	await fund(B, 5000n);
 	await A.transfer(C.pubHex, 1000n);
-	await A.enterRound(0, "down", 1000n); // round pools escrow across the split boundaries
-	await B.enterRound(0, "up", 1000n);
-	await C.enterRound(0, "up", 1000n);
+	await A.bond(1000n); // bonds lock gBTC across the split boundaries
+	await B.bond(1000n);
+	await C.bond(500n);
 	await A.transfer(B.pubHex, 200n);
 
 	const all = [...node.ledger.allWrites()].sort(cmpWrite);

@@ -7,8 +7,7 @@
  * restart — making a node a light/partial node BY CHOICE. The network only stays
  * whole if some nodes archive (keep everything).
  *
- * Op set: the gBTC bridge, the oracle, threshold custody, and Gavl Rounds
- * (round.enter).
+ * Op set: the gBTC bridge, transfers, and threshold custody.
  */
 
 import type { Write } from "../chain/writer.ts";
@@ -39,8 +38,8 @@ export class KeepAllPolicy implements PersistPolicy {
 }
 
 /**
- * Mine: keep what touches my keys — my farms/transfers/positions, plus the oracle
- * posts (everyone needs the price). Everything else is RAM-only.
+ * Mine: keep what touches my keys — my farms/transfers, plus bridge mint/settle
+ * (shared infra). Everything else is RAM-only.
  */
 export class MinePolicy implements PersistPolicy {
 	readonly name = "mine";
@@ -55,10 +54,9 @@ export class MinePolicy implements PersistPolicy {
 		const op = ctx.op;
 		if (!op) return false;
 		switch (op.kind) {
-			case "market.report":
 			case "bridge.deposit":
 			case "bridge.settle":
-				return true; // channel price + bridge mint/settle are shared infra — always keep
+				return true; // bridge mint/settle are shared infra — always keep
 			case "gbtc.transfer":
 				return this.keys.has(op.to);
 			case "bridge.withdraw":
@@ -69,7 +67,7 @@ export class MinePolicy implements PersistPolicy {
 	}
 
 	describe(): string {
-		return `Mine — persist writes touching ${this.keys.size} key(s), plus oracle posts.`;
+		return `Mine — persist writes touching ${this.keys.size} key(s), plus bridge mint/settle.`;
 	}
 }
 

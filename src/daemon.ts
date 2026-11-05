@@ -21,7 +21,7 @@ import { Ledger, rootOfHeads } from "./ledger/ledger.ts";
 import { GavlNode } from "./sync/node.ts";
 import { Account } from "./market/account.ts";
 import { computeView, finalizedView, viewAtAnchor } from "./market/btc.ts";
-import type { View, MarketDef } from "./market/btc.ts";
+import type { View } from "./market/btc.ts";
 import { serializeView, deserializeView, viewRoot } from "./market/state.ts";
 import type { Anchor } from "./consensus/anchor.ts";
 import type { Heads } from "./ledger/ledger.ts";
@@ -53,10 +53,6 @@ import { Esplora } from "./custody/esplora.ts";
 import { checkDeposit, utxosToInputs, confirmations, MIN_CONFIRMATIONS, txPaysWithdrawal } from "./custody/watcher.ts";
 import { pendingClaims, inFlightWithdrawals, slashable } from "./custody/bridge.ts";
 import type { PendingWithdrawal } from "./custody/bridge.ts";
-import { fetchPythUpdate, fetchSignedUpdate, HERMES_URL } from "./market/pricefeed.ts";
-import { verifyPythUpdate } from "./market/pyth.ts";
-import { verifySignedQuorum } from "./market/signed-feed.ts";
-import type { AggregateReading } from "./market/pricefeed.ts";
 import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
 import { defaultParams } from "./config.ts";
@@ -202,26 +198,6 @@ export interface ConsensusStatus {
 	pinnedPeers: string[];
 }
 
-/**
- * Source-side oracle pruning: should this node mint a new on-chain price post?
- *
- * Posting an identical price every poll is dead-weight — it grows every node's
- * write-chain and durable store forever, and (deleting it after the fact is a
- * consensus-level change to the hash-chained ledger, so we avoid creating it).
- * We post only when the price actually MOVED ≥ `minMoveBps` from the last post,
- * or it's gone STALE (≥ `heartbeatMs` since the last post) so the mark never
- * drifts too old. `lastPrice == null` (never posted) always posts.
- *
- * Pure + exported so the gating is unit-testable without the network/clock.
- */
-export function oracleShouldPost(a: { v: bigint; lastPrice: bigint | null; lastPostAt: number; now: number; minMoveBps: number; heartbeatMs: number }): boolean {
-	if (a.lastPrice == null || a.lastPrice === 0n) return true; // first post for this writer
-	const diff = a.v > a.lastPrice ? a.v - a.lastPrice : a.lastPrice - a.v;
-	const movedBps = Number((diff * 10_000n) / a.lastPrice);
-	if (movedBps >= a.minMoveBps) return true; // moved enough to be worth a write
-	return a.now - a.lastPostAt >= a.heartbeatMs; // else only on the staleness heartbeat
-}
-
 /** How many finalized anchors between durable checkpoints. Small enough to bound growth,
  *  large enough that snapshotting/pruning isn't a per-anchor cost. Override for tests/tuning. */
 const CHECKPOINT_EVERY = Number(process.env.GAVL_CHECKPOINT_EVERY ?? "16");
@@ -274,14 +250,6 @@ export class Daemon {
 	/** Whether the last startConsensus joined the mesh / farmed — replayed on switch. */
 	private meshOn = false;
 	private farmOn = false;
-	private publishing = false;
-	/** The oracle-publish config, remembered so it re-starts on a fresh chain after a
-	 *  channel switch (otherwise the new channel has no oracle → no price loads). */
-	private oraclePublishOpts?: { everyMs: number };
-	/** Bumped each time a publisher loop (re)starts, so an old loop bound to a torn-down
-	 *  node exits cleanly on a channel switch. */
-	private oracleGen = 0;
-	private lastOracleSource: (AggregateReading & { at: number }) | null = null;
 	/** Wall-clock arrival times (ms) of recent tip heights — for a measured anchor cadence.
 	 *  Display-only (never touches the deterministic fold), so Date.now() is fine here. */
 	private readonly anchorTimes: { height: number; at: number }[] = [];
@@ -581,7 +549,7 @@ export class Daemon {
 	async init(): Promise<{ replayed: number } | null> {
 		if (!this.storeOpts) return null;
 		// Per-channel store dir: each channel is its own economy (its own anchor chain +
-		// market state), so its persisted writes live under channels/<slug>/. The wallet
+		// ledger state), so its persisted writes live under channels/<slug>/. The wallet
 		// (your identity/keys) is shared across all channels, one level up.
 		const base = this.storeOpts.dir ?? join(homedir(), ".gavl", "store");
 		const dir = join(base, "channels", channelSlug(this.network ?? "gavl"));
@@ -674,30 +642,9 @@ export class Daemon {
 	view(): View {
 		const root = this.node.ledger.stateRoot();
 		if (this.viewCache && this.viewCache.root === root) return this.viewCache.view;
-		const view = computeView(this.node.ledger.allWrites(), { base: this.checkpointBase, market: this.channelMarket() });
+		const view = computeView(this.node.ledger.allWrites(), { base: this.checkpointBase });
 		this.viewCache = { root, view };
 		return view;
-	}
-
-	/** This channel's market definition (`label::pyth::feedId` / `label::signed::setHash`), or
-	 *  undefined for a plain (non-market) channel. A per-channel constant every node agrees on →
-	 *  deterministic fold. The fold accepts a quorum-SIGNED update from anyone, verified against this def. */
-	channelMarket(): MarketDef | undefined {
-		const c = parseChannel(this.network);
-		if (!c) return undefined;
-		return c.kind === "pyth" ? { kind: "pyth", feedId: c.feedId } : { kind: "signed", signerSet: c.signerSet };
-	}
-
-	/** Fetch-test a Pyth feed before creating a `label::pyth::feedId` market: pull the latest Hermes
-	 *  update and VERIFY it (guardian quorum + Merkle), returning the attested price/expo or an error. */
-	async testPythFeed(feedId: string): Promise<{ value: string | null; expo: number | null; error?: string }> {
-		const id = feedId.toLowerCase().replace(/^0x/, "");
-		if (!/^[0-9a-f]{64}$/.test(id)) return { value: null, expo: null, error: "a Pyth feed id is 64 hex characters" };
-		const blob = await fetchPythUpdate(id);
-		if (!blob) return { value: null, expo: null, error: "couldn't fetch a Pyth update for that feed" };
-		const p = verifyPythUpdate(blob).find((x) => x.feedId === id);
-		if (!p) return { value: null, expo: null, error: "no verified price for that feed id" };
-		return { value: p.price.toString(), expo: p.expo };
 	}
 
 	// ── state-committed checkpoints — the ledger never replays from 0 ──────
@@ -740,7 +687,7 @@ export class Daemon {
 		}
 		let r = this.appRootCache.get(prevId);
 		if (r === undefined) {
-			r = viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, prevId, this.checkpointBase, this.channelMarket()));
+			r = viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, prevId, this.checkpointBase));
 			this.appRootCache.set(prevId, r);
 		}
 		return r;
@@ -788,7 +735,7 @@ export class Daemon {
 		if (!ckpt || ckpt.height !== target) return; // the boundary anchor isn't reachable yet → wait
 		const heads = anchors.headsAt(ckpt.id);
 		if (Object.keys(heads).length === 0) return; // nothing certified yet
-		const view = viewAtAnchor(this.node.ledger.allWrites(), anchors, ckpt.id, this.checkpointBase, this.channelMarket()); // state at the boundary
+		const view = viewAtAnchor(this.node.ledger.allWrites(), anchors, ckpt.id, this.checkpointBase); // state at the boundary
 		this.lastCheckpointHeight = ckpt.height;
 		this.checkpointBase = view;
 		const snap: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(view) };
@@ -819,7 +766,7 @@ export class Daemon {
 		if (!this.node.anchors) return this.checkpointBase ? computeView([], { base: this.checkpointBase }) : computeView([]);
 		const finId = this.node.anchors.finalized(this.finalityDepth)?.id ?? null;
 		if (this.finalCache && this.finalCache.id === finId) return this.finalCache.view;
-		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase, this.channelMarket());
+		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase);
 		this.finalCache = { id: finId, view };
 		return view;
 	}
@@ -949,7 +896,7 @@ export class Daemon {
 	}
 
 	/** Join the live mesh and (optionally) start farming anchors. Resilient to a missing network. */
-	async startConsensus(opts: { network?: string; mesh: boolean; farm: boolean; publishOracle?: { everyMs: number } }): Promise<void> {
+	async startConsensus(opts: { network?: string; mesh: boolean; farm: boolean }): Promise<void> {
 		if (opts.network) this.network = opts.network;
 		this.meshOn = opts.mesh;
 		this.farmOn = opts.farm;
@@ -958,10 +905,6 @@ export class Daemon {
 		if (opts.mesh) await this.joinMesh();
 		await this.bootstrapChainRoot(); // JOIN the heaviest existing network (adopt its checkpoint) if there is one, else SEED the deterministic genesis
 
-		if (opts.publishOracle) {
-			this.oraclePublishOpts = opts.publishOracle; // remember so a channel switch re-publishes
-			this.startOraclePublisher(opts.publishOracle);
-		}
 		this.startReserveWatch(); // proof-of-reserves polling
 
 		if (opts.farm) {
@@ -1384,93 +1327,6 @@ export class Daemon {
 		} catch (e) {
 			return fail(`my share did not combine (${(e as Error).message})`);
 		}
-	}
-
-	/**
-	 * Relay THIS channel's price on a loop. A CHANNEL IS A MARKET with NO reporter — any node may
-	 * relay, an M-of-N quorum signature is the authority, and the fold re-verifies the bytes:
-	 *   • `label::pyth::feedId`   → the latest Wormhole-attested update from Hermes (13-of-19 guardians).
-	 *   • `label::signed::setHash` → the latest quorum-signed update from the set's aggregator endpoint
-	 *                                (GAVL_FEED_URL); the committed signer set is the trust anchor.
-	 * Post it whenever the publish-time advances; other nodes fold + verify the quorum independently.
-	 */
-	private startOraclePublisher(opts: { everyMs: number }): void {
-		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: this.producerKey() });
-		const def = parseChannel(this.network);
-		this.publishing = true;
-		const myGen = ++this.oracleGen; // a channel switch bumps this → the old loop below exits
-		if (!def) {
-			console.log(`  channel ${this.network}: not a market channel — no price`);
-			return;
-		}
-		if (def.kind === "pyth") this.relayPyth(acct, def.feedId, def.label, myGen, opts.everyMs);
-		else this.relaySigned(acct, def.signerSet, def.label, myGen, opts.everyMs);
-	}
-
-	/** Relay loop for a Pyth market: Hermes → verify the guardian quorum + Merkle proof → post when
-	 *  the attested publish-time advances. Hermes is untrusted transport; the guardians are the authority. */
-	private relayPyth(acct: Account, feedId: string, label: string, myGen: number, everyMs: number): void {
-		void (async () => {
-			let lastPub = this.view().market.seq; // last on-chain publish time
-			while (this.publishing && myGen === this.oracleGen) {
-				const blob = await fetchPythUpdate(feedId);
-				const p = blob ? verifyPythUpdate(blob).find((x) => x.feedId === feedId) : null;
-				if (p && p.price > 0n) {
-					this.lastOracleSource = { value: p.price, method: `Pyth ${feedId.slice(0, 10)}…`, used: 1, readings: [{ value: p.price, raw: `${p.price}e${p.expo}`, endpoint: HERMES_URL, key: feedId }], at: Date.now() };
-					if (p.publishTime > lastPub) {
-						try {
-							await acct.reportMarketUpdate(blob!); // newer attested update → relay it
-							lastPub = p.publishTime;
-						} catch {
-							/* retry next tick */
-						}
-					}
-				}
-				await new Promise((res) => setTimeout(res, everyMs));
-			}
-		})();
-		console.log(`  market ${label}: relaying Pyth feed ${feedId.slice(0, 10)}… from Hermes (verified on-chain; no reporter)`);
-	}
-
-	/** Relay loop for a generic SIGNED market: fetch the latest quorum-signed update from the set's
-	 *  aggregator endpoint (GAVL_FEED_URL), verify the M-of-N quorum against the channel's committed
-	 *  set hash, and post when the publish-time advances. No URL ⇒ this node only TRADES on updates
-	 *  others relay (it never forges — the fold rejects anything not signed by a quorum of the set). */
-	private relaySigned(acct: Account, signerSet: string, label: string, myGen: number, everyMs: number): void {
-		const url = process.env.GAVL_FEED_URL;
-		if (!url) {
-			console.log(`  market ${label}: signed set ${signerSet.slice(0, 10)}… — set GAVL_FEED_URL to relay it (trading on others' relays either way)`);
-			return;
-		}
-		void (async () => {
-			let lastPub = this.view().market.seq; // last on-chain publish time
-			while (this.publishing && myGen === this.oracleGen) {
-				const raw = await fetchSignedUpdate(url);
-				const r = raw != null ? verifySignedQuorum(raw, signerSet) : null;
-				if (r && r.price > 0n) {
-					this.lastOracleSource = { value: r.price, method: `signed ${signerSet.slice(0, 10)}…`, used: 1, readings: [{ value: r.price, raw: `${r.price}e${r.expo}`, endpoint: url, key: signerSet }], at: Date.now() };
-					if (r.publishTime > lastPub) {
-						try {
-							await acct.reportMarketUpdate(JSON.stringify(raw)); // genuine quorum-signed update → relay it
-							lastPub = r.publishTime;
-						} catch {
-							/* retry next tick */
-						}
-					}
-				} else if (raw != null) {
-					// the endpoint answered but the update didn't meet the channel's committed quorum
-					this.lastOracleSource = { value: null, method: `signed ${signerSet.slice(0, 10)}…`, used: 0, readings: [{ value: null, raw: null, endpoint: url, key: signerSet, error: "update didn't meet this channel's committed signer-set quorum" }], at: Date.now() };
-				}
-				await new Promise((res) => setTimeout(res, everyMs));
-			}
-		})();
-		console.log(`  market ${label}: relaying signed set ${signerSet.slice(0, 10)}… from ${url} (quorum-verified on-chain; no reporter)`);
-	}
-
-	/** The publisher's latest aggregate reading (per-source endpoint/key/raw/value +
-	 *  the average), or null if this node isn't publishing. Local metadata, never on-chain. */
-	oracleSource(): (AggregateReading & { at: number }) | null {
-		return this.lastOracleSource;
 	}
 
 	// ── real-BTC bridge (testnet) ────────────────────────────────────
@@ -1916,11 +1772,10 @@ export class Daemon {
 		const next = name.trim();
 		if (!next || next === this.network) return;
 
-		// 1. Tear down the current channel's consensus + storage. Stop the oracle loop and
-		//    farming FIRST so neither posts a write into the store while it's closing.
+		// 1. Tear down the current channel's consensus + storage. Stop farming FIRST so it
+		//    doesn't post a write into the store while it's closing.
 		this.farming = false;
 		clearInterval(this.encKeyTimer);
-		this.oracleGen++; // the running oracle publisher loop exits on its next tick
 		this.producer?.stop();
 		this.stopHealthWatch();
 		this.stopStallWatch();
@@ -1949,11 +1804,9 @@ export class Daemon {
 		for (const wa of this.wallet.list()) this.bind(wa); // same identities, new node
 
 		// 3. Switch to the new channel and bring it up (init store → replay → join + farm).
-		//    Re-pass the oracle-publish config so this node re-publishes the price on the new
-		//    chain (otherwise the new channel has no oracle.post writes → "no price" loads).
 		this.network = next;
 		await this.init();
-		await this.startConsensus({ mesh: this.meshOn, farm: this.farmOn, publishOracle: this.oraclePublishOpts });
+		await this.startConsensus({ mesh: this.meshOn, farm: this.farmOn });
 	}
 
 	async stop(): Promise<void> {
@@ -1972,67 +1825,4 @@ export class Daemon {
 function channelSlug(name: string): string {
 	const safe = name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 64);
 	return safe || "default";
-}
-
-/**
- * A channel is a decentralized COORDINATION ADDRESS — one human/agent-readable string that IS the
- * channel's definition and hashes (sha256) to its DHT topic. Three `::`-separated roles:
- *
- *     <name> :: <method> :: <coordinate>
- *
- *   • name        — the channel's identity / handle (e.g. `BTC-USD`).
- *   • method      — HOW peers coordinate: an OPEN namespace of coordination methods. Each shipped
- *                   method is a quorum-signed price anchor (the fold verifies the quorum, anyone
- *                   relays, no single signer can forge). Adding one is a `CHANNEL_METHODS` entry —
- *                   no parser change, nothing positional beyond the 3-role split.
- *   • coordinate  — the method's argument: the pointer it needs (a Pyth feed id, a signer-set hash…).
- *
- * Shipped methods: `pyth` (a Wormhole-attested feed, 13-of-19 guardian trust anchor) and `signed`
- * (your own Ed25519 M-of-N set, committed by `signerSetHash`). A string that isn't a valid
- * `<name>::<method>::<coordinate>` is a plain channel: no market, transfers only.
- */
-export type ChannelAddr = { name: string; method: string; coordinate: string };
-export type ChannelMarket = { label: string } & MarketDef;
-
-/** The coordination-method registry: validate a method's coordinate + map it to the market definition
- *  the fold/relay understand. EXTEND the namespace by adding an entry here — the address format and
- *  the 3-role split are unchanged, so nothing downstream relies on "part 3 happens to be hex". */
-const CHANNEL_METHODS: Record<string, { ok: (coordinate: string) => boolean; def: (coordinate: string) => MarketDef }> = {
-	pyth: { ok: (c) => /^[0-9a-f]{64}$/i.test(c), def: (c) => ({ kind: "pyth", feedId: c.toLowerCase() }) },
-	signed: { ok: (c) => /^[0-9a-f]{64}$/i.test(c), def: (c) => ({ kind: "signed", signerSet: c.toLowerCase() }) },
-};
-
-/** Split a channel string into its three coordination roles (method lower-cased), or null if it
- *  isn't a `<name>::<method>::<coordinate>` address. Generic — knows nothing about specific methods. */
-export function parseChannelAddr(name: string): ChannelAddr | null {
-	const parts = name.split("::");
-	if (parts.length !== 3 || parts.some((p) => p.length === 0)) return null;
-	return { name: parts[0], method: parts[1].toLowerCase(), coordinate: parts[2] };
-}
-
-/** Resolve a channel string to its market definition via the method registry, or null (not a market). */
-export function parseChannel(name: string): ChannelMarket | null {
-	const addr = parseChannelAddr(name);
-	if (!addr) return null;
-	const method = CHANNEL_METHODS[addr.method];
-	if (!method || !method.ok(addr.coordinate)) return null;
-	return { label: addr.name, ...method.def(addr.coordinate) };
-}
-
-/** A channel's stable 32-byte id. A market address's `id` (its 32-byte-hex coordinate) IS the id —
- *  used directly, no hash — so a market's id is literally its price-source id (a Pyth feed id /
- *  a signer-set hash); anything else hashes its full name to 32 bytes. Same id ⇒ same network. */
-export function channelTopic(name: string): Uint8Array {
-	const addr = parseChannelAddr(name);
-	if (addr && /^[0-9a-f]{64}$/i.test(addr.coordinate)) return fromHex(addr.coordinate.toLowerCase());
-	return sha256(name);
-}
-
-/** Pyth BTC/USD feed id — the instrument the shipped default market prices. */
-const BTC_USD_PYTH_FEED = "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
-
-/** The default channel — the BTC-USD Pyth market: a Wormhole-attested price anyone relays, no
- *  reporter. This is the channel `npm run dev` joins, so the app prices + trades out of the box. */
-export function defaultMarketChannel(): string {
-	return `BTC-USD::pyth::${BTC_USD_PYTH_FEED}`;
 }
