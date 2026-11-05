@@ -2,7 +2,7 @@
 //! the shell (title bar · sidebar · page · status bar). Pages live in `pages/`.
 
 use std::collections::{HashSet, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme, ThemeMode, TitleBar, WindowExt,
@@ -17,25 +17,36 @@ use gpui_kit::component::{
 use gpui_kit::*;
 use serde_json::Value;
 
-use crate::api::{self, Client, NetEvent, Snapshot};
+use crate::api::{self, Client, NetEvent, OffersPage, Snapshot, Swap, Wallet};
 use crate::format;
+use crate::pages::{market::MarketForm, wallet::SendForm};
 use crate::status::{self, Health};
 
 /// Network events kept for the activity log.
 const MAX_EVENTS: usize = 300;
 const POLL_EVERY: Duration = Duration::from_secs(2);
+/// Balances come from the chains' explorers via the daemon; poll them more gently.
+const WALLETS_EVERY: Duration = Duration::from_secs(15);
+/// Gavl's anchor target spacing (`ANCHOR_SECONDS`); deadlines are counted in anchors.
+const ANCHOR_SECONDS: f64 = 60.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
+    Market,
+    Swaps,
+    Wallet,
     Network,
     Node,
 }
 
 impl Page {
-    pub const ALL: [Page; 2] = [Page::Network, Page::Node];
+    pub const ALL: [Page; 5] = [Page::Market, Page::Swaps, Page::Wallet, Page::Network, Page::Node];
 
     fn label(self) -> &'static str {
         match self {
+            Page::Market => "Market",
+            Page::Swaps => "Swaps",
+            Page::Wallet => "Wallet",
             Page::Network => "Network",
             Page::Node => "Node",
         }
@@ -43,6 +54,9 @@ impl Page {
 
     fn icon(self) -> Icon {
         match self {
+            Page::Market => Icon::empty().path("icons/trending-up.svg"),
+            Page::Swaps => Icon::empty().path("icons/shield-check.svg"),
+            Page::Wallet => Icon::empty().path("icons/wallet.svg"),
             Page::Network => Icon::new(IconName::Network),
             Page::Node => Icon::new(IconName::HardDrive),
         }
@@ -56,12 +70,44 @@ pub enum Busy {
     Gossip,
     FleetUp,
     FleetDown,
+    PostOffer,
+    Take,
+    Cancel,
+    Send,
 }
 
 pub enum Connection {
     Connecting,
     Online,
     Offline(String),
+}
+
+/// One optional daemon endpoint's latest result.
+pub enum Feed<T> {
+    Loading,
+    /// The daemon answered 404: it doesn't serve this yet (e.g. no swap engine).
+    Missing,
+    Failed(String),
+    Ready(T),
+}
+
+impl<T> Feed<T> {
+    pub fn ready(&self) -> Option<&T> {
+        match self {
+            Feed::Ready(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// A transient error after good data keeps the data; the next poll retries.
+    fn update(&mut self, result: Result<Option<T>, String>) {
+        *self = match result {
+            Ok(Some(v)) => Feed::Ready(v),
+            Ok(None) => Feed::Missing,
+            Err(_) if matches!(self, Feed::Ready(_)) => return,
+            Err(e) => Feed::Failed(e),
+        };
+    }
 }
 
 pub struct GavlApp {
@@ -72,12 +118,21 @@ pub struct GavlApp {
     pub events: VecDeque<NetEvent>,
     events_cursor: u64,
     fetching: bool,
+    pub offers: Feed<OffersPage>,
+    pub swaps: Feed<Vec<Swap>>,
+    pub wallets: Feed<Vec<Wallet>>,
+    fetching_wallets: bool,
+    /// When the wallets last loaded; `None` forces a reload on the next poll.
+    pub wallets_at: Option<Instant>,
+    pub market: MarketForm,
+    pub send: SendForm,
     pub busy: HashSet<Busy>,
     _poll: Task<()>,
+    _inputs: Vec<Subscription>,
 }
 
 impl GavlApp {
-    pub fn new(client: Client, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(client: Client, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let poll = cx.spawn(async move |this, cx| {
             loop {
                 if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
@@ -87,20 +142,33 @@ impl GavlApp {
             }
         });
 
+        let mut inputs = Vec::new();
+        let market = MarketForm::new(window, cx, &mut inputs);
+        let send = SendForm::new(window, cx, &mut inputs);
+
         Self {
             client,
-            page: Page::Network,
+            page: Page::Market,
             snapshot: Snapshot::default(),
             connection: Connection::Connecting,
             events: VecDeque::new(),
             events_cursor: 0,
             fetching: false,
+            offers: Feed::Loading,
+            swaps: Feed::Loading,
+            wallets: Feed::Loading,
+            fetching_wallets: false,
+            wallets_at: None,
+            market,
+            send,
             busy: HashSet::new(),
             _poll: poll,
+            _inputs: inputs,
         }
     }
 
-    /// Pull `/api/state` + new events off the UI thread. Overlapping refreshes are dropped.
+    /// Pull `/api/state`, new events, the order board and swaps off the UI thread. Overlapping
+    /// refreshes are dropped.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.fetching {
             return;
@@ -113,18 +181,25 @@ impl GavlApp {
                 .background_spawn(async move {
                     let state = client.state()?;
                     let events = client.events(since).ok();
-                    anyhow::Ok((state, events))
+                    let offers = client.offers().map_err(|e| format!("{e:#}"));
+                    let swaps = client.swaps().map_err(|e| format!("{e:#}"));
+                    anyhow::Ok((state, events, offers, swaps))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.fetching = false;
                 match result {
-                    Ok((state, events)) => {
-                        this.apply_snapshot(state);
+                    Ok((state, events, offers, swaps)) => {
+                        this.snapshot = state;
                         if let Some(page) = events {
                             this.apply_events(page);
                         }
+                        this.offers.update(offers);
+                        this.swaps.update(swaps);
                         this.connection = Connection::Online;
+                        if this.wallets_at.is_none_or(|at| at.elapsed() >= WALLETS_EVERY) {
+                            this.refresh_wallets(cx);
+                        }
                     }
                     Err(err) => this.connection = Connection::Offline(format!("{err:#}")),
                 }
@@ -135,8 +210,24 @@ impl GavlApp {
         .detach();
     }
 
-    fn apply_snapshot(&mut self, state: Snapshot) {
-        self.snapshot = state;
+    /// Balances hit the chains' explorers, so they load on their own slower cadence.
+    fn refresh_wallets(&mut self, cx: &mut Context<Self>) {
+        if self.fetching_wallets {
+            return;
+        }
+        self.fetching_wallets = true;
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { client.wallets().map_err(|e| format!("{e:#}")) }).await;
+            this.update(cx, |this, cx| {
+                this.fetching_wallets = false;
+                this.wallets_at = Some(Instant::now());
+                this.wallets.update(result);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn apply_events(&mut self, page: api::EventPage) {
@@ -161,7 +252,7 @@ impl GavlApp {
     pub fn run<F, D>(&mut self, busy: Busy, window: &mut Window, cx: &mut Context<Self>, call: F, done: D)
     where
         F: FnOnce(&Client) -> anyhow::Result<Value> + Send + 'static,
-        D: FnOnce(&mut Self, Value) -> Option<String> + 'static,
+        D: FnOnce(&mut Self, Value, &mut Window, &mut Context<Self>) -> Option<String> + 'static,
     {
         if !self.busy.insert(busy) {
             return;
@@ -174,7 +265,7 @@ impl GavlApp {
                 this.busy.remove(&busy);
                 match result {
                     Ok(value) => {
-                        if let Some(message) = done(this, value) {
+                        if let Some(message) = done(this, value, window, cx) {
                             window.push_notification(Notification::success(message), cx);
                         }
                     }
@@ -194,6 +285,19 @@ impl GavlApp {
         self.snapshot.consensus.as_ref().and_then(|c| c.tip.as_ref()).map_or(0, |t| t.height)
     }
 
+    /// Wall-clock seconds per Gavl anchor: measured when the daemon has a figure, else the target.
+    pub fn anchor_seconds(&self) -> f64 {
+        match self.snapshot.consensus.as_ref() {
+            Some(c) if c.sec_per_anchor_measured && c.sec_per_anchor > 0. => c.sec_per_anchor,
+            _ => ANCHOR_SECONDS,
+        }
+    }
+
+    /// `anchors` from now as a rough span, e.g. `3h 20m`.
+    pub fn anchors_span(&self, anchors: u64) -> String {
+        format::span((anchors as f64 * self.anchor_seconds()).round() as u64)
+    }
+
     pub fn summary(&self) -> status::Summary {
         let consensus = match self.connection {
             Connection::Online => self.snapshot.consensus.as_ref(),
@@ -202,14 +306,35 @@ impl GavlApp {
         status::summarize(consensus)
     }
 
-    pub fn active_label(&self) -> String {
-        let active = self.snapshot.active.as_deref().unwrap_or_default();
+    pub fn active_key(&self) -> &str {
+        self.snapshot.active.as_deref().unwrap_or_default()
+    }
+
+    /// Whether `pub_hex` is one of this daemon's identities.
+    pub fn is_mine(&self, pub_hex: &str) -> bool {
+        self.snapshot.accounts.iter().any(|a| a.pub_hex == pub_hex)
+    }
+
+    pub fn account_label(&self, pub_hex: &str) -> String {
         self.snapshot
             .accounts
             .iter()
-            .find(|a| a.pub_hex == active)
+            .find(|a| a.pub_hex == pub_hex)
             .map(|a| a.label.clone())
-            .unwrap_or_else(|| format::short_hex(active))
+            .unwrap_or_else(|| format::short_hex(pub_hex))
+    }
+
+    pub fn active_label(&self) -> String {
+        self.account_label(self.active_key())
+    }
+
+    pub fn wallet(&self, chain: api::Chain) -> Option<&Wallet> {
+        self.wallets.ready()?.iter().find(|w| w.chain == chain)
+    }
+
+    /// Swaps still in progress.
+    pub fn open_swaps(&self) -> usize {
+        self.swaps.ready().map_or(0, |s| s.iter().filter(|s| !s.stage.is_final()).count())
     }
 
     /// Outline tags keep their text legible on both light and dark surfaces.
@@ -260,14 +385,21 @@ impl GavlApp {
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.open_swaps();
         let menu = SidebarMenu::new().children(Page::ALL.map(|page| {
-            SidebarMenuItem::new(page.label())
+            let item = SidebarMenuItem::new(page.label())
                 .icon(page.icon())
                 .active(self.page == page)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.page = page;
                     cx.notify();
-                }))
+                }));
+            if page == Page::Swaps && open > 0 {
+                let count = open.to_string();
+                item.suffix(move |_, _| Tag::info().small().child(count.clone()))
+            } else {
+                item
+            }
         }));
         Sidebar::new("nav")
             .collapsible(false)
@@ -299,6 +431,9 @@ impl GavlApp {
 
     fn render_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.page {
+            Page::Market => self.render_market(window, cx),
+            Page::Swaps => self.render_swaps(window, cx),
+            Page::Wallet => self.render_wallet(window, cx),
             Page::Network => self.render_network(window, cx),
             Page::Node => self.render_node(window, cx),
         }

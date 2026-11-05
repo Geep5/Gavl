@@ -58,7 +58,7 @@ impl GavlApp {
                     .disabled(fleet.count == 0 || removing)
                     .loading(removing)
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.run(Busy::FleetDown, window, cx, |client| client.fleet_down(), |_, _| Some("Stopped a local node".into()));
+                        this.run(Busy::FleetDown, window, cx, |client| client.fleet_down(), |_, _, _, _| Some("Stopped a local node".into()));
                     })),
             )
             .child(
@@ -68,7 +68,7 @@ impl GavlApp {
                     .disabled(fleet.count >= fleet.cap.max(1) || adding)
                     .loading(adding)
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.run(Busy::FleetUp, window, cx, |client| client.fleet_up(), |_, _| Some("Started a local node".into()));
+                        this.run(Busy::FleetUp, window, cx, |client| client.fleet_up(), |_, _, _, _| Some("Started a local node".into()));
                     })),
             )
             .child(muted(format!("{} of {} running", fleet.count, fleet.cap), cx));
@@ -134,7 +134,7 @@ impl GavlApp {
                         .disabled(switching)
                         .on_click(cx.listener(move |this, _, window, cx| {
                             let key = key.clone();
-                            this.run(Busy::SwitchAccount, window, cx, move |client| client.set_active(&key), |_, _| None);
+                            this.run(Busy::SwitchAccount, window, cx, move |client| client.set_active(&key), |_, _, _, _| None);
                         }))
                         .into_any_element()
                 })

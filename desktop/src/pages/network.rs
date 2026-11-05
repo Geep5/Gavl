@@ -114,7 +114,7 @@ impl GavlApp {
                     }))
                     .on_click(cx.listener(|this, clicked: &Vec<usize>, window, cx| {
                         let Some(&(secs, _)) = clicked.first().and_then(|ix| GOSSIP_PRESETS.get(*ix)) else { return };
-                        this.run(Busy::Gossip, window, cx, move |client| client.set_gossip_interval(secs), |_, _| None);
+                        this.run(Busy::Gossip, window, cx, move |client| client.set_gossip_interval(secs), |_, _, _, _| None);
                     })),
             )
             .when_some(current.filter(|c| !GOSSIP_PRESETS.iter().any(|(s, _)| s == c)), |this, c| {

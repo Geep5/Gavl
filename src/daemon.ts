@@ -11,7 +11,9 @@
  * their own chains via HTLCs. Every anchor commits (appRoot, lag-by-parent) to the order board its
  * parent certifies: market/fold.ts folds the certified writes, market/state.ts encodes the View.
  * One `Account` per wallet identity posts the order-board ops, all sharing the node and a single
- * monotonic clock (so op timestamps are causally ordered).
+ * monotonic clock (so op timestamps are causally ordered). The swap engine (swap/engine.ts, started
+ * by server.ts) drives every local identity's matches on Bitcoin/Litecoin and posts its ops through
+ * `submitOp`; the per-identity hot wallets behind /api/wallets and /api/send are the engine's.
  *
  * VDF is real chiavdf by default (genuine cooldown). The anchor space proof uses
  * the light stand-in by default so the node boots instantly without plotting —
@@ -19,20 +21,26 @@
  * either way; chiapos is opt-in via GAVL_SPACE=chiapos.
  */
 
+import * as btc from "@scure/btc-signer";
 import { Ledger, rootOfHeads } from "./ledger/ledger.ts";
 import type { Heads } from "./ledger/ledger.ts";
 import { GavlNode } from "./sync/node.ts";
 import { emptyView, serializeView, deserializeView, viewRoot, cloneView } from "./market/state.ts";
 import type { View, CanonOffer, CanonMatch } from "./market/state.ts";
 import { viewAtAnchor, advance, applyOp } from "./market/fold.ts";
-import { parseOp, opPayload, DEFAULT_OFFER_TTL } from "./market/ops.ts";
-import type { FundsProof } from "./market/ops.ts";
+import { parseOp, opPayload, DEFAULT_OFFER_TTL, isChain, parseAmount } from "./market/ops.ts";
+import type { Op } from "./market/ops.ts";
 import { Account } from "./market/account.ts";
 import { swapKey, swapSecretHash, takeSwapId, xOnly } from "./swap/keys.ts";
+import { CHAINS, SwapEngine } from "./swap/engine.ts";
+import type { EngineMode, SwapPolicy } from "./swap/engine.ts";
+import { MAX_MONEY } from "./swap/proof.ts";
+import { Esplora } from "./chains/esplora.ts";
+import type { Chain, Net } from "./chains/esplora.ts";
 import type { Anchor } from "./consensus/anchor.ts";
 import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
-import { defaultParams } from "./config.ts";
+import { defaultParams, swapPolicyFromEnv } from "./config.ts";
 import type { ChainParams, Write } from "./chain/writer.ts";
 import { AnchorChain, DEFAULT_FINALITY_DEPTH, DEFAULT_SETTLEMENT_DEPTH } from "./consensus/chain.ts";
 import type { SettledConflict } from "./consensus/chain.ts";
@@ -93,6 +101,20 @@ export interface DaemonOptions {
 		/** Or supply a custom policy directly (overrides `persist`). */
 		policy?: PersistPolicy;
 	};
+	/** Swap engine wiring. Defaults: Esplora per chain from GAVL_{BTC,LTC}_NET / _ESPLORA_URL, policy
+	 *  from config.ts swapPolicyFromEnv. The engine only ticks once `swaps.start()` is called. */
+	swaps?: { explorers?: Record<Chain, Esplora>; policy?: SwapPolicy; tickMs?: number; mode?: EngineMode };
+}
+
+/** One hot wallet of the active identity, as GET /api/wallets reports it (amounts: base-unit decimals). */
+export interface WalletInfo {
+	chain: Chain;
+	net: Net;
+	address: string;
+	confirmed: string;
+	unconfirmed: string;
+	/** Set when the explorer couldn't be reached (balances then read "0"). */
+	error?: string;
 }
 
 export interface ConsensusStatus {
@@ -153,6 +175,8 @@ const ANCHOR_KEEP_MARGIN = Number(process.env.GAVL_ANCHOR_MARGIN ?? "256");
 export class Daemon {
 	node: GavlNode;
 	readonly wallet: Wallet;
+	/** Drives every local identity's matches through the on-chain swap (src/swap/engine.ts). */
+	readonly swaps: SwapEngine;
 	readonly knownPeers = new KnownPeers();
 	readonly finalityDepth: number;
 	private readonly adoptQuorum: number;
@@ -210,6 +234,24 @@ export class Daemon {
 		this.node = this.freshNode();
 		this.wallet = new Wallet(opts.walletDir);
 		this.wallet.ensureSeeded();
+		const explorers = opts.swaps?.explorers ?? { bitcoin: Esplora.fromEnv("bitcoin"), litecoin: Esplora.fromEnv("litecoin") };
+		this.swaps = new SwapEngine({
+			host: {
+				board: () => this.board(),
+				channel: () => this.network,
+				identities: () => this.wallet.list().map((a) => ({ pubHex: a.pubHex, seed: a.keypair.privateKey })),
+				submitOp: (as, op) => this.submitOp(as, op),
+				log: (text) => {
+					console.log(`  swap: ${text}`);
+					this.recordNetEvent("swap", text);
+				},
+			},
+			explorers,
+			dataDir: join(this.dataDir, "swaps"),
+			policy: opts.swaps?.policy ?? swapPolicyFromEnv({ bitcoin: explorers.bitcoin.net, litecoin: explorers.litecoin.net }),
+			tickMs: opts.swaps?.tickMs ?? (Number(process.env.GAVL_SWAP_TICK_MS) || undefined),
+			mode: opts.swaps?.mode,
+		});
 		this.wireTipCadence();
 	}
 
@@ -244,6 +286,7 @@ export class Daemon {
 			this.maybeCheckpoint(); // snapshot + prune behind finality so history never grows unbounded
 			this.tryPendingSnapshot(); // a stashed peer checkpoint may now be verifiable
 			this.recordNetEvent("anchor", `tip → height ${tip.height}`);
+			this.swaps.poke(); // the board moved: proofs, locks, aborts may be due
 		};
 		// surface applied writes to the Network feed (base hook; the store hook below chains this, so
 		// it fires regardless of whether durable persistence is on).
@@ -594,14 +637,15 @@ export class Daemon {
 	}
 
 	/**
-	 * Post an order-board op from the ACTIVE identity. `build` gets the exact seq the write will take
-	 * (a taker's swap id depends on it). Before paying the write's cooldown the op is parsed and
-	 * dry-run through the fold against the tip's board at the next height, so a malformed or
-	 * already-invalid op throws here instead of landing as a no-op. The fold stays the authority:
-	 * the op can still be rejected if the board changes before it is certified.
+	 * Post an order-board op from local identity `as` (default: the ACTIVE one). `build` gets the exact
+	 * seq the write will take (a taker's swap id depends on it). Before paying the write's cooldown the
+	 * op is parsed and dry-run through the fold against the tip's board at the next height, so a
+	 * malformed or already-invalid op throws here instead of landing as a no-op. The fold stays the
+	 * authority: the op can still be rejected if the board changes before it is certified.
 	 */
-	private submit(build: (seq: number, seed: Uint8Array) => Record<string, unknown>): Promise<Write> {
-		const wa = this.wallet.active();
+	private submit(build: (seq: number, seed: Uint8Array) => Record<string, unknown>, as?: string): Promise<Write> {
+		const wa = as === undefined ? this.wallet.active() : this.wallet.get(as);
+		if (!wa) throw new Error(`daemon: unknown account ${as}`);
 		const acct = this.account(wa.pubHex);
 		return acct.post((seq: number) => {
 			const payload = build(seq, wa.keypair.privateKey);
@@ -652,28 +696,48 @@ export class Daemon {
 		return { matchId: w.id, ...derived };
 	}
 
-	/** Post this party's proof of funds for a match (built by the swap wallet). As the maker, the
-	 *  per-match swap key (derived from the seed and matchId) rides along as makerKey. */
-	async postProof(matchId: string, proof: FundsProof): Promise<{ writeId: string }> {
-		const m = this.board().view.matches.get(matchId);
-		if (!m) throw new Error("swap.proof rejected: no such match");
-		const isMaker = this.wallet.active().pubHex === m.maker; // same identity submit() posts as (captured synchronously)
-		const w = await this.submit((_seq, seed) =>
-			isMaker ? { kind: "swap.proof", matchId, makerKey: toHex(xOnly(swapKey(seed, matchId, m.makerChain, "maker"))), proof } : { kind: "swap.proof", matchId, proof },
+	/** Post `op` as local identity `as` — the swap engine's path onto the board (swap.proof /
+	 *  swap.locked / swap.abort for whichever local identity is the party). */
+	async submitOp(as: string, op: Op): Promise<{ writeId: string }> {
+		const w = await this.submit(() => opPayload(op), as);
+		return { writeId: w.id };
+	}
+
+	/** The active identity's hot wallet on each chain (address + balance from the explorer). */
+	async wallets(): Promise<{ wallets: WalletInfo[] }> {
+		const pub = this.wallet.active().pubHex;
+		const wallets = await Promise.all(
+			CHAINS.map(async (chain): Promise<WalletInfo> => {
+				const w = this.swaps.wallet(pub, chain);
+				const base = { chain, net: w.net, address: w.address() };
+				try {
+					const b = await w.balance();
+					return { ...base, confirmed: b.confirmed.toString(), unconfirmed: b.unconfirmed.toString() };
+				} catch (e) {
+					return { ...base, confirmed: "0", unconfirmed: "0", error: (e as Error).message };
+				}
+			}),
 		);
-		return { writeId: w.id };
+		return { wallets };
 	}
 
-	/** Record this party's HTLC lock outpoint (informational; a maker lock also bars the maker's abort). */
-	async postLocked(matchId: string, txid: string, vout: number): Promise<{ writeId: string }> {
-		const w = await this.submit(() => ({ kind: "swap.locked", matchId, txid, vout }));
-		return { writeId: w.id };
-	}
-
-	/** Maker only, before its own lock: cancel the match and restore the offer's capacity. */
-	async abortSwap(matchId: string): Promise<{ writeId: string }> {
-		const w = await this.submit(() => ({ kind: "swap.abort", matchId }));
-		return { writeId: w.id };
+	/** Withdraw from the active identity's hot wallet: `amount` base units to `to` at `feeRate` sat/vB
+	 *  (default: the swap policy's rate for the chain). */
+	async send(args: { chain: unknown; to: unknown; amount: unknown; feeRate?: unknown }): Promise<{ txid: string }> {
+		if (!isChain(args.chain)) throw new Error("send: chain must be bitcoin | litecoin");
+		if (typeof args.to !== "string" || args.to.length === 0) throw new Error("send: `to` address required");
+		const amount = parseAmount(args.amount, MAX_MONEY[args.chain]);
+		if (amount === null) throw new Error("send: amount must be a positive base-unit decimal string");
+		const feeRate = args.feeRate === undefined || args.feeRate === null ? this.swaps.policy.feeRate[args.chain] : Number(args.feeRate);
+		const wallet = this.swaps.wallet(this.wallet.active().pubHex, args.chain);
+		const to = args.to.trim();
+		try {
+			btc.Address(wallet.network.btc).decode(to);
+		} catch {
+			throw new Error(`send: ${to} is not a ${args.chain} ${wallet.net} address`);
+		}
+		const pay = await wallet.send({ to, amount, feeRate });
+		return { txid: pay.txid };
 	}
 
 	consensus(): ConsensusStatus {
@@ -1026,6 +1090,7 @@ export class Daemon {
 	}
 
 	async stop(): Promise<void> {
+		await this.swaps.stop();
 		this.farming = false;
 		this.producer?.stop();
 		this.stopHealthWatch();

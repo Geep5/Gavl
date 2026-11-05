@@ -61,6 +61,50 @@ refund window in anchors, and a 12h margin for chain-vs-anchor clock drift.
 API: `GET /api/offers`, `GET /api/matches?mine=1`, `POST /api/offer`, `POST /api/take` (the secret
 hash and swap key derive from the active identity's seed), `POST /api/cancel`.
 
+### Swap engine (`src/swap/engine.ts`)
+
+Every daemon runs a swap engine that drives each match one of its local identities is party to —
+nobody clicks "lock" or "claim". It ticks on every new anchor and every few seconds, and each tick
+re-derives what to do from the board, both chains (Esplora), and `<dataDir>/swaps/<matchId>.json`.
+
+| Stage (`GET /api/swaps`) | Taker (initiator) | Maker |
+|---|---|---|
+| `proofs` | posts `swap.proof` (wallet UTXOs ≥ amount + fee budget) and verifies the maker's | posts `swap.proof` + `makerKey`, verifies the taker's |
+| `waitingTakerLock` | funds `HTLC(hash, maker, taker, 24h)` on its chain while the lock window is open, posts `swap.locked` | waits for that output |
+| `waitingMakerLock` | waits for the maker's output | funds `HTLC(hash, taker, maker, 12h)`, posts `swap.locked` |
+| `claiming` | claims the maker's HTLC (reveals the secret) | reads the secret off that claim's witness, claims the taker's HTLC |
+| `waitingCounterClaim` | claimed; waits for the maker to claim | locked; waits for the taker's claim |
+| `refundPending` → `refunded` | refunds its HTLC once the CSV matures | same |
+| `done` / `cancelled` / `failed` | terminal | terminal |
+
+Safety rules:
+
+- A counterparty HTLC counts only if an **unspent output pays exactly the agreed amount to the
+  address derived from the agreed terms** (hash, both keys, refund window) with ≥ N confirmations
+  (`GAVL_BTC_CONFS` / `GAVL_LTC_CONFS`; mainnet 3 / 12, testnet 1 / 3, regtest 1). A `swap.locked`
+  hint is never trusted.
+- The maker locks only if the taker's refund opens at least its own 12h window **+ a margin**
+  (`GAVL_SWAP_MARGIN_SECS`, default 4h) later — otherwise it refuses and posts `swap.abort`. It also
+  aborts when the taker's proof of funds is invalid and no lock is seen, or when
+  `proofDeadline + 30` anchors pass without a lock. The taker doesn't start a lock within
+  `GAVL_SWAP_LOCK_MARGIN` (default 5) anchors of that deadline.
+- The taker claims only while ≥ a quarter of the maker's refund window remains, so revealing the
+  secret can't race the maker's refund.
+- Never lock twice: before funding, the HTLC address is scanned for an existing exact-amount output
+  (adopted), and a lock intent is persisted before broadcasting; a fresh intent blocks re-funding for
+  30s. Claims/refunds are persisted before broadcast and re-sent until mined.
+- Keys and the secret are always re-derived from the seed; the swap file holds only the public terms
+  (so a refund still works after the board prunes the match), txids/raw spends and the stage. It is
+  deleted once the match is pruned and every local side is terminal. On boot every file is reloaded
+  and the first tick rescans both chains — a crash anywhere resumes.
+- A counterparty's proof that fails because the explorer is unreachable is retried, never failed.
+
+Fees: `GAVL_BTC_FEERATE` / `GAVL_LTC_FEERATE` sat/vB (mainnet 10 / 2, else 2). `GAVL_SWAP_ENGINE=off`
+disables the engine (wallets only); `nolock` is fault injection for tests (everything but funding).
+
+API: `GET /api/wallets` (the active identity's BTC/LTC hot-wallet addresses + balances),
+`POST /api/send {chain, to, amount, feeRate?}`, `GET /api/swaps` (every local identity's swaps).
+
 ### Proof-of-Space-Time cooldown
 
 Every write pays a cooldown bound to two scarce resources, so neither sybils nor faster hardware help:
@@ -151,7 +195,7 @@ Peers find each other automatically through the shipped default relays; point at
 ### Desktop app (`desktop/`)
 
 The default UI: a native client for the daemon API, built with [GPUI Kit](https://gpui-kit.com) on
-[GPUI Fast](https://github.com/longbridge/gpui-fast). Two pages: **Network · Node**; the network's
+[GPUI Fast](https://github.com/longbridge/gpui-fast). Pages: **Market** (order board with take/post/cancel, your offers) · **Swaps** (per-swap progress, lock/claim/refund txids, deadlines, plain-language next steps) · **Wallet** (BTC/LTC deposit addresses, balances, send) · **Network · Node**. Amounts are entered and shown in BTC/LTC with 8 decimals and converted to sats/litoshis exactly; the network's
 health stays in the title bar, and block/peer details sit in the status bar. `npm run desktop`
 starts it alone against an already-running daemon (stable Rust, pinned by
 `desktop/rust-toolchain.toml`); `GAVL_API=http://host:port` points it at a daemon other than
@@ -192,6 +236,7 @@ relays that already exist. Relays are a **default, not an authority** — swap t
 npm test                 # full suite
 npm run regtest:install  # once — installs the local regtest tooling
 npm run test:regtest     # end-to-end tests against local regtest chains
+npm run test:e2e         # 3 daemon processes swapping BTC↔LTC on regtest (happy paths, kills, restarts, aborts)
 npm run dev:hash         # zero-setup: hash VDF + stand-in space (no venv)
 npm run daemon           # real-PoST daemon only (no UI)
 npm run daemon:hash      # daemon with the fast stand-ins
@@ -231,6 +276,8 @@ src/
   sync/          Nostr transport · chunked bulk frames · gossip · signed producer↔address bindings
   store/         durable write store (node:sqlite) + state snapshots/checkpoints + selective persist policy
   market/        the order board anchors commit to (appRoot): ops, fold, state encoding, write-posting Account
+  swap/          Taproot HTLC, seed-derived keys, funds proofs, the swap engine
+  wallet/        BIP86 hot wallet per chain
   chains/        Esplora client for Bitcoin + Litecoin (UTXOs, txs, broadcast)
   daemon.ts      boots ledger + node + store + consensus
   server.ts      localhost JSON API for the desktop app

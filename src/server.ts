@@ -12,6 +12,9 @@
  *   POST /api/offer   {give:{chain,amount}, want:{chain,amount}, minFill, expiresIn?} → { offerId }
  *   POST /api/take    {offerId, fill}       → { matchId, hash, takerKey }  (secret + key derived from the seed)
  *   POST /api/cancel  {offerId}             → { writeId }
+ *   GET  /api/wallets                       → { wallets: [{chain, net, address, confirmed, unconfirmed, error?}] }  (active identity)
+ *   POST /api/send    {chain, to, amount, feeRate?} → { txid }   withdraw from the active identity's hot wallet
+ *   GET  /api/swaps                         → { swaps }  every local identity's swaps, as the swap engine drives them
  *   POST /api/accounts            {label}   → create + activate an identity
  *   POST /api/accounts/active     {pubHex}  → switch the active identity
  *   POST /api/channel             {name}    → switch channel
@@ -27,7 +30,7 @@ import { createServer as netServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Daemon } from "./daemon.ts";
-import { defaultParams } from "./config.ts";
+import { defaultParams, swapEngineModeFromEnv } from "./config.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
@@ -75,6 +78,11 @@ const FARM = process.env.GAVL_FARM !== "0";
 // GAVL_DATA_DIR isolates a node's wallet + producer key — REQUIRED to run several nodes on one box.
 const DATA_DIR = process.env.GAVL_DATA_DIR; // undefined → ~/.gavl
 
+// Swap engine (src/swap/engine.ts): on by default; GAVL_SWAP_ENGINE=off leaves only the wallets,
+// "nolock" is fault injection for tests (everything but funding an HTLC). Parsed up front so a typo
+// fails at boot, not mid-swap.
+const SWAP_ENGINE = swapEngineModeFromEnv();
+
 const daemon = new Daemon({
 	params: defaultParams(),
 	network: NETWORK,
@@ -91,6 +99,7 @@ const daemon = new Daemon({
 	// Replication floor: warn when fewer than this many distinct nodes hold the latest checkpoint,
 	// so RAM state stays durable across churn. Default 1 (off); set to your archiver count.
 	replicationTarget: Number(process.env.GAVL_REPLICATION_TARGET ?? "1"),
+	swaps: { mode: SWAP_ENGINE === "off" ? undefined : SWAP_ENGINE },
 });
 
 // ── local fleet: up/down extra independent nodes on this machine, driven by the UI stepper ───────
@@ -223,6 +232,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		return send(res, 200, daemon.matches(url.searchParams.get("mine") === "1"));
 	}
 
+	if (method === "GET" && path === "/api/wallets") {
+		return send(res, 200, await daemon.wallets());
+	}
+
+	if (method === "GET" && path === "/api/swaps") {
+		return send(res, 200, { swaps: daemon.swaps.swaps() });
+	}
+
 	if (method === "POST") {
 		const body = await readBody(req);
 
@@ -236,6 +253,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		}
 		if (path === "/api/cancel") {
 			return send(res, 200, await daemon.cancelOffer(String(body.offerId ?? "")));
+		}
+		if (path === "/api/send") {
+			return send(res, 200, await daemon.send({ chain: body.chain, to: body.to, amount: body.amount, feeRate: body.feeRate }));
 		}
 		if (path === "/api/accounts") {
 			const acct = daemon.createAccount(String(body.label ?? "account"));
@@ -316,8 +336,9 @@ createServer((req, res) => {
 	}
 
 	await daemon.startConsensus({ network: NETWORK, mesh: MESH, farm: FARM });
+	if (SWAP_ENGINE !== "off") daemon.swaps.start();
 	const c = daemon.consensus();
-	console.log(`  → mesh ${c.mesh ? "joined" : "off"}, ${c.peers} peer(s), farming ${c.farming ? "live" : "off"}`);
+	console.log(`  → mesh ${c.mesh ? "joined" : "off"}, ${c.peers} peer(s), farming ${c.farming ? "live" : "off"}, swap engine ${SWAP_ENGINE}`);
 });
 
 process.on("SIGINT", async () => {
