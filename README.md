@@ -172,35 +172,33 @@ network's finalized checkpoint and pulls committed state, never a message backlo
 
 ## Run
 
-Needs **Node ≥ 23.6** (native TypeScript — no build step) and **Python ≥ 3.9** (real PoST only).
+Needs **Node ≥ 23.6** (native TypeScript — no build step), **Rust** via [rustup](https://rustup.rs)
+(the desktop app; on macOS also Xcode) and **Python ≥ 3.9** (real PoST only).
 Works on macOS, Linux, Windows. **Nothing to install for networking** — no router, no relay of your
 own, no ports to open.
 
 ```bash
 npm install              # once
 npm run setup:chia       # once — venv + chiavdf/chiapos (prebuilt wheels; no C++ toolchain)
-npm run dev              # real-PoST daemon + web UI, then open http://localhost:5180
+npm run dev              # real-PoST daemon + the desktop app
 ```
 
 `npm run dev` runs **real Proof-of-Space-Time** (chiavdf + chiapos) over **Nostr**, plus price relay
-and the web UI. No Python for the proofs? `npm run dev:hash` swaps in the fast stand-ins
-(`GAVL_VDF=hash GAVL_SPACE=standin`).
+and the desktop app (the first launch compiles it, a few minutes). Closing the window leaves the
+node running; Ctrl-C stops both. No Python for the proofs? `npm run dev:hash` swaps in the fast
+stand-ins (`GAVL_VDF=hash GAVL_SPACE=standin`).
 
 Peers find each other automatically through the shipped default relays; point at your own with
 `GAVL_RELAYS=wss://a,wss://b`. The daemon fails fast and loud if it can't reach any relay.
 
 ### Desktop app (`desktop/`)
 
-A native client for the same daemon API, built with [GPUI Kit](https://gpui-kit.com) on
-[GPUI Fast](https://github.com/longbridge/gpui-fast). It has the same features as the web UI,
-arranged as five pages: **Rounds · Wallet · Network · Custody · Node**. The network's health stays
-in the title bar, and block/peer details sit in the status bar. Start the daemon first, then:
-
-```bash
-cd desktop && cargo run --release   # stable Rust (pinned by desktop/rust-toolchain.toml)
-```
-
-`GAVL_API=http://host:port` points it at a daemon other than `http://127.0.0.1:6440`.
+The default UI: a native client for the daemon API, built with [GPUI Kit](https://gpui-kit.com) on
+[GPUI Fast](https://github.com/longbridge/gpui-fast). Five pages: **Rounds · Wallet · Network ·
+Custody · Node**; the network's health stays in the title bar, and block/peer details sit in the
+status bar. `npm run desktop` starts it alone against an already-running daemon (stable Rust, pinned
+by `desktop/rust-toolchain.toml`); `GAVL_API=http://host:port` points it at a daemon other than
+`http://127.0.0.1:6440`.
 
 ## Multi-node (the committee)
 
@@ -238,8 +236,8 @@ relays that already exist. Relays are a **default, not an authority** — swap t
 ```bash
 npm test                 # full suite
 npm run dev:hash         # zero-setup: hash VDF + stand-in space (no venv)
-npm run daemon           # real-PoST daemon only (no web UI)
-npm run web:dev          # web UI only (expects a daemon on :6440)
+npm run daemon           # real-PoST daemon only (no UI)
+npm run desktop          # desktop app only (expects a daemon on :6440)
 ```
 
 Key env vars: `GAVL_VDF=chia|hash` · `GAVL_SPACE=chiapos|standin`
@@ -266,9 +264,8 @@ src/
   market/        Gavl Rounds (parimutuel bull/bear), btc fold, account, Pyth/signed price feeds
   custody/       real-BTC bridge: FROST threshold · DKG · Taproot · deposits · tx · watcher · reshare
   daemon.ts      boots ledger + node + store + consensus + price relay + bridge
-  server.ts      localhost JSON API for the web UI
-web/             Svelte SPA — the 1-click bull/bear rounds UI
-desktop/         native Rust client (GPUI Kit + GPUI Fast) for the same daemon API
+  server.ts      localhost JSON API for the desktop app
+desktop/         native Rust client (GPUI Kit + GPUI Fast) — the Gavl app
 ```
 
 ---

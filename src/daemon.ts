@@ -1,5 +1,5 @@
 /**
- * Daemon — the local engine behind the web UI.
+ * Daemon — the local engine behind the desktop app.
  *
  * Boots a single Ledger + GavlNode and builds one `Account` per wallet
  * identity, all sharing the node (so they trade with each other locally) and a
@@ -286,7 +286,7 @@ export class Daemon {
 	 *  Display-only (never touches the deterministic fold), so Date.now() is fine here. */
 	private readonly anchorTimes: { height: number; at: number }[] = [];
 
-	/** Recent network/diagnostic steps (seq'd ring buffer) for the web UI's Network feed. Display-only
+	/** Recent network/diagnostic steps (seq'd ring buffer) for the app's Network activity log. Display-only
 	 *  — never touches the deterministic fold, so Date.now() is fine here. */
 	private readonly netEvents: { seq: number; ts: number; kind: string; text: string }[] = [];
 	private netSeq = 0;
@@ -629,7 +629,7 @@ export class Daemon {
 		return { replayed: writes };
 	}
 
-	/** Record a network/diagnostic step for the web UI's Network feed. */
+	/** Record a network/diagnostic step for the app's Network activity log. */
 	recordNetEvent(kind: string, text: string): void {
 		this.netEvents.push({ seq: ++this.netSeq, ts: Date.now(), kind, text });
 		if (this.netEvents.length > 500) this.netEvents.shift();

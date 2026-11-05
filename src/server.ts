@@ -1,5 +1,5 @@
 /**
- * HTTP+JSON API for the web UI — a thin control surface over the Daemon.
+ * HTTP+JSON API for the desktop app — a thin control surface over the Daemon.
  *
  * Localhost only. No deps (Node's http). All amounts are strings (BigInt-safe).
  * Writes pay the PoST cooldown, so action endpoints are async and can take a

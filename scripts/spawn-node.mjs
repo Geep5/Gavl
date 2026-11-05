@@ -14,8 +14,8 @@
 //
 // Runs the daemon in the FOREGROUND (open one terminal per node). Inherits proof-mode env, so it
 // joins a real-PoST network by default; add `GAVL_VDF=hash GAVL_SPACE=standin` to match a dev:hash
-// net. The web UI (vite, port 5180) is single-instance — view extra nodes via their API port or
-// `curl localhost:<port>/api/state`.
+// net. The desktop app follows one daemon (GAVL_API) — view extra nodes on the app's Node page,
+// via `GAVL_API=http://127.0.0.1:<port> npm run desktop`, or `curl localhost:<port>/api/state`.
 
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";

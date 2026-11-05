@@ -5,9 +5,10 @@
   "type": "module",
   "description": "Gavl — a decentralized 1-click Bitcoin bull/bear market (parimutuel rounds) on a Proof-of-Space-Time cooldown ledger, networked over Nostr.",
   "scripts": {
-    "dev": "concurrently -k -n daemon,web -c blue,magenta \"npm:daemon:dev\" \"npm:web:dev\"",
-    "dev:hash": "concurrently -k -n daemon,web -c blue,magenta \"npm:daemon:hash\" \"npm:web:dev\"",
-    "dev:fresh": "concurrently -k -n daemon,web -c blue,magenta \"npm:daemon:fresh\" \"npm:web:dev\"",
+    "dev": "concurrently -n daemon,desktop -c blue,magenta \"npm:daemon:dev\" \"npm:desktop\"",
+    "dev:hash": "concurrently -n daemon,desktop -c blue,magenta \"npm:daemon:hash\" \"npm:desktop\"",
+    "dev:fresh": "concurrently -n daemon,desktop -c blue,magenta \"npm:daemon:fresh\" \"npm:desktop\"",
+    "desktop": "cd desktop && cargo run --release",
     "daemon": "node src/server.ts",
     "daemon:dev": "cross-env GAVL_ORACLE_PUBLISH=1 node src/server.ts",
     "daemon:hash": "cross-env GAVL_VDF=hash GAVL_SPACE=standin GAVL_ORACLE_PUBLISH=1 node src/server.ts",
@@ -17,8 +18,6 @@
     "feed:signer": "node src/feed-signer.ts",
     "feed:member": "node src/feed-member.ts",
     "feed:aggregator": "node src/feed-aggregator.ts",
-    "web:dev": "vite --config web/vite.config.js web",
-    "web:build": "vite --config web/vite.config.js build web",
     "test": "node --test \"test/*.test.ts\"",
     "test:fast": "node --test test/intent-match.test.ts test/intent-fold.test.ts test/intent-gossip.test.ts test/consensus.test.ts test/consensus-gossip.test.ts test/ledger.test.ts test/post-cooldown.test.ts test/sync.test.ts test/custody-threshold.test.ts test/custody-bridge.test.ts",
     "test:chia": "node --test test/chia.test.ts",
@@ -29,13 +28,10 @@
     "node": ">=23.6"
   },
   "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^7.1.2",
     "@types/node": "^22.0.0",
     "concurrently": "^10.0.3",
     "cross-env": "^10.1.0",
-    "svelte": "^5.56.0",
-    "typescript": "^5.6.0",
-    "vite": "^8.0.14"
+    "typescript": "^5.6.0"
   },
   "dependencies": {
     "@noble/curves": "^2.2.0",
