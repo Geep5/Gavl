@@ -32,7 +32,7 @@ async function buildCheckpoint(): Promise<{ snapshot: StoredSnapshot; full: { wr
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node: S, params: PARAMS, k: K, now, keypair: kp });
 	const poster = mk();
-	const appRoot = viewRoot(emptyView()); // the app state is empty: every anchor commits the same appRoot
+	const appRoot = viewRoot(emptyView()); // no order-board ops here: every anchor commits the empty board's root
 	const m = generateKeyPair();
 	const prover = standinProver(m);
 	const mineOn = async (): Promise<void> => {

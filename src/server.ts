@@ -7,6 +7,11 @@
  *
  *   GET  /api/state                         → { accounts, active, consensus, storage, fleet }
  *   GET  /api/events?since=N                → network/diagnostic log page
+ *   GET  /api/offers                        → { height, offers }   listed offers as of the tip anchor
+ *   GET  /api/matches[?mine=1]              → { height, matches }  matches (mine: my identities' only)
+ *   POST /api/offer   {give:{chain,amount}, want:{chain,amount}, minFill, expiresIn?} → { offerId }
+ *   POST /api/take    {offerId, fill}       → { matchId, hash, takerKey }  (secret + key derived from the seed)
+ *   POST /api/cancel  {offerId}             → { writeId }
  *   POST /api/accounts            {label}   → create + activate an identity
  *   POST /api/accounts/active     {pubHex}  → switch the active identity
  *   POST /api/channel             {name}    → switch channel
@@ -210,9 +215,28 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 		return send(res, 200, daemon.events(since));
 	}
 
+	if (method === "GET" && path === "/api/offers") {
+		return send(res, 200, daemon.offers());
+	}
+
+	if (method === "GET" && path === "/api/matches") {
+		return send(res, 200, daemon.matches(url.searchParams.get("mine") === "1"));
+	}
+
 	if (method === "POST") {
 		const body = await readBody(req);
 
+		// ── order board (ops are posted by the ACTIVE identity; each pays a write's PoST cooldown) ──
+		if (path === "/api/offer") {
+			const expiresIn = body.expiresIn === undefined ? undefined : Number(body.expiresIn);
+			return send(res, 200, await daemon.postOffer({ give: body.give, want: body.want, minFill: body.minFill, expiresIn }));
+		}
+		if (path === "/api/take") {
+			return send(res, 200, await daemon.takeOffer(String(body.offerId ?? ""), String(body.fill ?? "")));
+		}
+		if (path === "/api/cancel") {
+			return send(res, 200, await daemon.cancelOffer(String(body.offerId ?? "")));
+		}
 		if (path === "/api/accounts") {
 			const acct = daemon.createAccount(String(body.label ?? "account"));
 			return send(res, 200, { pubHex: acct.pubHex });

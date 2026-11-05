@@ -30,7 +30,7 @@ test("a fresh peer bootstraps from a pruned peer's checkpoint and converges with
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node: A, params: PARAMS, k: K, now, keypair: kp });
 	const poster = mk();
-	// The app state is empty, so every anchor commits the same appRoot; this test is about trustless
+	// No order-board ops are posted, so every anchor commits the empty board's root; this test is about trustless
 	// checkpoint bootstrap (heads + appRoot authentication), not app-state folding.
 	const appRoot = viewRoot(emptyView());
 

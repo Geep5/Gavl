@@ -30,7 +30,7 @@ async function buildServer(): Promise<{ snapshot: StoredSnapshot; full: { writes
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node: S, params: PARAMS, k: K, now, keypair: kp });
 	const poster = mk();
-	// The app state is empty, so every anchor commits the same appRoot; this test is about adoption.
+	// No order-board ops are posted, so every anchor commits the empty board's root; this test is about adoption.
 	const appRoot = viewRoot(emptyView());
 	const m = generateKeyPair();
 	const prover = standinProver(m);

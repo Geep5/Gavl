@@ -8,7 +8,10 @@
  * finality deepening, peers joining.
  *
  * Gavl holds no funds: it is the ephemeral order board for BTC↔LTC atomic swaps, which settle on
- * their own chains via HTLCs. The app state every anchor commits to is in market/state.ts.
+ * their own chains via HTLCs. Every anchor commits (appRoot, lag-by-parent) to the order board its
+ * parent certifies: market/fold.ts folds the certified writes, market/state.ts encodes the View.
+ * One `Account` per wallet identity posts the order-board ops, all sharing the node and a single
+ * monotonic clock (so op timestamps are causally ordered).
  *
  * VDF is real chiavdf by default (genuine cooldown). The anchor space proof uses
  * the light stand-in by default so the node boots instantly without plotting —
@@ -17,13 +20,20 @@
  */
 
 import { Ledger, rootOfHeads } from "./ledger/ledger.ts";
+import type { Heads } from "./ledger/ledger.ts";
 import { GavlNode } from "./sync/node.ts";
-import { emptyView, serializeView, deserializeView, viewRoot } from "./market/state.ts";
+import { emptyView, serializeView, deserializeView, viewRoot, cloneView } from "./market/state.ts";
+import type { View, CanonOffer, CanonMatch } from "./market/state.ts";
+import { viewAtAnchor, advance, applyOp } from "./market/fold.ts";
+import { parseOp, opPayload, DEFAULT_OFFER_TTL } from "./market/ops.ts";
+import type { FundsProof } from "./market/ops.ts";
+import { Account } from "./market/account.ts";
+import { swapKey, swapSecretHash, takeSwapId, xOnly } from "./swap/keys.ts";
 import type { Anchor } from "./consensus/anchor.ts";
 import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
 import { defaultParams } from "./config.ts";
-import type { ChainParams } from "./chain/writer.ts";
+import type { ChainParams, Write } from "./chain/writer.ts";
 import { AnchorChain, DEFAULT_FINALITY_DEPTH, DEFAULT_SETTLEMENT_DEPTH } from "./consensus/chain.ts";
 import type { SettledConflict } from "./consensus/chain.ts";
 import { genesisAnchor, GENESIS_PRODUCER } from "./consensus/genesis.ts";
@@ -215,7 +225,7 @@ export class Daemon {
 				console.error(`  ⚠ consensus: REFUSING a branch that abandons SETTLED anchor ${c.settled.id.slice(0, 8)} (height ${c.settled.height}) — tip ${c.rejected.id.slice(0, 8)} at height ${c.rejected.height}. The network has split deeper than settlement; this node stays on its settled history. Operator action needed.`);
 				this.recordNetEvent("consensus", `refused branch abandoning settled height ${c.settled.height}`);
 			},
-			verifyState: (a) => a.appRoot === this.appRoot,
+			verifyState: (a) => this.checkAppRoot(a),
 		});
 		const node = new GavlNode(new Ledger(this.params), chain);
 		node.mode = `${this.params.vdf.name}/${this.spaceMode}`; // hello advertises this → peers detect a proof-mode mismatch
@@ -278,9 +288,16 @@ export class Daemon {
 			this.pendingSnapshot = snap; // need the child anchor to authenticate the state
 			return false;
 		}
-		if (viewRoot(deserializeView(snap.state)) !== child.appRoot) return false; // state doesn't match the committed appRoot → reject
-		// Authentic. Seed the ledger at the checkpoint.
+		let state: View;
+		try {
+			state = deserializeView(snap.state);
+		} catch {
+			return false; // not this app's canonical state shape
+		}
+		if (viewRoot(state) !== child.appRoot) return false; // state doesn't match the committed appRoot → reject
+		// Authentic. Seed the ledger at the checkpoint and fold forward from its state.
 		this.node.ledger.seedCheckpoint(snap.heads);
+		this.setCheckpointBase(state);
 		this.lastCheckpointHeight = snap.height;
 		this.lastSnapshot = snap;
 		this.pendingSnapshot = undefined;
@@ -374,19 +391,22 @@ export class Daemon {
 		// snapshot is appRoot-verified on the sync path.
 		const snap = await this.store.loadSnapshot();
 		if (snap) {
-			deserializeView(snap.state); // throws on a state that isn't this app's canonical shape
+			this.setCheckpointBase(deserializeView(snap.state)); // throws on a state that isn't this app's canonical shape
 			this.node.ledger.seedCheckpoint(snap.heads);
 			this.lastCheckpointHeight = snap.height;
 			this.lastSnapshot = snap; // serve it to fresh peers too
 			console.log(`  storage: loaded checkpoint at height ${snap.height} (${Object.keys(snap.heads).length} writer head(s)) — skipping replay below it`);
 		}
 
-		// Replay persisted writes into the ledger BEFORE going live.
+		// Replay persisted writes into the ledger BEFORE going live. Seed the logical clock past the
+		// highest replayed ts so new writes are GLOBALLY monotonic — otherwise a restart resets ts to
+		// 0, colliding with persisted writes in the intra-epoch (ts) fold order.
 		const { writes } = await this.store.replay((w) => {
 			// skipTimeProof: these writes already passed full verification (VDF included) before they
 			// were persisted, so re-walking each O(iters) cooldown here would block boot for minutes on
 			// a large backlog. The cheap sig/id/structure checks still run, catching disk corruption.
 			this.node.ledger.apply(w, { skipTimeProof: true });
+			if (w.ts > this.clock) this.clock = w.ts;
 		});
 
 		// Persist every newly-applied write (write-through, policy-filtered). Guarded against
@@ -422,15 +442,85 @@ export class Daemon {
 		return this.wallet.create(label);
 	}
 
+	// ── accounts: one write-producing Account per wallet identity ──────
+	private readonly accounts = new Map<string, Account>();
+	/** Logical clock for write `ts` — monotonic across every account (seeded past replayed writes). */
+	private clock = 0;
+	private readonly now = (): number => ++this.clock;
+
+	/** The write-producing Account for a wallet identity (bound to the current node). */
+	account(pubHex: string): Account {
+		const existing = this.accounts.get(pubHex);
+		if (existing) return existing;
+		const wa = this.wallet.get(pubHex);
+		if (!wa) throw new Error(`daemon: unknown account ${pubHex}`);
+		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: wa.keypair });
+		this.accounts.set(pubHex, acct);
+		return acct;
+	}
+
 	// ── committed app state + state-committed checkpoints — the ledger never replays from 0 ──
+	/** The order board at the ledger's prune floor (the last checkpoint). The ledger holds only writes
+	 *  ABOVE it; every fold resumes from here. Undefined ⇒ full history (never checkpointed). */
+	private checkpointBase?: View;
 	private lastCheckpointHeight = -1;
 	/** The latest durable checkpoint (kept in memory so it can be served to fresh peers). */
 	private lastSnapshot?: StoredSnapshot;
 	/** A peer's checkpoint awaiting anchor-chain sync before it can be authenticated. */
 	private pendingSnapshot?: StoredSnapshot;
-	/** The appRoot every anchor must commit (the producer mines it; AnchorChain.verifyState checks a
-	 *  peer's against it). The app state is empty (market/state.ts), so it is the same for every anchor. */
-	private readonly appRoot = viewRoot(emptyView());
+	/** viewRoot of the empty board — what genesis (and any anchor on a parentless chain) commits. */
+	private readonly emptyAppRoot = viewRoot(emptyView());
+	/** Memoized fold per anchor id. A pure function of the anchor (its certified writes are immutable
+	 *  once it's in-chain) and the checkpoint base, so it is dropped whenever the base moves. Bounded:
+	 *  only recent anchors are ever asked for (tip, its parent, inbound anchors' parents). */
+	private readonly viewCache = new Map<string, View>();
+
+	/** Rebase every fold onto `base` (a checkpoint's committed state). */
+	private setCheckpointBase(base: View | undefined): void {
+		this.checkpointBase = base;
+		this.viewCache.clear();
+	}
+
+	/** The order board anchor `anchorId` certifies, folded from the checkpoint base. Read-only:
+	 *  callers must clone before mutating. Memoized only once the ledger holds every write the anchor
+	 *  certifies — a fold over a partial write set (still syncing) is never cached as the anchor's. */
+	private viewAt(anchorId: string): View {
+		const cached = this.viewCache.get(anchorId);
+		if (cached) return cached;
+		const anchors = this.node.anchors!;
+		const v = viewAtAnchor(this.node.ledger.allWrites(), anchors, anchorId, this.checkpointBase);
+		if (this.haveAllWrites(anchors.headsAt(anchorId))) {
+			if (this.viewCache.size >= 64) this.viewCache.delete(this.viewCache.keys().next().value!); // oldest first
+			this.viewCache.set(anchorId, v);
+		}
+		return v;
+	}
+
+	/** The appRoot an anchor extending `prev` must commit: viewRoot of the board `prev` certifies
+	 *  (lag-by-parent → always computable from an in-chain anchor); empty at genesis. */
+	private appRootFor(prev: Anchor | null): string {
+		if (!prev || !this.node.anchors) return this.emptyAppRoot;
+		return viewRoot(this.viewAt(prev.id));
+	}
+
+	/** AnchorChain.verifyState hook — enforce a peer's appRoot against our own fold. If we lack the
+	 *  parent's certified writes we DEFER (can't judge yet; it would be re-checked on arrival). */
+	private checkAppRoot(anchor: Anchor): boolean {
+		const anchors = this.node.anchors;
+		if (!anchors) return true;
+		const prev = anchor.prev ? (anchors.get(anchor.prev) ?? null) : null;
+		if (!prev) return anchor.appRoot === this.emptyAppRoot;
+		if (!this.haveAllWrites(anchors.headsAt(prev.id))) return true; // missing data → defer, don't reject
+		return anchor.appRoot === this.appRootFor(prev);
+	}
+
+	/** True if our ledger holds every writer's chain up to `heads` (so we can fold that state). */
+	private haveAllWrites(heads: Heads): boolean {
+		for (const writer of Object.keys(heads)) {
+			if (this.node.ledger.idAt(writer, heads[writer].seq) !== heads[writer].id) return false;
+		}
+		return true;
+	}
 
 	/** Once finality advances past the cadence, checkpoint the committed state and prune history
 	 *  behind it so RAM never grows without bound — for EVERY node, with or without a durable
@@ -456,14 +546,17 @@ export class Daemon {
 		if (!ckpt || ckpt.height !== target) return; // the boundary anchor isn't reachable yet → wait
 		const heads = anchors.headsAt(ckpt.id);
 		if (Object.keys(heads).length === 0) return; // nothing certified yet
+		if (!this.haveAllWrites(heads)) return; // can't fold the boundary state yet → wait for the writes
+		const view = this.viewAt(ckpt.id); // the committed board at the boundary
 		this.lastCheckpointHeight = ckpt.height;
-		const snap: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(emptyView()) };
+		const snap: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(view) };
 		this.lastSnapshot = snap; // kept in RAM to serve fresh peers (key-only nodes included)
 		this.node.reBeaconHave(); // advertise we hold the new checkpoint; count toward the replication floor
 		this.node.checkReplication(); // warn if too few nodes hold it
 		this.recordNetEvent("checkpoint", `committed @ height ${ckpt.height} (${Object.keys(heads).length} writer head${Object.keys(heads).length === 1 ? "" : "s"})`);
 		const before = this.node.ledger.summary().writes;
 		this.node.ledger.pruneBelow(heads); // drop RAM history below the checkpoint — bounds memory
+		this.setCheckpointBase(view); // every later fold resumes from the boundary state
 		// Bound the anchor chain too (local memory only — not committed in any root). Keep a
 		// suffix below the checkpoint that still covers the retarget window, so every backward
 		// walk (difficulty, finality, heads) stays intact.
@@ -475,6 +568,112 @@ export class Daemon {
 		const persisted = store ? " (persisting)" : " (RAM-only)";
 		if (store) void store.persistSnapshot(snap).then(() => store.pruneBelow(heads)).catch(() => {});
 		console.log(`  checkpoint: height ${ckpt.height} (boundary), ${Object.keys(heads).length} writer(s); pruned ${before - this.node.ledger.summary().writes} write(s) + ${anchorsBefore - anchors.size} anchor(s) from RAM${persisted}`);
+	}
+
+	// ── order board ──────────────────────────────────────────────────
+
+	/** The order board the current tip anchor certifies (the freshest consensus-ordered state; the
+	 *  tip's child will commit to it). Pre-consensus: the checkpoint base, or empty. Read-only. */
+	board(): { height: number | null; view: View } {
+		const tip = this.node.anchors?.tip() ?? null;
+		if (!tip) return { height: null, view: this.checkpointBase ?? emptyView() };
+		return { height: tip.height, view: this.viewAt(tip.id) };
+	}
+
+	/** Listed offers (JSON-safe), id-sorted. */
+	offers(): { height: number | null; offers: CanonOffer[] } {
+		const { height, view } = this.board();
+		return { height, offers: serializeView(view).offers };
+	}
+
+	/** Matches (JSON-safe), id-sorted; `mine` keeps those where a wallet identity is maker or taker. */
+	matches(mine: boolean): { height: number | null; matches: CanonMatch[] } {
+		const { height, view } = this.board();
+		const keys = new Set(this.wallet.list().map((a) => a.pubHex));
+		return { height, matches: serializeView(view).matches.filter((m) => !mine || keys.has(m.maker) || keys.has(m.taker)) };
+	}
+
+	/**
+	 * Post an order-board op from the ACTIVE identity. `build` gets the exact seq the write will take
+	 * (a taker's swap id depends on it). Before paying the write's cooldown the op is parsed and
+	 * dry-run through the fold against the tip's board at the next height, so a malformed or
+	 * already-invalid op throws here instead of landing as a no-op. The fold stays the authority:
+	 * the op can still be rejected if the board changes before it is certified.
+	 */
+	private submit(build: (seq: number, seed: Uint8Array) => Record<string, unknown>): Promise<Write> {
+		const wa = this.wallet.active();
+		const acct = this.account(wa.pubHex);
+		return acct.post((seq: number) => {
+			const payload = build(seq, wa.keypair.privateKey);
+			const op = parseOp(payload);
+			if (!op) throw new Error(`malformed ${String(payload.kind)} op`);
+			const { height, view } = this.board();
+			const h = (height ?? 0) + 1;
+			const dry = cloneView(view);
+			advance(dry, h);
+			const reason = applyOp(dry, { id: "", writer: acct.pubHex, seq }, op, h);
+			if (reason) throw new Error(`${op.kind} rejected: ${reason}`);
+			return opPayload(op);
+		});
+	}
+
+	/** List an offer: give `give.amount` on `give.chain` for `want.amount` on `want.chain` (base units,
+	 *  decimal strings), in fills of ≥ minFill give-units, listed for `expiresIn` anchors. */
+	async postOffer(args: { give: { chain: string; amount: string }; want: { chain: string; amount: string }; minFill: string; expiresIn?: number }): Promise<{ offerId: string }> {
+		const w = await this.submit(() => ({
+			kind: "offer.post",
+			give: { chain: args.give?.chain, amount: args.give?.amount },
+			want: { chain: args.want?.chain, amount: args.want?.amount },
+			minFill: args.minFill,
+			expiresIn: args.expiresIn ?? DEFAULT_OFFER_TTL,
+		}));
+		return { offerId: w.id };
+	}
+
+	/** Cancel one of the active identity's offers (open matches keep their reserved fill). */
+	async cancelOffer(offerId: string): Promise<{ writeId: string }> {
+		const w = await this.submit(() => ({ kind: "offer.cancel", offerId }));
+		return { writeId: w.id };
+	}
+
+	/** Take `fill` give-units of an offer as the swap INITIATOR. The secret hash and the taker's swap
+	 *  key are derived from the wallet seed and the take's position (swap/keys.ts takeSwapId), so the
+	 *  daemon can re-derive them from the match record (offerId, taker, takeSeq) at any time. */
+	async takeOffer(offerId: string, fill: string): Promise<{ matchId: string; hash: string; takerKey: string }> {
+		const offer = this.board().view.offers.get(offerId);
+		if (!offer) throw new Error("offer.take rejected: no such offer");
+		const taker = this.wallet.active().pubHex;
+		let derived = { hash: "", takerKey: "" };
+		const w = await this.submit((seq, seed) => {
+			const swapId = takeSwapId(offerId, taker, seq);
+			derived = { hash: toHex(swapSecretHash(seed, swapId)), takerKey: toHex(xOnly(swapKey(seed, swapId, offer.want.chain, "taker"))) };
+			return { kind: "offer.take", offerId, fill, ...derived };
+		});
+		return { matchId: w.id, ...derived };
+	}
+
+	/** Post this party's proof of funds for a match (built by the swap wallet). As the maker, the
+	 *  per-match swap key (derived from the seed and matchId) rides along as makerKey. */
+	async postProof(matchId: string, proof: FundsProof): Promise<{ writeId: string }> {
+		const m = this.board().view.matches.get(matchId);
+		if (!m) throw new Error("swap.proof rejected: no such match");
+		const isMaker = this.wallet.active().pubHex === m.maker; // same identity submit() posts as (captured synchronously)
+		const w = await this.submit((_seq, seed) =>
+			isMaker ? { kind: "swap.proof", matchId, makerKey: toHex(xOnly(swapKey(seed, matchId, m.makerChain, "maker"))), proof } : { kind: "swap.proof", matchId, proof },
+		);
+		return { writeId: w.id };
+	}
+
+	/** Record this party's HTLC lock outpoint (informational; a maker lock also bars the maker's abort). */
+	async postLocked(matchId: string, txid: string, vout: number): Promise<{ writeId: string }> {
+		const w = await this.submit(() => ({ kind: "swap.locked", matchId, txid, vout }));
+		return { writeId: w.id };
+	}
+
+	/** Maker only, before its own lock: cancel the match and restore the offer's capacity. */
+	async abortSwap(matchId: string): Promise<{ writeId: string }> {
+		const w = await this.submit(() => ({ kind: "swap.abort", matchId }));
+		return { writeId: w.id };
 	}
 
 	consensus(): ConsensusStatus {
@@ -572,7 +771,7 @@ export class Daemon {
 			} else {
 				prover = new StandinSpaceProver(new Plot(farmer.publicKey, this.k));
 			}
-			this.producer = new Producer({ node: this.node, keypair: farmer, prover, params: this.params, appRootFor: () => this.appRoot });
+			this.producer = new Producer({ node: this.node, keypair: farmer, prover, params: this.params, appRootFor: (prev) => this.appRootFor(prev) });
 			this.farming = true;
 			this.startHealthWatch(); // warn if we farm but never produce an anchor
 			this.startFarming();
@@ -639,6 +838,7 @@ export class Daemon {
 		this.node.ledger.reset();
 		this.lastCheckpointHeight = -1;
 		this.lastSnapshot = undefined;
+		this.setCheckpointBase(undefined);
 		await this.store?.clear();
 		return true;
 	}
@@ -649,7 +849,7 @@ export class Daemon {
 	 *  genesis-mismatch detection (a peer with a different block 0 is on another network). */
 	private genesisFor(): Anchor {
 		const difficulty = this.schedule?.base ?? this.params.difficulty; // genesis difficulty = schedule base
-		return genesisAnchor({ network: this.network, difficulty, appRoot: this.appRoot });
+		return genesisAnchor({ network: this.network, difficulty, appRoot: this.emptyAppRoot });
 	}
 
 	/**
@@ -812,9 +1012,11 @@ export class Daemon {
 
 		// 2. Fresh ledger + anchor chain — a clean state for the new channel.
 		this.node = this.freshNode();
+		this.accounts.clear(); // bound to the old node; rebound lazily on the new one
 		this.lastCheckpointHeight = -1;
 		this.lastSnapshot = undefined;
 		this.pendingSnapshot = undefined;
+		this.setCheckpointBase(undefined);
 		this.wireTipCadence();
 
 		// 3. Switch to the new channel and bring it up (init store → replay → join + farm).

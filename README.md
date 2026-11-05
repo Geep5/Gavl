@@ -14,8 +14,8 @@ nothing about orders or swaps persists on Gavl long-term. Gavl holds no funds �
 vault, no wrapped tokens. Each user's daemon automates its own swap steps and keeps the swap secrets
 on local disk until the swap ends.
 
-> **Status:** the PoST anchor chain, Nostr gossip and the Esplora chain client (`src/chains/`) run
-> today. Offer matching and the swap engine (`src/swap/`) are being built. Testnet only.
+> **Status:** the PoST anchor chain, Nostr gossip, the Esplora chain client (`src/chains/`) and the
+> order board (`src/market/`) run today. The swap engine (`src/swap/`) is being built. Testnet only.
 
 ---
 
@@ -37,7 +37,29 @@ The **initiator** (who knows the preimage) locks first with the **longer** windo
 preimage on-chain, which the counterparty then uses to claim the initiator's output. If either
 party walks away, both refund after their timeouts.
 
-### Proof-of-Space-Time cooldown
+### Order board (`src/market/`)
+
+The app state every anchor commits to (`appRoot`) is the order board, folded from certified writes
+in the PoST-bound order. Time is the anchor height (60s target); every deadline is a height, so the
+fold is a pure function of the certified writes and the height, and a node resuming from a
+checkpoint reaches the same root as one that folded all history.
+
+| Op | By | Effect |
+|---|---|---|
+| `offer.post {give, want, minFill, expiresIn}` | maker | lists an offer (amounts in sats/litoshis, decimal strings); expires after `expiresIn` anchors (default 1440 = 24h, max 2880) |
+| `offer.cancel {offerId}` | maker | delists it; open matches keep their reserved fill |
+| `offer.take {offerId, fill, hash, takerKey}` | anyone but the maker | reserves `fill` (≥ minFill, ≤ remaining); the taker owes `floor(fill × want / give)`; neither leg may be P2TR dust |
+| `swap.proof {matchId, makerKey?, proof}` | either party, ≤ 10 anchors after the take | proof of funds (shape-checked here, verified on-chain by the counterparty's daemon); the maker's carries its swap key; both in → `escrow`, else `cancelled` and the fill returns to the offer |
+| `swap.locked {matchId, txid, vout}` | either party, in escrow | records the HTLC outpoint (a hint) |
+| `swap.abort {matchId}` | maker, before its own lock | `cancelled`, fill returns to the offer |
+
+The **taker** is the initiator (holds the secret, locks first on the maker's `want` chain, 24h
+refund); the **maker** locks second on its `give` chain (12h). A match record is dropped
+`10 + 30 + 1440 + 720 = 2200` anchors after the take: proof window, the taker's lock window, its 24h
+refund window in anchors, and a 12h margin for chain-vs-anchor clock drift.
+
+API: `GET /api/offers`, `GET /api/matches?mine=1`, `POST /api/offer`, `POST /api/take` (the secret
+hash and swap key derive from the active identity's seed), `POST /api/cancel`.
 
 ### Proof-of-Space-Time cooldown
 
@@ -208,7 +230,7 @@ src/
   consensus/     anchor chain, fork choice, finality, difficulty, canonical order
   sync/          Nostr transport · chunked bulk frames · gossip · signed producer↔address bindings
   store/         durable write store (node:sqlite) + state snapshots/checkpoints + selective persist policy
-  market/        app state anchors commit to (appRoot) — empty until the order board lands
+  market/        the order board anchors commit to (appRoot): ops, fold, state encoding, write-posting Account
   chains/        Esplora client for Bitcoin + Litecoin (UTXOs, txs, broadcast)
   daemon.ts      boots ledger + node + store + consensus
   server.ts      localhost JSON API for the desktop app

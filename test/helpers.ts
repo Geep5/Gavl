@@ -7,7 +7,8 @@ import { Plot } from "../src/pos/space.ts";
 import { StandinSpaceProver, StandinSpaceVerifier } from "../src/consensus/space.ts";
 import type { SpaceProver } from "../src/consensus/space.ts";
 import type { KeyPair } from "../src/det/ed25519.ts";
-import type { GavlNode } from "../src/sync/node.ts";
+
+export { Account } from "../src/market/account.ts";
 
 /** Low difficulty so multi-write, multi-node tests stay quick. */
 export const PARAMS: ChainParams = {
@@ -31,38 +32,6 @@ export async function makeChain(n: number, params: ChainParams = PARAMS, k: numb
 		prev = w.id;
 	}
 	return { writer, writes };
-}
-
-/** A wallet identity that appends signed writes to its own chain over a GavlNode: each write extends
- *  this identity's chain (paying the PoST cooldown) and is submitted to the node (applied locally +
- *  gossiped). `payload` is opaque to consensus. */
-export class Account {
-	readonly node: GavlNode;
-	readonly writer: Writer;
-	private readonly now: () => number;
-
-	constructor(opts: { node: GavlNode; params: ChainParams; k: number; now: () => number; keypair?: KeyPair }) {
-		this.node = opts.node;
-		this.writer = new Writer({ k: opts.k, params: opts.params, keypair: opts.keypair });
-		this.now = opts.now;
-	}
-
-	get pubHex(): string {
-		return this.writer.pubHex;
-	}
-
-	async post(payload: unknown): Promise<Write> {
-		const mine = this.node.ledger.heads()[this.writer.pubHex];
-		const seq = mine ? mine.seq + 1 : 0;
-		const prev = mine ? mine.id : null;
-		const w = await this.writer.write({ prev, seq, stateRoot: this.node.ledger.stateRoot(), payload, ts: this.now() });
-		this.node.submit(w);
-		return w;
-	}
-
-	noop(): Promise<Write> {
-		return this.post(null);
-	}
 }
 
 /** Shared stand-in space backend for fast anchor tests (no plotting). */
