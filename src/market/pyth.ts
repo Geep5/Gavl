@@ -19,6 +19,7 @@
 
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
+import { createHash } from "node:crypto";
 
 /** Wormhole mainnet guardian set #7 (19 guardians; Ethereum-style 20-byte addresses, hex). The
  *  signers whose quorum attests every Pyth price — the Pyth-market trust anchor. Fetched from the
@@ -78,22 +79,26 @@ const toSigned = (v: bigint, bits: number): bigint => (v >> (BigInt(bits) - 1n) 
  * MEMOIZED. Verification is a PURE function of the blob (~13 secp256k1 recoveries + keccak/Merkle),
  * and the fold re-derives state by re-folding the same `market.report` writes many times (every boot,
  * every cold view, once per catch-up anchor). Without this cache a node that has run a while
- * re-verifies hundreds of past updates on boot and pegs the event loop — HTTP + swarm starve. Only
+ * re-verifies thousands of past updates per fold and pegs the event loop — HTTP + swarm starve. Only
  * the default guardian set/index (the consensus path) is cached; a custom set (tests) bypasses it.
- * Bounded FIFO so it can't grow unboundedly — an eviction just costs one re-verify.
+ *
+ * The cap MUST exceed the number of reports one fold walks: a fold scans them in order, so a FIFO
+ * smaller than that working set evicts each entry just before it is needed again and every lookup
+ * misses (3 relaying nodes post ~2k reports/hour). Keyed by a SHA-256 of the blob, not the ~4 KB
+ * hex itself, so the cap bounds memory to a few MB instead of pinning every blob string.
  */
 const verifyCache = new Map<string, PythPrice[]>();
-const VERIFY_CACHE_MAX = 2048;
+const VERIFY_CACHE_MAX = 32_768;
 
 export function verifyPythUpdate(blobHex: string, guardians: readonly string[] = WORMHOLE_GUARDIANS, expectedSetIndex = WORMHOLE_GUARDIAN_SET_INDEX): PythPrice[] {
 	const cacheable = guardians === WORMHOLE_GUARDIANS && expectedSetIndex === WORMHOLE_GUARDIAN_SET_INDEX;
-	const hit = cacheable ? verifyCache.get(blobHex) : undefined;
+	if (!cacheable) return verifyPythUpdateUncached(blobHex, guardians, expectedSetIndex);
+	const key = createHash("sha256").update(blobHex).digest("base64");
+	const hit = verifyCache.get(key);
 	if (hit) return hit;
 	const result = verifyPythUpdateUncached(blobHex, guardians, expectedSetIndex);
-	if (cacheable) {
-		if (verifyCache.size >= VERIFY_CACHE_MAX) verifyCache.delete(verifyCache.keys().next().value as string); // evict oldest
-		verifyCache.set(blobHex, result);
-	}
+	if (verifyCache.size >= VERIFY_CACHE_MAX) verifyCache.delete(verifyCache.keys().next().value as string); // evict oldest
+	verifyCache.set(key, result);
 	return result;
 }
 

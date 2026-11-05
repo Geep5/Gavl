@@ -69,6 +69,10 @@ export const MAX_CONTENT = 16 * 1024;
  *  not fragile here — but a multi-hundred-chunk snapshot is worth spreading out rather than
  *  hammering ten relays flat out. */
 const CHUNK_STAGGER_MS = 25;
+/** Backoff for re-arming a relay's subscriptions after they close (connect failed / relay CLOSED).
+ *  Doubles per consecutive failure, capped, and resets once the relay connects. */
+const RELAY_RETRY_BASE_MS = 5_000;
+const RELAY_RETRY_MAX_MS = 60_000;
 
 const enc = new TextEncoder();
 
@@ -147,7 +151,7 @@ export class NostrTransport {
 	private myPubkey = "";
 	private network = "gavl";
 	private pool: SimplePool | undefined;
-	private subs: SubCloser[] = [];
+	private readonly relaySubs = new Map<string, SubCloser[]>(); // relay url → its armed subscriptions
 	private destroyed = false;
 
 	// ── the peer set (same shape as every Gavl transport) ──
@@ -168,6 +172,7 @@ export class NostrTransport {
 	private readonly relayUp = new Set<string>();
 	private readonly relayOk = new Map<string, number>();
 	private readonly relayFail = new Map<string, number>();
+	private readonly relayRetry = new Map<string, number>(); // consecutive failed arms → backoff
 
 	private announceIntervalSec = Number(process.env.GAVL_ANNOUNCE_INTERVAL) || 30;
 	private announceTimer: ReturnType<typeof setInterval> | undefined;
@@ -222,27 +227,13 @@ export class NostrTransport {
 		// Health: a relay that never connects is dead weight; publishing still succeeds via the rest.
 		this.pool.onRelayConnectionSuccess = (url: string) => {
 			this.relayUp.add(url);
+			this.relayRetry.delete(url);
 		};
 		this.pool.onRelayConnectionFailure = (url: string) => {
 			this.relayUp.delete(url);
 			this.relayFail.set(url, (this.relayFail.get(url) ?? 0) + 1);
 		};
-
-		// PRESENCE (replaceable): relays replay the stored set on subscribe, so this single filter
-		// delivers the WHOLE current network immediately, then streams joins/refreshes live.
-		this.subs.push(
-			this.pool.subscribe(this.relays, { kinds: [KIND_PRESENCE], "#d": [this.network] }, { onevent: (e: NostrEvent) => this.onPresence(e) }),
-		);
-		// DIRECT: only frames addressed to us. `since` keeps a relay from replaying anything old.
-		const since = Math.floor(Date.now() / 1000) - 60;
-		this.subs.push(
-			this.pool.subscribe(this.relays, { kinds: [KIND_DIRECT], "#p": [this.myPubkey], since }, { onevent: (e: NostrEvent) => this.onWire(e) }),
-		);
-		// GOSSIP: channel-wide broadcast. Receiving is armed now so the sender-side optimization can
-		// land in N2 without a protocol break (a mixed-version fleet interops either way).
-		this.subs.push(
-			this.pool.subscribe(this.relays, { kinds: [KIND_GOSSIP], "#d": [this.network], since }, { onevent: (e: NostrEvent) => this.onWire(e) }),
-		);
+		for (const url of this.relays) this.armRelay(url);
 
 		this.publishPresence();
 		this.setAnnounceInterval(this.announceIntervalSec);
@@ -252,14 +243,16 @@ export class NostrTransport {
 	async destroy(): Promise<void> {
 		this.destroyed = true;
 		if (this.announceTimer) clearInterval(this.announceTimer);
-		for (const s of this.subs) {
-			try {
-				s.close();
-			} catch {
-				/* already closed */
+		for (const subs of this.relaySubs.values()) {
+			for (const s of subs) {
+				try {
+					s.close();
+				} catch {
+					/* already closed */
+				}
 			}
 		}
-		this.subs = [];
+		this.relaySubs.clear();
 		for (const c of this.active.values()) c.fireClose();
 		this.active.clear();
 		try {
@@ -271,6 +264,47 @@ export class NostrTransport {
 			/* pool already torn down */
 		}
 		this.pool = undefined;
+	}
+
+	/** Arm the channel subscriptions on ONE relay, and re-arm them with backoff whenever they close.
+	 *  nostr-tools gives a subscription a single connect attempt (pool.maxWaitForConnection, 3 s) and
+	 *  never retries it, so a relay that is down at boot — or a connect that times out while the event
+	 *  loop is busy — would leave this node deaf on that relay for good, while it keeps publishing
+	 *  (publish reconnects per call) and looks alive to everyone else. Once a relay is connected the
+	 *  pool's enableReconnect resubscribes across drops without closing, so this only fires on a
+	 *  failed connect or a relay-sent CLOSED. */
+	private armRelay(url: string): void {
+		if (!this.pool || this.destroyed) return;
+		let closed = false;
+		const onclose = () => {
+			if (closed) return;
+			closed = true;
+			for (const s of this.relaySubs.get(url) ?? []) {
+				try {
+					s.close();
+				} catch {
+					/* already closed */
+				}
+			}
+			this.relaySubs.delete(url);
+			if (this.destroyed) return;
+			const n = (this.relayRetry.get(url) ?? 0) + 1;
+			this.relayRetry.set(url, n);
+			const t = setTimeout(() => this.armRelay(url), Math.min(RELAY_RETRY_MAX_MS, RELAY_RETRY_BASE_MS * 2 ** (n - 1)));
+			if (typeof t.unref === "function") t.unref(); // a pending re-arm must not hold the process open
+		};
+		// `since` keeps a relay from replaying old frames; recomputed per arm so a re-arm doesn't replay.
+		const since = Math.floor(Date.now() / 1000) - 60;
+		this.relaySubs.set(url, [
+			// PRESENCE (replaceable): relays replay the stored set on subscribe, so this single filter
+			// delivers the WHOLE current network immediately, then streams joins/refreshes live.
+			this.pool.subscribe([url], { kinds: [KIND_PRESENCE], "#d": [this.network] }, { onevent: (e: NostrEvent) => this.onPresence(e), onclose }),
+			// DIRECT: only frames addressed to us.
+			this.pool.subscribe([url], { kinds: [KIND_DIRECT], "#p": [this.myPubkey], since }, { onevent: (e: NostrEvent) => this.onWire(e), onclose }),
+			// GOSSIP: channel-wide broadcast. Receiving is armed now so the sender-side optimization can
+			// land in N2 without a protocol break (a mixed-version fleet interops either way).
+			this.pool.subscribe([url], { kinds: [KIND_GOSSIP], "#d": [this.network], since }, { onevent: (e: NostrEvent) => this.onWire(e), onclose }),
+		]);
 	}
 
 	// ── presence / discovery (replaces seeds + PEX) ─────────────────────
