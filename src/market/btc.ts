@@ -13,14 +13,26 @@ import type { Write } from "../chain/writer.ts";
 import type { Op } from "./ops.ts";
 import { isOp } from "./ops.ts";
 import { finalizedOrdering, orderingFor } from "../consensus/order.ts";
+import type { FinalOrdering } from "../consensus/order.ts";
 import type { AnchorChain } from "../consensus/chain.ts";
 import type { Anchor } from "../consensus/anchor.ts";
 import { emptyBridge, gbtcOf as bridgeGbtcOf, totalGbtc, pendingTotal, mintFromDeposit, transferGbtc, requestWithdrawal, completeWithdrawal, recordClaim, recordBroadcast, pruneStaleClaims, settleIdleFee } from "../custody/bridge.ts";
 import type { BridgeState } from "../custody/bridge.ts";
 import { equivocationCulprit } from "../custody/fault-proof.ts";
 import { verify as verifyThreshold } from "../custody/threshold.ts";
-import { depositAttestationDigest, settleAttestationDigest } from "../custody/attestation.ts";
+import { depositAttestationDigest, settleAttestationDigest, handoffDigest } from "../custody/attestation.ts";
+import { custodyCommittee, custodyParamsOf, epochBoundary } from "../custody/epoch.ts";
+import type { AnchorView, CustodyParams, EpochCommittee } from "../custody/epoch.ts";
 import { fromHex } from "../det/canonical.ts";
+
+/** Who holds the fund key, as recorded on-chain: the committee (sorted ids) + its signing threshold,
+ *  the epoch whose ceremony gave it its shares, and the certified height the record landed at. */
+export interface CustodyHolder {
+	epoch: number;
+	committee: string[];
+	min: number;
+	since: number;
+}
 
 export interface CustodyState {
 	/** The threshold-custody fund's group key (hex), or null until genesis announces it.
@@ -31,7 +43,64 @@ export interface CustodyState {
 	/** Committee producers with a PROVEN fault (custody.fault) → the height the fault was recorded.
 	 *  Committee derivation skips them for every epoch whose boundary is past that height. Permanent. */
 	excluded: Map<string, number>;
+	/** The committee that currently holds the key: set by custody.fund (genesis), advanced only by a
+	 *  group-key-signed custody.handoff. A failed reshare records nothing, so this stays the real holder. */
+	holder: CustodyHolder | null;
+	/** The holder before `holder` — kept so holderAt() can answer "who held it at a boundary" even when
+	 *  the latest handoff landed after that boundary (see holderAt). */
+	prevHolder: CustodyHolder | null;
+	/** Genesis endorsements not yet unanimous: proposal (fundProposalKey) → sorted ids of the sampled
+	 *  genesis committee members who posted it. Only real members can add entries; cleared once a
+	 *  fund is established. */
+	fundVotes: Map<string, string[]>;
 }
+
+/** The recorded holder as of anchor height `height`: the latest record certified strictly BELOW it.
+ *  Every node reading the same finalized state gets the same answer for an epoch boundary, even if
+ *  one handoff landed between the boundary and now. Null if none (pre-genesis, or the boundary
+ *  precedes the genesis record). */
+export function holderAt(custody: CustodyState, height: number): CustodyHolder | null {
+	if (custody.holder && custody.holder.since < height) return custody.holder;
+	if (custody.prevHolder && custody.prevHolder.since < height) return custody.prevHolder;
+	return null;
+}
+
+/** A committee as posted on-chain: a non-empty, strictly sorted (so canonical + duplicate-free) id list
+ *  with an integer threshold in [1, size]. */
+function validCommittee(committee: unknown, min: unknown): committee is string[] {
+	if (!Array.isArray(committee) || committee.length === 0 || typeof min !== "number" || !Number.isInteger(min) || min < 1 || min > committee.length) return false;
+	for (let i = 0; i < committee.length; i++) if (typeof committee[i] !== "string" || (i > 0 && !(committee[i - 1] < committee[i]))) return false;
+	return true;
+}
+
+const copyHolder = (h: CustodyHolder | null): CustodyHolder | null => (h ? { ...h, committee: [...h.committee] } : null);
+
+/**
+ * How the fold checks custody records against the chain that certifies them. `committeeAt` returns
+ * THE custody committee for `epoch` (custodyCommittee over the certifying chain + the network's
+ * CustodyParams), or null when the record can't be checked: a CERTIFIED fold requires the epoch's
+ * boundary to sit strictly below the write's certified height, so a record's validity depends only
+ * on history at that height — every fold path (full, checkpoint-resumed, any later anchor) agrees.
+ * Without rules (an anchor-less fold) custody.fund / custody.handoff are no-ops.
+ */
+export interface CustodyRules {
+	committeeAt(epoch: number, bornHeight: number, fundEpoch: number | null, excluded: ReadonlyMap<string, number>): EpochCommittee | null;
+}
+
+/** Rules over `chain` (oldest→newest). `certified`: enforce boundary < the write's certified height
+ *  (finalized / per-anchor folds); false for the optimistic tip fold, whose writes aren't certified yet. */
+export function custodyRules(chain: AnchorView[], params: CustodyParams, certified: boolean): CustodyRules {
+	return {
+		committeeAt: (epoch, bornHeight, fundEpoch, excluded) => {
+			if (!Number.isInteger(epoch) || epoch < 1) return null;
+			if (certified && epochBoundary(epoch, params.epochLength) >= bornHeight) return null;
+			return custodyCommittee(chain, epoch, params, fundEpoch, excluded);
+		},
+	};
+}
+
+const fundProposalKey = (groupKey: string, epoch: number, committee: string[], min: number): string => `${groupKey}|${epoch}|${committee.join(",")}|${min}`;
+const sameCommittee = (c: EpochCommittee, committee: string[], min: number): boolean => c.min === min && [...c.committee].sort().join(",") === committee.join(",");
 
 export interface View {
 	/** The BTC bridge: gBTC balances + BTC reserves + processed deposits + pending
@@ -110,6 +179,9 @@ export interface ViewOptions {
 	 *  finalizedView/viewAtAnchor; absent (an anchor-less optimistic fold) → custody.fault records
 	 *  nothing, since the producer set can't be checked. */
 	isRecentProducer?: (id: string, height: number) => boolean;
+	/** Custody-record gate (custodyRules): built from the certifying chain by finalizedView /
+	 *  viewAtAnchor; absent → custody.fund / custody.handoff record nothing. */
+	custodyRules?: CustodyRules;
 }
 
 /** The fault-record gate over a certifying chain: did `id` produce an anchor at a height in
@@ -160,7 +232,14 @@ export function cloneView(v: View): View {
 			chargeFrom: cp(b.chargeFrom),
 			pot: b.pot,
 		},
-		custody: { fundKey: v.custody.fundKey, epoch: v.custody.epoch, excluded: new Map(v.custody.excluded) },
+		custody: {
+			fundKey: v.custody.fundKey,
+			epoch: v.custody.epoch,
+			excluded: new Map(v.custody.excluded),
+			holder: copyHolder(v.custody.holder),
+			prevHolder: copyHolder(v.custody.prevHolder),
+			fundVotes: new Map([...v.custody.fundVotes].map(([k, ids]) => [k, [...ids]])),
+		},
 	};
 	return out;
 }
@@ -169,13 +248,13 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
 	const cmp = opts.order ?? cmpWrite;
 	const view: View = opts.base
 		? cloneView(opts.base) // deep copy so the cached/snapshot base isn't mutated
-		: { bridge: emptyBridge(), custody: { fundKey: null, epoch: -1, excluded: new Map() } };
+		: { bridge: emptyBridge(), custody: { fundKey: null, epoch: -1, excluded: new Map(), holder: null, prevHolder: null, fundVotes: new Map() } };
 	const nowHeight = opts.nowHeight ?? 0;
 	for (const w of [...writes].sort(cmp)) {
 		const op = w.payload as Op | null;
 		// Effects timed by height (credit clocks, claim/fault heights) use the write's STABLE
 		// certifying height (bornAt) so they don't drift as the global nowHeight advances.
-		if (isOp(op)) applyOp(view, w, op, opts.bornAt?.get(w.id) ?? nowHeight, opts.isRecentProducer);
+		if (isOp(op)) applyOp(view, w, op, opts.bornAt?.get(w.id) ?? nowHeight, opts.isRecentProducer, opts.custodyRules);
 	}
 	accrueDemurrage(view, nowHeight); // idle gBTC pays a linear fee into the liquidity pot
 	pruneStaleClaims(view.bridge, nowHeight); // retire deposit-mint requests unminted past the reclaim grace
@@ -190,9 +269,7 @@ export function computeView(writes: Write[], opts: ViewOptions = {}): View {
  * every node must pass the same value.
  */
 export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, base?: View, faultLookback?: number): View {
-	const { included, order, bornAt, nowHeight, chain } = finalizedOrdering(writes, anchors, k);
-	if (nowHeight === null) return computeView([], { base });
-	return computeView(included, { order, nowHeight, bornAt, base, isRecentProducer: faultLookback === undefined ? undefined : producedWithin(chain, faultLookback) });
+	return foldOrdering(finalizedOrdering(writes, anchors, k), anchors, base, faultLookback);
 }
 
 /**
@@ -204,13 +281,24 @@ export function finalizedView(writes: Write[], anchors: AnchorChain, k: number, 
  * `faultLookback` as in finalizedView.
  */
 export function viewAtAnchor(writes: Write[], anchors: AnchorChain, anchorId: string, base?: View, faultLookback?: number): View {
-	const anchor = anchors.get(anchorId);
-	const { included, order, bornAt, nowHeight, chain } = orderingFor(writes, anchors, anchor ?? null);
-	if (nowHeight === null) return computeView([], { base });
-	return computeView(included, { order, nowHeight, bornAt, base, isRecentProducer: faultLookback === undefined ? undefined : producedWithin(chain, faultLookback) });
+	return foldOrdering(orderingFor(writes, anchors, anchors.get(anchorId) ?? null), anchors, base, faultLookback);
 }
 
-function applyOp(view: View, w: Write, op: Op, bornHeight: number, isRecentProducer?: (id: string, height: number) => boolean): void {
+/** Fold a certified ordering with the gates its certifying chain provides: the fault-record producer
+ *  check and the custody-record committee check (the network's CustodyParams ride on ChainParams). */
+function foldOrdering(o: FinalOrdering, anchors: AnchorChain, base?: View, faultLookback?: number): View {
+	if (o.nowHeight === null) return computeView([], { base });
+	return computeView(o.included, {
+		order: o.order,
+		nowHeight: o.nowHeight,
+		bornAt: o.bornAt,
+		base,
+		isRecentProducer: faultLookback === undefined ? undefined : producedWithin(o.chain, faultLookback),
+		custodyRules: custodyRules(o.chain, custodyParamsOf(anchors.params), true),
+	});
+}
+
+function applyOp(view: View, w: Write, op: Op, bornHeight: number, isRecentProducer?: (id: string, height: number) => boolean, rules?: CustodyRules): void {
 	switch (op.kind) {
 		case "bridge.deposit": {
 			// Mint gBTC 1:1 from a VERIFIED BTC deposit. Authorized ONLY by the committee
@@ -261,13 +349,55 @@ function applyOp(view: View, w: Write, op: Op, bornHeight: number, isRecentProdu
 			return;
 		}
 		case "custody.fund": {
-			// First announce wins and is IMMUTABLE — the fund address is permanent, so a
-			// later (or conflicting) announce can never move it. Every genesis committee
-			// member posts the same key; whichever lands first sticks.
-			if (view.custody.fundKey !== null) return;
-			if (typeof op.groupKey !== "string" || !/^[0-9a-f]+$/.test(op.groupKey) || typeof op.epoch !== "number") return;
+			// GENESIS: the fund key + first holder. Valid only as a UNANIMOUS endorsement by THE sampled
+			// genesis committee for `epoch` (derived here from the certifying chain): each member posts
+			// the identical proposal from its producer key — the write's Ed25519 signature IS the
+			// endorsement, so the writer must be a member. The proposal takes effect once every member
+			// has posted it (the DKG is n-of-n, so all of them hold the key). A stranger's key, a
+			// non-sampled committee, or a missing member never establishes a fund. First complete
+			// proposal wins and is IMMUTABLE — the fund address is permanent.
+			if (view.custody.fundKey !== null || !rules) return;
+			if (typeof op.groupKey !== "string" || !/^[0-9a-f]+$/.test(op.groupKey) || !validCommittee(op.committee, op.min)) return;
+			const c = rules.committeeAt(op.epoch, bornHeight, null, view.custody.excluded);
+			if (!c || !sameCommittee(c, op.committee, op.min) || !op.committee.includes(w.writer)) return;
+			const key = fundProposalKey(op.groupKey, op.epoch, op.committee, op.min);
+			// One live vote per member: a newer proposal from the same member withdraws its earlier one,
+			// so pending votes stay bounded by the number of distinct members (no unbounded growth).
+			for (const [k, ids] of view.custody.fundVotes) {
+				if (k === key || !ids.includes(w.writer)) continue;
+				const rest = ids.filter((id) => id !== w.writer);
+				if (rest.length === 0) view.custody.fundVotes.delete(k);
+				else view.custody.fundVotes.set(k, rest);
+			}
+			const votes = new Set(view.custody.fundVotes.get(key) ?? []).add(w.writer);
+			if (votes.size < op.committee.length) {
+				view.custody.fundVotes.set(key, [...votes].sort());
+				return;
+			}
 			view.custody.fundKey = op.groupKey;
 			view.custody.epoch = op.epoch;
+			view.custody.holder = { epoch: op.epoch, committee: [...op.committee], min: op.min, since: bornHeight };
+			view.custody.fundVotes.clear(); // decided — losing proposals are dead
+			return;
+		}
+		case "custody.handoff": {
+			// A reshare completed: the NEW committee proved it holds the key by threshold-signing the
+			// record with its new shares (BIP340 under the fund key, like an attestation), and it must be
+			// THE sampled committee for that epoch (derived here from the certifying chain). Only a LATER
+			// epoch than the current holder's advances it; a stale / replayed / forged record is a no-op.
+			const cur = view.custody.holder;
+			if (!rules || !cur || view.custody.fundKey === null || !Number.isInteger(op.epoch) || op.epoch <= cur.epoch || !validCommittee(op.committee, op.min) || typeof op.sig !== "string") return;
+			const c = rules.committeeAt(op.epoch, bornHeight, view.custody.epoch, view.custody.excluded);
+			if (!c || !sameCommittee(c, op.committee, op.min)) return;
+			let ok = false;
+			try {
+				ok = verifyThreshold(fromHex(op.sig), handoffDigest({ groupKey: view.custody.fundKey, epoch: op.epoch, committee: op.committee, min: op.min }), fromHex(view.custody.fundKey));
+			} catch {
+				ok = false; // malformed sig → unauthorized
+			}
+			if (!ok) return;
+			view.custody.prevHolder = cur;
+			view.custody.holder = { epoch: op.epoch, committee: [...op.committee], min: op.min, since: bornHeight };
 			return;
 		}
 		case "custody.fault": {

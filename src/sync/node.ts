@@ -386,11 +386,22 @@ export class GavlNode {
 		if (!this.anchors) return;
 		const before = this.anchors.tip()?.id ?? null;
 		let gap = false;
+		let conflict = false; // a peer anchor was refused as conflicting with our lock
 		const rejects = new Map<string, number>(); // GAVL_SYNC_DEBUG: tally why peer anchors don't ingest
 		for (const a of [...anchors].sort((x, y) => x.height - y.height)) {
 			const r = await this.anchors.add(a);
 			if (!r.ok && r.reason === "unknown prev anchor") gap = true;
+			if (!r.ok && r.reason === "rejected: conflicts with finalized history") conflict = true;
 			if (!r.ok) rejects.set(r.reason, (rejects.get(r.reason) ?? 0) + 1);
+		}
+		// The peer is on a heavier branch our lock refused. It won't pull ours (fork choice only pulls
+		// heavier tips), so push our branch from the fork up: its own fork resolution then sees the
+		// branch we finalized and — being the same rule over the same anchors — reaches our verdict.
+		if (conflict) {
+			const ours = this.anchors.chainTo();
+			const onOurs = new Set(ours.map((a) => a.id));
+			const forkFrom = Math.min(...anchors.filter((a) => !onOurs.has(a.id)).map((a) => a.height));
+			conn.send({ t: "anchor-chain", anchors: ours.filter((a) => a.height >= forkFrom) });
 		}
 		if (process.env.GAVL_SYNC_DEBUG) {
 			const hs = anchors.map((a) => a.height);

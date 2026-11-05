@@ -1,11 +1,11 @@
 /**
- * AnchorChain — heaviest-cumulative-weight fork choice + depth finality.
+ * AnchorChain — heaviest-cumulative-weight fork choice + sticky depth finality.
  *
  * Stores every valid anchor it has seen; the tip is the anchor of greatest
  * cumulative weight (ties broken by lower id, deterministically). The canonical
  * chain is the tip's ancestry. A heavier fork switches the tip — a reorg — but
- * reorging an anchor `k` deep from the tip requires out-weighing `k` anchors'
- * worth of PoST, which is the finality guarantee.
+ * once the tip's `finalityDepth`-th ancestor is LOCKED, a fork that abandons it
+ * must win the fork-resolution rule (resolveFork), not just out-weigh it.
  *
  * `add` is async because anchor verification runs the (pluggable) space verifier,
  * which for chiapos is a subprocess call. Fork-choice reads (tip/finalized/...)
@@ -20,21 +20,60 @@ import type { RetargetSchedule } from "./difficulty.ts";
 import type { ChainParams } from "../chain/writer.ts";
 import { rootOfHeads } from "../ledger/ledger.ts";
 import type { Heads } from "../ledger/ledger.ts";
+import { GENESIS_PRODUCER } from "./genesis.ts";
 
 export type AddResult = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Default sticky-finality depth (daemon + server). Safety does NOT depend on it — resolveFork
+ * reconciles any honest split at any depth. It sets how often a "finalized" anchor can still be
+ * reverted by an honest race: at depth d a node only locks after its tip is d anchors past an
+ * anchor, so a revert needs one side to mint d+1 anchors before hearing the other's first. Depth 1
+ * reverted on a single double-mint (seen in-process under load); 2 needs a three-anchor gossip
+ * blackout, i.e. > 2 × the anchor interval (~2 min at the 60 s target), for one extra anchor of
+ * finality latency.
+ */
+export const DEFAULT_FINALITY_DEPTH = 2;
+
+/**
+ * Default SETTLEMENT depth (daemon + server): an anchor this deep is never reverted, not even by
+ * resolveFork — a branch that doesn't contain it stays rejected (and is reported via
+ * onSettledConflict), so a split that outlives S anchors becomes a permanent, LOUD split instead
+ * of an un-backed coin. Every irreversible external action (signing / broadcasting a BTC payout,
+ * posting bridge.settle, deleting superseded key shares, checkpoint-pruning history) keys off
+ * this, never off soft finality. 6 anchors ≈ 6 min at the 60 s target: a partition shorter than
+ * that still heals via resolveFork; one longer has already let both sides settle conflicting state.
+ */
+export const DEFAULT_SETTLEMENT_DEPTH = 6;
+
+/** A conflicting branch refused because it doesn't contain this node's settled anchor. */
+export interface SettledConflict {
+	settled: { id: string; height: number };
+	rejected: { id: string; height: number; weight: string };
+}
+
+/** Anchors (ending at the fork point) whose producers form the reference weights for resolveFork:
+ *  long enough to cover the active producer set, short enough that long-gone farmers don't count. */
+const FORK_WINDOW = 64;
 
 export interface AnchorChainOptions {
 	/** Deterministic difficulty schedule. Omit → constant `params.difficulty` (back-compat). */
 	schedule?: RetargetSchedule;
 	/**
 	 * Sticky-finality depth. Once this node has seen the tip reach `finalityDepth`
-	 * over an anchor, that anchor is locked: any fork that does not descend from it
-	 * is rejected, even if heavier. This turns the heaviest-chain rule's PROBABILISTIC
-	 * finality into HARD finality for an online node — a fast-VDF attacker can still
-	 * win the tip, but cannot revert an already-finalized settlement (the main damage
-	 * a deep reorg would do). Omit → no locking (pure heaviest-chain).
+	 * over an anchor, that anchor is locked: a fork that does not descend from it
+	 * takes the tip only if it wins resolveFork (built exclusively by a weighted
+	 * majority of the pre-fork producers, or — when neither side is — heavier).
+	 * A minority's heavier private fork can't revert a majority-finalized
+	 * settlement, and an honest split (each side locked its own branch while it
+	 * couldn't hear the other) still converges. Omit → no locking (pure heaviest-chain).
 	 */
 	finalityDepth?: number;
+	/** Settlement depth (≥ finalityDepth): the tip's ancestor this deep is SETTLED — irreversible,
+	 *  even by resolveFork. Omit → no settlement tracking (settled() is the locked/root anchor). */
+	settlementDepth?: number;
+	/** Called when a branch is refused for abandoning the settled anchor (a split deeper than S). */
+	onSettledConflict?: (c: SettledConflict) => void;
 	/**
 	 * Application-state validator for an anchor's `appRoot`. The consensus layer can't fold
 	 * app state itself ("consensus never imports app state"), so the app supplies a closure:
@@ -59,6 +98,10 @@ export class AnchorChain {
 	private readonly verifier: SpaceVerifier;
 	private readonly schedule?: RetargetSchedule;
 	private readonly lockDepth?: number;
+	private readonly settleDepth?: number;
+	private readonly onSettledConflict?: (c: SettledConflict) => void;
+	/** The most recent conflict refused for abandoning the settled anchor (null = none seen). */
+	settledConflict: SettledConflict | null = null;
 	private readonly verifyState?: (anchor: Anchor, fullHeads: Heads) => boolean | Promise<boolean>;
 	private readonly anchors = new Map<string, Anchor>();
 	private tipId: string | null = null;
@@ -70,6 +113,8 @@ export class AnchorChain {
 	private finalCache: { id: string; heads: Heads } | null = null;
 	/** The deepest anchor this node has locked as final (sticky). */
 	private lockedId: string | null = null;
+	/** The deepest anchor this node has SETTLED (monotonic; never reverted, see settlementDepth). */
+	private settledId: string | null = null;
 	/** Oldest anchor still held (the prune floor) + its materialized FULL heads, so head
 	 *  reconstruction still works after the ancestry below it is dropped. null = unpruned. */
 	private floorId: string | null = null;
@@ -83,28 +128,40 @@ export class AnchorChain {
 		this.verifier = verifier;
 		this.schedule = opts.schedule;
 		this.lockDepth = opts.finalityDepth;
+		this.settleDepth = opts.settlementDepth;
+		this.onSettledConflict = opts.onSettledConflict;
 		this.verifyState = opts.verifyState;
 	}
 
-	/** True if `anchor` descends from (or is) the locked final anchor. */
-	private descendsFromLock(anchor: Anchor): boolean {
-		if (!this.lockedId) return true;
+	/** True if `anchor` descends from (or is) anchor `id` (null id → trivially true). */
+	private descendsFrom(anchor: Anchor, id: string | null): boolean {
+		if (!id) return true;
 		let cur: Anchor | undefined = anchor;
 		while (cur) {
-			if (cur.id === this.lockedId) return true;
+			if (cur.id === id) return true;
 			cur = cur.prev ? this.anchors.get(cur.prev) : undefined;
 		}
 		return false;
 	}
 
-	/** After the tip moves, lock the anchor now `lockDepth` deep (monotonically). */
+	/** After the tip moves, lock the anchor now `lockDepth` deep and settle the one `settleDepth`
+	 *  deep (both monotonic: never rewound by the tip moving). */
 	private updateLock(): void {
-		if (this.lockDepth === undefined) return;
-		const newly = this.finalized(this.lockDepth);
-		if (!newly) return;
-		// Only advance the lock forward (never rewind it).
-		const prevLocked = this.lockedId ? this.anchors.get(this.lockedId) : undefined;
-		if (!prevLocked || newly.height > prevLocked.height) this.lockedId = newly.id;
+		const advance = (cur: string | null, depth: number | undefined): string | null => {
+			if (depth === undefined) return cur;
+			const newly = this.finalized(depth);
+			if (!newly) return cur;
+			const prev = cur ? this.anchors.get(cur) : undefined;
+			return !prev || newly.height > prev.height ? newly.id : cur;
+		};
+		this.lockedId = advance(this.lockedId, this.lockDepth);
+		this.settledId = advance(this.settledId, this.settleDepth);
+	}
+
+	/** The settled anchor: the deepest anchor this node will never revert. With no settlement depth
+	 *  configured, the root (genesis / adopted floor). Null before any root. */
+	settled(): Anchor | null {
+		return this.settledId ? this.anchors.get(this.settledId) ?? null : null;
 	}
 
 	/**
@@ -143,18 +200,83 @@ export class AnchorChain {
 			return { ok: false, reason: "appRoot ≠ folded state" };
 		}
 
-		// Sticky finality: reject any tip that would abandon the locked final anchor,
-		// even if it's heavier. Store the anchor (it may be a valid sibling branch) but
-		// never let it become the tip.
-		const wouldBeTip = this.tipId === null || heavier(anchor, this.anchors.get(this.tipId)!);
-		if (wouldBeTip && this.descendsFromLock(anchor)) {
-			this.tipId = anchor.id;
-			this.tipHeads = v.heads; // cache the new tip's full heads (handles reorg: v.heads is for this tip)
-			this.updateLock();
-		} else if (wouldBeTip) {
-			return { ok: false, reason: "rejected: conflicts with finalized history" };
+		// Sticky finality: an anchor that doesn't descend from the locked final anchor can't take the
+		// tip by weight alone. The lock is LOCAL, though — a node that kept mining while it couldn't
+		// hear the rest of the network locked its own branch while the other side locked a sibling —
+		// so a conflicting branch is weighed against the lock (resolveFork) instead of rejected
+		// outright, and every node holding the same anchors reaches the same verdict.
+		const tip = this.tipId === null ? null : this.anchors.get(this.tipId)!;
+		const wouldBeTip = tip === null || heavier(anchor, tip);
+		if (this.descendsFrom(anchor, this.lockedId)) {
+			if (wouldBeTip) this.setTip(anchor, v.heads);
+			return { ok: true };
 		}
-		return { ok: true };
+		const verdict = this.resolveFork(anchor, tip!);
+		if (verdict.switchTo !== undefined && (verdict.final || wouldBeTip)) {
+			// SETTLEMENT is absolute: never switch to a branch that abandons the settled anchor, whatever
+			// resolveFork says. Irreversible actions (BTC payouts, share deletion) already happened on it.
+			if (!this.descendsFrom(anchor, this.settledId)) {
+				const settled = this.anchors.get(this.settledId!)!;
+				this.settledConflict = { settled: { id: settled.id, height: settled.height }, rejected: { id: anchor.id, height: anchor.height, weight: anchor.weight } };
+				this.onSettledConflict?.(this.settledConflict);
+				return { ok: false, reason: "rejected: conflicts with SETTLED history" };
+			}
+			this.lockedId = verdict.switchTo; // re-anchor finality on the winning branch, then re-derive from the new tip
+			this.setTip(anchor, v.heads);
+			return { ok: true };
+		}
+		if (wouldBeTip) return { ok: false, reason: "rejected: conflicts with finalized history" };
+		return { ok: true }; // a lighter conflicting branch: stored, re-weighed as it grows
+	}
+
+	private setTip(anchor: Anchor, heads: Heads): void {
+		this.tipId = anchor.id;
+		this.tipHeads = heads; // cache the new tip's full heads (handles reorg: heads are this tip's)
+		this.updateLock();
+	}
+
+	/**
+	 * Weigh a branch that conflicts with the lock (ending at `anchor`) against the current one (ending
+	 * at `tip`, which descends from the lock). F = their common ancestor. The REFERENCE weights are the
+	 * anchors won per producer in the FORK_WINDOW anchors ending at F — history both sides agree on, so
+	 * anchors minted after the fork (however many) buy no say. A branch is FINAL if producers who built
+	 * on it and NOT on the other branch hold a strict majority of that reference weight: two disjoint
+	 * majorities can't exist, so at most one branch is final and every node picks the same one.
+	 *   - current branch final        → keep it (a minority's heavier private fork can't revert it)
+	 *   - conflicting branch final    → switch; lock its first anchor above F
+	 *   - neither (e.g. a 2-vs-2 split, or a fork below any reference history) → plain heaviest-chain
+	 *     between the two; lock F, the last anchor both sides share
+	 */
+	private resolveFork(anchor: Anchor, tip: Anchor): { switchTo?: string; final: boolean } {
+		const ours = new Map<string, Anchor>(); // tip's ancestry, by id
+		for (let cur: Anchor | undefined = tip; cur; cur = cur.prev ? this.anchors.get(cur.prev) : undefined) ours.set(cur.id, cur);
+		const theirs: Anchor[] = []; // the conflicting branch above F, newest first
+		let fork: Anchor | undefined = anchor;
+		while (fork && !ours.has(fork.id)) {
+			theirs.push(fork);
+			fork = fork.prev ? this.anchors.get(fork.prev) : undefined;
+		}
+		if (!fork) return { final: false }; // no shared history held (pruned / foreign root) — keep the lock
+		const ourProducers = new Set<string>();
+		for (let cur = tip; cur.id !== fork.id; cur = this.anchors.get(cur.prev!)!) ourProducers.add(cur.producer);
+		const theirProducers = new Set(theirs.map((a) => a.producer));
+
+		const weight = new Map<string, number>();
+		let total = 0;
+		let cur: Anchor | undefined = fork;
+		for (let i = 0; i < FORK_WINDOW && cur; i++, cur = cur.prev ? this.anchors.get(cur.prev) : undefined) {
+			if (cur.producer === GENESIS_PRODUCER) continue;
+			weight.set(cur.producer, (weight.get(cur.producer) ?? 0) + 1);
+			total++;
+		}
+		const support = (mine: Set<string>, other: Set<string>): number => {
+			let s = 0;
+			for (const p of mine) if (!other.has(p)) s += weight.get(p) ?? 0;
+			return s;
+		};
+		if (2 * support(ourProducers, theirProducers) > total) return { final: false };
+		if (2 * support(theirProducers, ourProducers) > total) return { switchTo: theirs[theirs.length - 1].id, final: true };
+		return { switchTo: fork.id, final: false };
 	}
 
 	/** Reconstruct the FULL writer-heads an anchor certified, accumulating deltas along its
@@ -229,6 +351,8 @@ export class AnchorChain {
 		if (!tip) return;
 		const lock = this.lockedId ? this.anchors.get(this.lockedId) : undefined;
 		if (lock && floorHeight > lock.height) floorHeight = lock.height; // never drop the locked region
+		const settled = this.settleDepth !== undefined && this.settledId ? this.anchors.get(this.settledId) : undefined;
+		if (settled && floorHeight > settled.height) floorHeight = settled.height; // …nor the settled anchor (fork checks walk to it)
 		if (floorHeight <= 0) return; // always keep genesis as the base case
 		const haveFloor = this.floorId ? this.anchors.get(this.floorId) : undefined;
 		if (haveFloor && floorHeight <= haveFloor.height) return; // already pruned at least this deep
@@ -292,6 +416,7 @@ export class AnchorChain {
 			this.tipId = null;
 			this.floorId = null;
 			this.lockedId = null;
+			this.settledId = null;
 		}
 		for (const a of linked) this.anchors.set(a.id, a); // below-floor ancestry: difficulty-window context only
 		this.anchors.set(floor.id, floor);
@@ -300,6 +425,7 @@ export class AnchorChain {
 		this.tipId = floor.id;
 		this.tipHeads = { ...floorHeads };
 		this.lockedId = floor.id; // the adopted checkpoint is final by assumption
+		this.settledId = floor.id; // …and settled (weak subjectivity: we chose to trust it)
 	}
 
 	/**
@@ -319,6 +445,7 @@ export class AnchorChain {
 		this.tipId = genesis.id;
 		this.tipHeads = { ...heads };
 		this.lockedId = genesis.id; // genesis is final by definition
+		this.settledId = genesis.id;
 		this.genesisId = genesis.id; // any OTHER prev=null anchor is now a rejected fake (see add)
 	}
 

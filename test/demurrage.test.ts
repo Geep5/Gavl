@@ -38,8 +38,8 @@ const bornAll = (node: GavlNode, extra: [string, number][] = []) => {
 	for (const [id, h] of extra) m.set(id, h);
 	return m;
 };
-const viewAt = (node: GavlNode, born: Map<string, number>, nowHeight: number, balances: Record<string, bigint>) =>
-	computeView(node.ledger.allWrites(), { bornAt: born, nowHeight, base: withGbtc(computeView([]), balances) });
+const viewAt = (node: GavlNode, born: Map<string, number>, nowHeight: number, balances: Record<string, bigint>, fund?: TestFund) =>
+	computeView(node.ledger.allWrites(), { bornAt: born, nowHeight, base: withGbtc(fund ? fund.seed() : computeView([]), balances) });
 
 test("no charge inside the grace (nor before the first whole day past it)", async () => {
 	const { node, mk, fund, balances } = harness();
@@ -150,20 +150,19 @@ test("a fresh credit resets the clock — activity keeps a balance untouched", a
 	const { node, mk, fund, balances } = harness();
 	const A = mk();
 	fund(A, BAL); // seeded at height 0 via withGbtc
-	const tf = new TestFund();
-	await tf.announce(A); // folds at height 0 (before the deposit)
+	const tf = new TestFund(); // its fund is seeded into the fold base (established before the deposit)
 	const refresh = await tf.fund(A, A.pubHex, 1n); // a second credit to A
 	const born = bornAll(node, [[refresh.id, 5000]]); // the fresh credit lands at height 5000
 
 	// At a height where the ORIGINAL clock (grace end = GRACE) would have charged 3 days, the
 	// refreshed clock (grace end = 5000 + GRACE) is still in grace → untouched.
-	const v = viewAt(node, born, GRACE + 3 * DEMURRAGE_DAY, balances);
+	const v = viewAt(node, born, GRACE + 3 * DEMURRAGE_DAY, balances, tf);
 	assert.equal(gbtcOf(v, A.pubHex), BAL + 1n, "the later credit reset A's clock → still in grace, untouched");
 	assert.equal(v.bridge.pot, 0n, "nothing charged");
 	assert.ok(marketConserved(v));
 
 	// Past the REFRESHED grace, the fee runs from the new clock.
-	const w = viewAt(node, born, 5000 + GRACE + 4 * DEMURRAGE_DAY, balances);
+	const w = viewAt(node, born, 5000 + GRACE + 4 * DEMURRAGE_DAY, balances, tf);
 	assert.equal(w.bridge.pot, expectedFee(BAL + 1n, 4), "fee counts days from the reset clock");
 	assert.ok(marketConserved(w));
 });

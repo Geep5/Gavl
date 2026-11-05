@@ -102,8 +102,14 @@ export class Account {
 
 	/** Announce the threshold-custody fund's group key on-chain (genesis). First write
 	 *  wins and is immutable — every node + client then derives the permanent address. */
-	announceFund(groupKey: string, epoch: number): Promise<Write> {
-		return this.produce({ kind: "custody.fund", groupKey, epoch });
+	announceFund(groupKey: string, epoch: number, committee: string[], min: number): Promise<Write> {
+		return this.produce({ kind: "custody.fund", groupKey, epoch, committee: [...committee].sort(), min });
+	}
+
+	/** Record a completed reshare: `committee` holds the key from `epoch`, proven by `sig` — the new
+	 *  committee's threshold signature over handoffDigest. Anyone may relay it. */
+	recordHandoff(epoch: number, committee: string[], min: number, sig: string): Promise<Write> {
+		return this.produce({ kind: "custody.handoff", epoch, committee: [...committee].sort(), min, sig });
 	}
 
 	view(): View {

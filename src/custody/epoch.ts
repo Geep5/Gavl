@@ -29,6 +29,7 @@
 import type { Member } from "./sampling.ts";
 import { sampleCommittee } from "./sampling.ts";
 import { GENESIS_PRODUCER } from "../consensus/genesis.ts";
+import type { ChainParams } from "../chain/writer.ts";
 
 /** The minimum an epoch derivation needs from an anchor (Anchor satisfies this). */
 export interface AnchorView {
@@ -84,8 +85,47 @@ export function committeeEpochsFor(chain: AnchorView[], selfId: string, epochs: 
 }
 
 /** Default cap on committee size (K_MAX). The committee is min(eligible producers, size): it grows
- *  with the network up to this many seats. Override with custody opts `size` / GAVL_COMMITTEE_MAX. */
+ *  with the network up to this many seats. Override via the network's CustodyParams.size. */
 export const DEFAULT_COMMITTEE_MAX = 31;
+
+/**
+ * The custody committee's CONSENSUS parameters — part of a network's ChainParams (`custody`), so
+ * the fold can re-derive any epoch's committee from its own certifying chain and check
+ * custody.fund / custody.handoff against it. Every node on a network must agree on all of them;
+ * the daemon binds them into the genesis anchor, so a node with different values is on a
+ * different network (its block 0 differs) rather than silently computing different committees.
+ */
+export interface CustodyParams {
+	/** Anchors per custody epoch. */
+	epochLength: number;
+	/** K_MAX: the committee is min(eligible producers, size). */
+	size: number;
+	/** Membership lookback in anchors (only producers inside it are eligible). */
+	windowAnchors: number;
+	/** Minimum committee size before custody activates (genesis waits for this many producers). */
+	minCommittee: number;
+	/** Genesis committee size — small so the n-of-n DKG completes; grown to `size` after. */
+	genesisSize: number;
+}
+
+export const DEFAULT_CUSTODY_PARAMS: CustodyParams = { epochLength: 16, size: DEFAULT_COMMITTEE_MAX, windowAnchors: 32, minCommittee: 3, genesisSize: 3 };
+
+/** A network's custody params from its ChainParams (defaults if unset). */
+export function custodyParamsOf(params: Pick<ChainParams, "custody">): CustodyParams {
+	return params.custody ?? DEFAULT_CUSTODY_PARAMS;
+}
+
+/**
+ * THE custody committee for `epoch` — the one rotation runs ceremonies with and the fold checks
+ * records against. The genesis epoch (or, before any fund, every candidate genesis epoch) samples
+ * `genesisSize` seats; later epochs sample K_MAX. Null if the epoch isn't selectable on `chain` or
+ * its committee is below `minCommittee`.
+ */
+export function custodyCommittee(chain: AnchorView[], epoch: number, p: CustodyParams, fundEpoch: number | null, excluded?: ReadonlyMap<string, number>): EpochCommittee | null {
+	const size = p.genesisSize >= p.size || (fundEpoch !== null && epoch !== fundEpoch) ? p.size : p.genesisSize;
+	const c = committeeForEpoch(chain, epoch, { epochLength: p.epochLength, size, windowAnchors: p.windowAnchors, excluded });
+	return c && c.committee.length >= p.minCommittee ? c : null;
+}
 
 /** Shared inputs for committee derivation. All are consensus-critical: every node must
  *  agree on them or it computes a different committee. */

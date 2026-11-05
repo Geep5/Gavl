@@ -20,14 +20,13 @@
 import { Ledger, rootOfHeads } from "./ledger/ledger.ts";
 import { GavlNode } from "./sync/node.ts";
 import { Account } from "./market/account.ts";
-import { computeView, finalizedView, viewAtAnchor } from "./market/btc.ts";
+import { computeView, finalizedView, viewAtAnchor, holderAt, custodyRules } from "./market/btc.ts";
 import type { View } from "./market/btc.ts";
 import { serializeView, deserializeView, viewRoot } from "./market/state.ts";
 import type { Anchor } from "./consensus/anchor.ts";
 import type { Heads } from "./ledger/ledger.ts";
 import type { FundKey } from "./custody/threshold.ts";
-import { DkgCoordinator } from "./custody/dkg-coordinator.ts";
-import { saveShare, loadShare } from "./custody/share-store.ts";
+import { ShareStore } from "./custody/share-store.ts";
 import type { StoredShare } from "./custody/share-store.ts";
 import { fundAddress as deriveFundAddress } from "./custody/bitcoin.ts";
 import { depositAddress } from "./custody/deposit.ts";
@@ -43,8 +42,8 @@ import { assembleReshare } from "./custody/reshare-blob.ts";
 import { groupKeyOf } from "./custody/pvss.ts";
 import { schnorr_FROST as FROST } from "@noble/curves/secp256k1.js";
 import type { CeremonyAuth } from "./custody/ceremony-auth.ts";
-import { committeeEpochsFor, committeeForEpoch, eligibilityWindow, epochOf, DEFAULT_COMMITTEE_MAX } from "./custody/epoch.ts";
-import type { AnchorView } from "./custody/epoch.ts";
+import { custodyCommittee, custodyParamsOf, epochOf } from "./custody/epoch.ts";
+import type { AnchorView, CustodyParams } from "./custody/epoch.ts";
 import { fid, quorumForRound } from "./custody/committee.ts";
 import { depositAttestationDigest, settleAttestationDigest } from "./custody/attestation.ts";
 import { isCeremonyTimeout } from "./custody/ceremony.ts";
@@ -57,7 +56,8 @@ import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
 import { defaultParams } from "./config.ts";
 import type { ChainParams } from "./chain/writer.ts";
-import { AnchorChain } from "./consensus/chain.ts";
+import { AnchorChain, DEFAULT_FINALITY_DEPTH, DEFAULT_SETTLEMENT_DEPTH } from "./consensus/chain.ts";
+import type { SettledConflict } from "./consensus/chain.ts";
 import { genesisAnchor, GENESIS_PRODUCER } from "./consensus/genesis.ts";
 import type { RetargetSchedule } from "./consensus/difficulty.ts";
 import { Producer } from "./consensus/producer.ts";
@@ -85,7 +85,7 @@ export interface DaemonOptions {
 	params?: ChainParams;
 	/** Plot-size exponent for each identity's PoST plot. */
 	k?: number;
-	/** Anchor-depth at which state is considered final. */
+	/** Anchor-depth at which state is considered final (default DEFAULT_FINALITY_DEPTH). */
 	finalityDepth?: number;
 	/** Distinct peers that must offer the same checkpoint before a fresh node adopts it as a trusted
 	 *  floor (genesis-free bootstrap). Default 1 (trust the first peer); set ≥2 for quorum so a lone
@@ -116,28 +116,16 @@ export interface DaemonOptions {
 		policy?: PersistPolicy;
 	};
 	/**
-	 * Threshold-custody config. There is ONLY one mode: an autonomous epoch-driven committee. The
-	 * fund key is DKG'd across a PoST-weighted committee sampled from the anchor chain and reshared
-	 * to a fresh committee each epoch, no node ever holding it whole. Needs farming on (the node's
-	 * stable producer key is its committee id). A lone node (< minCommittee farmers) holds NO key and
-	 * cannot mint — it waits for peers. There is no single-key/solo fallback, on any network.
+	 * Threshold-custody NODE settings. There is ONLY one mode: an autonomous epoch-driven committee.
+	 * The fund key is DKG'd across a PoST-weighted committee sampled from the anchor chain and
+	 * reshared to a fresh committee each epoch, no node ever holding it whole. Needs farming on (the
+	 * node's stable producer key is its committee id). A lone node (< minCommittee farmers) holds NO
+	 * key and cannot mint — it waits for peers. The committee-SAMPLING params (epoch length, K_MAX,
+	 * window, minCommittee, genesis size) are consensus and live on `params.custody`, not here.
 	 */
 	custody?: {
-		/** Anchors per custody epoch (default 16). */
-		epochLength?: number;
-		/** Max committee size K_MAX: the committee is min(eligible producers, size), so it grows
-		 *  with the network up to this cap (default DEFAULT_COMMITTEE_MAX = 31). Consensus-critical. */
-		size?: number;
-		/** Genesis committee size — small so the n-of-n DKG completes; grown to `size` by the first
-		 *  reshare (default: minCommittee). */
-		genesisSize?: number;
-		/** Min eligible producers before committee custody activates (default 3). */
-		minCommittee?: number;
 		/** Per-ceremony timeout in ms (default 30s). */
 		ceremonyTimeoutMs?: number;
-		/** Membership lookback in anchors (default 2 × epochLength): only producers of recent
-		 *  finalized anchors are eligible, so long-gone farmers drop out. Consensus-critical. */
-		windowAnchors?: number;
 	};
 }
 
@@ -158,6 +146,11 @@ export interface ConsensusStatus {
 	 *  "∅" means a peer advertised no genesis at all (older code). */
 	foreignGenesisSeen?: string[];
 	finalizedHeight: number | null;
+	/** Height of the SETTLED anchor (irreversible; payouts and share deletion key off it). */
+	settledHeight: number | null;
+	/** Set when a peer's branch was REFUSED for abandoning this node's settled history — a split
+	 *  deeper than settlement that needs an operator. Null while healthy. */
+	settlementConflict: SettledConflict | null;
 	/** Distinct ANCHOR PRODUCERS in the recent chain — the committee is sampled from these, so this is
 	 *  the number that must reach minCommittee for genesis (NOT the op-writer count). */
 	producers: number;
@@ -242,7 +235,7 @@ export class Daemon {
 	constructor(opts: DaemonOptions = {}) {
 		this.params = opts.params ?? defaultParams();
 		this.k = opts.k ?? 11;
-		this.finalityDepth = opts.finalityDepth ?? 1;
+		this.finalityDepth = opts.finalityDepth ?? DEFAULT_FINALITY_DEPTH;
 		this.adoptQuorum = opts.adoptQuorum ?? 1;
 		this.replicationTarget = opts.replicationTarget ?? 1;
 		// Idle anchor heartbeat. Server passes this from GAVL_HEARTBEAT_MS; for a directly-constructed
@@ -252,18 +245,37 @@ export class Daemon {
 		this.spaceMode = opts.space ?? "standin";
 		this.plotDir = opts.plotDir ?? join(homedir(), ".gavl", "plots");
 		this.dataDir = opts.walletDir ?? join(homedir(), ".gavl");
+		this.shares = new ShareStore(join(this.dataDir, "custody", "shares"));
 		this.storeOpts = opts.store;
 		this.custodyOpts = opts.custody ?? {};
 		this.schedule = opts.schedule;
 		this.network = opts.network ?? "gavl";
 		// Verifier must match the space backend producers use, or anchors are rejected.
 		this.verifier = this.spaceMode === "chiapos" ? new ChiaSpaceVerifier() : new StandinSpaceVerifier();
-		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, this.verifier, { schedule: opts.schedule, finalityDepth: this.finalityDepth, verifyState: (a, h) => this.checkAppRoot(a, h) }));
-		this.node.mode = `${this.params.vdf.name}/${this.spaceMode}`; // hello advertises this → peers detect a proof-mode mismatch
+		this.node = this.freshNode();
 		this.wallet = new Wallet(opts.walletDir);
 		this.wallet.ensureSeeded();
 		for (const wa of this.wallet.list()) this.bind(wa);
 		this.wireTipCadence();
+	}
+
+	/** A fresh ledger + anchor chain (boot and channel switch): soft finality at `finalityDepth`,
+	 *  SETTLEMENT at DEFAULT_SETTLEMENT_DEPTH (irreversible; a deeper conflicting branch is refused
+	 *  and reported, see settlementConflict), and the app-state check on every anchor. */
+	private freshNode(): GavlNode {
+		const chain = new AnchorChain(this.params, this.verifier, {
+			schedule: this.schedule,
+			finalityDepth: this.finalityDepth,
+			settlementDepth: DEFAULT_SETTLEMENT_DEPTH,
+			onSettledConflict: (c) => {
+				console.error(`  ⚠ consensus: REFUSING a branch that abandons SETTLED anchor ${c.settled.id.slice(0, 8)} (height ${c.settled.height}) — tip ${c.rejected.id.slice(0, 8)} at height ${c.rejected.height}. The network has split deeper than settlement; this node stays on its settled history. Operator action needed.`);
+				this.recordNetEvent("consensus", `refused branch abandoning settled height ${c.settled.height}`);
+			},
+			verifyState: (a, h) => this.checkAppRoot(a, h),
+		});
+		const node = new GavlNode(new Ledger(this.params), chain);
+		node.mode = `${this.params.vdf.name}/${this.spaceMode}`; // hello advertises this → peers detect a proof-mode mismatch
+		return node;
 	}
 
 	/** Record when each new tip height is observed → a rolling measured cadence.
@@ -278,6 +290,7 @@ export class Daemon {
 			this.driveRotation(); // advance the custody epoch loop on each finality move
 			this.maintainCommittee(); // keep this node directly linked to its committee members
 			this.maybeAuthorizePending(); // co-sign pending withdrawals / mints / settles
+			this.pruneShares(); // shares from epochs the chain has recorded a later holder past are dead
 			this.maybeCheckpoint(); // snapshot + prune behind finality so history never grows unbounded
 			this.tryPendingSnapshot(); // a stashed peer checkpoint may now be verifiable
 			this.recordNetEvent("anchor", `tip → height ${tip.height}`);
@@ -334,6 +347,7 @@ export class Daemon {
 		this.pendingSnapshot = undefined;
 		this.viewCache = undefined;
 		this.finalCache = undefined;
+		this.settledCache = undefined;
 		return true;
 	}
 
@@ -404,16 +418,20 @@ export class Daemon {
 		const params = this.committeeParams();
 		const finEpoch = epochOf(anchors.finalized(this.finalityDepth)?.height ?? 0, params.epochLength);
 		const optEpoch = epochOf(tip.height, params.epochLength);
-		const opts = { ...params, excluded: this.finalizedFaults() };
-		const mine = committeeEpochsFor(chain, this.producerId(), [finEpoch, optEpoch], { ...opts, minCommittee: this.custodyOpts.minCommittee ?? 3 });
+		const excluded = this.finalizedFaults();
+		const fundEpoch = this.fundEpoch();
+		const rosters = [...new Set([finEpoch, optEpoch])].filter((e) => e >= 1).map((e) => custodyCommittee(chain, e, params, fundEpoch, excluded));
 		// Connect to my co-committee members DIRECTLY via the producer↔address binding (no rendezvous;
-		// works on a bounded mesh). Resolve the rosters for the epochs I'm in and link them.
+		// works on a bounded mesh). Resolve the rosters for the epochs I'm in and link them. A reshare
+		// runs between the RECORDED holder and the new committee, so holders and incoming members link
+		// to each other too (the holder may be several epochs old after failed reshares).
 		const me = this.producerId();
+		const holder = this.finalView().custody.holder;
+		const isHolder = !!holder?.committee.includes(me);
+		const inRoster = rosters.some((c) => c?.committee.includes(me));
 		const members = new Set<string>();
-		for (const e of mine) {
-			const c = committeeForEpoch(chain, e, opts);
-			if (c) for (const id of c.committee) if (id !== me) members.add(id);
-		}
+		for (const c of rosters) if (c && (isHolder || c.committee.includes(me))) for (const id of c.committee) if (id !== me) members.add(id);
+		if (holder && (isHolder || inRoster)) for (const id of holder.committee) if (id !== me) members.add(id);
 		this.transport.connectCommittee([...members]);
 		this.logCommitteeReadiness(optEpoch, [...members], chain); // surface WHY the committee may not be forming
 	}
@@ -442,7 +460,7 @@ export class Daemon {
 			// the per-producer anchor counts so divergence is obvious at a glance: "[me:273]" means this node
 			// sees only ITSELF producing (its peers' anchors aren't on its canonical chain → the net has split,
 			// anchors outrunning gossip); a healthy net shows several keys with similar counts.
-			const minC = this.custodyOpts.minCommittee ?? 3;
+			const minC = this.committeeParams().minCommittee;
 			const me = this.producerId();
 			const counts = new Map<string, number>();
 			for (const a of chain) {
@@ -610,12 +628,15 @@ export class Daemon {
 
 	/** Optimistic view over all local writes (responsive — reflects an action immediately).
 	 *  Folds the writes the ledger still holds onto the checkpoint base (so it never re-folds
-	 *  pruned history), and memoizes on the heads root so polls don't re-fold unchanged state. */
+	 *  pruned history), checking custody records against the current tip's chain (they aren't
+	 *  certified yet, so no height gate), and memoizes on the heads root + tip. */
 	view(): View {
 		const root = this.node.ledger.stateRoot();
-		if (this.viewCache && this.viewCache.root === root) return this.viewCache.view;
-		const view = computeView(this.node.ledger.allWrites(), { base: this.checkpointBase });
-		this.viewCache = { root, view };
+		const tip = this.node.anchors?.tip() ?? null;
+		if (this.viewCache && this.viewCache.root === root && this.viewCache.tip === tip?.id) return this.viewCache.view;
+		const custodyRulesOpt = tip ? custodyRules(this.node.anchors!.chainTo(tip), this.committeeParams(), false) : undefined;
+		const view = computeView(this.node.ledger.allWrites(), { base: this.checkpointBase, custodyRules: custodyRulesOpt });
+		this.viewCache = { root, tip: tip?.id, view };
 		return view;
 	}
 
@@ -628,8 +649,9 @@ export class Daemon {
 	private lastSnapshot?: StoredSnapshot;
 	/** A peer's checkpoint awaiting anchor-chain sync before it can be authenticated. */
 	private pendingSnapshot?: StoredSnapshot;
-	private viewCache?: { root: string; view: View };
+	private viewCache?: { root: string; tip: string | undefined; view: View };
 	private finalCache?: { id: string | null; view: View };
+	private settledCache?: { id: string; view: View };
 	private emptyAppRootCache?: string;
 
 	private emptyAppRoot(): string {
@@ -694,10 +716,12 @@ export class Daemon {
 	private maybeCheckpoint(): void {
 		const anchors = this.node.anchors;
 		if (!anchors) return;
-		const fin = anchors.finalized(this.finalityDepth);
+		// Checkpoint (and prune history below it) only behind SETTLEMENT: pruning is irreversible, and a
+		// soft-final anchor can still be reverted by fork resolution.
+		const fin = anchors.settled();
 		if (!fin) return;
-		// Checkpoint at a DETERMINISTIC height — the largest CHECKPOINT_EVERY boundary the finalized
-		// anchor has crossed — not at each node's current finalized tip. So every honest node
+		// Checkpoint at a DETERMINISTIC height — the largest CHECKPOINT_EVERY boundary the settled
+		// anchor has crossed — not at each node's current tip. So every honest node
 		// checkpoints the SAME anchor, and a bootstrapping node can collect a quorum of identical
 		// offers (see docs/weak-subjectivity.md). Local-only; checkpoints aren't committed in any root.
 		const target = Math.floor(fin.height / CHECKPOINT_EVERY) * CHECKPOINT_EVERY;
@@ -725,6 +749,7 @@ export class Daemon {
 		anchors.prune(ckpt.height - margin); // keep a margin below the CHECKPOINT (not the tip) so it stays serveable
 		this.viewCache = undefined;
 		this.finalCache = undefined;
+		this.settledCache = undefined;
 		// Durable store, if any: persist the snapshot + reclaim the pruned blocks (best-effort).
 		const store = this.store;
 		const persisted = store ? " (persisting)" : " (RAM-only)";
@@ -740,6 +765,19 @@ export class Daemon {
 		if (this.finalCache && this.finalCache.id === finId) return this.finalCache.view;
 		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase, this.faultLookback());
 		this.finalCache = { id: finId, view };
+		return view;
+	}
+
+	/** SETTLED view: the state the settled anchor certifies — never reverted (see
+	 *  DEFAULT_SETTLEMENT_DEPTH). Every IRREVERSIBLE external action keys off this, never off
+	 *  finalView: signing / broadcasting BTC payouts, posting bridge.settle, and deleting superseded
+	 *  key shares. Checkpoints sit at or below the settled anchor, so the base fold is always valid. */
+	settledView(): View {
+		const settled = this.node.anchors?.settled();
+		if (!settled) return this.checkpointBase ? computeView([], { base: this.checkpointBase }) : computeView([]);
+		if (this.settledCache?.id === settled.id) return this.settledCache.view;
+		const view = viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, settled.id, this.checkpointBase, this.faultLookback());
+		this.settledCache = { id: settled.id, view };
 		return view;
 	}
 
@@ -776,19 +814,24 @@ export class Daemon {
 			holdsShare: !!cs,
 			committee: cs?.participants ?? null,
 			threshold: cs?.min ?? null,
-			minCommittee: this.custodyOpts.minCommittee ?? 3, // farmers needed to bootstrap genesis custody
+			minCommittee: this.committeeParams().minCommittee, // farmers needed to bootstrap genesis custody
 			committeeMax: this.committeeParams().size, // K_MAX: seats the committee grows to as producers join
 			encKeysKnown: this.encKeys.size(), // verified peer encryption keys (phase-1 announce liveness)
 			lastReshare: this.lastReshare, // latest per-epoch reshare outcome (for the UI indicator)
 		};
 	}
 
-	/** The consensus-critical committee-derivation shape (epoch length, K_MAX, eligibility window),
-	 *  resolved ONCE so every derivation site — the roster pre-connect and the rotation loop — uses
-	 *  identical values. Pair with finalizedFaults() for the exclusion set. */
-	private committeeParams(): { epochLength: number; size: number; windowAnchors: number } {
-		const epochLength = this.custodyOpts.epochLength ?? 16;
-		return { epochLength, size: this.custodyOpts.size ?? DEFAULT_COMMITTEE_MAX, windowAnchors: eligibilityWindow({ epochLength, windowAnchors: this.custodyOpts.windowAnchors }) };
+	/** The network's consensus custody params (epoch length, K_MAX, window, minCommittee, genesis size)
+	 *  — on ChainParams, so the fold checks custody records with exactly these. Pair with
+	 *  finalizedFaults() for the exclusion set. */
+	private committeeParams(): CustodyParams {
+		return custodyParamsOf(this.params);
+	}
+
+	/** The on-chain genesis epoch (optimistic view), or null before a fund exists. */
+	private fundEpoch(): number | null {
+		const e = this.view().custody.epoch;
+		return e >= 0 ? e : null;
 	}
 
 	/** How far back (anchors) a custody.fault's culprit must have produced for the fold to record it:
@@ -829,6 +872,8 @@ export class Daemon {
 			genesis: this.node.genesisId ?? null,
 			foreignGenesisSeen: this.node.warnedGenesis.size ? [...this.node.warnedGenesis] : undefined,
 			finalizedHeight: finalized ? finalized.height : null,
+			settledHeight: this.node.anchors?.settled()?.height ?? null,
+			settlementConflict: this.node.anchors?.settledConflict ?? null,
 			producers: producerSet.size,
 			iProduce: producerSet.has(myId),
 			myAnchors: recent.reduce((n, a) => n + (a.producer === myId ? 1 : 0), 0),
@@ -974,17 +1019,19 @@ export class Daemon {
 		this.lastSnapshot = undefined;
 		this.viewCache = undefined;
 		this.finalCache = undefined;
+		this.settledCache = undefined;
 		await this.store?.clear();
 		return true;
 	}
 
-	/** The DETERMINISTIC genesis for this node's network — a pure function of the network label + base
-	 *  difficulty (consensus/genesis.ts). Identical on every node on the same network whether it seeds this
-	 *  as its root or adopts a later checkpoint, so its id is the stable value advertised for genesis-mismatch
-	 *  detection (a peer that minted a different block 0 on the same label is on old code). */
+	/** The DETERMINISTIC genesis for this node's network — a pure function of the network label, base
+	 *  difficulty and the custody consensus params (consensus/genesis.ts). Identical on every node on the
+	 *  same network whether it seeds this as its root or adopts a later checkpoint, so its id is the stable
+	 *  value advertised for genesis-mismatch detection (a peer with a different block 0 — old code, or
+	 *  different custody params such as K_MAX — is on another network). */
 	private genesisFor(): Anchor {
 		const difficulty = this.schedule?.base ?? this.params.difficulty; // genesis difficulty = schedule base
-		return genesisAnchor({ network: this.network, difficulty, appRoot: this.emptyAppRoot() });
+		return genesisAnchor({ network: this.network, difficulty, appRoot: this.emptyAppRoot(), custody: this.committeeParams() });
 	}
 
 	/**
@@ -1015,7 +1062,7 @@ export class Daemon {
 	 * via GAVL_CUSTODY_MIN=1).
 	 */
 	private async lobbyThenFarm(): Promise<void> {
-		const need = this.custodyOpts.minCommittee ?? 3;
+		const need = this.committeeParams().minCommittee;
 		if (this.transport && need > 1) {
 			const graceMs = Number(process.env.GAVL_LOBBY_GRACE_MS ?? 0); // 0 = wait for quorum forever; >0 = opt into solo-start after the grace
 			const startedAt = Date.now();
@@ -1130,9 +1177,7 @@ export class Daemon {
 		this.rotation = new CommitteeRotation({
 			node: this.node,
 			selfId: this.producerId(),
-			...this.committeeParams(), // epochLength, K_MAX size, eligibility window — shared with maintainCommittee
-			genesisSize: this.custodyOpts.genesisSize ?? this.custodyOpts.minCommittee ?? 3, // small n-of-n genesis, grown after
-			minCommittee: this.custodyOpts.minCommittee ?? 3,
+			params: this.committeeParams(), // the network's consensus custody params — what the fold checks records against
 			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
 			excluded: () => this.finalizedFaults(), // proven faults → skipped by committee selection
 			auth: this.ceremonyAuth(),
@@ -1142,20 +1187,13 @@ export class Daemon {
 				const hex = this.view().custody.fundKey;
 				return hex ? fromHex(hex) : null;
 			},
-			fundEpoch: () => {
-				const e = this.view().custody.epoch;
-				return e >= 0 ? e : null; // -1 until genesis publishes; then the genesis epoch
-			},
-			publishFund: (key, epoch) => void this.custodyAccount().announceFund(toHex(key), epoch).catch(() => {}),
-			loadShare: () => this.committeeShare(),
-			saveShare: (s) => saveShare(this.sharePath(), s),
-			clearShare: () => {
-				try {
-					rmSync(this.sharePath(), { force: true }); // rotated out → the share is dead; remove it
-				} catch {
-					/* best effort */
-				}
-			},
+			fundEpoch: () => this.fundEpoch(),
+			publishFund: (key, epoch, committee, min) => void this.custodyAccount().announceFund(toHex(key), epoch, committee, min).catch(() => {}),
+			publishHandoff: (epoch, committee, min, sig) => void this.custodyAccount().recordHandoff(epoch, committee, min, toHex(sig)).catch(() => {}),
+			holderAt: (height) => holderAt(this.finalView().custody, height),
+			handoffRecorded: (epoch) => (this.view().custody.holder?.epoch ?? -1) >= epoch,
+			loadShare: (epoch) => this.shares.get(epoch),
+			saveShare: (s) => this.shares.save(s),
 			log: (m) => console.log(m),
 			onReshareShadow: (p) => this.runShadowReshare(p), // validation-only blob-path run, alongside the live ceremony
 			reshareViaBlob: process.env.GAVL_PVSS_RESHARE ? (p) => this.reshareViaBlob(p) : undefined, // CUTOVER (opt-in): the blob path IS the reshare, with the live ceremony as fallback
@@ -1282,13 +1320,25 @@ export class Daemon {
 		return null; // pre-genesis: no committee fund exists yet
 	}
 
-	/** Path to THIS node's persisted committee share (secret, node-local). */
-	private sharePath(): string {
-		return join(this.dataDir, "custody", "share.json");
-	}
-	/** This node's committee share if it holds one (from DKG or a reshare), else null. */
+	/** THIS node's persisted committee shares, one per ceremony epoch (secret, node-local). */
+	private readonly shares: ShareStore;
+	/** The share this node signs with: the one from the SETTLED holder's ceremony, so a newer share
+	 *  from a reshare whose handoff isn't settled yet is never used early (signing BTC payouts is
+	 *  irreversible). Before any holder is settled (genesis just ran), the newest share held. Null if
+	 *  this node isn't a holder. */
 	committeeShare(): StoredShare | null {
-		return loadShare(this.sharePath());
+		const holder = this.settledView().custody.holder;
+		return holder ? this.shares.get(holder.epoch) : this.shares.latest();
+	}
+
+	/** Drop shares the chain has superseded — IRREVERSIBLE, so only off SETTLED state: everything below
+	 *  the older of the two settled holder records (holderAt may still answer with prevHolder for a
+	 *  boundary the latest handoff landed after). A soft-final handoff that gets reverted never costs a
+	 *  share the old committee still needs. */
+	private pruneShares(): void {
+		const c = this.settledView().custody;
+		const keepFrom = c.prevHolder?.epoch ?? c.holder?.epoch;
+		if (keepFrom !== undefined) this.shares.pruneBelow(keepFrom);
 	}
 
 	/** This node's STABLE anchor-producer key (persisted) — also its committee identity.
@@ -1366,22 +1416,6 @@ export class Daemon {
 		}
 	}
 
-	/**
-	 * Run the distributed committee DKG over the LIVE node transport with the
-	 * configured committee, then persist THIS node's share (the key is generated
-	 * across the committee — no node ever holds it whole). Operator-triggered once
-	 * all committee members are connected. `selfId` must be this node's committee id.
-	 *
-	 * NOTE: the ceremony is proven over the in-memory transport (which mimics the
-	 * wire); running it across real networked daemons is a live-deployment step. This
-	 * wires the proven coordinator onto `this.node`'s real connections.
-	 */
-	async runCommitteeDkg(opts: { session: string; selfId: string; participants: string[]; min: number }): Promise<string> {
-		const coord = new DkgCoordinator(this.node, opts);
-		const result = await coord.start();
-		saveShare(this.sharePath(), { ...result, session: opts.session, selfId: opts.selfId, participants: opts.participants, min: opts.min });
-		return deriveFundAddress({ groupPubKey: result.groupPubKey, pub: result.pub, shares: {}, min: opts.min, max: opts.participants.length }, this.btcNetwork());
-	}
 	private esploraCache?: { key: string; client: Esplora };
 	/** The bridge's explorer client: network from GAVL_BTC_NET, endpoints from GAVL_ESPLORA_URL
 	 *  (comma-separated Esplora roots) or the network's public defaults. */
@@ -1558,18 +1592,26 @@ export class Daemon {
 		})();
 	}
 
-	/** Co-sign + broadcast the UNSENT finalized withdrawals (one batch), then post a
-	 *  bridge.broadcast note per withdrawal so the committee stops re-signing them. */
+	/** The withdrawals the committee may pay out in BTC: SETTLED burns only. A soft-final burn can
+	 *  still be reverted by fork resolution; paying it would leave the user both the BTC and the gBTC. */
+	payableWithdrawals(): PendingWithdrawal[] {
+		return this.settledView().bridge.pending;
+	}
+
+	/** Co-sign + broadcast the UNSENT SETTLED withdrawals (one batch), then post a bridge.broadcast
+	 *  note per withdrawal so the committee stops re-signing them. Paying BTC is irreversible, so a
+	 *  burn must be SETTLED (not merely soft-final): a reverted burn after the BTC left would leave the
+	 *  user holding both the gBTC and the BTC. */
 	private async coSignWithdrawals(): Promise<string | null> {
 		const cs = this.committeeShare();
 		if (!cs) return null;
-		const bridge = this.finalView().bridge;
+		const bridge = this.settledView().bridge;
 		const esplora = this.esplora();
 		// A withdrawal needs (re)signing UNLESS a real payout tx that actually pays it is already out
 		// there. The bridge.broadcast note is an unauthenticated hint, so verify it on-chain — a bogus
 		// note (or one an attacker overwrote) doesn't really pay, so we re-sign rather than stall.
 		const unsent: PendingWithdrawal[] = [];
-		for (const w of bridge.pending) {
+		for (const w of this.payableWithdrawals()) {
 			const noted = bridge.broadcasts.get(w.id);
 			if (noted) {
 				const tx = await esplora.getTx(noted).catch(() => null);
@@ -1623,10 +1665,10 @@ export class Daemon {
 		}
 	}
 
-	/** For each in-flight withdrawal whose payout txid has confirmed on-chain, co-sign the
+	/** For each SETTLED in-flight withdrawal whose payout txid has confirmed on-chain, co-sign the
 	 *  settle (committee threshold) so reserves drop. */
 	private async coSettleConfirmed(): Promise<void> {
-		const inFlight = inFlightWithdrawals(this.finalView().bridge);
+		const inFlight = inFlightWithdrawals(this.settledView().bridge);
 		if (inFlight.length === 0) return;
 		const esplora = this.esplora();
 		const tip = await esplora.tipHeight();
@@ -1722,8 +1764,7 @@ export class Daemon {
 		// 2. Fresh ledger + anchor chain — a clean economy for the new channel. The custody
 		//    loop + accounts referenced the OLD node, so drop them; startConsensus rebuilds
 		//    the rotation against the new node when farming.
-		this.node = new GavlNode(new Ledger(this.params), new AnchorChain(this.params, this.verifier, { schedule: this.schedule, finalityDepth: this.finalityDepth, verifyState: (a, h) => this.checkAppRoot(a, h) }));
-		this.node.mode = `${this.params.vdf.name}/${this.spaceMode}`; // hello advertises this → peers detect a proof-mode mismatch
+		this.node = this.freshNode();
 		this.rotation = undefined;
 		this.equivWatcher = undefined;
 		this.custodyAcct = undefined;
@@ -1732,6 +1773,7 @@ export class Daemon {
 		this.lastCheckpointHeight = -1;
 		this.viewCache = undefined;
 		this.finalCache = undefined;
+		this.settledCache = undefined;
 		this.wireTipCadence();
 		this.accounts.clear();
 		for (const wa of this.wallet.list()) this.bind(wa); // same identities, new node

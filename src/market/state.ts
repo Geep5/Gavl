@@ -17,7 +17,7 @@
  */
 
 import { sha256Hex, canonicalize } from "../det/canonical.ts";
-import type { View } from "./btc.ts";
+import type { View, CustodyHolder } from "./btc.ts";
 import { emptyBridge } from "../custody/bridge.ts";
 import type { BridgeState, PendingWithdrawal } from "../custody/bridge.ts";
 
@@ -39,11 +39,15 @@ export interface CanonBridge {
 	pot: string; // the liquidity pot (idle-fee bucket)
 }
 
-/** Plain-JSON custody state: the fund key/epoch plus the excluded (faulted) producers. */
+/** Plain-JSON custody state: the fund key/epoch, the excluded (faulted) producers, and the recorded
+ *  key holders (committees are already sorted id lists, so they serialize canonically as-is). */
 export interface CanonCustody {
 	fundKey: string | null;
 	epoch: number;
 	excluded: Entry<number>[]; // producer → fault height, sorted
+	holder: CustodyHolder | null;
+	prevHolder: CustodyHolder | null;
+	fundVotes: Entry<string[]>[]; // pending genesis proposal → sorted endorsers, sorted by proposal
 }
 
 export interface CanonState {
@@ -87,7 +91,14 @@ function serializeBridge(b: BridgeState): CanonBridge {
 export function serializeView(view: View): CanonState {
 	return {
 		bridge: serializeBridge(view.bridge),
-		custody: { fundKey: view.custody.fundKey, epoch: view.custody.epoch, excluded: mapEntries(view.custody.excluded, (h) => h) },
+		custody: {
+			fundKey: view.custody.fundKey,
+			epoch: view.custody.epoch,
+			excluded: mapEntries(view.custody.excluded, (h) => h),
+			holder: view.custody.holder ? { ...view.custody.holder, committee: [...view.custody.holder.committee] } : null,
+			prevHolder: view.custody.prevHolder ? { ...view.custody.prevHolder, committee: [...view.custody.prevHolder.committee] } : null,
+			fundVotes: mapEntries(view.custody.fundVotes, (ids) => [...ids]),
+		},
 	};
 }
 
@@ -117,6 +128,13 @@ function deserializeBridge(b: CanonBridge): BridgeState {
 export function deserializeView(s: CanonState): View {
 	return {
 		bridge: deserializeBridge(s.bridge),
-		custody: { fundKey: s.custody.fundKey, epoch: s.custody.epoch, excluded: new Map(s.custody.excluded) },
+		custody: {
+			fundKey: s.custody.fundKey,
+			epoch: s.custody.epoch,
+			excluded: new Map(s.custody.excluded),
+			holder: s.custody.holder ? { ...s.custody.holder, committee: [...s.custody.holder.committee] } : null,
+			prevHolder: s.custody.prevHolder ? { ...s.custody.prevHolder, committee: [...s.custody.prevHolder.committee] } : null,
+			fundVotes: new Map((s.custody.fundVotes ?? []).map(([k, ids]) => [k, [...ids]])),
+		},
 	};
 }

@@ -14,6 +14,7 @@ import type { Anchor, AnchorBody } from "./anchor.ts";
 import type { TimeProof } from "../pot/vdf.ts";
 import { sha256, sha256Hex, canonicalBytes, toHex, concatBytes } from "../det/canonical.ts";
 import { rootOfHeads } from "../ledger/ledger.ts";
+import type { CustodyParams } from "../custody/epoch.ts";
 
 /** Genesis's "producer" is a SENTINEL, not a real farmer — committee selection skips it (see epoch.ts).
  *  A 32-byte zero key, which no real Ed25519 producer can present (it isn't a valid signing identity). */
@@ -29,8 +30,12 @@ const GENESIS_DOMAIN = "gavl-genesis-v1";
  * VDF, and signature are placeholders — genesis carries no real proof (it's accepted by hardcoding).
  * `time.output` seeds height-1's challenge (anchorChallenge), so it's a deterministic network-bound hex.
  */
-export function genesisAnchor(opts: { network: string; difficulty: bigint; appRoot: string }): Anchor {
-	const seed = toHex(sha256(concatBytes(Buffer.from(GENESIS_DOMAIN, "utf8"), Buffer.from(opts.network, "utf8"))));
+export function genesisAnchor(opts: { network: string; difficulty: bigint; appRoot: string; custody?: CustodyParams }): Anchor {
+	// The network's custody consensus params are bound into block 0: nodes that disagree on them (e.g. a
+	// different GAVL_COMMITTEE_MAX) derive a different genesis and are visibly on another network, instead
+	// of silently sampling different committees and rejecting each other's custody records.
+	const consensus = opts.custody ? canonicalBytes(opts.custody) : new Uint8Array(0);
+	const seed = toHex(sha256(concatBytes(Buffer.from(GENESIS_DOMAIN, "utf8"), Buffer.from(opts.network, "utf8"), consensus)));
 	const body: AnchorBody = {
 		height: 0,
 		prev: null,

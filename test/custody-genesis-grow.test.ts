@@ -24,9 +24,8 @@ import { SignCoordinator } from "../src/custody/sign-coordinator.ts";
 import { quorumForRound } from "../src/custody/committee.ts";
 import { verify } from "../src/custody/threshold.ts";
 import { taprootOutputKey, verifyWithdrawal } from "../src/custody/bitcoin.ts";
-import type { StoredShare } from "../src/custody/share-store.ts";
 import { sha256 } from "../src/det/canonical.ts";
-import { PARAMS } from "./helpers.ts";
+import { PARAMS, CustodyLedger } from "./helpers.ts";
 
 const EPOCH = 4;
 const GENESIS_SIZE = 3;
@@ -42,29 +41,24 @@ test("genesis runs among a small committee, then the first reshare grows it to t
 	const nodes = Object.fromEntries(ids.map((id) => [id, new GavlNode(new Ledger(PARAMS))]));
 	for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) net.link(nodes[ids[i]], nodes[ids[j]]);
 
-	const published: { key: Uint8Array | null; epoch: number | null } = { key: null, epoch: null };
-	const shares = new Map<string, StoredShare | null>();
+	const custody = { epochLength: EPOCH, size: TARGET_SIZE, windowAnchors: 2 * EPOCH, minCommittee: GENESIS_SIZE, genesisSize: GENESIS_SIZE };
+	const ledger = new CustodyLedger(chainTo, custody);
 	const rots = ids.map(
 		(id) =>
 			new CommitteeRotation({
 				node: nodes[id],
 				selfId: id,
-				epochLength: EPOCH,
-				size: TARGET_SIZE,
-				genesisSize: GENESIS_SIZE,
-				minCommittee: GENESIS_SIZE,
+				params: custody,
 				timeoutMs: 500,
-				groupKey: () => published.key,
-				fundEpoch: () => published.epoch, // the on-chain genesis epoch (drives the size schedule)
-				publishFund: (k, e) => {
-					published.key = k;
-					published.epoch = e;
-				},
-				loadShare: () => shares.get(id) ?? null,
-				saveShare: (s) => shares.set(id, s),
-				clearShare: () => shares.set(id, null),
+				...ledger.hooks(id), // fundEpoch (the on-chain genesis epoch) drives the size schedule
 			}),
 	);
+	const advance = async (height: number) => {
+		ledger.height = height + 1;
+		const runs = rots.map((r) => r.onFinalized(chainTo(height)));
+		await net.idle();
+		await Promise.all(runs);
+	};
 
 	// the deterministic committees: genesis is size-3, the grown one is size-5.
 	const genesis = committeeForEpoch(chainTo(EPOCH), 1, { epochLength: EPOCH, size: GENESIS_SIZE })!.committee;
@@ -73,39 +67,38 @@ test("genesis runs among a small committee, then the first reshare grows it to t
 	assert.equal(grown.length, 5, "the grown committee is the full target size");
 
 	// ── epoch 1: genesis DKG among the SMALL committee ────────────────
-	const g = rots.map((r) => r.onFinalized(chainTo(EPOCH)));
-	await net.idle();
-	await Promise.all(g);
-	assert.ok(published.key, "fund key DKG'd + published");
-	assert.equal(published.epoch, 1, "genesis epoch recorded on-chain");
-	const address = taprootOutputKey(published.key!);
+	await advance(EPOCH);
+	const fund = ledger.custody();
+	assert.ok(fund.fundKey, "fund key DKG'd + published");
+	assert.equal(fund.epoch, 1, "genesis epoch recorded on-chain");
+	assert.equal(fund.holder?.min, 2, "genesis threshold is 2-of-3");
+	const groupKey = Buffer.from(fund.fundKey!, "hex");
+	const address = taprootOutputKey(groupKey);
 	for (const id of genesis) {
-		const s = shares.get(id);
+		const s = ledger.share(id, 1);
 		assert.ok(s, `${id} (genesis) holds a share`);
 		assert.deepEqual([...s!.participants].sort(), [...genesis].sort(), "tagged with the small genesis committee");
-		assert.equal(s!.min, 2, "genesis threshold is 2-of-3");
 	}
 
 	// ── epoch 2: the first reshare GROWS the committee to the full size ──
-	const r2 = rots.map((r) => r.onFinalized(chainTo(2 * EPOCH)));
-	await net.idle();
-	await Promise.all(r2);
+	await advance(2 * EPOCH);
+	const holder = ledger.custody().holder!;
+	assert.deepEqual(holder.committee, [...grown].sort(), "the grown committee recorded the handoff");
+	assert.equal(holder.min, 4, "grown threshold is 4-of-5");
 	for (const id of grown) {
-		const s = shares.get(id);
+		const s = ledger.share(id, 2);
 		assert.ok(s, `${id} (grown committee) holds a rotated share`);
-		assert.deepEqual([...s!.participants].sort(), [...grown].sort(), "tagged with the full grown committee");
-		assert.equal(s!.min, 4, "grown threshold is 4-of-5");
-		assert.equal(Buffer.compare(s!.groupPubKey, published.key!), 0, "SAME group key after growing");
+		assert.equal(Buffer.compare(s!.groupPubKey, groupKey), 0, "SAME group key after growing");
 	}
 
 	// ── the grown committee co-signs for the unchanged address ────────
 	const quorum = quorumForRound(grown, 4, 0);
-	const pub = shares.get(grown[0])!.pub;
+	const pub = ledger.share(grown[0], 2)!.pub;
 	const sighash = sha256("post-growth withdrawal");
-	const signers = quorum.map((id) => new SignCoordinator(nodes[id], { signId: "grown", selfId: id, quorum, pub, share: shares.get(id)!.share, message: sighash }));
+	const signers = quorum.map((id) => new SignCoordinator(nodes[id], { signId: "grown", selfId: id, quorum, pub, share: ledger.share(id, 2)!.share, message: sighash }));
 	const ss = signers.map((s) => s.start());
 	await net.idle();
 	const sigs = await Promise.all(ss);
-	assert.equal(verify(sigs[0], sighash, published.key!), true, "the grown 4-of-5 signs for the original key");
+	assert.equal(verify(sigs[0], sighash, groupKey), true, "the grown 4-of-5 signs for the original key");
 	assert.equal(verifyWithdrawal(sigs[0], sighash, address), true, "Bitcoin accepts it at the unchanged address");
 });

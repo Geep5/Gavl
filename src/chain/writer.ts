@@ -33,6 +33,7 @@ import { Plot, verifySpaceProof } from "../pos/space.ts";
 import type { PlotCommitment, SpaceProof } from "../pos/space.ts";
 import { requiredIters, vdfChallenge, writeWeight } from "./iters.ts";
 import type { ConsensusParams } from "./iters.ts";
+import type { CustodyParams } from "../custody/epoch.ts";
 
 /** Chain position — the only inputs to the proof challenge (no payload). */
 export interface Trunk {
@@ -65,6 +66,8 @@ export type VerifyResult = { ok: true } | { ok: false; reason: string };
 /** Consensus params plus the VDF engine. */
 export interface ChainParams extends ConsensusParams {
 	vdf: Vdf;
+	/** The network's custody-committee consensus params (absent → DEFAULT_CUSTODY_PARAMS). */
+	custody?: CustodyParams;
 }
 
 // ── Challenge + id derivation (shared by build and verify) ───────

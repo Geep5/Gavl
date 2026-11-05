@@ -12,8 +12,8 @@
  * codec (bytes ↔ {$u8:hex}) — the same one the wire uses.
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { toJsonSafe, fromJsonSafe } from "./u8json.ts";
 import type { DkgResult } from "./dkg-coordinator.ts";
 
@@ -24,9 +24,7 @@ export interface StoredShare extends DkgResult {
 	selfId: string; // THIS node's committee id
 	participants: string[]; // committee member ids (who to run signing with)
 	min: number; // signing threshold
-	/** The custody epoch this share belongs to (set by epoch-driven rotation). A share
-	 *  from an older epoch than the network's current one is stale — its holder was
-	 *  rotated out and can no longer participate as an old member in the next reshare. */
+	/** The custody epoch whose ceremony produced this share (genesis DKG or that epoch's reshare). */
 	epoch?: number;
 }
 
@@ -40,4 +38,41 @@ export function saveShare(path: string, s: StoredShare): void {
 export function loadShare(path: string): StoredShare | null {
 	if (!existsSync(path)) return null;
 	return fromJsonSafe(JSON.parse(readFileSync(path, "utf8"))) as StoredShare;
+}
+
+/**
+ * A node's shares, one file per custody epoch (`<dir>/<epoch>.json`). A reshare's new share is kept
+ * BESIDE the old one: until a custody.handoff for the new epoch is final on-chain, the old committee
+ * is still the recorded holder and must be able to hand off again if this reshare didn't take. Old
+ * epochs are dropped only once the chain has recorded a later holder (pruneBelow).
+ */
+export class ShareStore {
+	readonly dir: string;
+	constructor(dir: string) {
+		this.dir = dir;
+	}
+	save(s: StoredShare & { epoch: number }): void {
+		saveShare(join(this.dir, `${s.epoch}.json`), s);
+	}
+	get(epoch: number): StoredShare | null {
+		return loadShare(join(this.dir, `${epoch}.json`));
+	}
+	/** Epochs held, ascending. */
+	epochs(): number[] {
+		if (!existsSync(this.dir)) return [];
+		return readdirSync(this.dir)
+			.map((f) => /^(\d+)\.json$/.exec(f)?.[1])
+			.filter((e): e is string => e !== undefined)
+			.map(Number)
+			.sort((a, b) => a - b);
+	}
+	/** The newest share held (any epoch), or null. */
+	latest(): StoredShare | null {
+		const es = this.epochs();
+		return es.length ? this.get(es[es.length - 1]) : null;
+	}
+	/** Delete every share from an epoch before `epoch` — dead once a later holder is recorded. */
+	pruneBelow(epoch: number): void {
+		for (const e of this.epochs()) if (e < epoch) rmSync(join(this.dir, `${e}.json`), { force: true });
+	}
 }

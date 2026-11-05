@@ -36,13 +36,20 @@ export type Op =
 	 *  does nothing. */
 	| { kind: "custody.fault"; a: unknown; b: unknown }
 	/** Announce the threshold-custody fund's group key on-chain, established by the
-	 *  epoch-0 genesis DKG. FIRST write wins and is IMMUTABLE — so every node + client
+	 *  genesis DKG among `committee` (signing threshold `min`), which becomes the first
+	 *  recorded key HOLDER. FIRST write wins and is IMMUTABLE — so every node + client
 	 *  learns the one permanent fund address, and rotations never change it. (v1 trusts
-	 *  the first announcer; proving it came from a real committee DKG is future work,
-	 *  alongside gate #4 non-public keys.) */
-	| { kind: "custody.fund"; groupKey: string; epoch: number };
+	 *  the first announcer; proving it came from the chain-sampled genesis committee is
+	 *  future work.) */
+	| { kind: "custody.fund"; groupKey: string; epoch: number; committee: string[]; min: number }
+	/** Record that epoch `epoch`'s reshare COMPLETED: `committee` (sorted ids, threshold `min`)
+	 *  now holds the fund key. `sig` is a BIP340 threshold signature by the fund group key over
+	 *  handoffDigest — made by the NEW committee with its NEW shares, so it exists only if at
+	 *  least `min` of them really hold working shares. The next reshare hands off from this
+	 *  recorded holder; a failed reshare records nothing, so the real holders retry. */
+	| { kind: "custody.handoff"; epoch: number; committee: string[]; min: number; sig: string };
 
-const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "custody.fund", "custody.fault"]);
+const KINDS = new Set<string>(["bridge.deposit", "gbtc.transfer", "bridge.withdraw", "bridge.claim", "bridge.broadcast", "bridge.settle", "custody.fund", "custody.fault", "custody.handoff"]);
 
 export function isOp(v: unknown): v is Op {
 	return !!v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string" && KINDS.has((v as { kind: string }).kind);

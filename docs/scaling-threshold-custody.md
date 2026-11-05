@@ -38,7 +38,14 @@ built from the finalized burn. Concretely the fold checks
 4. **Rotation every epoch.** The outgoing committee reshares the *same* secret to the incoming
    one (proactive secret sharing). The group key — and therefore every deposit address — never
    changes; old shares become useless. To steal, an attacker must hold ≥ M seats of one randomly
-   drawn committee *within one epoch*.
+   drawn committee *within one epoch*. Who hands off is the **recorded holder**: `custody.fund`
+   records the genesis committee (accepted only once every member of the chain-sampled genesis
+   committee has posted it from its producer key), and each completed reshare's new committee
+   records itself with `custody.handoff`, threshold-signed by the group key with its new shares.
+   The fold re-derives each epoch's committee from its own certifying chain (the sampling params
+   are network consensus params) and accepts a record only if it names that committee, its
+   signature verifies, and its epoch is newer. BTC payouts, settles and share deletion wait for
+   **settlement** (6 anchors), a depth no fork resolution can revert.
 5. **One key, every coin.** BTC and LTC both verify BIP340 Schnorr over secp256k1 and both support
    Taproot, so one committee key backs both vaults. Deposit tweaks and attestation digests carry
    an asset tag so a signature for one coin can never be replayed for another.
@@ -87,7 +94,8 @@ Growth helps twice: more honest farmers lower `f`, and more farmers allow a larg
   independent farmers.
 - **Funds can freeze.** If more than a third of a committee vanishes before handing off, nobody
   can sign until enough return. Larger committees and the recent-activity window reduce this;
-  a failed reshare leaves the old committee in charge and retries next epoch. Resharing under
+  a failed reshare records no handoff, so the recorded holder stays in charge (keeping its shares)
+  and the next epoch reshares from it. Resharing under
   churn is where systems like this break in practice, so it gets the heaviest testing.
 - **Practical size ceiling.** DKG and resharing cost roughly k² point-to-point messages per epoch
   over Nostr relays; signing costs roughly k per withdrawal. The usable K_MAX is measured, not

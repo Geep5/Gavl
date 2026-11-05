@@ -87,18 +87,33 @@ There is no trusted setup and no committed key: every network (testnet, signet, 
 mints its fund key the same way. Once an epoch boundary is finalized with **≥`minCommittee` (default
 3) distinct producers** in its eligibility window, every node derives the same genesis committee
 (the *first* such epoch, sampled at `genesisSize`, default `minCommittee`), its members run a
-distributed DKG over the mesh, and each publishes the resulting group key as `custody.fund` (first
-write wins; all members post the same key). Every later epoch reshares the same key to that epoch's
-committee — grown to `K_MAX` — so the address never moves. The genesis DKG is *n-of-n*: a member that
-never completes it times out the ceremony (`GAVL_CUSTODY_TIMEOUT_MS`), and the members retry the same
-genesis epoch at the next epoch boundary.
+distributed DKG over the mesh, and each publishes the resulting group key as `custody.fund` from its
+producer key. The fold re-derives that epoch's committee from the anchor chain itself and accepts the
+fund only once **every** sampled member has posted the identical announce (the DKG is n-of-n), so a
+stranger can never set the vault key; the committee becomes the first recorded **key holder**. Every
+later epoch reshares the same key from the recorded holder to that epoch's committee — grown to
+`K_MAX` — so the address never moves; the new committee then records itself as holder with a
+`custody.handoff` that must name the chain-sampled committee and carry a threshold signature by the
+fund key made with its new shares. A reshare that fails records nothing, so the old holder keeps its
+shares and the next epoch retries from it. The committee-sampling parameters (epoch length, `K_MAX`,
+window, `minCommittee`, genesis size) are consensus parameters of the network (`ChainParams.custody`,
+bound into the genesis anchor). The genesis DKG is *n-of-n*: a member that never completes it times out
+the ceremony (`GAVL_CUSTODY_TIMEOUT_MS`), and the members retry the same genesis epoch at the next
+epoch boundary.
 
 ### Consensus + bounded RAM (`src/consensus/`)
 
 A permissionless **anchor chain** of PoST-proven head certificates linearizes the multi-writer logs:
-heaviest-cumulative-weight fork choice with depth-`k` finality, difficulty retarget so the VDF cost
-is the pace. Each anchor commits an `appRoot` (a root of the folded state its parent certified), so a
-`k`-deep finalized anchor is a **trustless checkpoint**: a node boots by loading the last checkpoint
+heaviest-cumulative-weight fork choice with sticky depth-`k` finality (default 2), difficulty retarget so the VDF cost
+is the pace. A branch that abandons a node's locked anchor wins only if producers holding a weighted
+majority of the pre-fork window built it exclusively — else, if neither side has that, the heavier
+branch wins — so a healed partition converges while a minority's heavier private fork can't revert
+what the majority finalized. Beneath that sits **settlement** (depth 6): a settled anchor is never
+reverted, and a branch that abandons it is refused and flagged (`settlementConflict` in
+`/api/state`). Everything irreversible — signing/broadcasting BTC payouts, posting `bridge.settle`,
+deleting superseded key shares, checkpoint-pruning history — waits for settlement, never soft
+finality. Each anchor commits an `appRoot` (a root of the folded state its parent certified), so a
+settled anchor is a **trustless checkpoint**: a node boots by loading the last checkpoint
 and folding only the writes above it, prunes history below it from RAM, and bootstraps fresh peers by
 serving committed *state* rather than history. Everything that lives in RAM is bounded the same way —
 it costs something to create and it decays or expires — so a node's footprint is bounded by the real
@@ -209,8 +224,9 @@ Key env vars: `GAVL_VDF=chia|hash` · `GAVL_SPACE=chiapos|standin`
 addresses) · `GAVL_ESPLORA_URL=<url,url>` (Esplora REST roots for the bridge, tried in order; overrides
 the public defaults, required for regtest) · `GAVL_DATA_DIR` / `GAVL_PORT`
 (isolate a node) · `GAVL_NETWORK=<label>` (channel name; default `gavl-testnet`) ·
-`GAVL_RELAYS=<wss://…,wss://…>` (override the default relay set) · `GAVL_COMMITTEE_MAX=<n>` (custody
-committee cap K_MAX; default 31 — consensus-critical, every node must agree) ·
+`GAVL_RELAYS=<wss://…,wss://…>` (override the default relay set) · `GAVL_COMMITTEE_MAX=<n>` /
+`GAVL_CUSTODY_EPOCH=<anchors>` / `GAVL_CUSTODY_MIN=<n>` (custody consensus params: K_MAX default 31,
+epoch 16, min 3 — bound into the genesis anchor, so nodes that differ are on different networks) ·
 `GAVL_ANNOUNCE_INTERVAL=<seconds>` (presence refresh cadence; default 30). Real PoST needs the `setup:chia` venv; choosing `GAVL_VDF=chia` without it throws
 (never a silent downgrade). Moving a *live* channel from stand-ins to real PoST is a coordinated
 upgrade — see [`docs/real-post-cutover.md`](docs/real-post-cutover.md).

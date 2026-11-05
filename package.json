@@ -18,6 +18,7 @@
     "test:chia": "node --test test/chia.test.ts",
     "regtest:install": "node scripts/regtest/install.mjs",
     "test:regtest": "cross-env GAVL_REGTEST=1 node --test \"test/regtest/*.test.ts\"",
+    "test:churn": "cross-env GAVL_REGTEST=1 GAVL_CHURN=1 node --test --test-timeout=0 test/regtest/churn.test.ts",
     "setup:chia": "node scripts/setup_chia.mjs",
     "demo": "node src/index.ts"
   },

@@ -27,6 +27,9 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Daemon } from "./daemon.ts";
 import { btcNetFromEnv } from "./custody/esplora.ts";
+import { DEFAULT_CUSTODY_PARAMS } from "./custody/epoch.ts";
+import type { CustodyParams } from "./custody/epoch.ts";
+import { defaultParams } from "./config.ts";
 import { gbtcOf, parseAmount } from "./market/btc.ts";
 import { totalGbtc, pendingTotal, demurrageChargeFrom } from "./custody/bridge.ts";
 
@@ -89,7 +92,22 @@ const DATA_DIR = process.env.GAVL_DATA_DIR; // undefined → ~/.gavl
 if (BTC_NET === "mainnet" && PERSIST === "off")
 	throw new Error("mainnet refuses in-memory storage (GAVL_PERSIST=off) — a restart would erase who owns which BTC. Use GAVL_PERSIST=all on durable disk.");
 
+// Custody-committee CONSENSUS params (on ChainParams; the fold checks custody records with them and
+// they're bound into the genesis anchor). Env-tunable for local measurement runs (e.g. the K_MAX sweep),
+// but every node of one network must use identical values — a node that differs derives a different
+// block 0 and is visibly on another network.
+const EPOCH_LEN = Number(process.env.GAVL_CUSTODY_EPOCH ?? DEFAULT_CUSTODY_PARAMS.epochLength);
+const CUSTODY_MIN = Number(process.env.GAVL_CUSTODY_MIN ?? DEFAULT_CUSTODY_PARAMS.minCommittee);
+const custody: CustodyParams = {
+	epochLength: EPOCH_LEN,
+	size: Number(process.env.GAVL_COMMITTEE_MAX ?? DEFAULT_CUSTODY_PARAMS.size), // K_MAX
+	windowAnchors: 2 * EPOCH_LEN,
+	minCommittee: CUSTODY_MIN,
+	genesisSize: CUSTODY_MIN, // small n-of-n genesis, grown to K_MAX by the first reshare
+};
+
 const daemon = new Daemon({
+	params: defaultParams({ custody }),
 	network: NETWORK,
 	walletDir: DATA_DIR,
 	space: SPACE,
@@ -104,12 +122,7 @@ const daemon = new Daemon({
 	// Replication floor: warn when fewer than this many distinct nodes hold the latest checkpoint,
 	// so RAM state stays durable across churn. Default 1 (off); set to your archiver count.
 	replicationTarget: Number(process.env.GAVL_REPLICATION_TARGET ?? "1"),
-	custody: {
-		epochLength: Number(process.env.GAVL_CUSTODY_EPOCH ?? "16"),
-		size: process.env.GAVL_COMMITTEE_MAX ? Number(process.env.GAVL_COMMITTEE_MAX) : undefined, // K_MAX (default DEFAULT_COMMITTEE_MAX = 31)
-		minCommittee: Number(process.env.GAVL_CUSTODY_MIN ?? "3"),
-		ceremonyTimeoutMs: Number(process.env.GAVL_CUSTODY_TIMEOUT_MS ?? "30000"),
-	},
+	custody: { ceremonyTimeoutMs: Number(process.env.GAVL_CUSTODY_TIMEOUT_MS ?? "30000") },
 });
 
 // ── local fleet: up/down extra independent nodes on this machine, driven by the UI stepper ───────

@@ -39,7 +39,7 @@ function makeView(rev = false): View {
 		{ id: "burn1", owner: "aa", amount: 12n, btcAddress: "bc1qaa", fee: 500n },
 		{ id: "burn2", owner: "bb", amount: 31n, btcAddress: "bc1qbb", fee: 700n },
 	]; // pending is FIFO — order is itself state, NOT reversed
-	return { bridge, custody: { fundKey: "deadbeef", epoch: 0, excluded } };
+	return { bridge, custody: { fundKey: "deadbeef", epoch: 0, excluded, holder: { epoch: 2, committee: ["aa", "bb", "cc"], min: 2, since: 17 }, prevHolder: { epoch: 0, committee: ["aa", "bb"], min: 2, since: 3 }, fundVotes: new Map([["02ab|1|aa,bb,cc|2", ["aa", "cc"]]]) } };
 }
 
 test("viewRoot is independent of Map/Set insertion order", () => {
@@ -73,7 +73,7 @@ test("a single changed balance changes the root", () => {
 });
 
 test("empty view has a stable, defined root", () => {
-	const empty: View = { bridge: emptyBridge(), custody: { fundKey: null, epoch: -1, excluded: new Map() } };
+	const empty: View = { bridge: emptyBridge(), custody: { fundKey: null, epoch: -1, excluded: new Map(), holder: null, prevHolder: null, fundVotes: new Map() } };
 	assert.equal(viewRoot(empty), viewRoot(empty));
 	assert.match(viewRoot(empty), /^[0-9a-f]{64}$/);
 });

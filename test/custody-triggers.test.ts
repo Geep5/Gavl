@@ -19,24 +19,20 @@ import { computeView } from "../src/market/btc.ts";
 import { pendingClaims, unsentWithdrawals, inFlightWithdrawals } from "../src/custody/bridge.ts";
 import { PARAMS, K, TestFund } from "./helpers.ts";
 
+// One committee fund, seeded into every fold's base; deposits are minted against it with quorum sigs.
+const TF = new TestFund();
+
 function setup() {
 	const node = new GavlNode(new Ledger(PARAMS));
 	let t = 0;
 	const now = () => ++t;
 	const acct = () => new Account({ node, params: PARAMS, k: K, now }); // fresh identity each call
-	// Committee-mint helper: announce one fund key, then mint quorum-signed deposits against it.
-	const tf = new TestFund();
-	let announced = false;
 	const fund = async (depositor: string, amount: bigint, depositId?: string) => {
-		if (!announced) {
-			announced = true;
-			await tf.announce(acct());
-		}
-		await tf.fund(acct(), depositor, amount, depositId);
+		await TF.fund(acct(), depositor, amount, depositId);
 	};
 	return { node, acct, fund };
 }
-const bridge = (node: GavlNode) => computeView(node.ledger.allWrites()).bridge;
+const bridge = (node: GavlNode) => computeView(node.ledger.allWrites(), { base: TF.seed() }).bridge;
 
 test("a claim is an outstanding mint request until its deposit is minted", async () => {
 	const { node, acct, fund } = setup();

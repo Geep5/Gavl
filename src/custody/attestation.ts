@@ -29,3 +29,12 @@ export function depositAttestationDigest(d: { depositId: string; depositor: stri
 export function settleAttestationDigest(s: { withdrawalId: string }): Uint8Array {
 	return sha256(concatBytes(SETTLE_TAG, canonicalBytes({ withdrawalId: s.withdrawalId })));
 }
+
+const HANDOFF_TAG = new TextEncoder().encode("gavl-custody-handoff-v1");
+
+/** The 32-byte message a NEW committee signs (with its new shares) to record that it holds the fund
+ *  key after epoch `epoch`'s reshare. Binds the group key so a record can't be replayed onto another
+ *  fund; `committee` must be the sorted id list exactly as posted in custody.handoff. */
+export function handoffDigest(h: { groupKey: string; epoch: number; committee: string[]; min: number }): Uint8Array {
+	return sha256(concatBytes(HANDOFF_TAG, canonicalBytes({ groupKey: h.groupKey, epoch: h.epoch, committee: h.committee, min: h.min })));
+}

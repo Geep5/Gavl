@@ -62,14 +62,16 @@ export class MemoryNetwork {
 		return id;
 	}
 
-	/** Connect two nodes with a bidirectional in-memory link. */
-	link(a: GavlNode, b: GavlNode): void {
+	/** Connect two nodes with a bidirectional in-memory link. Returns a function that severs it
+	 *  (both sides see the close) — for partition tests. */
+	link(a: GavlNode, b: GavlNode): () => void {
 		const ca = new MemoryConnection(this, this.idOf(b)); // a's view of b → peerKey = b's id
 		const cb = new MemoryConnection(this, this.idOf(a));
 		ca.peer = cb;
 		cb.peer = ca;
 		a.addPeer(ca);
 		b.addPeer(cb);
+		return () => ca.close();
 	}
 
 	/** @internal */

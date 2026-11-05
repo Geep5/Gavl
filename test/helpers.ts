@@ -7,12 +7,17 @@ import { Plot } from "../src/pos/space.ts";
 import { StandinSpaceProver, StandinSpaceVerifier } from "../src/consensus/space.ts";
 import type { SpaceProver } from "../src/consensus/space.ts";
 import type { KeyPair } from "../src/det/ed25519.ts";
-import type { View } from "../src/market/btc.ts";
+import { computeView, holderAt, custodyRules } from "../src/market/btc.ts";
+import type { AnchorView, CustodyParams } from "../src/custody/epoch.ts";
+import type { View, CustodyState } from "../src/market/btc.ts";
+import type { Op } from "../src/market/ops.ts";
+import type { RotationConfig } from "../src/custody/rotation.ts";
+import type { StoredShare } from "../src/custody/share-store.ts";
 import { mintFromDeposit } from "../src/custody/bridge.ts";
 import { generateFundKeyDKG, thresholdSign, quorumOf } from "../src/custody/threshold.ts";
 import type { FundKey } from "../src/custody/threshold.ts";
 import { depositAttestationDigest } from "../src/custody/attestation.ts";
-import { toHex } from "../src/det/canonical.ts";
+import { toHex, fromHex } from "../src/det/canonical.ts";
 import type { Account } from "../src/market/account.ts";
 
 /** Seed gBTC balances directly into a fold base. Minting is committee-gated now (a threshold sig
@@ -25,9 +30,10 @@ export function withGbtc(base: View, balances: Record<string, bigint>): View {
 	return base;
 }
 
-/** A test committee fund: a DKG'd group key you announce on-chain, then mint against with a
- *  threshold signature — the real authorization path now that the single-attestor fallback is gone.
- *  `announce()` must fold BEFORE any `fund()` deposit (it carries the earliest ts when produced first). */
+/** A test committee fund: a DKG'd group key seeded into a fold base (as a settled genesis
+ *  custody.fund would leave it — the real announce needs the chain-sampled committee's unanimous
+ *  endorsement, see custody-handoff.test.ts), then minted against with a threshold signature — the
+ *  real authorization path now that the single-attestor fallback is gone. */
 export class TestFund {
 	readonly key: FundKey;
 	private n = 0;
@@ -37,9 +43,13 @@ export class TestFund {
 	get groupKeyHex(): string {
 		return toHex(this.key.groupPubKey);
 	}
-	/** Announce the group key on-chain via `announcer` (any account; first-write-wins). */
-	announce(announcer: Account, epoch = 1) {
-		return announcer.announceFund(this.groupKeyHex, epoch);
+	/** `base` (default: empty) with this fund established at `epoch` and its dealt identifiers as the
+	 *  genesis holder. Mutates and returns `base`. */
+	seed(base: View = computeView([]), epoch = 1): View {
+		base.custody.fundKey = this.groupKeyHex;
+		base.custody.epoch = epoch;
+		base.custody.holder = { epoch, committee: Object.keys(this.key.shares).sort(), min: this.key.min, since: 0 };
+		return base;
 	}
 	/** A quorum-signed `bridge.deposit` minting `amount` to `depositor`, relayed by `via` (any node).
 	 *  `depositId` defaults to a fresh outpoint; pass one to satisfy a specific claim. */
@@ -86,4 +96,60 @@ export async function waitFor(pred: () => boolean, ms: number): Promise<void> {
 		await new Promise((r) => setTimeout(r, 100));
 	}
 	throw new Error(`waitFor: condition not met within ${ms}ms`);
+}
+
+/**
+ * The custody slice of the chain, for rotation tests that drive CommitteeRotation without a full
+ * daemon: every publishFund / publishHandoff becomes a write BY THAT NODE (its id is its producer
+ * key) folded by the REAL fold (computeView + custodyRules over `chainAt(height)` with the network's
+ * CustodyParams), certified at `height` (set it to where the record would land). holderAt /
+ * handoffRecorded read the folded state. Shares live in a per-node, per-epoch map like the daemon's
+ * ShareStore.
+ */
+export class CustodyLedger {
+	height = 0;
+	private readonly writes: Write[] = [];
+	private readonly bornAt = new Map<string, number>();
+	readonly shares = new Map<string, Map<number, StoredShare>>();
+	private readonly chainAt: (height: number) => AnchorView[];
+	private readonly params: CustodyParams;
+
+	constructor(chainAt: (height: number) => AnchorView[], params: CustodyParams) {
+		this.chainAt = chainAt;
+		this.params = params;
+	}
+
+	custody(): CustodyState {
+		return computeView(this.writes, { bornAt: this.bornAt, nowHeight: this.height, custodyRules: custodyRules(this.chainAt(this.height), this.params, true) }).custody;
+	}
+	private post(writer: string, payload: Op): void {
+		const id = `w${this.writes.length}`;
+		this.writes.push({ id, writer, seq: this.writes.length, ts: this.writes.length, payload } as unknown as Write);
+		this.bornAt.set(id, this.height);
+	}
+	share(id: string, epoch: number): StoredShare | null {
+		return this.shares.get(id)?.get(epoch) ?? null;
+	}
+	/** The RotationConfig callbacks for node `id`. */
+	hooks(id: string): Pick<RotationConfig, "groupKey" | "fundEpoch" | "holderAt" | "handoffRecorded" | "publishFund" | "publishHandoff" | "loadShare" | "saveShare"> {
+		return {
+			groupKey: () => {
+				const k = this.custody().fundKey;
+				return k ? fromHex(k) : null;
+			},
+			fundEpoch: () => {
+				const e = this.custody().epoch;
+				return e >= 0 ? e : null;
+			},
+			holderAt: (h) => holderAt(this.custody(), h),
+			handoffRecorded: (epoch) => (this.custody().holder?.epoch ?? -1) >= epoch,
+			publishFund: (key, epoch, committee, min) => this.post(id, { kind: "custody.fund", groupKey: toHex(key), epoch, committee: [...committee].sort(), min }),
+			publishHandoff: (epoch, committee, min, sig) => this.post(id, { kind: "custody.handoff", epoch, committee, min, sig: toHex(sig) }),
+			loadShare: (epoch) => this.share(id, epoch),
+			saveShare: (s) => {
+				if (!this.shares.has(id)) this.shares.set(id, new Map());
+				this.shares.get(id)!.set(s.epoch, s);
+			},
+		};
+	}
 }

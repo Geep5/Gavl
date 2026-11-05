@@ -23,15 +23,20 @@ import { join } from "node:path";
 import { Daemon } from "../src/daemon.ts";
 import { MemoryNetwork } from "../src/sync/memory.ts";
 import { HashVdf } from "../src/pot/hash-vdf.ts";
-import { toHex } from "../src/det/canonical.ts";
+import { toHex, fromHex } from "../src/det/canonical.ts";
+import { depositAttestationDigest } from "../src/custody/attestation.ts";
+import { thresholdSign, verify } from "../src/custody/threshold.ts";
+import { gbtcOf } from "../src/market/btc.ts";
 import type { ChainParams } from "../src/chain/writer.ts";
 import { waitFor } from "./helpers.ts";
 
 const NETWORK = "gavl-dkg-genesis-test";
 const EPOCH = 8;
 
+/** The network's consensus params — custody sampling included (epoch length, K_MAX 4, window, min 3,
+ *  genesis 3), identical on every node, exactly as the fold checks custody records against them. */
 function params(): ChainParams {
-	return { vdf: new HashVdf(), difficulty: 20n, dcf: 1n << 20n, floorIters: 500n };
+	return { vdf: new HashVdf(), difficulty: 20n, dcf: 1n << 20n, floorIters: 500n, custody: { epochLength: EPOCH, size: 4, windowAnchors: 2 * EPOCH, minCommittee: 3, genesisSize: 3 } };
 }
 
 test("3 farmers DKG the genesis fund key; a later epoch reshares it to a re-sampled committee (same key)", { timeout: 240_000 }, async () => {
@@ -44,6 +49,8 @@ test("3 farmers DKG the genesis fund key; a later epoch reshares it to a re-samp
 	const narration: string[] = []; // the daemons narrate every epoch — kept quiet, dumped only on failure
 	const t0 = Date.now();
 	console.log = (...a: unknown[]) => void narration.push(`[${((Date.now() - t0) / 1000).toFixed(1)}s] ${a.join(" ")}`);
+	const warn = console.warn;
+	console.warn = console.log; // payout attempts warn against the (deliberately dead) explorer every tick
 	const spawn = async (): Promise<Daemon> => {
 		const dir = mkdtempSync(join(tmpdir(), "gavl-dkg-"));
 		dirs.push(dir);
@@ -51,9 +58,8 @@ test("3 farmers DKG the genesis fund key; a later epoch reshares it to a re-samp
 			walletDir: dir,
 			params: params(),
 			network: NETWORK,
-			finalityDepth: 3, // depth-1 sticky finality lets two concurrent same-height anchors lock a permanent 2-vs-2 split
 			heartbeatMs: 1_000, // keep anchors flowing after genesis; epochs (8 anchors) stay well above ceremony time
-			custody: { epochLength: EPOCH, minCommittee: 3, genesisSize: 3, size: 4, ceremonyTimeoutMs: 10_000 },
+			custody: { ceremonyTimeoutMs: 10_000 },
 		});
 		await d.startConsensus({ network: NETWORK, mesh: false, farm: true });
 		for (const other of daemons) net.link(d.node, other.node);
@@ -83,6 +89,40 @@ test("3 farmers DKG the genesis fund key; a later epoch reshares it to a re-samp
 		const addr = genesisNodes[0].fundAddress();
 		assert.ok(addr && addr.startsWith("tb1p"), "testnet P2TR fund address");
 
+		// ── payouts key off SETTLEMENT: a burn that is soft-final but not yet settled is never in the
+		//    set the committee signs BTC payouts for; once settled, it is ──
+		const user = genesisNodes[0].createAccount("user");
+		const deposit = { depositId: "ab".repeat(32) + ":0", depositor: user.pubHex, amount: 50_000n };
+		const digest = depositAttestationDigest(deposit);
+		let mintSig: Uint8Array | null = null;
+		await waitFor(() => {
+			// a 2-of-3 quorum of the holders' CURRENT shares (all from the same ceremony epoch)
+			const shares = genesisNodes.map((d) => d.committeeShare()!).filter(Boolean);
+			const epoch = shares[0]?.epoch;
+			const quorum = shares.filter((s) => s.epoch === epoch).slice(0, 2);
+			if (quorum.length < 2) return false;
+			const sig = thresholdSign(digest, quorum[0].pub, Object.fromEntries(quorum.map((s) => [s.share.identifier, s.share])));
+			if (!verify(sig, digest, fromHex(fundKey))) return false;
+			mintSig = sig;
+			return true;
+		}, 30_000);
+		await user.attestDeposit(deposit.depositId, deposit.depositor, deposit.amount, toHex(mintSig!));
+		await waitFor(() => gbtcOf(genesisNodes[0].view(), user.pubHex) === deposit.amount, 30_000);
+		const burn = await user.withdraw(20_000n, "tb1qexampleexampleexampleexampleexample");
+		const watcher = genesisNodes[0];
+		let softOnly = false; // observed: in the soft-final view, NOT in the payable (settled) set
+		// Real daemons farm on the real clock, so this polls (tightly: the soft-final-but-unsettled window
+		// is only the few anchors between finality depth and settlement depth).
+		const deadline = Date.now() + 60_000;
+		while (!watcher.payableWithdrawals().some((w) => w.id === burn.id)) {
+			if (watcher.finalView().bridge.pending.some((w) => w.id === burn.id)) softOnly = true;
+			if (Date.now() > deadline) throw new Error("the burn never settled");
+			await new Promise((r) => setTimeout(r, 5));
+		}
+		assert.ok(softOnly, "while only soft-final, the burn was NOT payable");
+		assert.ok((watcher.consensus().settledHeight ?? -1) >= 0, "settled height is reported");
+		assert.equal(watcher.consensus().settlementConflict, null, "no settlement conflict on a healthy network");
+
 		// ── churn: a 4th farmer joins; once it farms inside the eligibility window, a later epoch's
 		//    re-sampled committee includes it and the reshare hands it a share of the SAME key ──
 		const late = await spawn();
@@ -95,6 +135,9 @@ test("3 farmers DKG the genesis fund key; a later epoch reshares it to a re-samp
 		const s = late.committeeShare()!;
 		assert.equal(toHex(s.groupPubKey), fundKey, "the reshare handed the newcomer a share of the SAME group key");
 		assert.ok(s.epoch! > genesisEpoch, "via a later epoch's reshare");
+		const holder = late.finalView().custody.holder!;
+		assert.ok(holder.epoch >= s.epoch!, "the newcomer's share is the one a FINALIZED handoff record names (or a later one has landed since)");
+		assert.ok(holder.committee.includes(lateId) || holder.epoch > s.epoch!, "the recorded holder committee includes the newcomer");
 		assert.ok(s.participants.some((id) => !genesisMembers.includes(id)), "the committee was re-sampled (not the genesis set)");
 		// every node still holding a share holds one for the same key; the fund never moved
 		for (const d of daemons) {
@@ -113,6 +156,7 @@ test("3 farmers DKG the genesis fund key; a later epoch reshares it to a re-samp
 		throw e;
 	} finally {
 		console.log = log;
+		console.warn = warn;
 		await Promise.all(daemons.map((d) => d.stop()));
 		for (const d of dirs) rmSync(d, { recursive: true, force: true });
 		delete process.env.GAVL_BOOTSTRAP_PACE_MS;
