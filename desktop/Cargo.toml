@@ -1,0 +1,17 @@
+[package]
+name = "gavl-desktop"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Native Gavl desktop client (GPUI Kit on GPUI Fast) for the local Gavl daemon."
+
+[[bin]]
+name = "gavl-desktop"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit = { version = "0.9", features = ["gpui-fast"] }
+ureq = { version = "3", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

@@ -189,6 +189,19 @@ and the web UI. No Python for the proofs? `npm run dev:hash` swaps in the fast s
 Peers find each other automatically through the shipped default relays; point at your own with
 `GAVL_RELAYS=wss://a,wss://b`. The daemon fails fast and loud if it can't reach any relay.
 
+### Desktop app (`desktop/`)
+
+A native client for the same daemon API, built with [GPUI Kit](https://gpui-kit.com) on
+[GPUI Fast](https://github.com/longbridge/gpui-fast). It has the same features as the web UI,
+arranged as five pages: **Rounds · Wallet · Network · Custody · Node**. The network's health stays
+in the title bar, and block/peer details sit in the status bar. Start the daemon first, then:
+
+```bash
+cd desktop && cargo run --release   # stable Rust (pinned by desktop/rust-toolchain.toml)
+```
+
+`GAVL_API=http://host:port` points it at a daemon other than `http://127.0.0.1:6440`.
+
 ## Multi-node (the committee)
 
 Custody needs **≥3 nodes actually FARMING** (a merely-connected node doesn't count). On every machine:
@@ -255,6 +268,7 @@ src/
   daemon.ts      boots ledger + node + store + consensus + price relay + bridge
   server.ts      localhost JSON API for the web UI
 web/             Svelte SPA — the 1-click bull/bear rounds UI
+desktop/         native Rust client (GPUI Kit + GPUI Fast) for the same daemon API
 ```
 
 ---
