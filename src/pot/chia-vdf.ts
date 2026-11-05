@@ -33,4 +33,13 @@ export class ChiaVdf implements Vdf {
 		);
 		return res.ok === true;
 	}
+
+	/** Same check as `verify`, off the event loop — used on the async anchor-ingestion path. */
+	async verifyAsync(challenge: Uint8Array, proof: TimeProof): Promise<boolean> {
+		const res = await chiaCallAsync(
+			{ cmd: "vdf_verify", challenge: Buffer.from(challenge).toString("hex"), iters: proof.iters, proof: proof.proof },
+			this.paths,
+		);
+		return res.ok === true;
+	}
 }

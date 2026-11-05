@@ -1,8 +1,9 @@
 /**
  * Bridge to the real Chia primitives (chiavdf / chiapos) via a Python helper.
  *
- * Calls are synchronous (spawnSync) so they fit the synchronous Vdf interface —
- * the VDF is CPU-bound anyway, so blocking is fine for a producer/writer. The
+ * `chiaCall` is synchronous (spawnSync) for the synchronous `Vdf.verify` interface and one-time
+ * setup; anything on the node's hot path (VDF eval, PoS prove/verify, anchor VDF verify) uses
+ * `chiaCallAsync` so the daemon keeps serving its API and gossip while the helper runs. The
  * helper paths default to the in-repo venv but can be overridden by env vars
  * (GAVL_CHIA_PYTHON / GAVL_CHIA_HELPER) for a system install.
  */
@@ -38,8 +39,7 @@ export function chiaCall(req: unknown, paths: ChiaPaths = {}): any {
 
 /**
  * Async variant — runs the helper without blocking the event loop, so a node
- * can keep gossiping while a long VDF computes in the subprocess. Used by the
- * VDF `eval` path (the one operation that genuinely takes wall-clock time).
+ * keeps serving its API and gossiping while the helper runs.
  */
 export function chiaCallAsync(req: unknown, paths: ChiaPaths = {}): Promise<any> {
 	const python = paths.python ?? DEFAULT_PYTHON;

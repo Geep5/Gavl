@@ -11,7 +11,7 @@
  * async; the underlying bridge call is sync (CPU-bound), wrapped in a Promise.
  */
 
-import { chiaCall } from "../chia/proc.ts";
+import { chiaCall, chiaCallAsync } from "../chia/proc.ts";
 import type { ChiaPaths } from "../chia/proc.ts";
 import { sha256, toHex, fromHex, concatBytes, u32be } from "../det/canonical.ts";
 import type { SpaceCommitment, SpaceProver, SpaceVerifier, MinedProof } from "../consensus/space.ts";
@@ -45,7 +45,7 @@ export class ChiaSpaceProver implements SpaceProver {
 	}
 
 	async prove(challenge: Uint8Array): Promise<MinedProof | null> {
-		const res = chiaCall({ cmd: "pos_prove", path: this.plotPath, challenge: toHex(challenge) }, this.paths);
+		const res = await chiaCallAsync({ cmd: "pos_prove", path: this.plotPath, challenge: toHex(challenge) }, this.paths);
 		if (!res.proof || !res.quality) return null;
 		return { proof: res.proof as string, quality: res.quality as string };
 	}
@@ -61,7 +61,7 @@ export class ChiaSpaceVerifier implements SpaceVerifier {
 		if (commitment.kind !== "chiapos" || typeof proof !== "string") return { ok: false };
 		// The committed plot id must be the producer's canonical plot (identity binding).
 		if (commitment.id !== plotIdFor(producer, commitment.k)) return { ok: false };
-		const res = chiaCall({ cmd: "pos_verify", plotId: commitment.id, k: commitment.k, challenge: toHex(challenge), proof }, this.paths);
+		const res = await chiaCallAsync({ cmd: "pos_verify", plotId: commitment.id, k: commitment.k, challenge: toHex(challenge), proof }, this.paths);
 		return res.quality ? { ok: true, quality: res.quality as string } : { ok: false };
 	}
 }
