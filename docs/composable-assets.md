@@ -1,7 +1,7 @@
 # Composable Assets (design note)
 
-Status: **proposal — not yet implemented.** This is for review before any change to
-the consensus-critical `ops.ts` / `state.ts`.
+Status: **superseded by [`runtime.md`](runtime.md)** (kernel feeds + app storage replace the
+asset facets). Kept for the reasoning.
 
 ## The idea
 
