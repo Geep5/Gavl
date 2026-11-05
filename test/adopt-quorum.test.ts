@@ -17,53 +17,43 @@ import { MemoryNetwork } from "../src/sync/memory.ts";
 import { AnchorChain } from "../src/consensus/chain.ts";
 import { mineAnchor } from "../src/consensus/anchor.ts";
 import type { Anchor } from "../src/consensus/anchor.ts";
-import { Account } from "../src/market/account.ts";
-import { computeView, viewAtAnchor } from "../src/market/btc.ts";
-import { serializeView, deserializeView, viewRoot } from "../src/market/state.ts";
-import type { View } from "../src/market/btc.ts";
+import { serializeView, deserializeView, viewRoot, emptyView } from "../src/market/state.ts";
 import type { StoredSnapshot } from "../src/store/store.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
+import { Account, PARAMS, K, STANDIN_VERIFIER, standinProver } from "./helpers.ts";
 
 /** Build a server: writes + an anchor chain, then prune BOTH to a checkpoint (genesis gone).
- *  Returns the pruned node, the checkpoint snapshot, and the full pre-prune view for comparison. */
-async function buildServer(): Promise<{ snapshot: StoredSnapshot; full: { writes: any[]; anchors: Anchor[]; root: string; view: View } }> {
+ *  Returns the checkpoint snapshot and the full pre-prune writes/anchors/root for comparison. */
+async function buildServer(): Promise<{ snapshot: StoredSnapshot; full: { writes: any[]; anchors: Anchor[]; root: string } }> {
 	const S = new GavlNode(new Ledger(PARAMS), new AnchorChain(PARAMS, STANDIN_VERIFIER, { finalityDepth: 1 }));
 	let t = 0;
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node: S, params: PARAMS, k: K, now, keypair: kp });
 	const poster = mk();
-	// gBTC is committee-gated now, so balances live in the fold base (withGbtc), not in a sig-less
-	// deposit write. This test is about adoption/appRoot, not mint authorization — it just needs the
-	// gBTC to EXIST in the SAME base the appRoot, snapshot state, and B's reconstruction all fold from.
-	const balances: Record<string, bigint> = {};
-	const fund = (a: Account, amt: bigint) => (balances[a.pubHex] = (balances[a.pubHex] ?? 0n) + amt);
-	const base = () => withGbtc(computeView([]), balances); // a FRESH base each call (withGbtc mutates it)
+	// The app state is empty, so every anchor commits the same appRoot; this test is about adoption.
+	const appRoot = viewRoot(emptyView());
 	const m = generateKeyPair();
 	const prover = standinProver(m);
 	const mineOn = async (): Promise<void> => {
 		const prev = S.anchorTip();
-		const all = S.ledger.allWrites();
-		const appRoot = prev ? viewRoot(viewAtAnchor(all, S.anchors!, prev.id, base())) : viewRoot(computeView([], { base: base() }));
 		const a = (await mineAnchor({ prev, prevHeads: prev ? S.anchors!.headsAt(prev.id) : {}, producer: m, prover, heads: S.ledger.heads(), params: PARAMS, appRoot }))!;
 		await S.submitAnchor(a);
 	};
 	const acctA = mk();
 	const acctB = mk();
 	await poster.noop(); // a write from a third account
-	fund(acctA, 5000n);
-	fund(acctB, 5000n);
-	await acctA.transfer(acctB.pubHex, 700n);
+	await acctA.noop();
+	await acctB.noop();
 	await mineOn();
 	await mineOn();
-	await acctA.transfer(acctB.pubHex, 50n);
+	await acctA.noop();
 	await mineOn();
 	await mineOn();
 
-	const full = { writes: S.ledger.allWrites(), anchors: S.anchors!.chainTo(), root: S.ledger.stateRoot(), view: computeView(S.ledger.allWrites(), { base: base() }) };
+	const full = { writes: S.ledger.allWrites(), anchors: S.anchors!.chainTo(), root: S.ledger.stateRoot() };
 	const ckpt = S.anchors!.finalized(2)!;
 	const heads = S.anchors!.headsAt(ckpt.id);
-	const snapshot: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(viewAtAnchor(full.writes, S.anchors!, ckpt.id, base())) };
+	const snapshot: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(emptyView()) };
 	return { snapshot, full };
 }
 
@@ -135,7 +125,7 @@ test("a fresh node adopts only when a QUORUM of distinct peers offers the same c
 
 	assert.ok(seeded(), "B bootstrapped once two peers vouched for the checkpoint");
 	assert.equal(B.ledger.stateRoot(), full.root, "B reached the servers' full state");
-	assert.equal(viewRoot(computeView(B.ledger.allWrites(), { base: deserializeView(snapshot.state) })), viewRoot(full.view), "B's view matches");
+	assert.equal(viewRoot(deserializeView(snapshot.state)), viewRoot(emptyView()), "the adopted checkpoint state is the (empty) committed app state");
 });
 
 test("a fresh node REFUSES to adopt on a single peer's say-so when quorum is 2", async () => {

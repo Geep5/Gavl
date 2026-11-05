@@ -22,8 +22,7 @@ import { join } from "node:path";
 import type { Write } from "../chain/writer.ts";
 import type { Heads } from "../ledger/ledger.ts";
 import type { CanonState } from "../market/state.ts";
-import type { PersistPolicy, PolicyContext } from "./policy.ts";
-import { decode, recordKept } from "./policy.ts";
+import type { PersistPolicy } from "./policy.ts";
 
 /** A durable state checkpoint: the appRoot-certified view at a finalized anchor, plus the
  *  heads it covers. Loaded on boot so the node resumes from state instead of replaying. */
@@ -44,7 +43,6 @@ export interface StoreOptions {
 export class WriteStore {
 	private readonly db: DatabaseSync;
 	private readonly policy: PersistPolicy;
-	private readonly ctx: PolicyContext = { op: null, keptPositions: new Set() };
 	private readonly insWrite: ReturnType<DatabaseSync["prepare"]>;
 	private readonly insSnap: ReturnType<DatabaseSync["prepare"]>;
 	private kept = 0;
@@ -78,10 +76,7 @@ export class WriteStore {
 	 */
 	async persist(write: Write): Promise<boolean> {
 		this.seen++;
-		const op = decode(write);
-		this.ctx.op = op;
-		if (!this.policy.keep(write, this.ctx)) return false;
-		recordKept(write, op, this.ctx); // hook so writes that later reference this one are kept too
+		if (!this.policy.keep(write)) return false;
 		this.insWrite.run(write.writer, write.seq, JSON.stringify(write));
 		this.kept++;
 		return true;

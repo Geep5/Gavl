@@ -1,8 +1,8 @@
 /**
- * Esplora endpoint failover — the custody bridge must survive a block-explorer outage (a dead
- * mempool.space testnet API blocked deposit verification fleet-wide). Dead/5xx endpoints fail over;
- * 4xx (a real answer) does not; the endpoint that worked is remembered so steady-state calls don't
- * re-pay a dead endpoint's timeout.
+ * Esplora endpoint failover — a swap daemon must survive a block-explorer outage (a claim or refund
+ * has to land before its timelock window closes). Dead/5xx endpoints fail over; 4xx (a real answer)
+ * does not; the endpoint that worked is remembered so steady-state calls don't re-pay a dead
+ * endpoint's timeout.
  *
  *   node --test test/esplora-failover.test.ts
  */
@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { Esplora, btcNetFromEnv, esploraBasesFromEnv } from "../src/custody/esplora.ts";
+import { DEFAULT_BASES, Esplora, esploraBasesFromEnv, netFromEnv } from "../src/chains/esplora.ts";
 
 const TX = { txid: "ab".repeat(32), vout: [{ value: 1234 }], status: { confirmed: true, block_height: 5 } };
 
@@ -70,24 +70,35 @@ test("all endpoints dead → one descriptive error naming them", async () => {
 	await assert.rejects(() => es.getTx(TX.txid), /all endpoints failed/);
 });
 
-test("GAVL_BTC_NET: regtest/signet/mainnet explicit, anything else is testnet", () => {
-	assert.equal(btcNetFromEnv("regtest"), "regtest");
-	assert.equal(btcNetFromEnv("signet"), "signet");
-	assert.equal(btcNetFromEnv("mainnet"), "mainnet");
-	assert.equal(btcNetFromEnv(undefined), "testnet");
-	assert.equal(btcNetFromEnv("bogus"), "testnet", "mainnet is never selected implicitly");
+test("GAVL_{BTC,LTC}_NET: regtest/mainnet explicit, anything else is testnet", () => {
+	for (const chain of ["bitcoin", "litecoin"] as const) {
+		assert.equal(netFromEnv(chain, "regtest"), "regtest");
+		assert.equal(netFromEnv(chain, "mainnet"), "mainnet");
+		assert.equal(netFromEnv(chain, undefined), "testnet");
+		assert.equal(netFromEnv(chain, "bogus"), "testnet", "mainnet is never selected implicitly");
+	}
 });
 
-test("GAVL_ESPLORA_URL: comma-separated bases, trimmed, trailing slash dropped; unset → defaults", async () => {
-	assert.deepEqual(esploraBasesFromEnv(" http://127.0.0.1:3002/ ,http://h:1/api//,"), ["http://127.0.0.1:3002", "http://h:1/api"]);
-	assert.equal(esploraBasesFromEnv(undefined), undefined);
-	assert.equal(esploraBasesFromEnv(" , "), undefined);
+test("per-chain defaults: litecoin talks to litecoinspace, bitcoin to mempool.space/blockstream", () => {
+	assert.deepEqual(DEFAULT_BASES.litecoin.mainnet, ["https://litecoinspace.org/api"]);
+	assert.deepEqual(DEFAULT_BASES.litecoin.testnet, ["https://litecoinspace.org/testnet/api"]);
+	assert.equal(DEFAULT_BASES.bitcoin.mainnet[0], "https://mempool.space/api");
+	const ltc = new Esplora({ chain: "litecoin" });
+	assert.equal(ltc.chain, "litecoin");
+	assert.equal(ltc.net, "testnet");
+});
+
+test("GAVL_{BTC,LTC}_ESPLORA_URL: comma-separated bases, trimmed, trailing slash dropped; unset → defaults", async () => {
+	assert.deepEqual(esploraBasesFromEnv("bitcoin", " http://127.0.0.1:3002/ ,http://h:1/api//,"), ["http://127.0.0.1:3002", "http://h:1/api"]);
+	assert.equal(esploraBasesFromEnv("litecoin", undefined), undefined);
+	assert.equal(esploraBasesFromEnv("bitcoin", " , "), undefined);
 	const live = await mock();
-	const es = new Esplora({ net: "regtest", bases: esploraBasesFromEnv(`${live.url}/`) });
+	const es = new Esplora({ chain: "litecoin", net: "regtest", bases: esploraBasesFromEnv("litecoin", `${live.url}/`) });
 	assert.equal((await es.getTx(TX.txid))?.txid, TX.txid, "the override base is the one queried");
 	live.close();
 });
 
 test("regtest has no public explorer — without an override it fails loudly", async () => {
-	await assert.rejects(() => new Esplora({ net: "regtest" }).tipHeight(), /no endpoint for regtest — set GAVL_ESPLORA_URL/);
+	await assert.rejects(() => new Esplora({ net: "regtest" }).tipHeight(), /no endpoint for bitcoin regtest — set GAVL_BTC_ESPLORA_URL/);
+	await assert.rejects(() => new Esplora({ chain: "litecoin", net: "regtest" }).tipHeight(), /no endpoint for litecoin regtest — set GAVL_LTC_ESPLORA_URL/);
 });

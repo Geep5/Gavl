@@ -16,9 +16,7 @@ import { AnchorChain } from "../src/consensus/chain.ts";
 import { mineAnchor } from "../src/consensus/anchor.ts";
 import type { Anchor } from "../src/consensus/anchor.ts";
 import { Producer } from "../src/consensus/producer.ts";
-import { Account } from "../src/market/account.ts";
-import { computeView, finalizedView, gbtcOf } from "../src/market/btc.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
+import { Account, PARAMS, K, STANDIN_VERIFIER, standinProver } from "./helpers.ts";
 
 function miner() {
 	const keypair = generateKeyPair();
@@ -67,7 +65,7 @@ test("two producers converge on a single heaviest anchor chain", async () => {
 	assert.ok(A.anchorTip()!.height >= 3, "the agreed chain advanced");
 });
 
-test("a gBTC balance finalizes from gossiped anchors on the other node", async () => {
+test("a write finalizes from gossiped anchors on the other node", async () => {
 	const A = consensusNode();
 	const B = consensusNode();
 	const net = new MemoryNetwork();
@@ -77,10 +75,10 @@ test("a gBTC balance finalizes from gossiped anchors on the other node", async (
 	let ts = 0;
 	const now = () => ++ts;
 	const alice = new Account({ node: A, params: PARAMS, k: K, now });
-
-	// alice is funded with gBTC (seeded into the fold base — the snapshot both nodes resume from).
-	const balances = { [alice.pubHex]: 2000n };
+	await alice.noop();
 	await net.idle();
+	assert.equal(B.ledger.stateRoot(), A.ledger.stateRoot(), "B replicated alice's write");
+	assert.equal(B.anchors!.headsCovered(B.ledger.heads(), 1), false, "not yet finalized before any anchor");
 
 	const pa = new Producer({ node: A, ...miner(), params: PARAMS });
 	for (let i = 0; i < 3; i++) {
@@ -89,6 +87,8 @@ test("a gBTC balance finalizes from gossiped anchors on the other node", async (
 	}
 
 	assert.equal(B.anchorTip()!.id, A.anchorTip()!.id, "anchor tips converged over gossip");
-	const vb = finalizedView(B.ledger.allWrites(), B.anchors!, 1, withGbtc(computeView([]), balances));
-	assert.equal(gbtcOf(vb, alice.pubHex), 2000n, "B finalized alice's gBTC via gossip");
+	const fin = B.anchors!.finalizedHeads(1);
+	assert.ok(fin[alice.pubHex], "B's finalized heads include alice");
+	assert.deepEqual(fin[alice.pubHex], A.ledger.heads()[alice.pubHex], "B finalized alice's write via gossip");
+	assert.equal(B.anchors!.headsCovered(A.ledger.heads(), 1), true);
 });

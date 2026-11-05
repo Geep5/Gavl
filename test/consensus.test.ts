@@ -14,13 +14,11 @@ import assert from "node:assert/strict";
 import { generateKeyPair } from "../src/det/ed25519.ts";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
-import { Account } from "../src/market/account.ts";
-import { computeView, gbtcOf, finalizedView } from "../src/market/btc.ts";
 import { mineAnchor, verifyAnchor } from "../src/consensus/anchor.ts";
 import type { Anchor } from "../src/consensus/anchor.ts";
 import { AnchorChain } from "../src/consensus/chain.ts";
 import { retarget } from "../src/consensus/difficulty.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
+import { Account, PARAMS, K, STANDIN_VERIFIER, standinProver } from "./helpers.ts";
 
 function miner() {
 	const keypair = generateKeyPair();
@@ -116,28 +114,30 @@ test("finalized order is anchor-bound, neutralizing the ts-ordering attack", asy
 	const B = new Account({ node, params: PARAMS, k: K, now });
 	const C = new Account({ node, params: PARAMS, k: K, now });
 
-	// A is funded (gBTC, seeded into the fold base) and forwards to B with a LATE ts; B then
-	// forwards more than it could hold without A's funding, with an EARLY ts.
-	const balances = { [A.pubHex]: 2_000n };
+	// A writes with a LATE ts and is anchored first; B then writes with an EARLY ts and is
+	// anchored second. Finalized order follows the anchors, not the self-declared ts.
 	ts = 100;
-	await A.transfer(B.pubHex, 1_500n);
+	await A.noop();
 	const m = miner();
 	const g = (await mineAnchor({ prev: null, producer: m.keypair, prover: m.prover, heads: node.ledger.heads(), params: PARAMS }))!;
 
 	ts = 1;
-	await B.transfer(C.pubHex, 1_400n); // only affordable once A's 1500 has landed
+	await B.noop();
+	await C.noop();
 	const a1 = (await mineAnchor({ prev: g, producer: m.keypair, prover: m.prover, heads: node.ledger.heads(), params: PARAMS }))!;
 
 	const c = chain();
 	await c.add(g);
 	await c.add(a1);
 
-	const writes = node.ledger.allWrites();
-	const provisional = computeView(writes, { base: withGbtc(computeView([]), balances) });
-	const finalized = finalizedView(writes, c, 0, withGbtc(computeView([]), balances));
-
-	assert.equal(gbtcOf(provisional, C.pubHex), 0n, "ts attack: spend folds before funding → fails");
-	assert.equal(gbtcOf(finalized, C.pubHex), 1_400n, "anchor order respects funding causality regardless of ts");
+	const atG = c.headsAt(g.id);
+	const atA1 = c.headsAt(a1.id);
+	assert.ok(atG[A.pubHex], "A's late-ts write is finalized by the first anchor");
+	assert.equal(atG[B.pubHex], undefined, "B's early-ts write cannot jump ahead of the anchor that first covers it");
+	assert.ok(atA1[B.pubHex] && atA1[C.pubHex], "B and C finalize at the second anchor");
+	assert.equal(c.headsCovered(node.ledger.heads(), 0), true, "all writes finalized at depth 0");
+	assert.equal(c.headsCovered(node.ledger.heads(), 1), false, "B/C not yet buried one deep");
+	assert.equal(c.headsCovered({ [A.pubHex]: node.ledger.heads()[A.pubHex] }, 1), true, "A buried one deep");
 });
 
 test("difficulty retargets toward a target iters-per-anchor", async () => {
@@ -164,7 +164,8 @@ test("a fresh node trusts the heaviest chain as a checkpoint and ignores a light
 	let ts = 0;
 	const now = () => ++ts;
 	const alice = new Account({ node, params: PARAMS, k: K, now });
-	const balances = { [alice.pubHex]: 2000n }; // 2000 gBTC, seeded into the checkpoint base
+	await alice.noop();
+	await alice.noop();
 
 	const m = miner();
 	const heavy: Anchor[] = [];
@@ -182,8 +183,11 @@ test("a fresh node trusts the heaviest chain as a checkpoint and ignores a light
 		const h = checkpoint[w.writer];
 		return h !== undefined && w.seq <= h.seq;
 	});
-	const view = finalizedView(writesUpToCheckpoint, fresh, 0, withGbtc(computeView([]), balances));
-	assert.equal(gbtcOf(view, alice.pubHex), 2000n, "checkpoint reconstructs the gBTC balance");
+	assert.equal(writesUpToCheckpoint.length, 2, "checkpoint covers alice's writes");
+	const replayed = new Ledger(PARAMS);
+	for (const w of writesUpToCheckpoint) replayed.apply(w);
+	assert.deepEqual(replayed.heads(), checkpoint, "replay to the checkpoint reconstructs its heads");
+	assert.equal(replayed.stateRoot(), node.ledger.stateRoot(), "checkpoint reconstructs the ledger state");
 
 	const m2 = miner();
 	const evil = (await mineAnchor({ prev: null, producer: m2.keypair, prover: m2.prover, heads: {}, params: PARAMS }))!;

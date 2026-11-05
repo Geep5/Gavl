@@ -10,7 +10,6 @@
   state and verifies everything. **No light clients.**
 - **Commodity hardware.** Anyone can run a node on a normal machine — that's the point of
   decentralization, not just "equal in software."
-- **Committee as decentralized as possible** — large, rotated, open to anyone.
 
 This is a deliberate trilemma choice: **decentralization + equality over raw throughput**
 (the Bitcoin/Monero ethos — keep nodes cheap so everyone runs one, accept a throughput
@@ -116,7 +115,7 @@ forever, not just at boot.
 - Hold **active state + recent writes + periodic snapshots**; drop old writes (no genesis
   replay is already the design — this finishes it).
 - Per-node RAM: O(lifetime) → **O(active state)**.
-- **GC inactive / zero-balance / no-position / no-bond accounts** — drop their heads too,
+- **GC inactive accounts** (no live offers) — drop their heads too,
   so the heads-set is O(*active* writers), not O(*ever-written*).
 - Files: `ledger` (prune below a snapshot height), `store/policy`, a snapshot format,
   bootstrap-from-snapshot path. Listed as remaining (≈P4) in project notes.
@@ -138,22 +137,6 @@ it raises the active-trader ceiling without giving up equality.
   markets it doesn't care about. Intents are ephemeral (TTL) and non-consensus, so this is
   safe and doesn't touch the ledger.
 - Skip only if you insist every node literally sees every resting offer.
-
-## Committee — "as decentralized as possible"
-
-A threshold ceremony (DKG/sign/reshare) is O(n)–O(n²) in messages, so it **cannot** run
-among a million nodes — the committee is inherently a bounded subset. Maximize
-decentralization three ways (two already built):
-
-1. **Rotation** (built) — fresh committee each epoch, so over time *many* nodes serve.
-2. **Open, stake-weighted entry** (built — bonding) — anyone bonded + farming can be
-   sampled; permissionless.
-3. **Push committee `size`** (the knob) as large as the ceremony stays performant — e.g.
-   5 → 30–50 is more decentralized per-epoch at higher ceremony cost. Beyond ~tens, the
-   DKG/sign rounds get slow; that's the practical ceiling.
-
-You can't have "all million sign every withdrawal," but rotation gives you "all million are
-*eligible* and *take turns*" — the decentralized spirit of it.
 
 ## Explicitly OUT (and why)
 
@@ -182,7 +165,6 @@ Throughput only rises further with lever #3 (cheaper verification). Node *count*
 - **Phase B — pruning + snapshots** (#2): longevity on commodity hardware.
 - **Phase C — verification throughput** (#3): raise the active-trader ceiling.
 - **Phase D — intent scoping** (#4): optional; kill the O(N²) offer flood.
-- **Committee `size`**: a config knob, bump anytime within ceremony-performance limits.
 
 ## One-line summary
 

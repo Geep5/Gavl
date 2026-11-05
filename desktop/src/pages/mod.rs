@@ -1,9 +1,7 @@
 //! One module per sidebar destination, plus the small layout vocabulary they share.
 
-mod custody;
 mod network;
 mod node;
-mod wallet;
 
 use gpui_kit::component::{ActiveTheme, StyledExt, WindowExt, clipboard::Clipboard, h_flex, scroll::ScrollableElement, v_flex};
 use gpui_kit::prelude::FluentBuilder;

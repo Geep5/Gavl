@@ -5,14 +5,10 @@
  * Writes pay the PoST cooldown, so action endpoints are async and can take a
  * few hundred ms.
  *
- *   GET  /api/state                         → { accounts, active, gbtc, bridge, consensus, custody, storage, fleet }
+ *   GET  /api/state                         → { accounts, active, consensus, storage, fleet }
  *   GET  /api/events?since=N                → network/diagnostic log page
  *   POST /api/accounts            {label}   → create + activate an identity
  *   POST /api/accounts/active     {pubHex}  → switch the active identity
- *   POST /api/transfer            {to,amount}
- *   POST /api/withdraw            {amount,btcAddress,fee}
- *   POST /api/deposit/claim       {txid}
- *   POST /api/withdrawals/process
  *   POST /api/channel             {name}    → switch channel
  *   POST /api/identity/reroll|import|export, /api/peers/dial|unpin, /api/gossip-interval, /api/fleet/up|down
  */
@@ -26,12 +22,7 @@ import { createServer as netServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Daemon } from "./daemon.ts";
-import { btcNetFromEnv } from "./custody/esplora.ts";
-import { DEFAULT_CUSTODY_PARAMS } from "./custody/epoch.ts";
-import type { CustodyParams } from "./custody/epoch.ts";
 import { defaultParams } from "./config.ts";
-import { gbtcOf, parseAmount } from "./market/btc.ts";
-import { totalGbtc, pendingTotal, demurrageChargeFrom } from "./custody/bridge.ts";
 
 const PORT = Number(process.env.GAVL_PORT ?? 6440);
 
@@ -76,38 +67,11 @@ const FARM = process.env.GAVL_FARM !== "0";
 // Networking is Nostr over public relays: outbound WSS only, so there is no local port to probe and
 // nothing to install. The daemon fails LOUD (and exits) if it can't reach any relay — see joinMesh.
 
-// Threshold custody — there is ONLY one mode: an M-of-N committee. A DKG at genesis, reshare each
-// epoch, and NO node ever holds the key. A node won't custody until ≥minCommittee farmers form the
-// committee, so a LONE node has no fund and WAITS for peers — it never falls back to a single key, on
-// any network. (Solo/seed mode was removed entirely.) GAVL_DATA_DIR isolates a node's wallet +
-// custody secrets — REQUIRED to run several nodes on one box.
-if (process.env.GAVL_CUSTODY && process.env.GAVL_CUSTODY !== "committee")
-	console.warn(`  note: GAVL_CUSTODY=${process.env.GAVL_CUSTODY} ignored — committee is the only custody mode (solo/seed was removed; a lone node waits for peers).`);
-const BTC_NET = btcNetFromEnv(); // GAVL_BTC_NET: mainnet | testnet (default) | signet | regtest
+// GAVL_DATA_DIR isolates a node's wallet + producer key — REQUIRED to run several nodes on one box.
 const DATA_DIR = process.env.GAVL_DATA_DIR; // undefined → ~/.gavl
 
-// Mainnet safety-lock: custody is already committee-only (no single-key path can arise), but real BTC
-// must also never live only in RAM — a restart would erase who owns which BTC. Refuse in-memory on
-// mainnet. Testnet/signet/regtest are free to do as they like.
-if (BTC_NET === "mainnet" && PERSIST === "off")
-	throw new Error("mainnet refuses in-memory storage (GAVL_PERSIST=off) — a restart would erase who owns which BTC. Use GAVL_PERSIST=all on durable disk.");
-
-// Custody-committee CONSENSUS params (on ChainParams; the fold checks custody records with them and
-// they're bound into the genesis anchor). Env-tunable for local measurement runs (e.g. the K_MAX sweep),
-// but every node of one network must use identical values — a node that differs derives a different
-// block 0 and is visibly on another network.
-const EPOCH_LEN = Number(process.env.GAVL_CUSTODY_EPOCH ?? DEFAULT_CUSTODY_PARAMS.epochLength);
-const CUSTODY_MIN = Number(process.env.GAVL_CUSTODY_MIN ?? DEFAULT_CUSTODY_PARAMS.minCommittee);
-const custody: CustodyParams = {
-	epochLength: EPOCH_LEN,
-	size: Number(process.env.GAVL_COMMITTEE_MAX ?? DEFAULT_CUSTODY_PARAMS.size), // K_MAX
-	windowAnchors: 2 * EPOCH_LEN,
-	minCommittee: CUSTODY_MIN,
-	genesisSize: CUSTODY_MIN, // small n-of-n genesis, grown to K_MAX by the first reshare
-};
-
 const daemon = new Daemon({
-	params: defaultParams({ custody }),
+	params: defaultParams(),
 	network: NETWORK,
 	walletDir: DATA_DIR,
 	space: SPACE,
@@ -122,7 +86,6 @@ const daemon = new Daemon({
 	// Replication floor: warn when fewer than this many distinct nodes hold the latest checkpoint,
 	// so RAM state stays durable across churn. Default 1 (off); set to your archiver count.
 	replicationTarget: Number(process.env.GAVL_REPLICATION_TARGET ?? "1"),
-	custody: { ceremonyTimeoutMs: Number(process.env.GAVL_CUSTODY_TIMEOUT_MS ?? "30000") },
 });
 
 // ── local fleet: up/down extra independent nodes on this machine, driven by the UI stepper ───────
@@ -198,54 +161,11 @@ process.on("exit", killFleet);
 process.on("SIGINT", () => { killFleet(); process.exit(0); });
 process.on("SIGTERM", () => { killFleet(); process.exit(0); });
 
-// ── View → JSON (Maps + BigInts → plain, string amounts) ─────────
+// ── state → JSON ─────────────────────────────────────────────────
 
 function serializeState() {
-	const view = daemon.view(); // optimistic tip — reflects actions immediately
-	const me = daemon.wallet.active().pubHex;
-
-	// gBTC balances: { pubkey: amount } (1:1 claims on BTC in the custody fund)
-	const gbtc: Record<string, string> = {};
-	for (const [pubkey, amt] of view.bridge.gbtc) gbtc[pubkey] = amt.toString();
-
-	const consensus = daemon.consensus();
-	const rsv = daemon.onChainReservesCached(); // proof-of-reserves reading (cached, polled)
-	const onChainR = rsv != null ? rsv.sats : null;
-	// Idle-fee (demurrage) clock for the active account: no fee until `feeFromHeight` (last credit +
-	// grace); past it the idle balance pays 1% per 30 days, pro-rated per whole day. The UI turns this
-	// height into a live countdown via the current tip. Null if the account has no balance/clock.
-	const cf = view.bridge.chargeFrom.get(me);
-	const idleDecay = cf ? { feeFromHeight: demurrageChargeFrom(cf.since) } : null;
-	// Conservation buckets (reserves == free + pending + pot) for the UI breakdown.
-	// `free` is the remainder, so the three always sum to reserves.
-	const freeV = view.bridge.reserves - pendingTotal(view.bridge) - view.bridge.pot;
-	const bridge = {
-		// collateral = gBTC, a 1:1 claim on BTC in the custody fund
-		myGbtc: gbtcOf(view, me).toString(),
-		idleDecay, // { feeFromHeight } | null — when your idle gBTC starts paying the gentle idle fee
-
-		reserves: view.bridge.reserves.toString(), // BTC sats in the fund
-		gbtcOutstanding: totalGbtc(view.bridge).toString(),
-		pending: pendingTotal(view.bridge).toString(), // burned, awaiting BTC payout
-		pendingCount: view.bridge.pending.length,
-		// YOUR OWN deposit address — derived from (fund key, your pubkey), so a deposit
-		// here is cryptographically bound to you and can't be claimed by anyone else.
-		depositAddress: daemon.depositAddressFor(me),
-		fundAddress: daemon.fundAddress(), // base fund address (change/consolidation)
-		btcNetwork: daemon.btcNetwork(),
-		// proof of reserves: real on-chain BTC vs the ledger's claimed reserves
-		onChainReserves: onChainR != null ? onChainR.toString() : null,
-		reconciled: onChainR != null ? onChainR >= view.bridge.reserves : null, // real BTC covers the ledger?
-		shortfall: onChainR != null ? (view.bridge.reserves > onChainR ? (view.bridge.reserves - onChainR).toString() : "0") : null,
-		reservesCheckedAgoMs: rsv != null ? Date.now() - rsv.at : null,
-		// ── the liquidity pot (fed by demurrage idle fees) ──
-		pot: view.bridge.pot.toString(),
-		// conservation breakdown (free + pending + pot == reserves)
-		free: freeV.toString(),
-	};
-
 	const accounts = daemon.wallet.list().map((a) => ({ label: a.label, pubHex: a.pubHex }));
-	return { accounts, active: me, gbtc, bridge, consensus, custody: daemon.custodyStatus(), storage: daemon.storeStats(), fleet: fleetStatus() };
+	return { accounts, active: daemon.wallet.active().pubHex, consensus: daemon.consensus(), storage: daemon.storeStats(), fleet: fleetStatus() };
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -254,20 +174,6 @@ function send(res: ServerResponse, status: number, body: unknown): void {
 	const json = JSON.stringify(body);
 	res.writeHead(status, { "content-type": "application/json", "access-control-allow-origin": "*", "access-control-allow-headers": "content-type", "access-control-allow-methods": "GET,POST,OPTIONS" });
 	res.end(json);
-}
-
-/**
- * UX guard: mirror the fold's spend checks so a doomed write 400s with a reason
- * instead of folding to a silent no-op (the fold drops invalid ops without error,
- * which looks like a dead button in the UI). The fold stays authoritative — this
- * is feedback, not a security boundary.
- */
-function requireSpendable(amountStr: string, label: string): bigint {
-	const amt = parseAmount(amountStr);
-	if (amt === null) throw new Error(`${label} must be a positive whole number of gBTC`);
-	const have = gbtcOf(daemon.view(), daemon.wallet.active().pubHex);
-	if (have < amt) throw new Error(`insufficient gBTC: you have ${have}, need ${amt} — deposit BTC to the fund and claim it first`);
-	return amt;
 }
 
 function readBody(req: IncomingMessage): Promise<any> {
@@ -315,43 +221,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 			daemon.wallet.setActive(String(body.pubHex));
 			return send(res, 200, { active: body.pubHex });
 		}
-		// ── gBTC ──
-		if (path === "/api/transfer") {
-			if (!String(body.to ?? "").trim()) throw new Error("recipient pubkey required");
-			requireSpendable(String(body.amount), "amount");
-			await daemon.active().transfer(String(body.to), String(body.amount));
-			return send(res, 200, { ok: true });
-		}
-		if (path === "/api/withdraw") {
-			// Burn gBTC to redeem BTC to a Bitcoin address → a pending withdrawal. `fee` (sats, optional)
-			// is the withdrawer's chosen miner fee, deducted from their own payout. The protocol does NOT
-			// cap it (broadcast what you want) — the sane upper bound is a UI guardrail; here we only
-			// require a non-negative integer so it can build. Omit it to use the daemon default.
-			if (!String(body.btcAddress ?? "").trim()) throw new Error("BTC address required");
-			requireSpendable(String(body.amount), "amount");
-			const feeStr = body.fee != null && String(body.fee).trim() !== "" ? String(body.fee) : undefined;
-			if (feeStr !== undefined && !/^\d+$/.test(feeStr)) throw new Error("fee must be a non-negative integer (sats)");
-			await daemon.active().withdraw(String(body.amount), String(body.btcAddress), feeStr);
-			return send(res, 200, { ok: true });
-		}
-		if (path === "/api/deposit/claim") {
-			// REAL deposit: verify a BTC txid paid the fund (via Esplora) → mint gBTC.
-			const txid = String(body.txid ?? "").trim();
-			// Validate the txid shape before hitting Esplora — a malformed id makes Esplora
-			// 400 with a cryptic "esplora tx: HTTP 400". A txid is 64 hex chars.
-			if (!/^[0-9a-fA-F]{64}$/.test(txid)) {
-				throw new Error(`txid must be 64 hex characters (got ${txid.length}) — paste the full Bitcoin transaction id`);
-			}
-			const credited = await daemon.claimDeposit(txid, daemon.wallet.active().pubHex);
-			return send(res, 200, { credited: credited.toString() });
-		}
-		if (path === "/api/withdrawals/process") {
-			// Build + threshold-sign + broadcast the pending withdrawals as one BTC tx.
-			const txid = await daemon.processWithdrawals();
-			return send(res, 200, { txid });
-		}
 		if (path === "/api/channel") {
-			// Join a different channel by name. Each channel is its own economy (own anchor
+			// Join a different channel by name. Each channel is its own network (own anchor
 			// chain + ledger state); your wallet/identity is shared. Returns once the switch lands.
 			const name = String(body.name ?? "").trim();
 			if (!name) return send(res, 400, { error: "channel name required" });
@@ -423,11 +294,6 @@ createServer((req, res) => {
 	await daemon.startConsensus({ network: NETWORK, mesh: MESH, farm: FARM });
 	const c = daemon.consensus();
 	console.log(`  → mesh ${c.mesh ? "joined" : "off"}, ${c.peers} peer(s), farming ${c.farming ? "live" : "off"}`);
-	const cu = daemon.custodyStatus();
-	if (cu.fundKeyOnChain)
-		console.log(`  custody: committee — fund ${cu.fundAddress} (key ${cu.fundKeyOnChain.slice(0, 12)}…; this node ${cu.holdsShare ? "holds a share" : "is watching"})`);
-	else
-		console.log(`  custody: committee — WAITING for ≥${cu.minCommittee} farmers to run genesis DKG. No fund key yet, so minting is disabled until the committee forms — a lone node waits for peers; there is no single-key fallback.`);
 });
 
 process.on("SIGINT", async () => {

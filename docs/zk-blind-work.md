@@ -1,4 +1,4 @@
-# ZK "blind useful work" — private positions, publicly verified
+# ZK "blind useful work" — private offers, publicly verified
 
 Status: **design note — not implemented.** This is the most cryptographically heavy
 idea in Gavl; it touches the consensus fold, so it is deliberately doc-first.
@@ -9,8 +9,8 @@ idea in Gavl; it touches the consensus fold, so it is deliberately doc-first.
 > processing?*
 
 The answer is **zero-knowledge proofs**: a client submits a write that carries a
-**proof that the action is valid** — margin sufficient, conservation holds,
-signature valid — **without revealing what the action is** (asset, side, size,
+**proof that the action is valid** — well-formed offer, rate limits respected,
+signature valid — **without revealing what the action is** (side, size,
 price). Every node **verifies the proof** (cheap, blind, total redundancy) and
 folds the result into state **without ever learning the contents.** This is how
 Zcash / Aztec / Renegade work, and it maps onto Gavl's "everyone folds the same
@@ -21,31 +21,26 @@ writes" model directly — you just fold *proofs* instead of plaintext ops.
 Privacy and trustlessness are **orthogonal**. This note is precise about which it
 buys:
 
-- ✅ **Confidential trading.** Positions/orders are hidden; nodes process blind.
-  No node (and no observer) learns who holds what or what a trade was.
+- ✅ **Confidential orders.** Offers are hidden; nodes process blind.
+  No node (and no observer) learns who posted what or what was matched.
 - ✅ **Still fully decentralized.** No matcher, no privileged verifier — every node
   verifies every proof independently, same as it folds every write today.
-- ❌ **Does NOT make BTC custody trustless.** A node holding a key-share must
-  *knowingly sign* a withdrawal to check it's legitimate; ZK can hide *who*
-  withdraws and *how much*, but cannot remove the active, knowing authorization
-  custody requires. **Privacy ≠ trustless custody.** The bridge problem is
-  untouched by this note. (See the custody discussion: real-BTC-in always needs a
-  bonded quorum; ZK only makes that quorum's actions private, not unnecessary.)
+- ❌ **Does NOT hide the settlement.** Swaps settle as Taproot HTLCs on Bitcoin and
+  Litecoin; those transactions (and the shared hash lock) stay public on their own
+  chains. ZK here only hides the order-board layer.
 
-So: this makes the **trading layer private**. It is not a bridge and not a
-custody solution.
+So: this makes the **order board private**. It changes nothing about on-chain settlement.
 
 ## How it fits Gavl's architecture
 
 Gavl's state is `fold(ordered writes)`. Today a write carries a plaintext op and
 every node re-applies it. The ZK version:
 
-1. **Client-side (private):** the user computes the new state transition locally
-   (e.g. "open a long, escrow X of coin C") and generates a zk-SNARK proving:
-   - they own the inputs (signature over committed balances),
-   - conservation holds (inputs == outputs + fees; no value created),
-   - the position's margin invariant holds,
-   - **without revealing** the amounts, the asset, or the side.
+1. **Client-side (private):** the user builds the offer locally
+   (e.g. "sell X BTC for Y LTC") and generates a zk-SNARK proving:
+   - they are the signer (signature over a committed offer),
+   - the offer is well-formed (amounts in range, supported pair),
+   - **without revealing** the amounts, the price, or the side.
 2. **The write carries:** the proof + the *public inputs* (commitments /
    nullifiers — hashes that hide values but prevent double-spend), NOT the op.
 3. **Every node (blind):** runs `verifyProof(proof, publicInputs)`. If it
@@ -81,29 +76,26 @@ lib is installed. So:
 
 ## Honest scope + risk
 
-- **Biggest, highest-risk addition to Gavl by far.** A circuit bug forges money
-  silently (no plaintext to cross-check). Held to a higher bar than custody.
+- **Biggest, highest-risk addition to Gavl by far.** A circuit bug forges a valid-looking
+  write silently (no plaintext to cross-check).
 - **Trusted setup** (Groth16) reintroduces a one-time trust event unless a
   transparent system (PLONK/STARK) is used — STARKs avoid setup but are bigger
   proofs / heavier verify.
 - **Determinism of the verifier across nodes is non-negotiable** — divergent
   verify = chain split. WASM verifier strongly preferred.
-- **It's the trading layer only.** Real BTC still needs the (separate, trusted)
-  bridge; native synthetic perps need no ZK at all to be trustless.
+- **It's the order-board layer only.** On-chain HTLC settlement is unaffected.
 
 ## Phasing if pursued
 
 1. **Spike:** drop in a WASM Groth16 verifier, prove it verifies a trivial circuit
    deterministically inside a Node fold. Pure feasibility check, no Gavl wiring.
-2. **Shielded transfer:** the simplest private op — confidential coin transfer
+2. **Shielded offer:** the simplest private op — a confidential offer
    (commitment + nullifier), folded blind. Validates the whole pipeline.
-3. **Private trading:** extend to the gBTC exchange (private side/size).
+3. **Private matching:** extend to blind offer matching (private side/size/price).
 
 ## The honest recommendation
 
-Build the **native, trustless gBTC exchange in plaintext first** — it's real,
-in-spirit, and shippable. Treat ZK blind-work
-as a **separate, later epic** gated on the Phase-1 verifier spike, because it is
-the heaviest and most dangerous code in the system and it is *additive* (privacy
-on top of a working exchange), not a prerequisite. Privacy is a powerful upgrade to a
-working market — not the foundation to build the market on.
+Build the **plaintext atomic-swap order board first** — it's real and shippable.
+Treat ZK blind-work as a **separate, later epic** gated on the Phase-1 verifier spike,
+because it is the heaviest and most dangerous code in the system and it is *additive*
+(privacy on top of a working market), not a prerequisite.

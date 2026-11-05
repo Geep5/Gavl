@@ -13,11 +13,6 @@ pub fn int(n: u128) -> String {
     out
 }
 
-/// A gBTC amount (integer sats-denominated units) for display.
-pub fn gbtc(n: u128) -> String {
-    format!("{} gBTC", int(n))
-}
-
 /// `d2abf17309f9…` → `d2abf173…7fa5`.
 pub fn short_hex(s: &str) -> String {
     if s.len() > 14 { format!("{}…{}", &s[..8], &s[s.len() - 4..]) } else { s.to_owned() }

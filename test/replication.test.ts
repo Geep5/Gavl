@@ -5,7 +5,7 @@
  * reachable node still holds it. Nodes advertise the checkpoint they hold (snapshot-have /
  * snapshot-offer) and count DISTINCT holders (deduped by peerKey, like the adoption quorum), so
  * the network can measure its replication factor: state survives the loss of up to factor-1
- * holders between handoffs. Under target, a node warns (and a capable archiver can pull-to-persist).
+ * holders between checkpoints. Under target, a node warns (and a capable archiver can pull-to-persist).
  *
  *   node --test test/replication.test.ts
  */
@@ -20,13 +20,10 @@ import { MemoryNetwork } from "../src/sync/memory.ts";
 import { AnchorChain } from "../src/consensus/chain.ts";
 import { mineAnchor } from "../src/consensus/anchor.ts";
 import type { Anchor } from "../src/consensus/anchor.ts";
-import { Account } from "../src/market/account.ts";
-import { computeView, viewAtAnchor } from "../src/market/btc.ts";
-import { serializeView, viewRoot } from "../src/market/state.ts";
-import type { View } from "../src/market/btc.ts";
+import { serializeView, viewRoot, emptyView } from "../src/market/state.ts";
 import type { StoredSnapshot } from "../src/store/store.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
+import { Account, PARAMS, K, STANDIN_VERIFIER, standinProver } from "./helpers.ts";
 
 /** Build a checkpoint + the full pre-prune chain (mirrors test/adopt-quorum.ts). */
 async function buildCheckpoint(): Promise<{ snapshot: StoredSnapshot; full: { writes: any[]; anchors: Anchor[] } }> {
@@ -35,24 +32,19 @@ async function buildCheckpoint(): Promise<{ snapshot: StoredSnapshot; full: { wr
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node: S, params: PARAMS, k: K, now, keypair: kp });
 	const poster = mk();
-	const balances: Record<string, bigint> = {};
-	const fund = (a: Account, amt: bigint) => (balances[a.pubHex] = (balances[a.pubHex] ?? 0n) + amt);
-	const base = () => withGbtc(computeView([]), balances);
+	const appRoot = viewRoot(emptyView()); // the app state is empty: every anchor commits the same appRoot
 	const m = generateKeyPair();
 	const prover = standinProver(m);
 	const mineOn = async (): Promise<void> => {
 		const prev = S.anchorTip();
-		const all = S.ledger.allWrites();
-		const appRoot = prev ? viewRoot(viewAtAnchor(all, S.anchors!, prev.id, base())) : viewRoot(computeView([], { base: base() }));
 		const a = (await mineAnchor({ prev, prevHeads: prev ? S.anchors!.headsAt(prev.id) : {}, producer: m, prover, heads: S.ledger.heads(), params: PARAMS, appRoot }))!;
 		await S.submitAnchor(a);
 	};
 	const acctA = mk();
 	const acctB = mk();
 	await poster.noop();
-	fund(acctA, 5000n);
-	fund(acctB, 5000n);
-	await acctA.transfer(acctB.pubHex, 700n);
+	await acctA.noop();
+	await acctB.noop();
 	await mineOn();
 	await mineOn();
 	await mineOn();
@@ -60,7 +52,7 @@ async function buildCheckpoint(): Promise<{ snapshot: StoredSnapshot; full: { wr
 	const full = { writes: S.ledger.allWrites(), anchors: S.anchors!.chainTo() };
 	const ckpt = S.anchors!.finalized(2)!;
 	const heads = S.anchors!.headsAt(ckpt.id);
-	const snapshot: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(viewAtAnchor(full.writes, S.anchors!, ckpt.id, base())) };
+	const snapshot: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(emptyView()) };
 	return { snapshot, full };
 }
 

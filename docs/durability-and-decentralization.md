@@ -1,102 +1,59 @@
 # Durability & the cost of decentralization
 
 > Gavl's stance on survival: **no central backstop — the protocol is the only guarantor.**
-> But that only holds if the ledger is durably replicated, so "the network dies" means
-> *permanent, total* destruction of every copy — **not** a reboot.
+> Gavl holds no coins, so what has to survive is small: the anchor chain (for consensus) and,
+> on each user's own machine, the secrets of that user's in-flight swaps.
 
 ## Two axes people conflate
 
 Decentralization and durability are independent:
 
 - **Decentralization** — *who* holds the state. Goal: no node is special; every equal full
-  node can hold and serve the whole ledger, and any peer can re-sync from any other.
+  node can hold and serve the whole anchor chain, and any peer can re-sync from any other.
 - **Durability** — does the state survive a restart. A property of whether each node persists
   to disk; unrelated to how many nodes there are.
 
 Bitcoin is maximally decentralized *and* every full node writes the chain to disk. The target
-is **no-special-node = yes** and **ephemeral = no**. There is no decentralization tax that
-forces ephemerality — the two axes are orthogonal.
+is **no-special-node = yes** and **ephemeral = no** for consensus state. There is no
+decentralization tax that forces ephemerality — the two axes are orthogonal.
 
-## Receipt vs. vault
+## What is (and isn't) at stake
 
-gBTC is not the asset. It is a 1:1 **claim** on real BTC held in the threshold-custody fund.
-The asset lives on the Bitcoin blockchain whether or not the Gavl ledger does. So losing the
-ledger does **not** evaporate the BTC — it **strands** it:
+Coins never leave Bitcoin or Litecoin. Offers on the Gavl order board are ephemeral: they expire
+and are not meant to persist long-term. Losing every copy of the Gavl chain therefore loses
+**no funds** — it loses the order board and the consensus history, and the network restarts
+from a new genesis.
 
-- the receipts vanish, the gold stays in the vault;
-- holders can still *see* the BTC in the fund address on any explorer, but cannot prove it's
-  theirs or move it;
-- and because the custody **shares** are secret + node-local (never gossiped, not
-  re-syncable), if they die with the nodes the BTC is **entombed** — forever visible, forever
-  frozen.
+What *does* matter for money is local: during a swap, a user's daemon holds the swap secret
+(the HTLC preimage, for the initiator) and the keys for its claim/refund paths. Those live on
+that user's disk until the swap ends. If they are lost mid-swap, the HTLC refund leaf still
+returns the locked coins to their sender after the timeout — but the initiator who loses the
+preimage after the counterparty has locked can no longer claim. That is a per-user risk, not a
+network one.
 
-This is why, for a *backed* claim, durability is a custody obligation, not a stylistic choice.
-
-## The chosen stance: no backstop, protocol-only guarantor
-
-Gavl makes **no central promise** to make depositors whole. The protocol is the only
-guarantor. This is deliberate and trustless — the same risk class as "smart-contract risk" in
-DeFi, or "if every copy of the chain is destroyed, the chain is gone" in Bitcoin:
-
-> The ledger lives, replicated, across equal full nodes. It survives as long as **≥ 1 durable
-> copy** exists to serve the rest. If **every durable copy is permanently and simultaneously
-> destroyed**, claims are unrecoverable and the vault BTC is frozen. That is the accepted cost
-> of having no trusted central party. **Deposit at your own risk.**
-
-### The load-bearing word is "permanently"
+## Persistence rules
 
 "All nodes go down" must mean *permanent, simultaneous destruction of every durable copy* —
 **not** a reboot, an outage, a coordinated upgrade, or a cloud-region blip. Those are routine
 and must be fully recoverable. Therefore:
 
-- **every full node persists every write to disk** (`GAVL_PERSIST=all`, the archiver) — this
-  is mandatory, not optional;
-- the in-memory mode (`GAVL_PERSIST=off`) is **dev-only**. Shipping it with real coins turns
-  "dies on total permanent destruction" (rare, accepted) into "dies on a reboot" (frequent,
-  catastrophic) — a different and unacceptable system.
-
-The chosen philosophy is therefore an argument *for* hardening durable persistence, not against
-it. The two must match: the implementation should only lose state under the same conditions the
-stance says it may.
+- full nodes persist writes to disk (`GAVL_PERSIST=all`, the archiver);
+- the in-memory mode (`GAVL_PERSIST=off`) is **dev-only**;
+- swap secrets are written to local disk crash-safely **before** any on-chain lock that
+  depends on them, and kept until the swap has been claimed or refunded.
 
 ## Recovery matrix
 
-| Scenario | Ledger | Vault BTC | Outcome |
+| Scenario | Anchor chain | Swaps in flight | Outcome |
 |---|---|---|---|
-| Some nodes restart | re-syncs from peers | safe | no loss — normal operation |
-| **All** nodes reboot, disks intact | recovers from disk, re-gossips | safe | no loss — the expected "outage" case |
-| All disks lost, **≥ M custody shares survive** | gone | spendable by the quorum | **orphaned BTC** — recoverable only if claims can be reconstructed (see lever below) |
-| All ledger copies lost **and < M shares survive** | gone | frozen forever | **terminal** — the accepted cost |
-
-## The residual-safety lever (key possession)
-
-In the surviving-but-degraded cases, the only thing a holder still has is **their account
-keypair**. By itself that proves *identity*, not *balance* — after a total ledger loss it shows
-*who you are*, not *what you held*. How much residual safety exists is a design choice:
-
-- **None** — keys prove identity only; a wiped ledger is final. Simplest, harshest.
-- **Portable claim proofs** — holders retain signed balance attestations, and/or the network
-  anchors periodic state checkpoints to durable storage (or to Bitcoin via `OP_RETURN`). Then a
-  successor network — *or the surviving M-of-N custody quorum* — can reconstruct claims from
-  durable artifacts and sweep the stranded vault BTC to honor them.
-
-The second turns "entombed forever" into "recoverable if ≥ M shares + holder proofs survive" —
-a strictly better floor, still with no central party. Pick deliberately, and document whichever
-you choose so depositors know the real guarantee.
-
-## Ledger vs. shares — opposite recovery properties
-
-- **Ledger** (balances) — public, replicated, re-syncable from any peer. *Resilient.* Loss
-  needs every copy gone.
-- **Custody shares** (key material) — secret, node-local, never gossiped, **not** re-syncable.
-  *Fragile.* Mitigate with **M-of-N redundancy** (tolerate up to N − M losses), durable +
-  backed-up share storage, and **reshare before attrition** drops the live count below M.
+| Some nodes restart | re-syncs from peers | resume from local disk | no loss — normal operation |
+| **All** nodes reboot, disks intact | recovers from disk, re-gossips | resume from local disk | no loss — the expected "outage" case |
+| All chain copies lost | gone; new genesis | unaffected (settle on BTC/LTC) | order board resets; no funds lost |
+| One user's disk lost mid-swap | unaffected | that user's secrets gone | refund leaf returns their locked coins after timeout; an initiator may lose the claim side |
 
 ## Requirements that fall out of this
 
-1. Durable, crash-safe persistence on **every** node — fix the boot/replay path and prove it
-   survives `kill -9` mid-withdrawal. In-memory mode stays dev-only.
-2. **M-of-N ≥ 2-of-3** custody with backed-up shares + reshare, so the spend authority outlives
-   any single node's death (and the vault is never one lost share away from entombment).
-3. A written, depositor-facing statement of the real guarantee: no backstop, the terminal
-   failure mode, and whichever residual-safety lever is chosen.
+1. Durable, crash-safe persistence on archiver nodes; in-memory mode stays dev-only.
+2. Swap secrets persisted locally before they are needed, removed only after the swap ends.
+3. A written, user-facing statement of the real guarantee: Gavl never holds funds; each user's
+   daemon is responsible for its own swap state.

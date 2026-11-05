@@ -4,33 +4,40 @@
 
 # Gavl
 
-A decentralized **no-oracle gBTC exchange** on a **Proof-of-Space-Time cooldown ledger**, networked
-over [Nostr](https://nostr.com) (public relays; nothing to install, nothing to host).
+A **decentralized, ephemeral BTC↔LTC atomic-swap order board**, running on a
+**Proof-of-Space-Time** (chiapos + chiavdf) anchor chain gossiped over [Nostr](https://nostr.com)
+relays (public relays; nothing to install, nothing to host).
 
-**gBTC** is a 1:1 claim on real Bitcoin held in a **threshold-custody fund** that only an M-of-N
-committee can spend (no single party ever holds the key). There is **no price oracle**: nothing in
-the state machine reads an external price, and every op only *moves* gBTC between buckets, so
-reserves always equal what they back. A per-anchor **batch auction** for trading is planned but not
-built yet; today the ledger supports deposits, transfers, and withdrawals.
+Makers post offers, takers accept them, and the two matched parties then swap **directly on-chain**
+via Taproot HTLCs. Gavl is only the meeting place: **coins never leave their own chains**, and
+nothing about orders or swaps persists on Gavl long-term. Gavl holds no funds — no custody, no
+vault, no wrapped tokens. Each user's daemon automates its own swap steps and keeps the swap secrets
+on local disk until the swap ends.
 
-PoST is the clock and the doorman: every write pays a cooldown (a proof of space *and* of time), so
-an attacker can't spin up cheap identities to flood the network. State lives in **RAM** and is
-**checkpointed into the consensus chain**, so a node boots from committed state (never replaying
-from genesis).
-
-> [!WARNING]
-> **Gavl is not a savings account.** A **free gBTC balance left idle past a 7-day grace pays a small
-> idle fee** — 1% per 30 days, charged per whole idle day — into the shared liquidity pot. Receiving
-> gBTC resets the clock. **Keep money in while you're using it, and withdraw what you're done with.**
-> That pressure is what keeps the system RAM-light — it is deliberately *not* a place to park BTC.
-
-> **Status:** the real-BTC bridge runs end-to-end on **testnet** across a 3-node committee. Custody
-> is committee-only (no single-key path on any network). Still gated on an independent audit + a
-> large, independent farmer set — **don't put real mainnet BTC in it.**
+> **Status:** the PoST anchor chain, Nostr gossip and the Esplora chain client (`src/chains/`) run
+> today. Offer matching and the swap engine (`src/swap/`) are being built. Testnet only.
 
 ---
 
 ## How it works
+
+### Atomic swaps (Taproot HTLCs)
+
+Each side locks coins on its own chain into a Taproot output with a **NUMS internal key** (no
+key-path spend) and two script leaves:
+
+- **claim:** `OP_SHA256 <H> OP_EQUALVERIFY <receiver> OP_CHECKSIG` — the receiver spends by
+  revealing the preimage of `H`;
+- **refund:** `<n> OP_CSV OP_DROP <sender> OP_CHECKSIG` — the sender takes the coins back after
+  `n` blocks.
+
+The **initiator** (who knows the preimage) locks first with the **longer** window, the
+**counterparty** locks second with the **shorter** one: 24h / 12h → **BTC 144 / 72 blocks**,
+**LTC 576 / 288 blocks**. When the initiator claims the counterparty's output it reveals the
+preimage on-chain, which the counterparty then uses to claim the initiator's output. If either
+party walks away, both refund after their timeouts.
+
+### Proof-of-Space-Time cooldown
 
 ### Proof-of-Space-Time cooldown
 
@@ -48,59 +55,6 @@ is what makes "verify against your current peers" cheap and a RAM chain with no 
 possible. Real PoST (chiavdf + chiapos) is the default; `GAVL_VDF=hash GAVL_SPACE=standin` is a fast
 stand-in for tests/UI work.
 
-### Ledger (`src/market/btc.ts`)
-
-The application state is a pure fold of the write set: the gBTC bridge (`bridge.deposit`,
-`bridge.claim`, `bridge.withdraw`, `bridge.broadcast`, `bridge.settle`), `gbtc.transfer`, and
-custody ops (`custody.fund`, `custody.fault`). The liquidity pot is fed only by the **idle-balance
-fee** (demurrage); nothing draws from it. Conservation is a tested invariant:
-`reserves == free + pending + pot` — ops only *move* gBTC, never mint. There are no value caps on
-deposits, withdrawals, or custodied total; the only bridge limits are standing *count* caps on the
-outstanding backlog (1,024 pending withdrawals, 1,024 unminted claims) so the committee's signing
-queue can't be buried.
-
-### Real-BTC bridge + committee custody (`src/custody/`)
-
-gBTC is a 1:1 claim on Bitcoin in a fund no single party can spend, secured by **FROST threshold
-Schnorr** (Taproot-compatible, BIP340-valid spends). The fund key is **DKG'd across independent
-farmers** — each node only ever holds its own share — and the committee **reshares every epoch
-without moving the fund address**. Deposits go to per-identity fund-derived addresses (verified
-on-chain via Esplora before minting); withdrawals are threshold-signed and broadcast as real BTC
-txs.
-
-Security comes from the committee itself, not from collateral: each epoch a fresh committee is
-**VDF-sampled, PoST-weighted** (by anchors won) from the producers of finalized anchors in a recent
-window (default 2 epochs, so long-gone farmers drop out). Its size is **min(eligible producers,
-K_MAX)** — it grows with the network up to K_MAX (default 31, `GAVL_COMMITTEE_MAX`) — with a 2/3
-signing threshold. A member caught **equivocating** (two conflicting signed ceremony messages) is
-reported automatically with a `custody.fault` proof the fold verifies; if the culprit produced an
-anchor recently (within the eligibility window + 2 epochs), it is **excluded** from every later
-committee. No bonding, nothing to slash.
-
-Custody is **committee-only**: it needs **≥3 nodes actually farming** to run the genesis DKG. Until
-then a node holds no fund key and can't mint — it waits for peers. Mainnet additionally refuses
-in-memory storage (`GAVL_PERSIST=off`).
-
-#### Genesis — the fund key is DKG'd live, on every network
-
-There is no trusted setup and no committed key: every network (testnet, signet, regtest, mainnet)
-mints its fund key the same way. Once an epoch boundary is finalized with **≥`minCommittee` (default
-3) distinct producers** in its eligibility window, every node derives the same genesis committee
-(the *first* such epoch, sampled at `genesisSize`, default `minCommittee`), its members run a
-distributed DKG over the mesh, and each publishes the resulting group key as `custody.fund` from its
-producer key. The fold re-derives that epoch's committee from the anchor chain itself and accepts the
-fund only once **every** sampled member has posted the identical announce (the DKG is n-of-n), so a
-stranger can never set the vault key; the committee becomes the first recorded **key holder**. Every
-later epoch reshares the same key from the recorded holder to that epoch's committee — grown to
-`K_MAX` — so the address never moves; the new committee then records itself as holder with a
-`custody.handoff` that must name the chain-sampled committee and carry a threshold signature by the
-fund key made with its new shares. A reshare that fails records nothing, so the old holder keeps its
-shares and the next epoch retries from it. The committee-sampling parameters (epoch length, `K_MAX`,
-window, `minCommittee`, genesis size) are consensus parameters of the network (`ChainParams.custody`,
-bound into the genesis anchor). The genesis DKG is *n-of-n*: a member that never completes it times out
-the ceremony (`GAVL_CUSTODY_TIMEOUT_MS`), and the members retry the same genesis epoch at the next
-epoch boundary.
-
 ### Consensus + bounded RAM (`src/consensus/`)
 
 A permissionless **anchor chain** of PoST-proven head certificates linearizes the multi-writer logs:
@@ -109,15 +63,15 @@ is the pace. A branch that abandons a node's locked anchor wins only if producer
 majority of the pre-fork window built it exclusively — else, if neither side has that, the heavier
 branch wins — so a healed partition converges while a minority's heavier private fork can't revert
 what the majority finalized. Beneath that sits **settlement** (depth 6): a settled anchor is never
-reverted, and a branch that abandons it is refused and flagged (`settlementConflict` in
-`/api/state`). Everything irreversible — signing/broadcasting BTC payouts, posting `bridge.settle`,
-deleting superseded key shares, checkpoint-pruning history — waits for settlement, never soft
-finality. Each anchor commits an `appRoot` (a root of the folded state its parent certified), so a
+`/api/state`). Irreversible local actions (checkpoint-pruning history) wait for settlement, never
+soft finality. Each anchor commits an `appRoot` (a root of the folded state its parent certified), so a
 settled anchor is a **trustless checkpoint**: a node boots by loading the last checkpoint
 and folding only the writes above it, prunes history below it from RAM, and bootstraps fresh peers by
 serving committed *state* rather than history. Everything that lives in RAM is bounded the same way —
-it costs something to create and it decays or expires — so a node's footprint is bounded by the real
-economy, not by spam. (`docs/` has the detail: weak-subjectivity, durability, scaling.)
+it costs something to create and it decays or expires — so a node's footprint is bounded by real
+activity, not by spam. (`docs/` has the detail: weak-subjectivity, durability, scaling.)
+
+### Networking — Nostr (`src/sync/`)
 
 ### Networking — Nostr (`src/sync/`)
 
@@ -134,8 +88,8 @@ Discovery is a **relay query**, so there are no seeds and no peer-exchange to bo
 publishes a replaceable **presence** event on the channel, so "who is on this network" is a single
 subscription. That presence carries a **signed producer↔address binding**, so any node can address
 a consensus-roster member directly. The mesh is **bounded** (`GAVL_MAX_PEERS`, default 16);
-committee members are pinned via their bindings. A node's stable address is its **Nostr pubkey**
-(printed at boot and shown in the UI's Network panel).
+A node's stable address is its **Nostr pubkey**
+(printed at boot and shown in the UI's Network page).
 
 Bulk frames (anchor-chain pulls, checkpoint snapshots) exceed what relays accept (~32 KB in
 practice, whatever NIP-11 advertises), so they are **chunked** across events and reassembled
@@ -147,6 +101,8 @@ learn something. Offline catch-up is the **checkpoint bootstrap** (a rejoining n
 network's finalized checkpoint and pulls committed state, never a message backlog).
 
 ---
+
+## Run
 
 ## Run
 
@@ -169,18 +125,19 @@ stand-ins (`GAVL_VDF=hash GAVL_SPACE=standin`).
 Peers find each other automatically through the shipped default relays; point at your own with
 `GAVL_RELAYS=wss://a,wss://b`. The daemon fails fast and loud if it can't reach any relay.
 
+
 ### Desktop app (`desktop/`)
 
 The default UI: a native client for the daemon API, built with [GPUI Kit](https://gpui-kit.com) on
-[GPUI Fast](https://github.com/longbridge/gpui-fast). Four pages: **Wallet · Network · Custody ·
-Node**; the network's health stays in the title bar, and block/peer details sit in the
-status bar. `npm run desktop` starts it alone against an already-running daemon (stable Rust, pinned
-by `desktop/rust-toolchain.toml`); `GAVL_API=http://host:port` points it at a daemon other than
+[GPUI Fast](https://github.com/longbridge/gpui-fast). Two pages: **Network · Node**; the network's
+health stays in the title bar, and block/peer details sit in the status bar. `npm run desktop`
+starts it alone against an already-running daemon (stable Rust, pinned by
+`desktop/rust-toolchain.toml`); `GAVL_API=http://host:port` points it at a daemon other than
 `http://127.0.0.1:6440`.
 
-## Multi-node (the committee)
+## Multi-node
 
-Custody needs **≥3 nodes actually FARMING** (a merely-connected node doesn't count). On every machine:
+On every machine:
 
 ```bash
 npm install && npm run setup:chia
@@ -190,11 +147,9 @@ npm run dev          # all nodes must use the SAME backend (all real-PoST or all
 Leave `GAVL_NETWORK` unset so all nodes share the default `gavl-testnet` channel. **They mesh
 themselves** — each node announces its presence on the channel and discovers the others through the
 relays, so there is nothing to dial (a node's Nostr pubkey is printed at boot and shown in the UI's
-Network panel if you want to pin one explicitly). To run more than one node on one machine, give
-each its own `GAVL_DATA_DIR` **and** `GAVL_PORT`. Watch the
-daemon log for `checkpoint: height N … K writer(s)` — `K` is how many nodes are *producing anchors*
-and must reach your node count; when ≥3 produce, the genesis DKG runs and the Custody panel flips
-to "M-of-N committee."
+Network page if you want to pin one explicitly). To run more than one node on one machine, give
+each its own `GAVL_DATA_DIR` **and** `GAVL_PORT`. Watch the daemon log for
+`checkpoint: height N … K writer(s)` — `K` is how many nodes are *producing anchors*.
 
 Verify a node is really farming:
 
@@ -203,33 +158,43 @@ curl -s localhost:6440/api/state | jq '.consensus | {farming, vdf, space, tip, p
 ```
 
 Want `farming: true`, `vdf: "chiavdf-wesolowski-1024"` + `space: "chiapos"` (real PoST; stand-ins show
-`hash-vdf-v0` / `standin`), `tip` climbing, and `peers` ≥ 2.
+`hash-vdf-v0` / `standin`), `tip` climbing, and `peers` ≥ 1.
 
 There is no hub, no rendezvous server, and no relay of your own to run: nodes meet on public
 relays that already exist. Relays are a **default, not an authority** — swap them freely with
-`GAVL_RELAYS`, and two nodes only need one relay in common. The infrastructure is *nothing*.
+`GAVL_RELAYS`, and two nodes only need one relay in common.
 
 ### Other scripts & env
 
 ```bash
 npm test                 # full suite
+npm run regtest:install  # once — installs the local regtest tooling
+npm run test:regtest     # end-to-end tests against local regtest chains
 npm run dev:hash         # zero-setup: hash VDF + stand-in space (no venv)
 npm run daemon           # real-PoST daemon only (no UI)
+npm run daemon:hash      # daemon with the fast stand-ins
+npm run daemon:fresh     # stand-ins, in-memory (GAVL_PERSIST=off) — a throwaway node
 npm run desktop          # desktop app only (expects a daemon on :6440)
 ```
 
 Key env vars: `GAVL_VDF=chia|hash` · `GAVL_SPACE=chiapos|standin`
 · `GAVL_K=<n>` (plot size; default 18 for chiapos) · `GAVL_MAX_PEERS=<n>` (bounded mesh; default 16) ·
-`GAVL_PERSIST=all|mine|off` · `GAVL_BTC_NET=testnet|signet|regtest|mainnet` (regtest → `bcrt1…`
-addresses) · `GAVL_ESPLORA_URL=<url,url>` (Esplora REST roots for the bridge, tried in order; overrides
-the public defaults, required for regtest) · `GAVL_DATA_DIR` / `GAVL_PORT`
-(isolate a node) · `GAVL_NETWORK=<label>` (channel name; default `gavl-testnet`) ·
-`GAVL_RELAYS=<wss://…,wss://…>` (override the default relay set) · `GAVL_COMMITTEE_MAX=<n>` /
-`GAVL_CUSTODY_EPOCH=<anchors>` / `GAVL_CUSTODY_MIN=<n>` (custody consensus params: K_MAX default 31,
-epoch 16, min 3 — bound into the genesis anchor, so nodes that differ are on different networks) ·
-`GAVL_ANNOUNCE_INTERVAL=<seconds>` (presence refresh cadence; default 30). Real PoST needs the `setup:chia` venv; choosing `GAVL_VDF=chia` without it throws
-(never a silent downgrade). Moving a *live* channel from stand-ins to real PoST is a coordinated
-upgrade — see [`docs/real-post-cutover.md`](docs/real-post-cutover.md).
+`GAVL_PERSIST=all|mine|off` · `GAVL_DATA_DIR` / `GAVL_PORT` (isolate a node) ·
+`GAVL_NETWORK=<label>` (channel name; default `gavl-testnet`) ·
+`GAVL_RELAYS=<wss://…,wss://…>` (override the default relay set) ·
+`GAVL_ANNOUNCE_INTERVAL=<seconds>` (presence refresh cadence; default 30) ·
+`GAVL_REPLICATION_TARGET=<n>` (warn when the latest checkpoint has fewer holders; see
+[`docs/replication-floor.md`](docs/replication-floor.md)).
+
+Swap chains (`src/chains/esplora.ts`): `GAVL_BTC_NET` / `GAVL_LTC_NET` = `mainnet|testnet|regtest`
+(default `testnet`; mainnet is never selected implicitly) · `GAVL_BTC_ESPLORA_URL` /
+`GAVL_LTC_ESPLORA_URL` = comma-separated Esplora REST bases, tried in order (defaults:
+mempool.space + blockstream.info for BTC, litecoinspace.org for LTC; **regtest has no default and
+needs an override**).
+
+Real PoST needs the `setup:chia` venv; choosing `GAVL_VDF=chia` without it throws (never a silent
+downgrade). Moving a *live* channel from stand-ins to real PoST is a coordinated upgrade — see
+[`docs/real-post-cutover.md`](docs/real-post-cutover.md).
 
 ---
 
@@ -243,9 +208,9 @@ src/
   consensus/     anchor chain, fork choice, finality, difficulty, canonical order
   sync/          Nostr transport · chunked bulk frames · gossip · signed producer↔address bindings
   store/         durable write store (node:sqlite) + state snapshots/checkpoints + selective persist policy
-  market/        gBTC ledger fold, op vocabulary, account, state serialization
-  custody/       real-BTC bridge: FROST threshold · DKG · Taproot · deposits · tx · watcher · reshare
-  daemon.ts      boots ledger + node + store + consensus + bridge
+  market/        app state anchors commit to (appRoot) — empty until the order board lands
+  chains/        Esplora client for Bitcoin + Litecoin (UTXOs, txs, broadcast)
+  daemon.ts      boots ledger + node + store + consensus
   server.ts      localhost JSON API for the desktop app
 desktop/         native Rust client (GPUI Kit + GPUI Fast) — the Gavl app
 ```
@@ -254,25 +219,11 @@ desktop/         native Rust client (GPUI Kit + GPUI Fast) — the Gavl app
 
 ## Trust model
 
-**Trustless:** consensus, ordering, storage; the gBTC ledger (fully-collateralized, conservation
-proven); threshold signing (no one holds the fund key). No price oracle anywhere.
+**Trustless:** consensus, ordering, storage, and settlement — a swap either completes on both chains
+or both sides refund, enforced by Bitcoin and Litecoin script, not by Gavl. No price oracle; the price
+is whatever maker and taker agree to.
 
-**Trusted (surfaced in the UI):** the **bridge committee's honest-majority assumption** (capture
-requires a 2/3 threshold of a VDF-sampled, PoST-weighted committee that grows with the network)
-plus a single Esplora chain view per node. Each channel is its own sandboxed economy.
+**Trusted per node:** the node's Esplora chain view (pick your own servers) and the user's own disk,
+which holds swap secrets until each swap ends. Each channel is its own sandboxed network.
 
-Before any mainnet satoshi: an **independent audit** (the largest open blocker) and a **large,
-independent farmer set** (sampling only protects when the space-time isn't all one operator's).
-Distributed DKG and non-public keys are already done. Until then it's testnet-only.
-
-## TODO / not yet built
-
-Tracked custody gaps — listed so they aren't rediscovered or "fixed" by accident:
-
-- [ ] **Live-DKG bootstrap robustness**. The genesis DKG is *n-of-n*, so one non-completing member
-  wedges it (every retry targets the same deterministic genesis epoch and committee); add
-  timeout-and-exclude / a qualified-set so the committee forms among the responsive ≥threshold members
-  and a stale node can't block it.
-- [ ] **Autonomous signing trigger** (custody ops). Each seat must independently detect a
-  deposit/withdrawal and join the 2-of-3 signing round; coordinating *when* to sign is the piece to
-  finish before real BTC moves in or out.
+Testnet only until the swap engine is finished and audited.

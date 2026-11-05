@@ -1,10 +1,10 @@
 /**
  * Esplora-compatible HTTP shim over a regtest node's JSON-RPC (bitcoind or litecoind), so the real
- * custody client (src/custody/esplora.ts) can run against a local chain:
+ * chain client (src/chains/esplora.ts) can run against a local chain:
  *
- *   const shim = await startEsploraShim(node);   // GAVL_ESPLORA_URL=shim.url
+ *   const shim = await startEsploraShim(node);   // GAVL_BTC_ESPLORA_URL / GAVL_LTC_ESPLORA_URL = shim.url
  *
- * Serves exactly the endpoints src/custody/esplora.ts calls (watcher.ts only goes through it):
+ * Serves exactly the endpoints src/chains/esplora.ts calls:
  *
  *   GET  /blocks/tip/height     → text: tip height
  *   GET  /tx/:txid              → JSON Esplora tx (confirmed via the index, or mempool); 404 text if unknown

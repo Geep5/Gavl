@@ -13,9 +13,8 @@ import assert from "node:assert/strict";
 
 import { Ledger, PENDING_MAX_AGE } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
-import { Account } from "../src/market/account.ts";
 import type { Write } from "../src/chain/writer.ts";
-import { PARAMS, K } from "./helpers.ts";
+import { PARAMS, K, Account } from "./helpers.ts";
 
 /** Produce a contiguous chain of `n` writes (seq 0..n-1) for one writer. */
 async function chainOf(n: number): Promise<{ writes: Write[]; writer: string }> {
@@ -29,7 +28,8 @@ test("a never-filling buffered write decays out of pending instead of lingering 
 	const { writes: w, writer } = await chainOf(6); // seq 0..5
 
 	const L = new Ledger(PARAMS);
-	assert.equal(L.apply(w[5]).buffered, true, "seq 5 is ahead of the tip → buffered");
+	const r5 = L.apply(w[5]);
+	assert.equal(r5.ok && r5.buffered, true, "seq 5 is ahead of the tip → buffered");
 	L.apply(w[0]); // tip now at seq 0; the gap (1..4) is still open
 
 	// Age the buffer past the decay window by re-applying an in-order write (idempotent, but each

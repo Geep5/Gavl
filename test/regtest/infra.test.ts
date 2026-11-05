@@ -1,7 +1,7 @@
 /**
  * Local multi-node test infrastructure, exercised through the REAL client code:
  *  - the Esplora shim (./esplora-shim.ts) over Bitcoin Core / Litecoin Core regtest, driven by
- *    src/custody/esplora.ts + watcher.ts exactly as the bridge drives a public explorer;
+ *    src/chains/esplora.ts exactly as a swap daemon drives a public explorer;
  *  - the local Nostr relay (./relay.ts), driven by two src/sync/nostr.ts transports.
  *
  *   npm run regtest:install                       # once: fetch node binaries
@@ -22,8 +22,8 @@ import { finalizeEvent, generateSecretKey, getPublicKey, type Event } from "nost
 import { RegtestNode, type Chain } from "./node.ts";
 import { startEsploraShim, type EsploraShim } from "./esplora-shim.ts";
 import { startRelay, type LocalRelay } from "./relay.ts";
-import { Esplora } from "../../src/custody/esplora.ts";
-import { checkDeposit, confirmations, MIN_CONFIRMATIONS, txPaysWithdrawal, utxosToInputs, verifyDeposit } from "../../src/custody/watcher.ts";
+import { hex } from "@scure/base";
+import { Esplora } from "../../src/chains/esplora.ts";
 import { NostrTransport } from "../../src/sync/nostr.ts";
 import { GavlNode } from "../../src/sync/node.ts";
 import { Ledger } from "../../src/ledger/ledger.ts";
@@ -48,7 +48,7 @@ for (const chain of ["bitcoin", "litecoin"] as Chain[]) {
 		before(async () => {
 			node = await RegtestNode.start(chain);
 			shim = await startEsploraShim(node);
-			esplora = new Esplora({ base: shim.url, timeoutMs: 5_000 });
+			esplora = new Esplora({ chain, net: "regtest", base: shim.url, timeoutMs: 5_000 });
 		});
 		after(async () => {
 			await shim?.close();
@@ -64,13 +64,13 @@ for (const chain of ["bitcoin", "litecoin"] as Chain[]) {
 			await assert.rejects(esplora.broadcast("00"), /esplora broadcast rejected: sendrawtransaction RPC error: .*"code":-22/);
 		});
 
-		test("P2TR deposit: mempool → confirmed → spendable, then a key-path withdrawal", async () => {
+		test("P2TR output: mempool → confirmed, then a key-path spend", async () => {
 			const net = node.network;
 			const secret = secp256k1.utils.randomSecretKey();
 			const fund = btc.p2tr(btc.utils.pubSchnorr(secret), undefined, net);
 			assert.ok(fund.address!.startsWith(`${net.bech32}1p`), fund.address);
 
-			// ── deposit seen in the mempool ──
+			// ── funding seen in the mempool ──
 			const dep = await node.fund(fund.address!, 1_000_000n, 0);
 			let utxos = await esplora.utxos(fund.address!);
 			assert.deepEqual(utxos, [{ txid: dep.txid, vout: dep.vout, value: 1_000_000, status: { confirmed: false } }]);
@@ -78,29 +78,22 @@ for (const chain of ["bitcoin", "litecoin"] as Chain[]) {
 			assert.ok(tx);
 			assert.equal(tx.status.confirmed, false);
 			assert.equal(tx.vout[dep.vout]!.scriptpubkey_address, fund.address);
+			assert.equal(tx.vout[dep.vout]!.scriptpubkey, hex.encode(fund.script));
 			assert.equal(tx.vout[dep.vout]!.value, 1_000_000);
-			assert.deepEqual(await checkDeposit(esplora, fund.address!, dep.txid), [], "nothing minted against an unconfirmed deposit");
 			let history = await esplora.addressTxs(fund.address!);
 			assert.deepEqual(history.map((t) => [t.txid, t.status.confirmed]), [[dep.txid, false]]);
 
-			// ── 1 confirmation: visible, still too shallow ──
+			// ── confirmed ──
 			const [block1] = await node.mine(1);
 			const tip1 = await esplora.tipHeight();
 			tx = (await esplora.getTx(dep.txid))!;
 			assert.deepEqual(tx.status, { confirmed: true, block_height: tip1, block_hash: block1, block_time: (await node.rpc("getblockheader", [block1])).time });
-			assert.equal(confirmations(tx, tip1), 1);
-			assert.deepEqual(verifyDeposit(tx, fund.address!, tip1), [], `MIN_CONFIRMATIONS=${MIN_CONFIRMATIONS}`);
-			assert.deepEqual(utxosToInputs(await esplora.utxos(fund.address!), MIN_CONFIRMATIONS, tip1), [], "too shallow to spend");
-
-			// ── MIN_CONFIRMATIONS: credited + spendable ──
-			await node.mine(MIN_CONFIRMATIONS - 1);
-			assert.deepEqual(await checkDeposit(esplora, fund.address!, dep.txid), [{ txid: dep.txid, vout: dep.vout, amount: 1_000_000n, confirmations: MIN_CONFIRMATIONS }]);
+			await node.mine(1);
 			utxos = await esplora.utxos(fund.address!);
 			assert.deepEqual(utxos.map((u) => [u.txid, u.vout, u.value, u.status.confirmed, u.status.block_height]), [[dep.txid, dep.vout, 1_000_000, true, tip1]]);
-			const inputs = utxosToInputs(utxos, MIN_CONFIRMATIONS, await esplora.tipHeight());
-			assert.deepEqual(inputs, [{ txid: dep.txid, index: dep.vout, amount: 1_000_000n }]);
+			const inputs = utxos.map((u) => ({ txid: u.txid, index: u.vout, amount: BigInt(u.value) }));
 
-			// ── withdrawal: key-path spend broadcast through the shim ──
+			// ── key-path spend broadcast through the shim ──
 			const dest = await node.newAddress("bech32");
 			const payout = 1_000_000n - 2_000n;
 			const spend = new btc.Transaction();
@@ -117,8 +110,8 @@ for (const chain of ["bitcoin", "litecoin"] as Chain[]) {
 			assert.deepEqual(history.map((t) => [t.txid, t.status.confirmed]), [[spendId, false], [dep.txid, true]], "newest first, mempool first");
 			const pending = (await esplora.getTx(spendId))!;
 			assert.equal(pending.status.confirmed, false);
-			assert.ok(txPaysWithdrawal(pending, dest, payout));
-			assert.ok(!txPaysWithdrawal(pending, dest, payout + 1n));
+			assert.ok(pending.vout.some((o) => o.scriptpubkey_address === dest && BigInt(o.value) === payout));
+			assert.deepEqual(pending.vin?.map((i) => [i.txid, i.vout, i.witness?.map((w) => w.length)]), [[dep.txid, dep.vout, [128]]], "key-path witness: one 64-byte signature");
 			assert.ok("fee" in pending && pending.fee === 2_000, "fee from indexed prevouts");
 
 			await node.mine(1);
@@ -222,7 +215,7 @@ describe("local nostr relay", { skip }, () => {
 			await until(() => b.got.includes("hello"), "a → b direct");
 			b.t.publishDirect(a.t.nodeKeyHex, { t: "hello", root: "y", heads: {} } as never);
 			await until(() => a.got.includes("hello"), "b → a direct");
-			assert.ok(b.t.liveQuorumAddrs().includes(a.t.nodeKeyHex), "a frame from a peer proves liveness");
+			assert.ok(b.t.livePeerAddrs().includes(a.t.nodeKeyHex), "a frame from a peer proves liveness");
 		} finally {
 			await a.t.destroy();
 			await b.t.destroy();

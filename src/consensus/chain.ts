@@ -39,10 +39,9 @@ export const DEFAULT_FINALITY_DEPTH = 2;
  * Default SETTLEMENT depth (daemon + server): an anchor this deep is never reverted, not even by
  * resolveFork — a branch that doesn't contain it stays rejected (and is reported via
  * onSettledConflict), so a split that outlives S anchors becomes a permanent, LOUD split instead
- * of an un-backed coin. Every irreversible external action (signing / broadcasting a BTC payout,
- * posting bridge.settle, deleting superseded key shares, checkpoint-pruning history) keys off
- * this, never off soft finality. 6 anchors ≈ 6 min at the 60 s target: a partition shorter than
- * that still heals via resolveFork; one longer has already let both sides settle conflicting state.
+ * of a silent rewrite. Every irreversible action (checkpoint-pruning history) keys off this, never
+ * off soft finality. 6 anchors ≈ 6 min at the 60 s target: a partition shorter than that still
+ * heals via resolveFork; one longer has already let both sides settle conflicting state.
  */
 export const DEFAULT_SETTLEMENT_DEPTH = 6;
 
@@ -343,8 +342,8 @@ export class AnchorChain {
 	 * is preserved by materializing the floor's full heads before its ancestry is dropped.
 	 *
 	 * Never prunes at/above the sticky lock (clamped), so finalized history is always intact.
-	 * The caller keeps `floorHeight` below the app checkpoint + a margin covering the retarget /
-	 * committee windows, so every reachable walk still has the anchors it needs.
+	 * The caller keeps `floorHeight` below the app checkpoint + a margin covering the retarget
+	 * window, so every reachable walk still has the anchors it needs.
 	 */
 	prune(floorHeight: number): void {
 		const tip = this.tip();

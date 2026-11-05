@@ -16,9 +16,7 @@
  * runs over an in-memory link (tests) or real Nostr relays (the mesh).
  */
 
-import type { SyncMessage, DkgWire, SignWire, ReshareWire } from "./messages.ts";
-import type { EncKeyAnnounce } from "../custody/enckey.ts";
-import type { Deal } from "../custody/pvss.ts";
+import type { SyncMessage } from "./messages.ts";
 import type { StoredSnapshot } from "../store/store.ts";
 import type { Write } from "../chain/writer.ts";
 import { Ledger } from "../ledger/ledger.ts";
@@ -80,7 +78,7 @@ export class GavlNode {
 	private readonly snapshotOffers = new Map<Connection, { anchorId: string; height: number }>();
 	// ── replication floor (keep RAM state alive across churn) ──
 	/** Desired number of DISTINCT nodes (including self) that durably hold the latest checkpoint.
-	 *  State survives the loss of up to `replicationTarget - 1` holders between handoffs. */
+	 *  State survives the loss of up to `replicationTarget - 1` holders between checkpoints. */
 	replicationTarget = 1;
 	/** Latest checkpoint each peer has advertised holding (via snapshot-have / snapshot-offer),
 	 *  per connection — the holders counted toward the replication factor. */
@@ -133,7 +131,7 @@ export class GavlNode {
 	 *  no event to nudge it. Broadcasting anchor-want makes every peer serve its chain from a recent floor;
 	 *  the heavier one wins fork-choice, and a fork deeper than the floor self-heals via the gap→full-pull
 	 *  path in ingestAnchors. Re-advertise heads too, to converge the write set. Idempotent and cheap; the
-	 *  daemon's stall watch calls this when a bootstrapping tip freezes while peers remain. */
+	 *  daemon calls this while bootstrapping its chain root. */
 	resync(): void {
 		const tip = this.anchors?.tip();
 		const from = tip ? Math.max(0, tip.height - 8) : 0; // small overlap captures a shallow fork without a full pull
@@ -298,85 +296,7 @@ export class GavlNode {
 				this.anchorQueue = this.anchorQueue.then(() => this.ingestAnchors(conn, anchors)).catch(() => {});
 				return;
 			}
-			case "dkg": {
-				// Hand the ceremony message to the registered coordinator, WITH the
-				// connection it arrived on — so the coordinator can reply point-to-point
-				// (round-2 secret shares ride the sender's own encrypted connection).
-				this.onCeremonyMessage?.(m.m); // watch for equivocation (auto fault-reporting)
-				this.onDkg?.(conn, m.m);
-				return;
-			}
-			case "sign": {
-				this.onCeremonyMessage?.(m.m);
-				this.onSign?.(m.m); // signing ceremony is broadcast-only (no secrets cross)
-				return;
-			}
-			case "reshare": {
-				this.onCeremonyMessage?.(m.m);
-				this.onReshare?.(conn, m.m); // sub-shares are point-to-point → needs the conn
-				return;
-			}
-			case "enckey": {
-				this.onEncKey?.(m.a); // self-authenticating (the binding is signed); the registry verifies it
-				return;
-			}
-			case "shadowdeal": {
-				this.onShadowDeal?.(m.epoch, m.deal); // validation-only; the deal's commitments are self-checking
-				return;
-			}
 		}
-	}
-
-	/** Tap on EVERY inbound ceremony message (dkg/sign/reshare), independent of the
-	 *  coordinators — registered by the equivocation watcher for auto fault-reporting. */
-	onCeremonyMessage?: (m: DkgWire | SignWire | ReshareWire) => void;
-
-	// ── DKG ceremony transport (used by custody/dkg-coordinator) ─────
-	/** Registered by a DkgCoordinator to receive ceremony messages + their connection. */
-	onDkg?: (conn: Connection, m: DkgWire) => void;
-	/** Broadcast a DKG message to all peers (round 1). */
-	dkgBroadcast(m: DkgWire): void {
-		this.broadcast({ t: "dkg", m });
-	}
-	/** Send a DKG message to ONE peer over its own connection (round-2 secret share). */
-	dkgReply(conn: Connection, m: DkgWire): void {
-		conn.send({ t: "dkg", m });
-	}
-
-	// ── signing ceremony transport (used by custody/sign-coordinator) ──
-	/** Registered by a SignCoordinator to receive signing-ceremony messages. */
-	onSign?: (m: SignWire) => void;
-	/** Broadcast a signing message (nonce commitment / sig share — both public). */
-	signBroadcast(m: SignWire): void {
-		this.broadcast({ t: "sign", m });
-	}
-
-	// ── reshare ceremony transport (used by custody/reshare-coordinator) ──
-	/** Registered by a ReshareCoordinator; receives reshare messages + their connection. */
-	onReshare?: (conn: Connection, m: ReshareWire) => void;
-	/** Broadcast a reshare message (hello / verifying share — both public). */
-	reshareBroadcast(m: ReshareWire): void {
-		this.broadcast({ t: "reshare", m });
-	}
-	/** Send a reshare message to ONE peer over its connection (secret sub-share). */
-	reshareReply(conn: Connection, m: ReshareWire): void {
-		conn.send({ t: "reshare", m });
-	}
-
-	// ── encryption-key announce transport (verifiable encrypted resharing, phase 1) ──
-	/** Registered by the daemon; receives peers' encryption-key announcements (verified by the registry). */
-	onEncKey?: (a: EncKeyAnnounce) => void;
-	/** Broadcast this node's encryption-key announcement (self-signed; safe to flood + re-broadcast). */
-	encKeyBroadcast(a: EncKeyAnnounce): void {
-		this.broadcast({ t: "enckey", a });
-	}
-
-	// ── shadow reshare transport (verifiable encrypted resharing, phase 2 shadow run) ──
-	/** Registered by the shadow coordinator; receives peers' shadow contribution deals. */
-	onShadowDeal?: (epoch: number, deal: Deal) => void;
-	/** Broadcast a shadow contribution deal (validation-only; safe to flood + re-broadcast). */
-	shadowDealBroadcast(epoch: number, deal: Deal): void {
-		this.broadcast({ t: "shadowdeal", epoch, deal });
 	}
 
 	/** Cap on buffered orphan anchors (transient bootstrap state) — far above any real suffix. */
@@ -439,7 +359,7 @@ export class GavlNode {
 	/** How many DISTINCT nodes (including self) durably hold checkpoint `anchorId`. Peers are deduped
 	 *  by their stable wire identity (peerKey) so one peer over many connections counts once — the
 	 *  same sybil guard as the adoption quorum. This is the replication floor: state survives the loss
-	 *  of up to `replicationFactor - 1` holders between handoffs. */
+	 *  of up to `replicationFactor - 1` holders between checkpoints. */
 	replicationFactor(anchorId: string): number {
 		const holders = new Set<string | Connection>();
 		if (this.snapshotHeader?.()?.anchorId === anchorId) holders.add("self"); // I hold it durably

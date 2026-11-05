@@ -7,8 +7,7 @@
  *    Connection object preserves send/onMessage/onClose exactly, so GavlNode is unchanged.
  *  - DISCOVERY replaces seeds + PEX entirely: each node publishes a replaceable PRESENCE event
  *    tagged with the channel, so "who is on this network" is one relay query. A node's signed
- *    producer↔address binding rides that same event (committee members address each other by
- *    consensus key, exactly as before).
+ *    producer↔address binding rides that same event (peers can resolve a node by its consensus key).
  *  - RELAYS ARE UNTRUSTED and individually unreliable — measured, not assumed (see N0 spike):
  *    some refuse to connect, some gate writes behind a web-of-trust, and at least one ACCEPTS a
  *    publish but never forwards it. So we always publish to ALL relays and treat any single one as
@@ -60,7 +59,7 @@ export const KIND_GOSSIP = 20777;
 export const KIND_DIRECT = 20778;
 
 /** Ignore presence older than this: a node that stopped refreshing is gone, and a stale entry must
- *  not inflate the live-quorum count (the lobby gates consensus on it). */
+ *  not count as a live peer. */
 export const PRESENCE_TTL_MS = 10 * 60_000;
 /** Max serialized frame we will publish. Relays accept ~32 KB; leave headroom for JSON escaping,
  *  tags and signature. Anything larger is chunked across events (see ./chunk.ts). */
@@ -85,10 +84,10 @@ export interface NostrOptions {
 	relays?: string[];
 	/** Hard cap on active peer connections (excluding pinned). Default 16. */
 	maxPeers?: number;
-	/** Diagnostic hook — human-readable network steps (peer/binding/committee) for the UI feed. */
+	/** Diagnostic hook — human-readable network steps (peer/binding) for the UI feed. */
 	onEvent?: (kind: string, text: string) => void;
 	/** Signs the producer↔address binding carried in our presence event. Without it the node still
-	 *  gossips but peers can't resolve it by producer key (committee addressing). */
+	 *  gossips but peers can't resolve it by producer key. */
 	bindingSigner?: (message: Uint8Array) => { producer: string; sig: string };
 }
 
@@ -157,10 +156,9 @@ export class NostrTransport {
 	// ── the peer set (same shape as every Gavl transport) ──
 	private readonly active = new Map<string, NostrConnection>(); // pubkey → live connection
 	private readonly seen = new Map<string, Presence>(); // pubkey → last verified presence
-	private readonly pinned = new Set<string>(); // never evicted (committee links + manual pins)
+	private readonly pinned = new Set<string>(); // never evicted (manual pins)
 	private readonly lastFrame = new Map<string, number>(); // pubkey → last frame FROM it (liveness)
 	private readonly producerToAddress = new Map<string, string>(); // producer hex → nostr pubkey
-	private readonly committeePins = new Set<string>();
 
 	// ── bulk frames: split on send, rebuilt on receive (./chunk.ts) ──
 	private readonly reasm = new Reassembler();
@@ -352,8 +350,8 @@ export class NostrTransport {
 		this.activate(ev.pubkey);
 	}
 
-	/** Drop peers whose presence went stale, so quorum math only ever counts nodes that are really
-	 *  there (a ghost quorum is what wedges the lobby).
+	/** Drop peers whose presence went stale, so peer counts only ever include nodes that are really
+	 *  there.
 	 *  @internal (test seam) */
 	sweepStale(): void {
 		const now = Date.now();
@@ -521,15 +519,13 @@ export class NostrTransport {
 		return [...new Set([...this.active.keys(), ...this.seen.keys(), ...this.producerToAddress.values()])];
 	}
 
-	/** Peers with LIVE two-way evidence: a frame arrived FROM them inside the freshness window. A
-	 *  committee pin counts only when it also has a live connection — never merely because we pinned
-	 *  it, which would be a ghost quorum. */
-	liveQuorumAddrs(): string[] {
+	/** Peers with LIVE two-way evidence: a frame arrived FROM them inside the freshness window — never
+	 *  merely a cached announce from an offline ghost. */
+	livePeerAddrs(): string[] {
 		const ms = Number(process.env.GAVL_LIVE_PEER_MS ?? 180_000);
 		const now = Date.now();
 		const live = new Set<string>();
 		for (const [peer, t] of this.lastFrame) if (now - t <= ms) live.add(peer);
-		for (const addr of this.committeePins) if (this.active.has(addr)) live.add(addr);
 		return [...live];
 	}
 
@@ -547,34 +543,10 @@ export class NostrTransport {
 		this.activate(pk);
 	}
 
-	/** Keep direct links to this node's committee members, resolved from their signed bindings. */
-	connectCommittee(producerIds: string[]): void {
-		const want = new Set<string>();
-		for (const pid of producerIds) {
-			const addr = this.producerToAddress.get(pid);
-			if (addr && addr !== this.myPubkey) want.add(addr);
-		}
-		for (const addr of [...this.committeePins]) {
-			if (want.has(addr)) continue;
-			this.committeePins.delete(addr);
-			this.pinned.delete(addr);
-		}
-		let linked = 0;
-		for (const addr of want) {
-			if (this.committeePins.has(addr)) continue;
-			this.committeePins.add(addr);
-			this.pinned.add(addr);
-			this.activate(addr);
-			linked++;
-		}
-		if (linked > 0) this.report("committee", `linked ${linked} member${linked === 1 ? "" : "s"} directly (${producerIds.length} in roster)`);
-	}
-
-	diagnostics(): { maxPeers: number; bindings: number; committeeLinked: number; gossipIntervalSec: number; relaysUp: number; relaysTotal: number } {
+	diagnostics(): { maxPeers: number; bindings: number; gossipIntervalSec: number; relaysUp: number; relaysTotal: number } {
 		return {
 			maxPeers: this.maxPeers,
 			bindings: this.producerToAddress.size,
-			committeeLinked: this.committeePins.size,
 			gossipIntervalSec: this.announceIntervalSec,
 			relaysUp: this.relayUp.size,
 			relaysTotal: this.relays.length,

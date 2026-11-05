@@ -1,140 +1,45 @@
 /**
- * Deterministic serialization + commitment for the application View.
+ * The application state an anchor commits to (its `appRoot`), and its deterministic encoding.
  *
- * The View ([market/btc.ts]) is held in RAM with `Map`/`Set`/`bigint` — none of
- * which `canonicalize` (plain-JSON only) can encode. To let an anchor COMMIT to the
- * folded state (so a finalized anchor becomes a trustless checkpoint), we need a
- * byte-for-byte deterministic encoding of the View:
+ * Gavl's app layer is the ephemeral BTC↔LTC order board; coins never touch this chain (swaps
+ * settle on Bitcoin and Litecoin via HTLCs), so there is no balance ledger here. Until the order
+ * board's state lands, the committed state is EMPTY: every anchor commits `viewRoot(emptyView())`,
+ * and checkpoints carry that empty state so a peer can still authenticate one against the
+ * anchor chain (snapshot.state ↦ viewRoot must equal the committing anchor's appRoot).
  *
- *   serializeView(view) -> CanonState   (plain JSON: Maps→sorted [k,v]; Sets→sorted; bigint→decimal)
+ *   serializeView(view) -> CanonState   (plain JSON, canonical)
  *   viewRoot(view)      -> sha256Hex(canonicalize(CanonState))
  *   deserializeView(s)  -> View          (exact inverse — loads a snapshot back into RAM)
  *
- * CONSENSUS-CRITICAL: every node must compute the SAME root for the SAME logical
- * state, regardless of Map insertion order. All map/set encodings are key-sorted;
- * arrays whose order is itself state (pending withdrawals FIFO)
- * are kept in fold order. Round-trips are tested to be lossless.
+ * CONSENSUS-CRITICAL: every node must compute the SAME root for the SAME logical state.
  */
 
 import { sha256Hex, canonicalize } from "../det/canonical.ts";
-import type { View, CustodyHolder } from "./btc.ts";
-import { emptyBridge } from "../custody/bridge.ts";
-import type { BridgeState, PendingWithdrawal } from "../custody/bridge.ts";
 
-// ── canonical (plain-JSON) shape ─────────────────────────────────
+/** The folded application state (empty — see the module doc). */
+export type View = Readonly<Record<string, never>>;
 
-type Entry<V> = [string, V];
+/** Plain-JSON (canonical) form of the View, as stored in checkpoints. */
+export type CanonState = Readonly<Record<string, never>>;
 
-export interface CanonBridge {
-	gbtc: Entry<string>[]; // pubkey → sats (decimal), sorted by pubkey
-	reserves: string;
-	processed: string[]; // sorted
-	pending: { id: string; owner: string; amount: string; btcAddress: string; fee: string }[]; // fold order (FIFO)
-	depositors: string[]; // sorted
-	claims: Entry<{ depositor: string; height: number }>[]; // depositId → {depositor, request height}, sorted
-	broadcasts: Entry<string>[]; // withdrawalId → txid, sorted
-	mintedTotal: string;
-	paidOut: string;
-	chargeFrom: Entry<{ since: number; from: number; base: string; days: number }>[]; // pubkey → demurrage idle clock, sorted
-	pot: string; // the liquidity pot (idle-fee bucket)
+const EMPTY: View = Object.freeze({});
+
+export function emptyView(): View {
+	return EMPTY;
 }
 
-/** Plain-JSON custody state: the fund key/epoch, the excluded (faulted) producers, and the recorded
- *  key holders (committees are already sorted id lists, so they serialize canonically as-is). */
-export interface CanonCustody {
-	fundKey: string | null;
-	epoch: number;
-	excluded: Entry<number>[]; // producer → fault height, sorted
-	holder: CustodyHolder | null;
-	prevHolder: CustodyHolder | null;
-	fundVotes: Entry<string[]>[]; // pending genesis proposal → sorted endorsers, sorted by proposal
+export function serializeView(_view: View): CanonState {
+	return {};
 }
 
-export interface CanonState {
-	bridge: CanonBridge;
-	custody: CanonCustody;
+/** Exact inverse of serializeView. Rejects anything that isn't the canonical (empty) state, so a
+ *  peer can't smuggle unknown fields into a checkpoint. */
+export function deserializeView(s: CanonState): View {
+	if (s === null || typeof s !== "object" || Array.isArray(s) || Object.keys(s).length !== 0) throw new Error("state: not a canonical app state");
+	return EMPTY;
 }
 
-// ── helpers ──────────────────────────────────────────────────────
-
-const byKey = (a: Entry<unknown>, b: Entry<unknown>): number => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
-
-function mapEntries<V, W>(m: Map<string, V>, f: (v: V) => W): Entry<W>[] {
-	const out: Entry<W>[] = [];
-	for (const [k, v] of m) out.push([k, f(v)]);
-	out.sort(byKey);
-	return out;
-}
-
-function sortedSet(s: Set<string>): string[] {
-	return [...s].sort();
-}
-
-// ── serialize ────────────────────────────────────────────────────
-
-function serializeBridge(b: BridgeState): CanonBridge {
-	return {
-		gbtc: mapEntries(b.gbtc, (v) => v.toString()),
-		reserves: b.reserves.toString(),
-		processed: sortedSet(b.processed),
-		pending: b.pending.map((p) => ({ id: p.id, owner: p.owner, amount: p.amount.toString(), btcAddress: p.btcAddress, fee: p.fee.toString() })),
-		depositors: sortedSet(b.depositors),
-		claims: mapEntries(b.claims, (c) => ({ depositor: c.depositor, height: c.height })),
-		broadcasts: mapEntries(b.broadcasts, (v) => v),
-		mintedTotal: b.mintedTotal.toString(),
-		paidOut: b.paidOut.toString(),
-		chargeFrom: mapEntries(b.chargeFrom, (e) => ({ since: e.since, from: e.from, base: e.base.toString(), days: e.days })),
-		pot: b.pot.toString(),
-	};
-}
-
-export function serializeView(view: View): CanonState {
-	return {
-		bridge: serializeBridge(view.bridge),
-		custody: {
-			fundKey: view.custody.fundKey,
-			epoch: view.custody.epoch,
-			excluded: mapEntries(view.custody.excluded, (h) => h),
-			holder: view.custody.holder ? { ...view.custody.holder, committee: [...view.custody.holder.committee] } : null,
-			prevHolder: view.custody.prevHolder ? { ...view.custody.prevHolder, committee: [...view.custody.prevHolder.committee] } : null,
-			fundVotes: mapEntries(view.custody.fundVotes, (ids) => [...ids]),
-		},
-	};
-}
-
-/** The application-state commitment: a single hash over the whole folded View. */
+/** The application-state commitment: a single hash over the whole View. */
 export function viewRoot(view: View): string {
 	return sha256Hex(canonicalize(serializeView(view)));
-}
-
-// ── deserialize (exact inverse) ──────────────────────────────────
-
-function deserializeBridge(b: CanonBridge): BridgeState {
-	const s = emptyBridge();
-	for (const [k, v] of b.gbtc) s.gbtc.set(k, BigInt(v));
-	s.reserves = BigInt(b.reserves);
-	for (const id of b.processed) s.processed.add(id);
-	s.pending = b.pending.map((p): PendingWithdrawal => ({ id: p.id, owner: p.owner, amount: BigInt(p.amount), btcAddress: p.btcAddress, fee: BigInt(p.fee ?? "1000") }));
-	for (const d of b.depositors) s.depositors.add(d);
-	for (const [k, c] of b.claims) s.claims.set(k, { depositor: c.depositor, height: c.height });
-	for (const [k, v] of b.broadcasts) s.broadcasts.set(k, v);
-	s.mintedTotal = BigInt(b.mintedTotal);
-	s.paidOut = BigInt(b.paidOut);
-	for (const [k, e] of b.chargeFrom) s.chargeFrom.set(k, { since: e.since, from: e.from, base: BigInt(e.base), days: e.days });
-	s.pot = BigInt(b.pot);
-	return s;
-}
-
-export function deserializeView(s: CanonState): View {
-	return {
-		bridge: deserializeBridge(s.bridge),
-		custody: {
-			fundKey: s.custody.fundKey,
-			epoch: s.custody.epoch,
-			excluded: new Map(s.custody.excluded),
-			holder: s.custody.holder ? { ...s.custody.holder, committee: [...s.custody.holder.committee] } : null,
-			prevHolder: s.custody.prevHolder ? { ...s.custody.prevHolder, committee: [...s.custody.prevHolder.committee] } : null,
-			fundVotes: new Map((s.custody.fundVotes ?? []).map(([k, ids]) => [k, [...ids]])),
-		},
-	};
 }

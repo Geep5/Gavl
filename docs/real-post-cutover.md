@@ -35,13 +35,11 @@ change to consensus.
 
 ## Prerequisites (every farming operator)
 
-1. **Chia bridge** — `python3 -m venv .venv && .venv/bin/pip install chiavdf chiapos`.
+1. **Chia helper** — `python3 -m venv .venv && .venv/bin/pip install chiavdf chiapos`.
 2. **Real-PoST config** — real PoST (`GAVL_VDF=chia`, `GAVL_SPACE=chiapos`) is the default; run
-   `npm run setup:chia` once for the bridge (see the README "Real PoST vs. the stand-ins" section).
+   `npm run setup:chia` once for the helper venv.
    Agree on a common `GAVL_K` (defaults to 18 for chiapos; e.g. set 20) so every node carries
    comparable space; plotting is one-time and reused.
-3. **≥3 farmers.** The custody committee runs genesis DKG only with ≥3 farmers — below that, minting
-   stays disabled. Line up at least three real-PoST nodes before cutover.
 
 ## Procedure
 
@@ -78,5 +76,5 @@ across the real-PoST nodes, with `producers ≥ 3`.
   anchorId)` is real finalized history. `adoptQuorum` raises the bar to "N independent operators
   aren't colluding," but it is not a cryptographic guarantee — hence distributing the pair
   out-of-band. Baked-in shipped checkpoints would harden this further (planned, not yet shipped).
-- **No automatic downgrade.** `GAVL_VDF=chia` throws if the bridge is missing — a misconfigured
+- **No automatic downgrade.** `GAVL_VDF=chia` throws if the Chia helper is missing — a misconfigured
   operator fails loudly rather than silently rejoining as a stand-in. That's intended.

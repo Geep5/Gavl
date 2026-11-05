@@ -5,9 +5,9 @@
  * chains the lower TIP id wins ENTIRELY. That's correct for consensus, but it means: if a node builds a
  * RUN of anchors before it syncs the others' competing run (i.e. production outruns gossip), the losing
  * run is orphaned wholesale — and that producer vanishes from the canonical chain. On the hub, fast
- * bootstrap anchors (~1.6s) outran mesh latency (~secs), so each node extended its OWN run, the runs
- * orphaned each other, and every node saw only itself → `producers≈1` → the committee's ≥3 bar was
- * never met. The fix is at the PACING layer (bootstrap must not mint faster than gossip converges), not
+ * anchors (~1.6s) outran mesh latency (~secs), so each node extended its OWN run, the runs orphaned
+ * each other, and every node saw only itself → `producers≈1`. The fix is at the PACING layer (a farmer
+ * with peers must not mint faster than gossip converges — producer.runAdaptive's peerPaceMs), not
  * the fork-choice; these tests pin the mechanism so it isn't re-diagnosed.
  *
  *   node --test test/anchor-convergence.test.ts

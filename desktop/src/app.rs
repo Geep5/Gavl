@@ -8,7 +8,6 @@ use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme, ThemeMode, TitleBar, WindowExt,
     alert::Alert,
     button::{Button, ButtonVariants},
-    input::InputState,
     notification::Notification,
     sidebar::{Sidebar, SidebarFooter, SidebarMenu, SidebarMenuItem},
     status_bar::StatusBar,
@@ -28,29 +27,23 @@ const POLL_EVERY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
-    Wallet,
     Network,
-    Custody,
     Node,
 }
 
 impl Page {
-    pub const ALL: [Page; 4] = [Page::Wallet, Page::Network, Page::Custody, Page::Node];
+    pub const ALL: [Page; 2] = [Page::Network, Page::Node];
 
     fn label(self) -> &'static str {
         match self {
-            Page::Wallet => "Wallet",
             Page::Network => "Network",
-            Page::Custody => "Custody",
             Page::Node => "Node",
         }
     }
 
     fn icon(self) -> Icon {
         match self {
-            Page::Wallet => Icon::new(gpui_kit::assets::IconName::Wallet),
             Page::Network => Icon::new(IconName::Network),
-            Page::Custody => Icon::new(gpui_kit::assets::IconName::ShieldCheck),
             Page::Node => Icon::new(IconName::HardDrive),
         }
     }
@@ -59,9 +52,6 @@ impl Page {
 /// An action that can be in flight; buttons show `loading` and refuse double-submits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Busy {
-    Claim,
-    Withdraw,
-    ProcessPayouts,
     SwitchAccount,
     Gossip,
     FleetUp,
@@ -83,30 +73,11 @@ pub struct GavlApp {
     events_cursor: u64,
     fetching: bool,
     pub busy: HashSet<Busy>,
-
-    pub deposit_txid: Entity<InputState>,
-    pub withdraw_amount: Entity<InputState>,
-    pub withdraw_address: Entity<InputState>,
-    pub withdraw_fee: Entity<InputState>,
-    pub claim_result: Option<String>,
-
     _poll: Task<()>,
-    _subscriptions: Vec<Subscription>,
 }
 
 impl GavlApp {
-    pub fn new(client: Client, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let deposit_txid = cx.new(|cx| InputState::new(window, cx).placeholder("Deposit transaction id (64 hex characters)"));
-        let withdraw_amount = cx.new(|cx| InputState::new(window, cx).placeholder("Amount"));
-        let withdraw_address = cx.new(|cx| InputState::new(window, cx).placeholder("Bitcoin address (tb1…)"));
-        let withdraw_fee = cx.new(|cx| InputState::new(window, cx).placeholder("Miner fee").default_value("1000"));
-
-        // Re-render on edits so derived validation and summaries stay current.
-        let mut subscriptions = Vec::new();
-        for input in [&deposit_txid, &withdraw_amount, &withdraw_address, &withdraw_fee] {
-            subscriptions.push(cx.observe(input, |_, _, cx| cx.notify()));
-        }
-
+    pub fn new(client: Client, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let poll = cx.spawn(async move |this, cx| {
             loop {
                 if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
@@ -118,20 +89,14 @@ impl GavlApp {
 
         Self {
             client,
-            page: Page::Wallet,
+            page: Page::Network,
             snapshot: Snapshot::default(),
             connection: Connection::Connecting,
             events: VecDeque::new(),
             events_cursor: 0,
             fetching: false,
             busy: HashSet::new(),
-            deposit_txid,
-            withdraw_amount,
-            withdraw_address,
-            withdraw_fee,
-            claim_result: None,
             _poll: poll,
-            _subscriptions: subscriptions,
         }
     }
 
@@ -229,20 +194,12 @@ impl GavlApp {
         self.snapshot.consensus.as_ref().and_then(|c| c.tip.as_ref()).map_or(0, |t| t.height)
     }
 
-    pub fn balance(&self) -> u128 {
-        self.snapshot.bridge.as_ref().map_or(0, |b| api::amount(&b.my_gbtc))
-    }
-
-    pub fn min_committee(&self) -> u32 {
-        self.snapshot.custody.as_ref().map(|c| c.min_committee).filter(|n| *n > 0).unwrap_or(3)
-    }
-
     pub fn summary(&self) -> status::Summary {
         let consensus = match self.connection {
             Connection::Online => self.snapshot.consensus.as_ref(),
             _ => None,
         };
-        status::summarize(consensus, self.min_committee())
+        status::summarize(consensus)
     }
 
     pub fn active_label(&self) -> String {
@@ -260,7 +217,7 @@ impl GavlApp {
         match health {
             Health::Live => Tag::success(),
             Health::Starting => Tag::info(),
-            Health::Lobby { .. } | Health::NoPeers => Tag::warning(),
+            Health::NoPeers => Tag::warning(),
             Health::Offline | Health::Disabled => Tag::danger(),
         }
         .outline()
@@ -316,12 +273,7 @@ impl GavlApp {
             .collapsible(false)
             .child(menu)
             .footer(
-                SidebarFooter::new().child(
-                    v_flex()
-                        .gap_0p5()
-                        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(self.active_label()))
-                        .child(div().font_semibold().child(format::gbtc(self.balance()))),
-                ),
+                SidebarFooter::new().child(div().text_xs().text_color(cx.theme().muted_foreground).child(self.active_label())),
             )
             .into_any_element()
     }
@@ -347,9 +299,7 @@ impl GavlApp {
 
     fn render_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.page {
-            Page::Wallet => self.render_wallet(window, cx),
             Page::Network => self.render_network(window, cx),
-            Page::Custody => self.render_custody(window, cx),
             Page::Node => self.render_node(window, cx),
         }
     }

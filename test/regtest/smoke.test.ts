@@ -1,8 +1,8 @@
 /**
  * Real-node smoke test: a Taproot KEY-PATH spend, signed outside any wallet with a
  * BIP-340 signature under the BIP-341-tweaked key, is accepted, relayed and mined by
- * Bitcoin Core and Litecoin Core regtest nodes. This is the exact shape of a
- * committee-signed withdrawal (group key → tweaked output key → one schnorr sig).
+ * Bitcoin Core and Litecoin Core regtest nodes — Taproot is live on both chains, which the
+ * swap HTLCs (Taproot outputs) rely on.
  *
  *   npm run regtest:install                       # once: fetch node binaries
  *   GAVL_REGTEST=1 node --test test/regtest/smoke.test.ts
@@ -21,7 +21,7 @@ const { Point } = secp256k1;
 const N = Point.Fn.ORDER;
 
 /**
- * BIP-341 key-path tweak done by hand (as a signing committee would): returns the
+ * BIP-341 key-path tweak done by hand: returns the
  * x-only internal key, the x-only output key Q = P + H_TapTweak(P)·G, and the secret
  * for Q with BIP-340's even-Y negations applied.
  */

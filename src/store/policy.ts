@@ -6,23 +6,13 @@
  * through RAM/gossip live; they're just not written to disk, so they're gone on
  * restart — making a node a light/partial node BY CHOICE. The network only stays
  * whole if some nodes archive (keep everything).
- *
- * Op set: the gBTC bridge, transfers, and threshold custody.
  */
 
 import type { Write } from "../chain/writer.ts";
-import type { Op } from "../market/ops.ts";
-import { isOp } from "../market/ops.ts";
-
-export interface PolicyContext {
-	op: Op | null;
-	/** Position ids this policy has chosen to keep (to keep their close/liquidate). */
-	keptPositions: Set<string>;
-}
 
 export interface PersistPolicy {
 	readonly name: string;
-	keep(write: Write, ctx: PolicyContext): boolean;
+	keep(write: Write): boolean;
 	describe(): string;
 }
 
@@ -37,10 +27,7 @@ export class KeepAllPolicy implements PersistPolicy {
 	}
 }
 
-/**
- * Mine: keep what touches my keys — my farms/transfers, plus bridge mint/settle
- * (shared infra). Everything else is RAM-only.
- */
+/** Mine: keep only the writes my own keys authored. Everything else is RAM-only. */
 export class MinePolicy implements PersistPolicy {
 	readonly name = "mine";
 	private readonly keys: Set<string>;
@@ -49,49 +36,11 @@ export class MinePolicy implements PersistPolicy {
 		this.keys = new Set(keys);
 	}
 
-	keep(write: Write, ctx: PolicyContext): boolean {
-		if (this.keys.has(write.writer)) return true; // anything I authored
-		const op = ctx.op;
-		if (!op) return false;
-		switch (op.kind) {
-			case "bridge.deposit":
-			case "bridge.settle":
-				return true; // bridge mint/settle are shared infra — always keep
-			case "gbtc.transfer":
-				return this.keys.has(op.to);
-			case "bridge.withdraw":
-				return this.keys.has(write.writer);
-			default:
-				return false;
-		}
+	keep(write: Write): boolean {
+		return this.keys.has(write.writer);
 	}
 
 	describe(): string {
-		return `Mine — persist writes touching ${this.keys.size} key(s), plus bridge mint/settle.`;
+		return `Mine — persist writes authored by ${this.keys.size} key(s).`;
 	}
-}
-
-/** Compose policies: keep if ANY keeps (union). */
-export class AnyPolicy implements PersistPolicy {
-	readonly name = "any";
-	private readonly policies: PersistPolicy[];
-	constructor(policies: PersistPolicy[]) {
-		this.policies = policies;
-	}
-	keep(write: Write, ctx: PolicyContext): boolean {
-		return this.policies.some((p) => p.keep(write, ctx));
-	}
-	describe(): string {
-		return this.policies.map((p) => p.describe()).join(" + ");
-	}
-}
-
-export function decode(write: Write): Op | null {
-	const op = write.payload as Op | null;
-	return isOp(op) ? op : null;
-}
-
-/** After deciding to KEEP a write, record ids it establishes for later references. */
-export function recordKept(_write: Write, _op: Op | null, _ctx: PolicyContext): void {
-	// (no cross-write id references needed in the current op set)
 }

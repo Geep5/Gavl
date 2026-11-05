@@ -1,7 +1,6 @@
 //! Blocking client for the local Gavl daemon's JSON API (`src/server.ts`).
 //!
-//! Every call runs on GPUI's background executor, never the UI thread. Amounts arrive as decimal
-//! strings (BigInt-safe on the daemon side) and stay strings here; `amount()` parses on read.
+//! Every call runs on GPUI's background executor, never the UI thread.
 
 use anyhow::{Context as _, Result, anyhow};
 use serde::Deserialize;
@@ -40,21 +39,6 @@ impl Client {
 
     pub fn set_active(&self, pub_hex: &str) -> Result<Value> {
         self.post("/api/accounts/active", json!({ "pubHex": pub_hex }))
-    }
-
-    pub fn claim_deposit(&self, txid: &str) -> Result<Value> {
-        self.post_slow("/api/deposit/claim", json!({ "txid": txid }))
-    }
-
-    pub fn withdraw(&self, amount: u128, btc_address: &str, fee: u128) -> Result<Value> {
-        self.post_slow(
-            "/api/withdraw",
-            json!({ "amount": amount.to_string(), "btcAddress": btc_address, "fee": fee.to_string() }),
-        )
-    }
-
-    pub fn process_withdrawals(&self) -> Result<Value> {
-        self.post_slow("/api/withdrawals/process", json!({}))
     }
 
     pub fn set_gossip_interval(&self, seconds: u32) -> Result<Value> {
@@ -103,11 +87,6 @@ fn read_json(mut res: ureq::http::Response<ureq::Body>) -> Result<Value> {
     Err(anyhow!(msg))
 }
 
-/// Parse a decimal amount string; malformed or missing reads as 0 (display only — the daemon is authoritative).
-pub fn amount(s: &str) -> u128 {
-    s.trim().parse().unwrap_or(0)
-}
-
 // ── /api/state ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -115,9 +94,7 @@ pub fn amount(s: &str) -> u128 {
 pub struct Snapshot {
     pub accounts: Vec<AccountRef>,
     pub active: Option<String>,
-    pub bridge: Option<Bridge>,
     pub consensus: Option<Consensus>,
-    pub custody: Option<Custody>,
     pub fleet: Option<Fleet>,
 }
 
@@ -126,31 +103,6 @@ pub struct Snapshot {
 pub struct AccountRef {
     pub label: String,
     pub pub_hex: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct Bridge {
-    pub my_gbtc: String,
-    pub idle_decay: Option<IdleDecay>,
-    pub reserves: String,
-    pub gbtc_outstanding: String,
-    pub pending: String,
-    pub pending_count: u32,
-    pub deposit_address: Option<String>,
-    pub fund_address: Option<String>,
-    pub btc_network: String,
-    pub on_chain_reserves: Option<String>,
-    pub reconciled: Option<bool>,
-    pub shortfall: Option<String>,
-    pub pot: String,
-    pub free: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct IdleDecay {
-    pub fee_from_height: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -175,7 +127,6 @@ pub struct Consensus {
     pub pinned_peers: Vec<String>,
     pub max_peers: Option<u32>,
     pub bindings: u32,
-    pub committee_linked: u32,
     pub gossip_interval_sec: Option<u32>,
     pub relays_up: Option<u32>,
     pub relays_total: Option<u32>,
@@ -186,21 +137,6 @@ pub struct Consensus {
 pub struct Tip {
     pub height: u64,
     pub id: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct Custody {
-    pub mode: String,
-    pub epoch: i64,
-    pub fund_key_on_chain: Option<String>,
-    pub fund_address: Option<String>,
-    pub committee_id: Option<String>,
-    pub holds_share: bool,
-    pub committee: Vec<String>,
-    pub threshold: u32,
-    pub min_committee: u32,
-    pub committee_max: u32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

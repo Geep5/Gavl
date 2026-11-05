@@ -17,13 +17,11 @@ import { MemoryNetwork } from "../src/sync/memory.ts";
 import { AnchorChain } from "../src/consensus/chain.ts";
 import { mineAnchor } from "../src/consensus/anchor.ts";
 import type { Anchor } from "../src/consensus/anchor.ts";
-import { Account } from "../src/market/account.ts";
-import { computeView, viewAtAnchor } from "../src/market/btc.ts";
-import { serializeView, deserializeView, viewRoot } from "../src/market/state.ts";
-import type { View } from "../src/market/btc.ts";
+import { serializeView, deserializeView, viewRoot, emptyView } from "../src/market/state.ts";
+import type { View } from "../src/market/state.ts";
 import type { StoredSnapshot } from "../src/store/store.ts";
 import { generateKeyPair } from "../src/det/ed25519.ts";
-import { PARAMS, K, STANDIN_VERIFIER, standinProver, withGbtc } from "./helpers.ts";
+import { Account, PARAMS, K, STANDIN_VERIFIER, standinProver } from "./helpers.ts";
 
 test("a fresh peer bootstraps genesis-free by adopting a pruned peer's checkpoint as a trusted floor", async () => {
 	// ── Build peer A: writes + an anchor chain that buries them to finality ──
@@ -32,19 +30,13 @@ test("a fresh peer bootstraps genesis-free by adopting a pruned peer's checkpoin
 	const now = () => ++t;
 	const mk = (kp?: any) => new Account({ node: A, params: PARAMS, k: K, now, keypair: kp });
 	const poster = mk();
-	// gBTC is committee-gated now, so balances live in the fold base (withGbtc), not a sig-less deposit
-	// write. This test is about genesis-free adoption, not mint authorization: the gBTC just has to
-	// EXIST in the SAME base that A's appRoot, the checkpoint state, and B's reconstruction fold from.
-	const balances: Record<string, bigint> = {};
-	const fund = (a: Account, amt: bigint) => (balances[a.pubHex] = (balances[a.pubHex] ?? 0n) + amt);
-	const base = () => withGbtc(computeView([]), balances); // a FRESH base each call (withGbtc mutates it)
+	// The app state is empty, so every anchor commits the same appRoot; this test is about adoption.
+	const appRoot = viewRoot(emptyView());
 
 	const m = generateKeyPair();
 	const prover = standinProver(m);
 	const mineOn = async (node: GavlNode): Promise<Anchor> => {
 		const prev = node.anchorTip();
-		const all = node.ledger.allWrites();
-		const appRoot = prev ? viewRoot(viewAtAnchor(all, node.anchors!, prev.id, base())) : viewRoot(computeView([], { base: base() }));
 		const a = (await mineAnchor({ prev, prevHeads: prev ? node.anchors!.headsAt(prev.id) : {}, producer: m, prover, heads: node.ledger.heads(), params: PARAMS, appRoot }))!;
 		await node.submitAnchor(a);
 		return a;
@@ -53,24 +45,22 @@ test("a fresh peer bootstraps genesis-free by adopting a pruned peer's checkpoin
 	const acctA = mk();
 	const acctB = mk();
 	await poster.noop(); // a write from a third account
-	fund(acctA, 5000n);
-	fund(acctB, 5000n);
-	await acctA.transfer(acctB.pubHex, 700n);
+	await acctA.noop();
+	await acctB.noop();
 	await mineOn(A);
 	await mineOn(A);
 	await poster.noop();
-	await acctA.transfer(acctB.pubHex, 50n);
+	await acctA.noop();
 	await mineOn(A);
 	await mineOn(A);
 
-	const fullView = computeView(A.ledger.allWrites(), { base: base() });
+	const fullWrites = A.ledger.allWrites().length;
 	const fullRoot = A.ledger.stateRoot();
 
 	// ── A checkpoints at a finalized anchor and PRUNES BOTH ledger AND anchor chain to it ──
 	const ckptAnchor = A.anchors!.finalized(2)!; // has children (so its appRoot is committed)
 	const ckptHeads = A.anchors!.headsAt(ckptAnchor.id);
-	const ckptState = viewAtAnchor(A.ledger.allWrites(), A.anchors!, ckptAnchor.id, base());
-	const snapshot: StoredSnapshot = { anchorId: ckptAnchor.id, height: ckptAnchor.height, heads: ckptHeads, state: serializeView(ckptState) };
+	const snapshot: StoredSnapshot = { anchorId: ckptAnchor.id, height: ckptAnchor.height, heads: ckptHeads, state: serializeView(emptyView()) };
 	A.ledger.pruneBelow(ckptHeads);
 	A.anchors!.prune(ckptAnchor.height); // ← the new part: A no longer holds genesis, only [ckpt..tip]
 	assert.equal(A.anchors!.get(A.anchors!.chainTo()[0].id)!.id, ckptAnchor.id, "A's anchor chain now bottoms at the checkpoint, not genesis");
@@ -129,6 +119,6 @@ test("a fresh peer bootstraps genesis-free by adopting a pruned peer's checkpoin
 	assert.equal(B.anchors!.tip()!.id, A.anchors!.tip()!.id, "B's anchor tip matches A's");
 	assert.equal(B.anchors!.get(ckptAnchor.id)!.id, ckptAnchor.id, "B adopted the checkpoint anchor as its floor");
 	assert.equal(B.ledger.stateRoot(), fullRoot, "B's state matches A's full state");
-	const bView = computeView(B.ledger.allWrites(), { base: bBase });
-	assert.equal(viewRoot(bView), viewRoot(fullView), "B's folded view matches A's");
+	assert.equal(viewRoot(bBase!), viewRoot(emptyView()), "B's authenticated checkpoint state is the committed (empty) app state");
+	assert.ok(B.ledger.allWrites().length > 0 && B.ledger.allWrites().length <= fullWrites, "B holds the suffix above the checkpoint");
 });

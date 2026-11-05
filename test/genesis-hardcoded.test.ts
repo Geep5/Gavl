@@ -3,12 +3,11 @@
  *
  * Previously each node MINTED its own genesis (a seeder election). Under hub latency two nodes seeded
  * before hearing each other → parallel chains of equal weight that fork-choice (heaviest-chain,
- * winner-take-all) can never merge → the network never converged and the committee never saw its ≥3
- * producers. Now every node DERIVES the byte-identical genesis from the network + base difficulty
+ * winner-take-all) can never merge → the network never converged. Now every node DERIVES the
+ * byte-identical genesis from the network + base difficulty
  * (genesis.ts) and installs it as the locked root (chain.installGenesis). These tests pin the four
  * properties that make that safe: it's deterministic (all nodes agree), peers sharing it can link each
- * other's anchors, a node with a DIFFERENT genesis cannot, a competing block 0 is rejected, and the
- * genesis sentinel producer is never sampled into a committee.
+ * other's anchors, a node with a DIFFERENT genesis cannot, and a competing block 0 is rejected.
  *
  *   node --test test/genesis-hardcoded.test.ts
  */
@@ -22,8 +21,6 @@ import { AnchorChain } from "../src/consensus/chain.ts";
 import { MemoryNetwork } from "../src/sync/memory.ts";
 import { Producer } from "../src/consensus/producer.ts";
 import { genesisAnchor, GENESIS_PRODUCER } from "../src/consensus/genesis.ts";
-import { committeeForEpoch } from "../src/custody/epoch.ts";
-import type { AnchorView } from "../src/custody/epoch.ts";
 import { PARAMS, STANDIN_VERIFIER, standinProver } from "./helpers.ts";
 
 const GOPTS = { network: "gavl-btc", difficulty: 20n, appRoot: "" };
@@ -94,26 +91,6 @@ test("a competing block 0 (a second prev=null anchor) is rejected", async () => 
 	assert.equal(res.ok, false, "a second prev=null anchor is rejected — block 0 is hardcoded");
 	assert.match(res.reason ?? "", /genesis/i);
 	assert.equal(A.anchorTip()!.id, g.id, "tip unchanged — still our hardcoded genesis");
-});
-
-test("the genesis sentinel producer is excluded from committee selection", () => {
-	const g = genesisAnchor(GOPTS);
-	const realA = "aa".repeat(32);
-	const realB = "bb".repeat(32);
-	// A finalized chain: the genesis sentinel at height 0, then real producers. Epoch 1's window is
-	// [0,4); the boundary anchor at height 4 supplies the beacon.
-	const finalized: AnchorView[] = [
-		{ height: 0, producer: GENESIS_PRODUCER, time: { output: g.time.output } },
-		{ height: 1, producer: realA, time: { output: "11".repeat(32) } },
-		{ height: 2, producer: realB, time: { output: "22".repeat(32) } },
-		{ height: 3, producer: realA, time: { output: "33".repeat(32) } },
-		{ height: 4, producer: realB, time: { output: "44".repeat(32) } },
-	];
-	const ec = committeeForEpoch(finalized, 1, { epochLength: 4, size: 3 });
-	assert.ok(ec, "committee derivable once the boundary anchor is present");
-	const ids = ec!.members.map((m) => m.id);
-	assert.ok(!ids.includes(GENESIS_PRODUCER), "the genesis sentinel is NOT an eligible member");
-	assert.deepEqual(new Set(ids), new Set([realA, realB]), "only the real anchor producers are eligible");
 });
 
 /** Run `fn` with console.warn silenced — the mismatch path logs loudly by design; tests assert STATE. */

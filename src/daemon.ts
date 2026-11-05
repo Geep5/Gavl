@@ -1,15 +1,14 @@
 /**
  * Daemon — the local engine behind the desktop app.
  *
- * Boots a single Ledger + GavlNode and builds one `Account` per wallet
- * identity, all sharing the node (so they trade with each other locally) and a
- * single monotonic clock (so op timestamps are causally ordered).
+ * Boots a single Ledger + GavlNode over the wallet's identities. With consensus wired (the
+ * default), the node also carries an AnchorChain, the daemon joins the live Nostr mesh
+ * (gossiping writes AND anchors over public relays), and runs a Producer that farms anchors over
+ * the heaviest tip. The UI can then watch the real consensus advance: tip height/weight climbing,
+ * finality deepening, peers joining.
  *
- * With consensus wired (the default), the node also carries an AnchorChain, the
- * daemon joins the live Nostr mesh (gossiping writes AND anchors over public relays),
- * and runs a Producer that farms anchors over the heaviest tip. The UI can then
- * watch the real consensus advance: tip height/weight climbing, finality
- * deepening, the custody committee forming.
+ * Gavl holds no funds: it is the ephemeral order board for BTC↔LTC atomic swaps, which settle on
+ * their own chains via HTLCs. The app state every anchor commits to is in market/state.ts.
  *
  * VDF is real chiavdf by default (genuine cooldown). The anchor space proof uses
  * the light stand-in by default so the node boots instantly without plotting —
@@ -19,39 +18,8 @@
 
 import { Ledger, rootOfHeads } from "./ledger/ledger.ts";
 import { GavlNode } from "./sync/node.ts";
-import { Account } from "./market/account.ts";
-import { computeView, finalizedView, viewAtAnchor, holderAt, custodyRules } from "./market/btc.ts";
-import type { View } from "./market/btc.ts";
-import { serializeView, deserializeView, viewRoot } from "./market/state.ts";
+import { emptyView, serializeView, deserializeView, viewRoot } from "./market/state.ts";
 import type { Anchor } from "./consensus/anchor.ts";
-import type { Heads } from "./ledger/ledger.ts";
-import type { FundKey } from "./custody/threshold.ts";
-import { ShareStore } from "./custody/share-store.ts";
-import type { StoredShare } from "./custody/share-store.ts";
-import { fundAddress as deriveFundAddress } from "./custody/bitcoin.ts";
-import { depositAddress } from "./custody/deposit.ts";
-import { buildWithdrawalTx } from "./custody/btctx.ts";
-import { signWithdrawalWithFailover } from "./custody/withdraw-ceremony.ts";
-import { SignCoordinator } from "./custody/sign-coordinator.ts";
-import { CommitteeRotation } from "./custody/rotation.ts";
-import { EquivocationWatcher } from "./custody/equivocation-watcher.ts";
-import { makeCeremonyAuth } from "./custody/ceremony-auth.ts";
-import { announceEncKey, deriveEncKey, EncKeyRegistry } from "./custody/enckey.ts";
-import { ShadowReshareCoordinator } from "./custody/shadow-reshare.ts";
-import { assembleReshare } from "./custody/reshare-blob.ts";
-import { groupKeyOf } from "./custody/pvss.ts";
-import { schnorr_FROST as FROST } from "@noble/curves/secp256k1.js";
-import type { CeremonyAuth } from "./custody/ceremony-auth.ts";
-import { custodyCommittee, custodyParamsOf, epochOf } from "./custody/epoch.ts";
-import type { AnchorView, CustodyParams } from "./custody/epoch.ts";
-import { fid, quorumForRound } from "./custody/committee.ts";
-import { depositAttestationDigest, settleAttestationDigest } from "./custody/attestation.ts";
-import { isCeremonyTimeout } from "./custody/ceremony.ts";
-import { Esplora, btcNetFromEnv, esploraBasesFromEnv } from "./custody/esplora.ts";
-import type { EsploraNet } from "./custody/esplora.ts";
-import { checkDeposit, utxosToInputs, confirmations, MIN_CONFIRMATIONS, txPaysWithdrawal } from "./custody/watcher.ts";
-import { pendingClaims, inFlightWithdrawals } from "./custody/bridge.ts";
-import type { PendingWithdrawal } from "./custody/bridge.ts";
 import { Wallet } from "./wallet.ts";
 import type { WalletAccount } from "./wallet.ts";
 import { defaultParams } from "./config.ts";
@@ -69,14 +37,14 @@ import { NostrTransport } from "./sync/nostr.ts";
 import { KnownPeers } from "./sync/known-peers.ts";
 import { generateKeyPair, keyPairFromSeed, sign } from "./det/ed25519.ts";
 import type { KeyPair } from "./det/ed25519.ts";
-import { toHex, fromHex, sha256 } from "./det/canonical.ts";
+import { toHex, fromHex } from "./det/canonical.ts";
 import { WriteStore } from "./store/store.ts";
 import type { StoredSnapshot } from "./store/store.ts";
 import { KeepAllPolicy, MinePolicy } from "./store/policy.ts";
 import type { PersistPolicy } from "./store/policy.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 
 export type SpaceMode = "standin" | "chiapos";
 
@@ -93,7 +61,7 @@ export interface DaemonOptions {
 	adoptQuorum?: number;
 	/** Desired number of DISTINCT nodes (including self) that durably hold the latest checkpoint —
 	 *  the replication floor that keeps RAM state alive across churn. State survives the loss of up
-	 *  to `replicationTarget - 1` holders between handoffs. Default 1. See docs/replication-floor.md. */
+	 *  to `replicationTarget - 1` holders between checkpoints. Default 1. See docs/replication-floor.md. */
 	replicationTarget?: number;
 	/** Anchor space backend: light stand-in (default) or real chiapos (real disk cost). */
 	space?: SpaceMode;
@@ -115,18 +83,6 @@ export interface DaemonOptions {
 		/** Or supply a custom policy directly (overrides `persist`). */
 		policy?: PersistPolicy;
 	};
-	/**
-	 * Threshold-custody NODE settings. There is ONLY one mode: an autonomous epoch-driven committee.
-	 * The fund key is DKG'd across a PoST-weighted committee sampled from the anchor chain and
-	 * reshared to a fresh committee each epoch, no node ever holding it whole. Needs farming on (the
-	 * node's stable producer key is its committee id). A lone node (< minCommittee farmers) holds NO
-	 * key and cannot mint — it waits for peers. The committee-SAMPLING params (epoch length, K_MAX,
-	 * window, minCommittee, genesis size) are consensus and live on `params.custody`, not here.
-	 */
-	custody?: {
-		/** Per-ceremony timeout in ms (default 30s). */
-		ceremonyTimeoutMs?: number;
-	};
 }
 
 export interface ConsensusStatus {
@@ -146,16 +102,15 @@ export interface ConsensusStatus {
 	 *  "∅" means a peer advertised no genesis at all (older code). */
 	foreignGenesisSeen?: string[];
 	finalizedHeight: number | null;
-	/** Height of the SETTLED anchor (irreversible; payouts and share deletion key off it). */
+	/** Height of the SETTLED anchor (irreversible; checkpoints and pruning key off it). */
 	settledHeight: number | null;
 	/** Set when a peer's branch was REFUSED for abandoning this node's settled history — a split
 	 *  deeper than settlement that needs an operator. Null while healthy. */
 	settlementConflict: SettledConflict | null;
-	/** Distinct ANCHOR PRODUCERS in the recent chain — the committee is sampled from these, so this is
-	 *  the number that must reach minCommittee for genesis (NOT the op-writer count). */
+	/** Distinct ANCHOR PRODUCERS in the recent chain (NOT the op-writer count). */
 	producers: number;
 	/** Whether THIS node is currently producing anchors (its producer key signed a recent anchor). A
-	 *  farming node that shows false is connected but not actually producing — the usual ceremony stall. */
+	 *  farming node that shows false is connected but not actually producing. */
 	iProduce: boolean;
 	/** How many of the recent anchors THIS node produced (a live "am I farming" counter). */
 	myAnchors: number;
@@ -165,11 +120,9 @@ export interface ConsensusStatus {
 	secPerAnchorMeasured: boolean;
 	/** Wire carrier: "nostr" (public relays) | null (mesh off). */
 	transport: string | null;
-	/** Bounded-mesh diagnostics: connection cap, resolved producer↔address bindings, and committee
-	 *  members directly linked. */
+	/** Bounded-mesh diagnostics: connection cap and resolved producer↔address bindings. */
 	maxPeers?: number;
 	bindings?: number;
-	committeeLinked?: number;
 	/** This node's nostr pubkey (hex). Null if mesh off. */
 	nodeKey: string | null;
 	/** nostr pubkeys of currently-connected peers. */
@@ -182,13 +135,13 @@ export interface ConsensusStatus {
  *  large enough that snapshotting/pruning isn't a per-anchor cost. Override for tests/tuning. */
 const CHECKPOINT_EVERY = Number(process.env.GAVL_CHECKPOINT_EVERY ?? "16");
 
-/** Anchors retained below a checkpoint. Generous enough to cover the retarget + committee
- *  windows (the only backward walks that reach below the checkpoint); the daemon takes the
- *  max with those windows. Bounds the anchor chain to a constant suffix instead of forever. */
+/** Anchors retained below a checkpoint. Generous enough to cover the retarget window (the only
+ *  backward walk that reaches below the checkpoint); the daemon takes the max with it. Bounds the
+ *  anchor chain to a constant suffix instead of forever. */
 const ANCHOR_KEEP_MARGIN = Number(process.env.GAVL_ANCHOR_MARGIN ?? "256");
 
 export class Daemon {
-	readonly node: GavlNode;
+	node: GavlNode;
 	readonly wallet: Wallet;
 	readonly knownPeers = new KnownPeers();
 	readonly finalityDepth: number;
@@ -198,11 +151,9 @@ export class Daemon {
 	private readonly k: number;
 	private readonly spaceMode: SpaceMode;
 	private readonly plotDir: string;
-	/** Root for node-local custody secrets (share + producer key), beside the wallet —
-	 *  so a distinct walletDir fully isolates a node (multiple nodes on one machine). */
+	/** Root for node-local secrets (the producer key), beside the wallet — so a distinct walletDir
+	 *  fully isolates a node (multiple nodes on one machine). */
 	private readonly dataDir: string;
-	private readonly accounts = new Map<string, Account>();
-	private clock = 0;
 
 	private transport?: NostrTransport;
 	private producer?: Producer;
@@ -212,11 +163,7 @@ export class Daemon {
 	private readonly targetSecPerAnchor: number;
 	private store?: WriteStore;
 	private readonly storeOpts?: DaemonOptions["store"];
-	private readonly custodyOpts: NonNullable<DaemonOptions["custody"]>;
 	private producerKeyCache?: KeyPair;
-	private custodyAcct?: Account;
-	private rotation?: CommitteeRotation;
-	private equivWatcher?: EquivocationWatcher;
 	/** Kept so a channel switch can rebuild ledger/anchors/store identically. */
 	private readonly verifier: SpaceVerifier;
 	private readonly schedule?: RetargetSchedule;
@@ -245,9 +192,7 @@ export class Daemon {
 		this.spaceMode = opts.space ?? "standin";
 		this.plotDir = opts.plotDir ?? join(homedir(), ".gavl", "plots");
 		this.dataDir = opts.walletDir ?? join(homedir(), ".gavl");
-		this.shares = new ShareStore(join(this.dataDir, "custody", "shares"));
 		this.storeOpts = opts.store;
-		this.custodyOpts = opts.custody ?? {};
 		this.schedule = opts.schedule;
 		this.network = opts.network ?? "gavl";
 		// Verifier must match the space backend producers use, or anchors are rejected.
@@ -255,7 +200,6 @@ export class Daemon {
 		this.node = this.freshNode();
 		this.wallet = new Wallet(opts.walletDir);
 		this.wallet.ensureSeeded();
-		for (const wa of this.wallet.list()) this.bind(wa);
 		this.wireTipCadence();
 	}
 
@@ -271,7 +215,7 @@ export class Daemon {
 				console.error(`  ⚠ consensus: REFUSING a branch that abandons SETTLED anchor ${c.settled.id.slice(0, 8)} (height ${c.settled.height}) — tip ${c.rejected.id.slice(0, 8)} at height ${c.rejected.height}. The network has split deeper than settlement; this node stays on its settled history. Operator action needed.`);
 				this.recordNetEvent("consensus", `refused branch abandoning settled height ${c.settled.height}`);
 			},
-			verifyState: (a, h) => this.checkAppRoot(a, h),
+			verifyState: (a) => a.appRoot === this.appRoot,
 		});
 		const node = new GavlNode(new Ledger(this.params), chain);
 		node.mode = `${this.params.vdf.name}/${this.spaceMode}`; // hello advertises this → peers detect a proof-mode mismatch
@@ -287,10 +231,6 @@ export class Daemon {
 				this.anchorTimes.push({ height: tip.height, at: Date.now() });
 				if (this.anchorTimes.length > 32) this.anchorTimes.shift(); // keep a small window
 			}
-			this.driveRotation(); // advance the custody epoch loop on each finality move
-			this.maintainCommittee(); // keep this node directly linked to its committee members
-			this.maybeAuthorizePending(); // co-sign pending withdrawals / mints / settles
-			this.pruneShares(); // shares from epochs the chain has recorded a later holder past are dead
 			this.maybeCheckpoint(); // snapshot + prune behind finality so history never grows unbounded
 			this.tryPendingSnapshot(); // a stashed peer checkpoint may now be verifiable
 			this.recordNetEvent("anchor", `tip → height ${tip.height}`);
@@ -339,15 +279,11 @@ export class Daemon {
 			return false;
 		}
 		if (viewRoot(deserializeView(snap.state)) !== child.appRoot) return false; // state doesn't match the committed appRoot → reject
-		// Authentic. Seed the ledger at the checkpoint + rebase folds onto its state.
+		// Authentic. Seed the ledger at the checkpoint.
 		this.node.ledger.seedCheckpoint(snap.heads);
-		this.checkpointBase = deserializeView(snap.state);
 		this.lastCheckpointHeight = snap.height;
 		this.lastSnapshot = snap;
 		this.pendingSnapshot = undefined;
-		this.viewCache = undefined;
-		this.finalCache = undefined;
-		this.settledCache = undefined;
 		return true;
 	}
 
@@ -388,123 +324,6 @@ export class Daemon {
 	 *  On success, re-advertise so peers serve the post-checkpoint write tail. */
 	private tryPendingSnapshot(): void {
 		if (this.pendingSnapshot && this.ingestSnapshot(this.pendingSnapshot)) this.node.advertise();
-	}
-
-	/** Feed the finalized chain to the custody rotation loop (no-op unless committee
-	 *  mode is active). Non-reentrant + one-shot per epoch, so calling on every tip is cheap. */
-	private driveRotation(): void {
-		const rot = this.rotation;
-		const anchors = this.node.anchors;
-		if (!rot || !anchors) return;
-		const finalAnchor = anchors.finalized(this.finalityDepth);
-		if (!finalAnchor) return;
-		void rot.onFinalized(anchors.chainTo(finalAnchor) as AnchorView[]);
-	}
-
-	/**
-	 * Directly link this node to its co-committee members, so the small committee is mutually
-	 * connected for the ceremonies independent of the bounded main mesh. Each member's transport
-	 * address is resolved from its signed producer↔address binding (no rendezvous). Computed over the
-	 * optimistic chain for the current + just-finalized epochs, so a node pre-connects BEFORE its
-	 * ceremony fires. Connectivity only — ceremony membership stays finalized-deterministic. No-op
-	 * unless committee mode + a live transport.
-	 */
-	private maintainCommittee(): void {
-		if (!this.transport) return;
-		const anchors = this.node.anchors;
-		const tip = anchors?.tip();
-		if (!anchors || !tip) return;
-		const chain = anchors.chainTo(tip) as AnchorView[];
-		const params = this.committeeParams();
-		const finEpoch = epochOf(anchors.finalized(this.finalityDepth)?.height ?? 0, params.epochLength);
-		const optEpoch = epochOf(tip.height, params.epochLength);
-		const excluded = this.finalizedFaults();
-		const fundEpoch = this.fundEpoch();
-		const rosters = [...new Set([finEpoch, optEpoch])].filter((e) => e >= 1).map((e) => custodyCommittee(chain, e, params, fundEpoch, excluded));
-		// Connect to my co-committee members DIRECTLY via the producer↔address binding (no rendezvous;
-		// works on a bounded mesh). Resolve the rosters for the epochs I'm in and link them. A reshare
-		// runs between the RECORDED holder and the new committee, so holders and incoming members link
-		// to each other too (the holder may be several epochs old after failed reshares).
-		const me = this.producerId();
-		const holder = this.finalView().custody.holder;
-		const isHolder = !!holder?.committee.includes(me);
-		const inRoster = rosters.some((c) => c?.committee.includes(me));
-		const members = new Set<string>();
-		for (const c of rosters) if (c && (isHolder || c.committee.includes(me))) for (const id of c.committee) if (id !== me) members.add(id);
-		if (holder && (isHolder || inRoster)) for (const id of holder.committee) if (id !== me) members.add(id);
-		this.transport.connectCommittee([...members]);
-		this.logCommitteeReadiness(optEpoch, [...members], chain); // surface WHY the committee may not be forming
-	}
-
-	/** Legibility: surface WHY the committee may not be forming, so a stuck node is DIAGNOSABLE instead
-	 *  of silently waiting (the failure mode that ate whole debugging sessions). Two cases:
-	 *
-	 *  (A) I'm NOT in a committee this epoch — usually because there aren't enough distinct anchor-
-	 *      PRODUCERS yet. Connected peers that only gossip/write don't count; a member must be MINTING
-	 *      anchors on THIS chain (e.g. a peer on a different proof mode lands its writes but not its
-	 *      anchors → it's a peer, not a producer). Report the producer count vs the floor — the single
-	 *      most common stuck-state, and previously invisible:
-	 *        "not forming — 1/3 anchor-producers (need 2 more nodes minting anchors)"
-	 *
-	 *  (B) I AM in the committee — report per co-member whether I can ADDRESS it (hold its binding) and
-	 *      whether I'm LINKED to it (live path for the ceremony):
-	 *        "bound 2/3 (missing a1b2)"  → a1b2's binding never reached me (handshake/announce open)
-	 *        "linked 1/3 (waiting 939f)" → bound but the path is cold — keepalive should be re-dialing
-	 *
-	 *  Throttled to log only when the picture changes: quiet when steady, a clean progression otherwise. */
-	private logCommitteeReadiness(epoch: number, members: string[], chain: AnchorView[]): void {
-		if (!this.transport) return;
-		let summary: string;
-		if (members.length === 0) {
-			// (A) not selected — almost always too few DISTINCT producers on this node's canonical chain. Show
-			// the per-producer anchor counts so divergence is obvious at a glance: "[me:273]" means this node
-			// sees only ITSELF producing (its peers' anchors aren't on its canonical chain → the net has split,
-			// anchors outrunning gossip); a healthy net shows several keys with similar counts.
-			const minC = this.committeeParams().minCommittee;
-			const me = this.producerId();
-			const counts = new Map<string, number>();
-			for (const a of chain) {
-				if (a.producer === GENESIS_PRODUCER) continue; // the hardcoded-genesis sentinel isn't a real producer
-				counts.set(a.producer, (counts.get(a.producer) ?? 0) + 1);
-			}
-			const p = counts.size;
-			const need = minC - p;
-			const breakdown = [...counts.entries()]
-				.sort((x, y) => y[1] - x[1])
-				.map(([k, n]) => `${k === me ? "me" : k.slice(0, 4)}:${n}`)
-				.join(" ");
-			summary =
-				p < minC
-					? `committee epoch ${epoch}: not forming — ${p}/${minC} producers [${breakdown}] (need ${need} more node${need === 1 ? "" : "s"} minting anchors${counts.has(me) ? "" : "; THIS node isn't producing"})`
-					: `committee epoch ${epoch}: ${p} producers present but this node isn't in the committee (standby)`;
-		} else {
-			// (B) selected — how reachable are my co-members for the ceremony.
-			const linked = new Set(this.transport.connectedPeerKeys());
-			const sh = (h: string) => h.slice(0, 4);
-			const missing: string[] = []; // co-members whose binding I lack → can't address them
-			const cold: string[] = []; // bound, but no live path right now → ceremony can't reach them yet
-			let bound = 0;
-			let conn = 0;
-			for (const m of members) {
-				const addr = this.transport.addressForProducer(m);
-				if (!addr) {
-					missing.push(m);
-					continue;
-				}
-				bound++;
-				if (linked.has(addr)) conn++;
-				else cold.push(m);
-			}
-			const n = members.length;
-			summary =
-				`committee epoch ${epoch}: ${n} co-member${n === 1 ? "" : "s"}` +
-				` · bound ${bound}/${n}${missing.length ? ` (missing ${missing.map(sh).join(",")})` : ""}` +
-				` · linked ${conn}/${n}${cold.length ? ` (waiting ${cold.map(sh).join(",")})` : ""}`;
-		}
-		if (summary === this.lastReadiness) return;
-		this.lastReadiness = summary;
-		console.log(`  ${summary}`);
-		this.recordNetEvent("committee", summary);
 	}
 
 	/**
@@ -555,23 +374,19 @@ export class Daemon {
 		// snapshot is appRoot-verified on the sync path.
 		const snap = await this.store.loadSnapshot();
 		if (snap) {
-			this.checkpointBase = deserializeView(snap.state);
+			deserializeView(snap.state); // throws on a state that isn't this app's canonical shape
 			this.node.ledger.seedCheckpoint(snap.heads);
 			this.lastCheckpointHeight = snap.height;
 			this.lastSnapshot = snap; // serve it to fresh peers too
 			console.log(`  storage: loaded checkpoint at height ${snap.height} (${Object.keys(snap.heads).length} writer head(s)) — skipping replay below it`);
 		}
 
-		// Replay persisted writes into the ledger BEFORE going live. Seed the logical
-		// clock past the highest replayed ts so new writes are GLOBALLY monotonic —
-		// otherwise a restart resets ts to 0, colliding with persisted writes and
-		// scrambling the optimistic (ts-ordered) fold.
+		// Replay persisted writes into the ledger BEFORE going live.
 		const { writes } = await this.store.replay((w) => {
 			// skipTimeProof: these writes already passed full verification (VDF included) before they
 			// were persisted, so re-walking each O(iters) cooldown here would block boot for minutes on
 			// a large backlog. The cheap sig/id/structure checks still run, catching disk corruption.
 			this.node.ledger.apply(w, { skipTimeProof: true });
-			if (w.ts > this.clock) this.clock = w.ts;
 		});
 
 		// Persist every newly-applied write (write-through, policy-filtered). Guarded against
@@ -602,110 +417,20 @@ export class Daemon {
 		return this.store?.stats() ?? null;
 	}
 
-	private now = (): number => ++this.clock;
-
-	private bind(wa: WalletAccount): Account {
-		const acct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: wa.keypair });
-		this.accounts.set(wa.pubHex, acct);
-		return acct;
+	/** Create a new wallet identity and make it active. */
+	createAccount(label: string): WalletAccount {
+		return this.wallet.create(label);
 	}
 
-	account(pubHex: string): Account {
-		const existing = this.accounts.get(pubHex);
-		if (existing) return existing;
-		const wa = this.wallet.get(pubHex);
-		if (!wa) throw new Error(`daemon: unknown account ${pubHex}`);
-		return this.bind(wa);
-	}
-
-	active(): Account {
-		return this.account(this.wallet.active().pubHex);
-	}
-
-	createAccount(label: string): Account {
-		return this.bind(this.wallet.create(label));
-	}
-
-	/** Optimistic view over all local writes (responsive — reflects an action immediately).
-	 *  Folds the writes the ledger still holds onto the checkpoint base (so it never re-folds
-	 *  pruned history), checking custody records against the current tip's chain (they aren't
-	 *  certified yet, so no height gate), and memoizes on the heads root + tip. */
-	view(): View {
-		const root = this.node.ledger.stateRoot();
-		const tip = this.node.anchors?.tip() ?? null;
-		if (this.viewCache && this.viewCache.root === root && this.viewCache.tip === tip?.id) return this.viewCache.view;
-		const custodyRulesOpt = tip ? custodyRules(this.node.anchors!.chainTo(tip), this.committeeParams(), false) : undefined;
-		const view = computeView(this.node.ledger.allWrites(), { base: this.checkpointBase, custodyRules: custodyRulesOpt });
-		this.viewCache = { root, tip: tip?.id, view };
-		return view;
-	}
-
-	// ── state-committed checkpoints — the ledger never replays from 0 ──────
-	/** View at the ledger's prune floor (the last checkpoint). The ledger holds only writes
-	 *  ABOVE it; every fold resumes from here. Undefined ⇒ full history (never checkpointed). */
-	private checkpointBase?: View;
+	// ── committed app state + state-committed checkpoints — the ledger never replays from 0 ──
 	private lastCheckpointHeight = -1;
 	/** The latest durable checkpoint (kept in memory so it can be served to fresh peers). */
 	private lastSnapshot?: StoredSnapshot;
 	/** A peer's checkpoint awaiting anchor-chain sync before it can be authenticated. */
 	private pendingSnapshot?: StoredSnapshot;
-	private viewCache?: { root: string; tip: string | undefined; view: View };
-	private finalCache?: { id: string | null; view: View };
-	private settledCache?: { id: string; view: View };
-	private emptyAppRootCache?: string;
-
-	private emptyAppRoot(): string {
-		return (this.emptyAppRootCache ??= viewRoot(computeView([])));
-	}
-
-	/** The appRoot an anchor extending `prev` must commit: viewRoot of the state `prev`
-	 *  certified (empty at genesis). Lag-by-parent → always computable from an in-chain anchor.
-	 *  Resumes from the checkpoint base so a pruned node folds forward, not from genesis. */
-	private appRootForParent(prev: Anchor | null): string {
-		if (!prev || !this.node.anchors) return this.emptyAppRoot();
-		return this.appRootFor(prev.id);
-	}
-
-	/** Memoized appRoot for the state `prevId` certified. It's a pure function of `prevId`
-	 *  (lag-by-parent → all children of prev commit the same appRoot) and the checkpoint base —
-	 *  prev's certified writes are immutable once in-chain. So cache by prevId, scoped to the
-	 *  checkpoint epoch (lastCheckpointHeight): when the base advances the whole cache is dropped
-	 *  (the old, now-pruned prevIds go with it). Folded once per (prev, checkpoint) instead of on
-	 *  every mine + every inbound anchor's verifyState. */
-	private appRootCache = new Map<string, string>();
-	private appRootCacheEpoch = Number.NaN;
-	private appRootFor(prevId: string): string {
-		if (this.appRootCacheEpoch !== this.lastCheckpointHeight) {
-			this.appRootCache.clear();
-			this.appRootCacheEpoch = this.lastCheckpointHeight;
-		}
-		let r = this.appRootCache.get(prevId);
-		if (r === undefined) {
-			r = viewRoot(viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, prevId, this.checkpointBase, this.faultLookback()));
-			this.appRootCache.set(prevId, r);
-		}
-		return r;
-	}
-
-	/** AnchorChain.verifyState hook — enforce a peer's appRoot against our own fold. If we lack
-	 *  the parent's certified writes we DEFER (can't judge yet; re-checked when they arrive). */
-	private checkAppRoot(anchor: Anchor, _heads: Heads): boolean {
-		const anchors = this.node.anchors;
-		if (!anchors) return true;
-		const prev = anchor.prev ? anchors.get(anchor.prev) ?? null : null;
-		if (!prev) return anchor.appRoot === this.emptyAppRoot();
-		const prevHeads = anchors.headsAt(prev.id);
-		if (!this.haveAllWrites(prevHeads)) return true; // missing data → defer, don't reject
-		return anchor.appRoot === this.appRootFor(prev.id);
-	}
-
-	/** True if our ledger holds every writer's chain up to `heads` (so we can fold that state). */
-	private haveAllWrites(heads: Heads): boolean {
-		for (const writer of Object.keys(heads)) {
-			if (this.node.ledger.idAt(writer, heads[writer].seq) !== heads[writer].id) return false;
-		}
-		return true;
-	}
+	/** The appRoot every anchor must commit (the producer mines it; AnchorChain.verifyState checks a
+	 *  peer's against it). The app state is empty (market/state.ts), so it is the same for every anchor. */
+	private readonly appRoot = viewRoot(emptyView());
 
 	/** Once finality advances past the cadence, checkpoint the committed state and prune history
 	 *  behind it so RAM never grows without bound — for EVERY node, with or without a durable
@@ -731,10 +456,8 @@ export class Daemon {
 		if (!ckpt || ckpt.height !== target) return; // the boundary anchor isn't reachable yet → wait
 		const heads = anchors.headsAt(ckpt.id);
 		if (Object.keys(heads).length === 0) return; // nothing certified yet
-		const view = viewAtAnchor(this.node.ledger.allWrites(), anchors, ckpt.id, this.checkpointBase, this.faultLookback()); // state at the boundary
 		this.lastCheckpointHeight = ckpt.height;
-		this.checkpointBase = view;
-		const snap: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(view) };
+		const snap: StoredSnapshot = { anchorId: ckpt.id, height: ckpt.height, heads, state: serializeView(emptyView()) };
 		this.lastSnapshot = snap; // kept in RAM to serve fresh peers (key-only nodes included)
 		this.node.reBeaconHave(); // advertise we hold the new checkpoint; count toward the replication floor
 		this.node.checkReplication(); // warn if too few nodes hold it
@@ -742,14 +465,11 @@ export class Daemon {
 		const before = this.node.ledger.summary().writes;
 		this.node.ledger.pruneBelow(heads); // drop RAM history below the checkpoint — bounds memory
 		// Bound the anchor chain too (local memory only — not committed in any root). Keep a
-		// suffix below the checkpoint that still covers the retarget + committee windows, so
-		// every backward walk (difficulty, finality, committee selection, heads) stays intact.
+		// suffix below the checkpoint that still covers the retarget window, so every backward
+		// walk (difficulty, finality, heads) stays intact.
 		const anchorsBefore = anchors.size;
-		const margin = Math.max(ANCHOR_KEEP_MARGIN, this.schedule?.window ?? 0, this.faultLookback()); // ≥ the eligibility window too
+		const margin = Math.max(ANCHOR_KEEP_MARGIN, this.schedule?.window ?? 0);
 		anchors.prune(ckpt.height - margin); // keep a margin below the CHECKPOINT (not the tip) so it stays serveable
-		this.viewCache = undefined;
-		this.finalCache = undefined;
-		this.settledCache = undefined;
 		// Durable store, if any: persist the snapshot + reclaim the pruned blocks (best-effort).
 		const store = this.store;
 		const persisted = store ? " (persisting)" : " (RAM-only)";
@@ -757,104 +477,12 @@ export class Daemon {
 		console.log(`  checkpoint: height ${ckpt.height} (boundary), ${Object.keys(heads).length} writer(s); pruned ${before - this.node.ledger.summary().writes} write(s) + ${anchorsBefore - anchors.size} anchor(s) from RAM${persisted}`);
 	}
 
-	/** Finality-bound view: only state the anchor chain has certified `finalityDepth` deep.
-	 *  Resumes from the checkpoint base; memoized on the finalized anchor id. */
-	finalView(): View {
-		if (!this.node.anchors) return this.checkpointBase ? computeView([], { base: this.checkpointBase }) : computeView([]);
-		const finId = this.node.anchors.finalized(this.finalityDepth)?.id ?? null;
-		if (this.finalCache && this.finalCache.id === finId) return this.finalCache.view;
-		const view = finalizedView(this.node.ledger.allWrites(), this.node.anchors, this.finalityDepth, this.checkpointBase, this.faultLookback());
-		this.finalCache = { id: finId, view };
-		return view;
-	}
-
-	/** SETTLED view: the state the settled anchor certifies — never reverted (see
-	 *  DEFAULT_SETTLEMENT_DEPTH). Every IRREVERSIBLE external action keys off this, never off
-	 *  finalView: signing / broadcasting BTC payouts, posting bridge.settle, and deleting superseded
-	 *  key shares. Checkpoints sit at or below the settled anchor, so the base fold is always valid. */
-	settledView(): View {
-		const settled = this.node.anchors?.settled();
-		if (!settled) return this.checkpointBase ? computeView([], { base: this.checkpointBase }) : computeView([]);
-		if (this.settledCache?.id === settled.id) return this.settledCache.view;
-		const view = viewAtAnchor(this.node.ledger.allWrites(), this.node.anchors!, settled.id, this.checkpointBase, this.faultLookback());
-		this.settledCache = { id: settled.id, view };
-		return view;
-	}
-
-	/** Current "now" on the anchor clock — the finalized anchor's height, or null pre-consensus. */
-	finalizedHeight(): number | null {
-		return this.node.anchors?.finalized(this.finalityDepth)?.height ?? null;
-	}
-
-	/** Custody status for the UI/operator: the mode, the autonomous loop's epoch, the
-	 *  on-chain fund key/address, and whether THIS node currently holds a committee share. */
-	custodyStatus(): {
-		mode: "committee";
-		epoch: number;
-		fundKeyOnChain: string | null;
-		fundAddress: string | null;
-		committeeId: string | null;
-		holdsShare: boolean;
-		committee: string[] | null;
-		threshold: number | null;
-		minCommittee: number;
-		committeeMax: number;
-		encKeysKnown: number;
-		lastReshare?: { epoch: number; ok: boolean; detail: string };
-	} {
-		const cs = this.committeeShare();
-		const onchain = this.view().custody.fundKey; // the announced committee group key (null until genesis DKG completes)
-		const id = this.producerId();
-		return {
-			mode: "committee",
-			epoch: this.rotation?.epoch ?? -1,
-			fundKeyOnChain: onchain,
-			fundAddress: this.fundAddress(), // null pre-genesis (no key yet)
-			committeeId: id,
-			holdsShare: !!cs,
-			committee: cs?.participants ?? null,
-			threshold: cs?.min ?? null,
-			minCommittee: this.committeeParams().minCommittee, // farmers needed to bootstrap genesis custody
-			committeeMax: this.committeeParams().size, // K_MAX: seats the committee grows to as producers join
-			encKeysKnown: this.encKeys.size(), // verified peer encryption keys (phase-1 announce liveness)
-			lastReshare: this.lastReshare, // latest per-epoch reshare outcome (for the UI indicator)
-		};
-	}
-
-	/** The network's consensus custody params (epoch length, K_MAX, window, minCommittee, genesis size)
-	 *  — on ChainParams, so the fold checks custody records with exactly these. Pair with
-	 *  finalizedFaults() for the exclusion set. */
-	private committeeParams(): CustodyParams {
-		return custodyParamsOf(this.params);
-	}
-
-	/** The on-chain genesis epoch (optimistic view), or null before a fund exists. */
-	private fundEpoch(): number | null {
-		const e = this.view().custody.epoch;
-		return e >= 0 ? e : null;
-	}
-
-	/** How far back (anchors) a custody.fault's culprit must have produced for the fold to record it:
-	 *  the eligibility window plus the two epochs a member can still serve after its boundary (its own
-	 *  epoch + handing off as the old committee). Consensus-critical — every fold site passes this, and
-	 *  the anchor-pruning margin covers it so the lookup never reaches pruned anchors. */
-	private faultLookback(): number {
-		const { epochLength, windowAnchors } = this.committeeParams();
-		return windowAnchors + 2 * epochLength;
-	}
-
-	/** Proven committee faults (producer → fault height) from FINALIZED state — the same value at
-	 *  every derivation site, so all nodes exclude identically. */
-	private finalizedFaults(): ReadonlyMap<string, number> {
-		return this.finalView().custody.excluded;
-	}
-
 	consensus(): ConsensusStatus {
 		const tip = this.node.anchorTip();
 		const finalized = this.node.anchors?.finalized(this.finalityDepth) ?? null;
 		const measured = this.measuredSecPerAnchor();
-		// Distinct anchor PRODUCERS in the recent (pruned) chain — the real committee signal, vs the
-		// op-writer count. Also whether THIS node is among them (it's actually producing, not just connected).
+		// Distinct anchor PRODUCERS in the recent (pruned) chain, vs the op-writer count. Also whether
+		// THIS node is among them (it's actually producing, not just connected).
 		const recent = this.node.anchors?.chainTo(tip) ?? [];
 		const myId = this.producerId();
 		// Exclude the hardcoded-genesis sentinel — it's the chain root, not a farmer, so it must not
@@ -900,7 +528,7 @@ export class Daemon {
 				network: this.network,
 				storageDir: join(this.dataDir, "nostr"),
 				maxPeers: process.env.GAVL_MAX_PEERS ? Number(process.env.GAVL_MAX_PEERS) : undefined,
-				onEvent: (kind, text) => this.recordNetEvent(kind, text), // surface peer/binding/committee steps to the UI feed
+				onEvent: (kind, text) => this.recordNetEvent(kind, text), // surface peer/binding steps to the UI feed
 				// sign producer↔address binding so peers can address us by our consensus key
 				bindingSigner: (msg) => ({ producer: this.producerId(), sig: toHex(sign(this.producerKey().privateKey, msg)) }),
 			});
@@ -932,12 +560,9 @@ export class Daemon {
 		if (opts.mesh) await this.joinMesh();
 		await this.bootstrapChainRoot(); // JOIN the heaviest existing network (adopt its checkpoint) if there is one, else SEED the deterministic genesis
 
-		this.startReserveWatch(); // proof-of-reserves polling
-
 		if (opts.farm) {
-			// Stable producer identity (persisted) so this node is the SAME committee
-			// candidate across reboots — its anchor-producer pubkey IS its committee id.
-			const farmer = this.producerKey(); // stable producer identity = this node's committee id
+			// Stable producer identity (persisted) so this node farms under the SAME key across reboots.
+			const farmer = this.producerKey();
 			let prover: SpaceProver;
 			if (this.spaceMode === "chiapos") {
 				// Real disk cost: plot the farmer's chiapos plot (slow the first time, then cached).
@@ -947,12 +572,10 @@ export class Daemon {
 			} else {
 				prover = new StandinSpaceProver(new Plot(farmer.publicKey, this.k));
 			}
-			this.producer = new Producer({ node: this.node, keypair: farmer, prover, params: this.params, appRootFor: (prev) => this.appRootForParent(prev) });
+			this.producer = new Producer({ node: this.node, keypair: farmer, prover, params: this.params, appRootFor: () => this.appRoot });
 			this.farming = true;
 			this.startHealthWatch(); // warn if we farm but never produce an anchor
-			this.startStallWatch(); // re-pull a bootstrapping tip that froze while peers remained
-			this.startCommitteeCustody(); // the only custody path: form/join the M-of-N committee
-			void this.lobbyThenFarm(); // join the channel as a LOBBY first — adopt an existing chain or start with a quorum, never fork a solo genesis
+			this.startFarming();
 		}
 	}
 
@@ -1014,24 +637,19 @@ export class Daemon {
 		const writes = this.node.ledger.summary().writes;
 		console.warn(`  storage: saved checkpoint (height ${this.lastCheckpointHeight}) isn't on the chain this node is joining — discarding it and ${writes} stale write(s), starting from genesis`);
 		this.node.ledger.reset();
-		this.checkpointBase = undefined;
 		this.lastCheckpointHeight = -1;
 		this.lastSnapshot = undefined;
-		this.viewCache = undefined;
-		this.finalCache = undefined;
-		this.settledCache = undefined;
 		await this.store?.clear();
 		return true;
 	}
 
-	/** The DETERMINISTIC genesis for this node's network — a pure function of the network label, base
-	 *  difficulty and the custody consensus params (consensus/genesis.ts). Identical on every node on the
-	 *  same network whether it seeds this as its root or adopts a later checkpoint, so its id is the stable
-	 *  value advertised for genesis-mismatch detection (a peer with a different block 0 — old code, or
-	 *  different custody params such as K_MAX — is on another network). */
+	/** The DETERMINISTIC genesis for this node's network — a pure function of the network label and base
+	 *  difficulty (consensus/genesis.ts). Identical on every node on the same network whether it seeds this
+	 *  as its root or adopts a later checkpoint, so its id is the stable value advertised for
+	 *  genesis-mismatch detection (a peer with a different block 0 is on another network). */
 	private genesisFor(): Anchor {
 		const difficulty = this.schedule?.base ?? this.params.difficulty; // genesis difficulty = schedule base
-		return genesisAnchor({ network: this.network, difficulty, appRoot: this.emptyAppRoot(), custody: this.committeeParams() });
+		return genesisAnchor({ network: this.network, difficulty, appRoot: this.appRoot });
 	}
 
 	/**
@@ -1047,74 +665,28 @@ export class Daemon {
 		anchors.installGenesis(this.genesisFor());
 	}
 
-	/**
-	 * The LOBBY — wait for a live quorum, then start the farmers TOGETHER. With the hardcoded genesis already
-	 * installed (every node shares block 0) there's no seeder to elect and no genesis to race; the lobby's
-	 * one job is to hold each node IDLE until `minCommittee` live farmers are present, so they all kick off
-	 * from the same root at once and interleave from the start — never one node sprinting ahead and building
-	 * a head-start branch the late joiners must reorg onto. By DEFAULT a node waits INDEFINITELY: farming
-	 * before quorum is pointless for a committee network (you can't form a 2-of-3 alone, and a late node
-	 * adopts whatever chain exists regardless of head start), and a node that can't see peers should sit
-	 * legible — "waiting for N more" — rather than mint a confusing solo chain that LOOKS like a split.
-	 * Set GAVL_LOBBY_GRACE_MS > 0 to opt into solo-start after that grace (a deliberately single-or-few-node
-	 * deployment). Roster is the LIVE peer set (liveQuorumAddrs: peers we've received a frame from, never
-	 * cached announces for offline ghosts). Mesh-off or need≤1 → farm at once (local dev / single-node chain
-	 * via GAVL_CUSTODY_MIN=1).
-	 */
-	private async lobbyThenFarm(): Promise<void> {
-		const need = this.committeeParams().minCommittee;
-		if (this.transport && need > 1) {
-			const graceMs = Number(process.env.GAVL_LOBBY_GRACE_MS ?? 0); // 0 = wait for quorum forever; >0 = opt into solo-start after the grace
-			const startedAt = Date.now();
-			let lastLobby = "";
-			while (this.farming) {
-				const roster = [this.transport.nodeKeyHex, ...this.transport.liveQuorumAddrs()];
-				if (roster.length >= need) {
-					console.log(`  consensus: live quorum of ${need} reached — starting farmers together`);
-					break; // quorum present → all start from the shared genesis ~together
-				}
-				if (graceMs > 0 && Date.now() - startedAt >= graceMs) {
-					console.log(`  consensus: GAVL_LOBBY_GRACE_MS elapsed (${Math.round(graceMs / 1000)}s) — solo-starting; peers converge onto the shared genesis when they join`);
-					break; // opt-in: solo start after the configured grace
-				}
-				const status = `lobby: ${roster.length}/${need} live farmers connected — idle until quorum (need ${need - roster.length} more)`;
-				if (status !== lastLobby) {
-					console.log(`  ${status}`);
-					lastLobby = status;
-				}
-				await new Promise((r) => setTimeout(r, 1000));
-			}
-		}
-		if (!this.farming) return;
+	/** Run the producer from the current tip. Adaptive: farm hard while there are unfinalized writes to
+	 *  bury, then drop to a slow heartbeat when idle — work tracks activity. busyPaceMs keeps the event
+	 *  loop (HTTP, gossip) responsive. */
+	private startFarming(): void {
 		const tip = this.node.anchorTip();
 		console.log(`  consensus: farming from block ${tip?.height ?? 0} on hardcoded genesis ${tip ? tip.id.slice(0, 8) + "…" : "?"}`);
-		// Adaptive: farm hard while there are unfinalized writes to bury, then drop to a slow heartbeat
-		// when idle — work tracks activity. busyPaceMs keeps the event loop (HTTP, gossip) responsive.
 		void this.producer!.runAdaptive({
 			until: () => !this.farming,
 			finalityDepth: this.finalityDepth,
 			busyPaceMs: 250,
-			// Bootstrap pace: until genesis publishes the committee fund key, mint empty anchors toward the
-			// first epoch boundary at THIS interval — between the 250ms busy pace and the ~32-min idle
-			// heartbeat. It must be SLOWER than the mesh gossips a height: mint faster and competing farmers
-			// each build a private run that fork-choice orphans wholesale, collapsing the canonical producer
-			// set so the committee never sees its ≥minCommittee distinct producers (the 3-node real-PoST
-			// `producers`-collapse — see producer.runAdaptive + test/anchor-convergence.test.ts). 8s leaves
-			// margin over hub latency; raise GAVL_BOOTSTRAP_PACE_MS if a slower mesh still diverges.
-			bootstrapPaceMs: Number(process.env.GAVL_BOOTSTRAP_PACE_MS ?? 8000),
+			// While peers are connected, never mint faster than the mesh gossips a height: competing
+			// farmers that outrun gossip each build a private run that fork-choice orphans wholesale (the
+			// 3-node real-PoST `producers`-collapse — see producer.runAdaptive). 8s leaves margin over relay
+			// latency; raise GAVL_PEER_PACE_MS if a slower mesh still diverges.
+			peerPaceMs: Number(process.env.GAVL_PEER_PACE_MS ?? 8000),
 			heartbeatMs: this.heartbeatMs,
-			// `custody.fundKey` is null until genesis completes, then stays set.
-			bootstrapping: () => this.view().custody.fundKey === null,
-			// Hold the gossip-safe pace floor whenever we have peers, not only during bootstrap: the difficulty
-			// retarget ramps GRADUALLY, so right after the committee forms the difficulty is still at its
-			// bootstrap (fast) level and the chain RE-SPLITS (fast minting outruns gossip, producers 3→1) if the
-			// floor lifts. It stops binding once the retarget slows anchors past it (toward the target rate).
 			hasPeers: () => this.node.peerCount > 0,
 		});
 	}
 
 	/** DIAGNOSTIC (3): a node that's farming but never produces an anchor (a small plot, a stalled VDF
-	 *  worker, or a forgotten venv) silently never joins the committee. Warn once after a grace period. */
+	 *  worker, or a forgotten venv) silently adds no weight. Warn once after a grace period. */
 	private startHealthWatch(): void {
 		if (this.healthTimer) return;
 		this.farmingStart = Date.now();
@@ -1136,216 +708,10 @@ export class Daemon {
 		this.healthTimer = undefined;
 	}
 
-	/**
-	 * Stall watchdog. During BOOTSTRAP (before the committee's fund key exists) the producer sprints
-	 * empty anchors to the genesis epoch boundary, so the tip should climb every few seconds. If it
-	 * FREEZES while we still have peers, we've most likely missed a heavier chain — a dropped anchor-tip
-	 * broadcast, or a link that went quiet. Re-pull from peers
-	 * and re-warm committee links to reconverge. Scoped to the bootstrap window on purpose: AFTER genesis,
-	 * a frozen tip is just an idle network (the heartbeat), and must NOT trigger churn. Tunable via
-	 * GAVL_STALL_MS; 0 disables.
-	 */
-	private startStallWatch(): void {
-		if (this.stallTimer) return;
-		const ms = Number(process.env.GAVL_STALL_MS ?? 30_000);
-		if (!Number.isFinite(ms) || ms <= 0) return;
-		this.stallTimer = setInterval(() => {
-			if (!this.farming || !this.transport) return;
-			if (this.view().custody.fundKey !== null) return; // bootstrap only — idle tips are normal once the committee exists
-			const peers = this.transport.connectedPeerKeys().length;
-			if (peers === 0) return; // nothing to pull from — the lobby/health watch covers a peerless node
-			const last = this.anchorTimes[this.anchorTimes.length - 1];
-			const frozenMs = last ? Date.now() - last.at : Infinity;
-			if (frozenMs < ms) return; // tip still moving
-			this.recordNetEvent("net", `tip frozen ${Number.isFinite(frozenMs) ? Math.round(frozenMs / 1000) + "s" : "(no anchor yet)"} with ${peers} peer(s) — re-pulling`);
-			this.node.resync(); // ask peers for any heavier chain we missed
-			this.maintainCommittee(); // re-resolve + re-warm committee links so the ceremony mesh recovers
-		}, ms);
-		if (typeof this.stallTimer.unref === "function") this.stallTimer.unref(); // never hold the process open
-	}
-
-	private stopStallWatch(): void {
-		if (this.stallTimer) clearInterval(this.stallTimer);
-		this.stallTimer = undefined;
-	}
-
-	/** Stand up the autonomous custody loop — the ONLY custody path, on every network: it watches
-	 *  finality (node.onTip → driveRotation) and runs the genesis DKG, then a per-epoch reshare, across
-	 *  the PoST-weighted committee sampled from the chain. The fund key is published on-chain at genesis. */
-	private startCommitteeCustody(): void {
-		if (this.rotation) return;
-		this.rotation = new CommitteeRotation({
-			node: this.node,
-			selfId: this.producerId(),
-			params: this.committeeParams(), // the network's consensus custody params — what the fold checks records against
-			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
-			excluded: () => this.finalizedFaults(), // proven faults → skipped by committee selection
-			auth: this.ceremonyAuth(),
-			ceremonySeed: () => this.producerKey().privateKey, // deterministic DKG material across retries
-
-			groupKey: () => {
-				const hex = this.view().custody.fundKey;
-				return hex ? fromHex(hex) : null;
-			},
-			fundEpoch: () => this.fundEpoch(),
-			publishFund: (key, epoch, committee, min) => void this.custodyAccount().announceFund(toHex(key), epoch, committee, min).catch(() => {}),
-			publishHandoff: (epoch, committee, min, sig) => void this.custodyAccount().recordHandoff(epoch, committee, min, toHex(sig)).catch(() => {}),
-			holderAt: (height) => holderAt(this.finalView().custody, height),
-			handoffRecorded: (epoch) => (this.view().custody.holder?.epoch ?? -1) >= epoch,
-			loadShare: (epoch) => this.shares.get(epoch),
-			saveShare: (s) => this.shares.save(s),
-			log: (m) => console.log(m),
-			onReshareShadow: (p) => this.runShadowReshare(p), // validation-only blob-path run, alongside the live ceremony
-			reshareViaBlob: process.env.GAVL_PVSS_RESHARE ? (p) => this.reshareViaBlob(p) : undefined, // CUTOVER (opt-in): the blob path IS the reshare, with the live ceremony as fallback
-		});
-
-		// Auto fault-reporting: watch every ceremony message this node sees; when a committee
-		// member equivocates (two conflicting signed messages for one slot), file the fault
-		// proof so the fold excludes it from later committees — unless it's already excluded.
-		this.equivWatcher = new EquivocationWatcher((a, b, culprit) => {
-			if (this.finalView().custody.excluded.has(culprit)) return;
-			console.log(`[custody] equivocation by ${culprit.slice(0, 16)}… → submitting fault proof`);
-			void this.custodyAccount().reportFault(a, b).catch(() => {});
-		});
-		this.node.onCeremonyMessage = (m) => this.equivWatcher!.observe(m);
-
-		// Verifiable encrypted resharing (phase 1): announce this node's X25519 encryption key (bound to
-		// its committee id) so peers can seal a future reshare sub-share to it, and learn peers' keys via
-		// the registry (binding-verified). Self-register so we can also seal to ourselves; re-announce on a
-		// loop so a late-joining peer catches it. Nothing consumes the registry yet — the reshare wiring is
-		// a later phase — so this only adds announce traffic, it changes no existing custody behavior.
-		const myAnnounce = announceEncKey(this.producerKey().privateKey, this.producerId());
-		this.encKeys.learn(myAnnounce);
-		this.node.onEncKey = (a) => void this.encKeys.learn(a);
-		this.node.onShadowDeal = (e, d) => this.shadowCoord?.onDeal(e, d); // route shadow deals to the current run
-		this.node.encKeyBroadcast(myAnnounce);
-		clearInterval(this.encKeyTimer);
-		this.encKeyTimer = setInterval(() => this.node.encKeyBroadcast(myAnnounce), 15_000);
-
-		const cp = this.committeeParams();
-		console.log(`  custody: committee mode (epochLength ${cp.epochLength}, max size ${cp.size}, window ${cp.windowAnchors}); id ${this.producerId().slice(0, 16)}…`);
-	}
-
-	/** SHADOW reshare (verifiable encrypted resharing, phase 2): build + publicly verify a PVSS blob
-	 *  ALONGSIDE the live ceremony and LOG the outcome — validation only, never writes a share. Driven by
-	 *  the rotation when a reshare fires. A sustained "blob ✓ · combine ✓" across a soak is the cutover
-	 *  signal; a "✗" means the blob path disagrees with the trusted path. */
-	private runShadowReshare(p: { epoch: number; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupKey: Uint8Array; myOldShare?: { signingShare: Uint8Array }; oldPub?: { verifyingShares: Record<string, Uint8Array> }; inNew: boolean }): void {
-		const coord = new ShadowReshareCoordinator({
-			node: this.node,
-			epoch: p.epoch,
-			selfId: this.producerId(),
-			oldQuorum: p.oldQuorum,
-			newCommittee: p.newCommittee,
-			newMin: p.newMin,
-			groupKey: p.groupKey,
-			myOldShare: p.myOldShare ? FROST.utils.Fn.fromBytes(p.myOldShare.signingShare) : undefined,
-			oldVerifyingShareOf: p.oldPub ? (id) => p.oldPub!.verifyingShares[fid(id)] : undefined,
-			myEncKey: p.inNew ? deriveEncKey(this.producerKey().privateKey) : undefined,
-			encKeyOf: (id) => this.encKeys.get(id),
-			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
-			auth: this.ceremonyAuth(),
-		});
-		this.shadowCoord = coord;
-		void coord.start().then((r) => {
-			const mark = (b: boolean | null) => (b === null ? "—" : b ? "✓" : "✗ MISMATCH");
-			console.log(`[custody] shadow reshare epoch ${r.epoch}: deals ${r.dealsSeen}/${p.oldQuorum.length}${r.complete ? "" : " incomplete"} · blob ${mark(r.blobVerifies)} · combine ${mark(r.combineOk)}${r.note ? ` · ${r.note}` : ""}`);
-			const detail = r.complete ? `shadow · blob ${mark(r.blobVerifies)} · combine ${mark(r.combineOk)}` : `shadow · forming (${r.dealsSeen}/${p.oldQuorum.length} deals)`;
-			this.lastReshare = { epoch: r.epoch, ok: r.complete && r.blobVerifies !== false && r.combineOk !== false, detail };
-		});
-	}
-
-	/** CUTOVER (verifiable encrypted resharing, phase 4, opt-in GAVL_PVSS_RESHARE): try to reshare via the
-	 *  durable blob path. Runs every TRUST GATE — the group key is preserved, contributions verify (if I'm
-	 *  an old member), and my share combines — then returns a saved-ready reshare result, "rotated-out" if I
-	 *  leave the committee, or null to FALL BACK to the live ceremony. It never returns a share it could not
-	 *  fully validate, so a flagged-on node is never worse off than the trusted ceremony. */
-	private async reshareViaBlob(p: { epoch: number; oldQuorum: string[]; newCommittee: string[]; newMin: number; groupKey: Uint8Array; myOldShare?: { signingShare: Uint8Array }; oldPub?: { verifyingShares: Record<string, Uint8Array> }; inNew: boolean }) {
-		const coord = new ShadowReshareCoordinator({
-			node: this.node,
-			epoch: p.epoch,
-			selfId: this.producerId(),
-			oldQuorum: p.oldQuorum,
-			newCommittee: p.newCommittee,
-			newMin: p.newMin,
-			groupKey: p.groupKey,
-			myOldShare: p.myOldShare ? FROST.utils.Fn.fromBytes(p.myOldShare.signingShare) : undefined,
-			oldVerifyingShareOf: p.oldPub ? (id) => p.oldPub!.verifyingShares[fid(id)] : undefined,
-			myEncKey: p.inNew ? deriveEncKey(this.producerKey().privateKey) : undefined,
-			encKeyOf: (id) => this.encKeys.get(id),
-			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
-			auth: this.ceremonyAuth(),
-		});
-		this.shadowCoord = coord;
-		const r = await coord.start();
-		const fail = (why: string): null => {
-			console.log(`[custody] blob reshare epoch ${p.epoch}: ${why} — falling back to the live ceremony`);
-			this.lastReshare = { epoch: p.epoch, ok: false, detail: `blob · ${why} — fell back to ceremony` };
-			return null;
-		};
-		if (!r.blob) return fail(`incomplete (${r.dealsSeen}/${p.oldQuorum.length} deals)`);
-		if (Buffer.compare(groupKeyOf(r.blob.deals), p.groupKey) !== 0) return fail("the reshare would change the fund key");
-		if (r.blobVerifies === false) return fail("a contribution failed public verification");
-		if (!p.inNew) {
-			console.log(`[custody] blob reshare epoch ${p.epoch}: rotated out (not in the new committee)`);
-			this.lastReshare = { epoch: p.epoch, ok: true, detail: "blob · rotated out" };
-			return "rotated-out" as const;
-		}
-		try {
-			const res = assembleReshare(r.blob, this.producerId(), deriveEncKey(this.producerKey().privateKey));
-			console.log(`[custody] blob reshare epoch ${p.epoch}: rotated in via the blob (contributions ${r.blobVerifies === null ? "self-checked" : "verified"})`);
-			this.lastReshare = { epoch: p.epoch, ok: true, detail: "blob · rotated in (same address)" };
-			return res;
-		} catch (e) {
-			return fail(`my share did not combine (${(e as Error).message})`);
-		}
-	}
-
-	// ── real-BTC bridge (testnet) ────────────────────────────────────
-
-	/** The threshold-custody fund key — ALWAYS the committee's; there is no single-key/solo path on
-	 *  any network. The group key is the ON-CHAIN published one (so any node, even one holding no
-	 *  share, derives the right address); if this node holds the matching share, pub/min are exposed
-	 *  for co-signing. Returns NULL pre-genesis: until the committee runs its DKG there is no fund
-	 *  key, no address, and nothing can be minted — a lone node simply waits for peers. */
-	private fundKey(): FundKey | null {
-		const onchain = this.view().custody.fundKey;
-		const cs = this.committeeShare();
-		if (onchain) {
-			const groupPubKey = fromHex(onchain);
-			if (cs && toHex(cs.groupPubKey) === onchain) return { groupPubKey, pub: cs.pub, shares: {}, min: cs.min, max: cs.participants.length };
-			return { groupPubKey, pub: {} as FundKey["pub"], shares: {}, min: 0, max: 0 }; // address-only (no share here)
-		}
-		if (cs) return { groupPubKey: cs.groupPubKey, pub: cs.pub, shares: {}, min: cs.min, max: cs.participants.length }; // hold a share; genesis announce not seen yet
-		return null; // pre-genesis: no committee fund exists yet
-	}
-
-	/** THIS node's persisted committee shares, one per ceremony epoch (secret, node-local). */
-	private readonly shares: ShareStore;
-	/** The share this node signs with: the one from the SETTLED holder's ceremony, so a newer share
-	 *  from a reshare whose handoff isn't settled yet is never used early (signing BTC payouts is
-	 *  irreversible). Before any holder is settled (genesis just ran), the newest share held. Null if
-	 *  this node isn't a holder. */
-	committeeShare(): StoredShare | null {
-		const holder = this.settledView().custody.holder;
-		return holder ? this.shares.get(holder.epoch) : this.shares.latest();
-	}
-
-	/** Drop shares the chain has superseded — IRREVERSIBLE, so only off SETTLED state: everything below
-	 *  the older of the two settled holder records (holderAt may still answer with prevHolder for a
-	 *  boundary the latest handoff landed after). A soft-final handoff that gets reverted never costs a
-	 *  share the old committee still needs. */
-	private pruneShares(): void {
-		const c = this.settledView().custody;
-		const keepFrom = c.prevHolder?.epoch ?? c.holder?.epoch;
-		if (keepFrom !== undefined) this.shares.pruneBelow(keepFrom);
-	}
-
-	/** This node's STABLE anchor-producer key (persisted) — also its committee identity.
-	 *  A fresh key each boot would make the node a different committee candidate every
-	 *  restart and forfeit its seat/share, so it's pinned to disk like the wallet seed. */
+	/** This node's STABLE anchor-producer key (persisted), pinned to disk like the wallet seed so the
+	 *  node farms under the same identity across restarts. */
 	private producerKeyPath(): string {
-		return join(this.dataDir, "custody", "farmer.json");
+		return join(this.dataDir, "farmer.json");
 	}
 	private producerKey(): KeyPair {
 		if (this.producerKeyCache) return this.producerKeyCache;
@@ -1354,335 +720,22 @@ export class Daemon {
 			this.producerKeyCache = keyPairFromSeed(fromHex(JSON.parse(readFileSync(path, "utf8")).seed));
 		} else {
 			const kp = generateKeyPair();
-			mkdirSync(join(this.dataDir, "custody"), { recursive: true });
+			mkdirSync(this.dataDir, { recursive: true });
 			writeFileSync(path, JSON.stringify({ seed: toHex(kp.privateKey) }), { mode: 0o600 }); // privateKey IS the 32-byte seed
 			this.producerKeyCache = kp;
 		}
 		return this.producerKeyCache;
 	}
 
-	/** This node's committee id (stable producer pubkey hex). */
+	/** This node's producer id (stable producer pubkey hex). */
 	producerId(): string {
 		return toHex(this.producerKey().publicKey);
 	}
 
-	/** Account bound to the producer key — used to announce the fund key on-chain. */
-	private custodyAccount(): Account {
-		if (!this.custodyAcct) this.custodyAcct = new Account({ node: this.node, params: this.params, k: this.k, now: this.now, keypair: this.producerKey() });
-		return this.custodyAcct;
-	}
-
-	/** Authenticates this node's ceremony messages (signs as its committee id = producer
-	 *  pubkey) and verifies peers' — so an impersonator on the committee topic is dropped. */
-	private ceremonyAuthCache?: CeremonyAuth;
-	private ceremonyAuth(): CeremonyAuth {
-		if (!this.ceremonyAuthCache) this.ceremonyAuthCache = makeCeremonyAuth(this.producerKey().privateKey);
-		return this.ceremonyAuthCache;
-	}
-
-	/**
-	 * Produce a COMMITTEE threshold signature over an attestation `digest` (gate #4) —
-	 * the authority for an on-chain mint/settle, replacing the single attestor key. This
-	 * node co-signs with its share over the committee ceremony (deterministic first
-	 * quorum), so the same digest yields the same ceremony on every member and they
-	 * converge on one signature. Returns the sig hex, or null if this node isn't a
-	 * quorum signer this round / the quorum couldn't be reached (caller retries).
-	 *
-	 * As with withdrawals, every member should INDEPENDENTLY verify the underlying fact
-	 * (the deposit landed / the payout confirmed, via Esplora) before co-signing — that
-	 * check is the caller's (claimDeposit / settle). Autonomous multi-node triggering of
-	 * the ceremony is the same coordination layer withdrawals need (next).
-	 */
-	private async committeeAttest(digest: Uint8Array): Promise<string | null> {
-		const cs = this.committeeShare();
-		if (!cs) return null;
-		const quorum = quorumForRound(cs.participants, cs.min, 0);
-		if (!quorum.includes(cs.selfId)) return null; // not a signer this round
-		try {
-			const coord = new SignCoordinator(this.node, {
-				signId: `attest:${toHex(sha256(digest))}`, // same digest → same ceremony on every member
-				selfId: cs.selfId,
-				quorum,
-				pub: cs.pub,
-				share: cs.share,
-				message: digest,
-				timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
-				auth: this.ceremonyAuth(),
-			});
-			return toHex(await coord.start());
-		} catch (e) {
-			if (isCeremonyTimeout(e)) return null; // quorum not reachable — retry later
-			throw e;
-		}
-	}
-
-	private esploraCache?: { key: string; client: Esplora };
-	/** The bridge's explorer client: network from GAVL_BTC_NET, endpoints from GAVL_ESPLORA_URL
-	 *  (comma-separated Esplora roots) or the network's public defaults. */
-	private esplora(): Esplora {
-		const net = this.btcNetwork();
-		const bases = esploraBasesFromEnv();
-		const key = `${net}|${bases?.join(",") ?? ""}`;
-		if (this.esploraCache?.key !== key) this.esploraCache = { key, client: new Esplora({ net, bases }) };
-		return this.esploraCache.client;
-	}
-	/** Which Bitcoin network the bridge is on (GAVL_BTC_NET; testnet by default). */
-	btcNetwork(): EsploraNet {
-		return btcNetFromEnv();
-	}
-	/** The base fund address (change + legacy + consolidation). Per-user deposits go to
-	 *  `depositAddressFor` instead — see the front-running fix. NULL pre-genesis (no committee
-	 *  fund key yet), so deposits/withdrawals are impossible until the committee forms. */
-	fundAddress(): string | null {
-		const fk = this.fundKey();
-		return fk ? deriveFundAddress(fk, this.btcNetwork()) : null;
-	}
-
-	/** A user's OWN Bitcoin deposit address — derived from (fund key, their pubkey), so a
-	 *  deposit here is cryptographically bound to them and can't be claimed by anyone else.
-	 *  NULL pre-genesis (no fund key) — there's nowhere to deposit until the committee forms. */
-	depositAddressFor(pubHex: string): string | null {
-		const fk = this.fundKey();
-		return fk ? depositAddress(fk.groupPubKey, pubHex, this.btcNetwork()) : null;
-	}
-
-	/** Every address the fund holds BTC at: the base, plus each depositor's per-user
-	 *  address (`owner` = the depositor, telling the signer which tweak to use). */
-	private fundAddresses(): { address: string; owner?: string }[] {
-		const base = this.fundAddress();
-		const list: { address: string; owner?: string }[] = base ? [{ address: base }] : []; // empty pre-genesis
-		for (const d of this.view().bridge.depositors) {
-			const addr = this.depositAddressFor(d);
-			if (addr) list.push({ address: addr, owner: d });
-		}
-		return list;
-	}
-
-	/**
-	 * PROOF OF RESERVES: the REAL confirmed BTC in the fund (sum of on-chain UTXOs),
-	 * cached + refreshed on a timer so reads are sync. Compared against the ledger's
-	 * `reserves` to detect under-backing (the safety check a custodial bridge must run).
-	 */
-	private onChainReserves: { sats: bigint; at: number } | null = null;
-	private reserveTimer?: ReturnType<typeof setInterval>;
-	private encKeyTimer?: ReturnType<typeof setInterval>;
-	/** Peers' verified X25519 encryption keys (verifiable encrypted resharing, phase 1). Populated by the
-	 *  enc-key announce gossip; consumed only by the SHADOW reshare run (validation-only). */
-	private readonly encKeys = new EncKeyRegistry();
-	/** The current epoch's shadow reshare coordinator (validation-only; never writes a share). */
-	private shadowCoord?: ShadowReshareCoordinator;
-	/** The latest reshare outcome — surfaced in custodyStatus for the UI's reshare indicator. */
-	private lastReshare?: { epoch: number; ok: boolean; detail: string };
 	/** DIAGNOSTIC (3): farming-health watchdog — warns when a node farms but never produces an anchor. */
 	private healthTimer?: ReturnType<typeof setInterval>;
 	private farmingStart = 0;
 	private warnedNoProduce = false;
-	/** Stall watchdog — re-pulls a bootstrapping tip that froze while peers remained (a missed
-	 *  anchor-tip / a quiet link), so genesis + the committee aren't blocked on a stale view. */
-	private stallTimer?: ReturnType<typeof setInterval>;
-	/** Last committee-readiness line logged, so the diagnostic only prints when the picture changes. */
-	private lastReadiness = "";
-	async refreshOnChainReserves(): Promise<void> {
-		try {
-			const esplora = this.esplora();
-			let sats = 0n;
-			for (const { address } of this.fundAddresses()) {
-				const utxos = await esplora.utxos(address);
-				for (const u of utxos) if (u.status.confirmed) sats += BigInt(u.value);
-			}
-			this.onChainReserves = { sats, at: Date.now() };
-		} catch {
-			/* network hiccup — keep the last reading */
-		}
-	}
-	onChainReservesCached(): { sats: bigint; at: number } | null {
-		return this.onChainReserves;
-	}
-	private startReserveWatch(): void {
-		if (this.reserveTimer) return; // once
-		void this.refreshOnChainReserves();
-		this.reserveTimer = setInterval(() => void this.refreshOnChainReserves(), 30_000);
-	}
-
-	/**
-	 * Begin claiming a real BTC deposit `txid` for `depositor` (verified to have paid THEIR
-	 * per-user address). This only posts the on-chain `bridge.claim` TRIGGER — the committee
-	 * then independently re-verifies + co-signs the mint, so no single key ever mints. No-op
-	 * (returns 0) pre-genesis: with no committee fund there's no deposit address and nothing
-	 * to claim. Returns the sats found (the gBTC appears once the committee mints).
-	 */
-	async claimDeposit(txid: string, depositor: string): Promise<bigint> {
-		// FRONT-RUN FIX: verify the deposit paid the CLAIMER's OWN per-user address. The strict
-		// per-user binding is the committee front-running guard — there is no fund-address fallback.
-		const addr = this.depositAddressFor(depositor);
-		if (!addr || !this.view().custody.fundKey) return 0n; // no committee fund yet — nothing to claim against
-		const deps = await checkDeposit(this.esplora(), addr, txid, MIN_CONFIRMATIONS);
-		let total = 0n;
-		for (const d of deps) {
-			const depositId = `${d.txid}:${d.vout}`;
-			await this.custodyAccount().claim(depositId, depositor); // post the trigger; the committee re-verifies + co-signs the mint
-			total += d.amount;
-		}
-		return total;
-	}
-
-	/**
-	 * Settle pending withdrawals by co-signing the unsent ones (the finality loop also does this
-	 * autonomously). Returns the broadcast txid of the batch, or null (incl. pre-genesis: no fund).
-	 */
-	async processWithdrawals(): Promise<string | null> {
-		if (!this.view().custody.fundKey) return null; // no committee fund yet
-		return this.coSignWithdrawals();
-	}
-
-	/**
-	 * Gather the fund's confirmed UTXOs and build a deterministic payout tx to `targets`
-	 * (+ change back to the fund, − fee). Enforces the SIGNING POLICY (the honest-member
-	 * veto): the only non-change outputs are the requested withdrawal addresses. Returns a
-	 * rebuild thunk (finalizing a PSBT consumes it) + the txid-to-be, or null if there
-	 * isn't enough confirmed BTC yet.
-	 */
-	private async buildPayout(targets: { id: string; btcAddress: string; amount: bigint; fee: bigint }[]): Promise<{ mkUnsigned: () => ReturnType<typeof buildWithdrawalTx> } | null> {
-		const fk = this.fundKey();
-		const fundAddr = this.fundAddress();
-		if (!fk || !fundAddr) return null; // no committee fund yet — nothing to sign against
-		const esplora = this.esplora();
-		const tip = await esplora.tipHeight();
-		const inputs = (await Promise.all(this.fundAddresses().map(async ({ address, owner }) => utxosToInputs(await esplora.utxos(address), MIN_CONFIRMATIONS, tip).map((u) => ({ ...u, owner }))))).flat();
-		const inSum = inputs.reduce((a, u) => a + u.amount, 0n);
-		// Each withdrawer receives amount − their OWN fee; the summed fees ARE the tx's miner fee, so
-		// the fund's reserves drop by exactly `gross` (Σamount = the burned gBTC) — 1:1 backing holds.
-		const payouts = targets.map((w) => ({ address: w.btcAddress, amount: w.amount - w.fee }));
-		const gross = targets.reduce((a, w) => a + w.amount, 0n);
-		if (inputs.length === 0 || inSum < gross) return null; // not enough confirmed BTC to cover it
-		const change = inSum - gross; // miner fee (= Σfee) is the gap between gross and the user payouts
-		if (change > 0n) payouts.push({ address: fundAddr, amount: change });
-		// VETO: the tx may pay ONLY the requested withdrawal addresses + change to the fund.
-		const requested = new Set(targets.map((w) => w.btcAddress));
-		for (const p of payouts) if (p.address !== fundAddr && !requested.has(p.address)) throw new Error(`withdrawal policy: refusing to pay ${p.address}`);
-		inputs.sort((a, b) => (a.txid === b.txid ? a.index - b.index : a.txid < b.txid ? -1 : 1));
-		payouts.sort((a, b) => (a.address === b.address ? Number(a.amount - b.amount) : a.address < b.address ? -1 : 1));
-		return { mkUnsigned: () => buildWithdrawalTx(fk, { inputs, outputs: payouts, network: this.btcNetwork() }) };
-	}
-
-	// ── autonomous committee co-signing (finality-driven; the trigger) ───────
-
-	private authorizing = false;
-	/**
-	 * On each finality advance, a committee member picks up ALL pending custody work from
-	 * FINALIZED state and co-signs it — withdrawals to sign, deposits to mint, payouts to
-	 * settle — with NO leader: every member reads the same finalized state, runs the same
-	 * deterministic ceremony per item, and idempotent effects make duplicates safe. This
-	 * is what makes the committee autonomous across many nodes. No-op unless this node holds
-	 * a share + a fund exists. Non-reentrant.
-	 */
-	private maybeAuthorizePending(): void {
-		if (this.authorizing || !this.committeeShare() || !this.view().custody.fundKey) return;
-		this.authorizing = true;
-		void (async () => {
-			try {
-				await this.coSignWithdrawals();
-				await this.coMintClaims();
-				await this.coSettleConfirmed();
-			} catch (e) {
-				console.warn(`[custody] authorize: ${(e as Error).message}`);
-			} finally {
-				this.authorizing = false;
-			}
-		})();
-	}
-
-	/** The withdrawals the committee may pay out in BTC: SETTLED burns only. A soft-final burn can
-	 *  still be reverted by fork resolution; paying it would leave the user both the BTC and the gBTC. */
-	payableWithdrawals(): PendingWithdrawal[] {
-		return this.settledView().bridge.pending;
-	}
-
-	/** Co-sign + broadcast the UNSENT SETTLED withdrawals (one batch), then post a bridge.broadcast
-	 *  note per withdrawal so the committee stops re-signing them. Paying BTC is irreversible, so a
-	 *  burn must be SETTLED (not merely soft-final): a reverted burn after the BTC left would leave the
-	 *  user holding both the gBTC and the BTC. */
-	private async coSignWithdrawals(): Promise<string | null> {
-		const cs = this.committeeShare();
-		if (!cs) return null;
-		const bridge = this.settledView().bridge;
-		const esplora = this.esplora();
-		// A withdrawal needs (re)signing UNLESS a real payout tx that actually pays it is already out
-		// there. The bridge.broadcast note is an unauthenticated hint, so verify it on-chain — a bogus
-		// note (or one an attacker overwrote) doesn't really pay, so we re-sign rather than stall.
-		const unsent: PendingWithdrawal[] = [];
-		for (const w of this.payableWithdrawals()) {
-			const noted = bridge.broadcasts.get(w.id);
-			if (noted) {
-				const tx = await esplora.getTx(noted).catch(() => null);
-				if (tx && txPaysWithdrawal(tx, w.btcAddress, w.amount - w.fee)) continue; // a real payout exists
-			}
-			unsent.push(w);
-		}
-		if (unsent.length === 0) return null;
-		const built = await this.buildPayout(unsent); // each withdrawal carries its own miner fee
-		if (!built) return null;
-		const signed = await signWithdrawalWithFailover(built.mkUnsigned, {
-			node: this.node,
-			signIdBase: unsent.map((w) => w.id).join(","),
-			selfId: cs.selfId,
-			committee: cs.participants,
-			min: cs.min,
-			pub: cs.pub,
-			groupPubKey: cs.groupPubKey,
-			share: cs.share,
-			timeoutMs: this.custodyOpts.ceremonyTimeoutMs ?? 30_000,
-			auth: this.ceremonyAuth(),
-		});
-		if (!signed) return null; // quorum not reached this round — retried next finality tick
-		try {
-			await esplora.broadcast(signed.hex);
-		} catch {
-			/* already in mempool (a re-sign of the deterministic tx) — fine; still re-assert the note */
-		}
-		for (const w of unsent) await this.custodyAccount().announceBroadcast(w.id, signed.txid); // (re)assert the real payout txid
-		return signed.txid;
-	}
-
-	/** For each finalized deposit-claim, INDEPENDENTLY verify it on-chain, then co-sign the
-	 *  mint (committee threshold). A bogus claim fails verification and mints nothing. */
-	private async coMintClaims(): Promise<void> {
-		const claims = pendingClaims(this.finalView().bridge);
-		if (claims.length === 0) return;
-		const esplora = this.esplora();
-		for (const { depositId, depositor } of claims) {
-			const colon = depositId.lastIndexOf(":");
-			if (colon < 0) continue;
-			const txid = depositId.slice(0, colon);
-			const vout = Number(depositId.slice(colon + 1));
-			const addr = this.depositAddressFor(depositor);
-			if (!addr) continue; // no fund key — can't derive the per-user address
-			const deps = await checkDeposit(esplora, addr, txid, MIN_CONFIRMATIONS);
-			const d = deps.find((x) => x.vout === vout);
-			if (!d) continue; // not verified (yet) — retried next tick
-			const sig = await this.committeeAttest(depositAttestationDigest({ depositId, depositor, amount: d.amount }));
-			if (sig) await this.custodyAccount().attestDeposit(depositId, depositor, d.amount, sig);
-		}
-	}
-
-	/** For each SETTLED in-flight withdrawal whose payout txid has confirmed on-chain, co-sign the
-	 *  settle (committee threshold) so reserves drop. */
-	private async coSettleConfirmed(): Promise<void> {
-		const inFlight = inFlightWithdrawals(this.settledView().bridge);
-		if (inFlight.length === 0) return;
-		const esplora = this.esplora();
-		const tip = await esplora.tipHeight();
-		for (const { withdrawal, txid } of inFlight) {
-			const tx = await esplora.getTx(txid);
-			if (!tx || confirmations(tx, tip) < MIN_CONFIRMATIONS) continue; // not confirmed yet
-			// AUTHENTICATE the note: only settle (drop reserves) if the confirmed tx ACTUALLY pays this
-			// withdrawal. Otherwise a bogus bridge.broadcast pointing at any confirmed tx could drop
-			// reserves with the withdrawer never paid — a robbery. A non-paying txid is ignored.
-			if (!txPaysWithdrawal(tx, withdrawal.btcAddress, withdrawal.amount - withdrawal.fee)) continue;
-			const sig = await this.committeeAttest(settleAttestationDigest({ withdrawalId: withdrawal.id }));
-			if (sig) await this.custodyAccount().settleWithdrawal(withdrawal.id, sig);
-		}
-	}
 
 	/** The channel/network this node is currently on. */
 	currentChannel(): string {
@@ -1694,14 +747,12 @@ export class Daemon {
 	/** Reroll: create a fresh identity and make it active. Returns its pubkey. */
 	rerollIdentity(label?: string): string {
 		const acct = this.wallet.create(label || `identity ${this.wallet.list().length + 1}`);
-		this.bind(acct);
 		return acct.pubHex;
 	}
 
 	/** Import an identity from a 32-byte seed (hex), make it active. Returns its pubkey. */
 	importIdentity(seedHex: string, label?: string): string {
 		const acct = this.wallet.importSeed(seedHex, label);
-		this.bind(acct);
 		return acct.pubHex;
 	}
 
@@ -1750,10 +801,8 @@ export class Daemon {
 		// 1. Tear down the current channel's consensus + storage. Stop farming FIRST so it
 		//    doesn't post a write into the store while it's closing.
 		this.farming = false;
-		clearInterval(this.encKeyTimer);
 		this.producer?.stop();
 		this.stopHealthWatch();
-		this.stopStallWatch();
 		this.producer = undefined;
 		if (this.transport) await this.transport.destroy().catch(() => {});
 		this.transport = undefined;
@@ -1761,22 +810,12 @@ export class Daemon {
 		this.store = undefined;
 		this.anchorTimes.length = 0; // reset cadence samples for the new chain
 
-		// 2. Fresh ledger + anchor chain — a clean economy for the new channel. The custody
-		//    loop + accounts referenced the OLD node, so drop them; startConsensus rebuilds
-		//    the rotation against the new node when farming.
+		// 2. Fresh ledger + anchor chain — a clean state for the new channel.
 		this.node = this.freshNode();
-		this.rotation = undefined;
-		this.equivWatcher = undefined;
-		this.custodyAcct = undefined;
-		// Reset checkpoint state — the new channel is a fresh economy with its own history.
-		this.checkpointBase = undefined;
 		this.lastCheckpointHeight = -1;
-		this.viewCache = undefined;
-		this.finalCache = undefined;
-		this.settledCache = undefined;
+		this.lastSnapshot = undefined;
+		this.pendingSnapshot = undefined;
 		this.wireTipCadence();
-		this.accounts.clear();
-		for (const wa of this.wallet.list()) this.bind(wa); // same identities, new node
 
 		// 3. Switch to the new channel and bring it up (init store → replay → join + farm).
 		this.network = next;
@@ -1786,12 +825,8 @@ export class Daemon {
 
 	async stop(): Promise<void> {
 		this.farming = false;
-		clearInterval(this.encKeyTimer);
-		clearInterval(this.reserveTimer);
-		this.reserveTimer = undefined;
 		this.producer?.stop();
 		this.stopHealthWatch();
-		this.stopStallWatch();
 		if (this.transport) await this.transport.destroy().catch(() => {});
 		if (this.store) await this.store.close().catch(() => {});
 		await this.params.vdf.close?.().catch(() => {}); // terminate the VDF worker pool, if any

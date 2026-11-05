@@ -22,8 +22,7 @@ import { nextDifficulty } from "../src/consensus/difficulty.ts";
 import type { RetargetSchedule } from "../src/consensus/difficulty.ts";
 import { Ledger } from "../src/ledger/ledger.ts";
 import { GavlNode } from "../src/sync/node.ts";
-import { Account } from "../src/market/account.ts";
-import { PARAMS, K, standinProver, STANDIN_VERIFIER } from "./helpers.ts";
+import { Account, PARAMS, K, standinProver, STANDIN_VERIFIER } from "./helpers.ts";
 
 function miner() {
 	const keypair = generateKeyPair();

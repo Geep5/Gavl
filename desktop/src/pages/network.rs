@@ -36,7 +36,6 @@ impl GavlApp {
         let advice = match summary.health {
             Health::Offline => Some("Nothing below is current until the daemon is reachable."),
             Health::NoPeers => Some("Other computers must run the same command (same proof mode) with GAVL_NETWORK unset."),
-            Health::Lobby { .. } => Some("Every node must use the same proof mode, or they can't share a chain."),
             Health::Live if consensus.producers == 1 && consensus.peers > 0 && consensus.i_produce => Some(
                 "So far every block came from this node. If that persists, compare the block number on each computer — a peer stuck behind is on its own chain.",
             ),
@@ -171,7 +170,6 @@ fn kind_label(kind: &str) -> SharedString {
         "anchor" => "Block".into(),
         "peer" => "Peer".into(),
         "binding" => "Address".into(),
-        "committee" => "Committee".into(),
         "checkpoint" => "Checkpoint".into(),
         "replication" => "Replication".into(),
         "gossip" => "Gossip".into(),

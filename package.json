@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Gavl — a no-oracle gBTC exchange on a Proof-of-Space-Time cooldown ledger with threshold BTC custody, networked over Nostr.",
+  "description": "Gavl — a decentralized, ephemeral BTC↔LTC atomic-swap order board on a Proof-of-Space-Time chain over Nostr; swaps settle on-chain via Taproot HTLCs.",
   "scripts": {
     "dev": "concurrently -n daemon,desktop -c blue,magenta \"npm:daemon\" \"npm:desktop\"",
     "dev:hash": "concurrently -n daemon,desktop -c blue,magenta \"npm:daemon:hash\" \"npm:desktop\"",
@@ -14,11 +14,10 @@
     "daemon:fresh": "cross-env GAVL_VDF=hash GAVL_SPACE=standin GAVL_PERSIST=off node src/server.ts",
     "node:spawn": "node scripts/spawn-node.mjs",
     "test": "node --test \"test/*.test.ts\"",
-    "test:fast": "node --test test/consensus.test.ts test/consensus-gossip.test.ts test/ledger.test.ts test/post-cooldown.test.ts test/sync.test.ts test/custody-threshold.test.ts test/custody-bridge.test.ts",
+    "test:fast": "node --test test/consensus.test.ts test/consensus-gossip.test.ts test/ledger.test.ts test/post-cooldown.test.ts test/sync.test.ts",
     "test:chia": "node --test test/chia.test.ts",
     "regtest:install": "node scripts/regtest/install.mjs",
     "test:regtest": "cross-env GAVL_REGTEST=1 node --test \"test/regtest/*.test.ts\"",
-    "test:churn": "cross-env GAVL_REGTEST=1 GAVL_CHURN=1 node --test --test-timeout=0 test/regtest/churn.test.ts",
     "setup:chia": "node scripts/setup_chia.mjs",
     "demo": "node src/index.ts"
   },

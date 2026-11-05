@@ -20,7 +20,6 @@ import { WorkerHashVdf } from "./pot/worker-hash-vdf.ts";
 import { ChiaVdf } from "./pot/chia-vdf.ts";
 import { chiaAvailable } from "./chia/proc.ts";
 import type { ChainParams } from "./chain/writer.ts";
-import { DEFAULT_CUSTODY_PARAMS } from "./custody/epoch.ts";
 
 export type VdfKind = "chia" | "hash";
 
@@ -49,6 +48,5 @@ export function defaultParams(overrides: Partial<ChainParams> = {}): ChainParams
 		difficulty: overrides.difficulty ?? 20n,
 		dcf: overrides.dcf ?? 1n << 20n,
 		floorIters: overrides.floorIters ?? 500n,
-		custody: overrides.custody ?? DEFAULT_CUSTODY_PARAMS,
 	};
 }

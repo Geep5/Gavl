@@ -17,7 +17,7 @@ use crate::status;
 
 impl GavlApp {
     pub fn render_node(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let body = v_flex().gap_8().child(self.render_identity(cx)).child(self.render_fleet(cx));
+        let body = v_flex().gap_8().child(self.render_identity(cx)).child(self.render_accounts(cx)).child(self.render_fleet(cx));
         page("page-node", "Node", "The keys and settings of the daemon this window is connected to.", body, cx)
     }
 
@@ -109,5 +109,36 @@ impl GavlApp {
                 v_flex().children(nodes).into_any_element()
             });
         section("Local nodes", Some("Extra independent farmers on this machine, for testing a multi-node network."), body, cx)
+    }
+
+    fn render_accounts(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let active = self.snapshot.active.clone().unwrap_or_default();
+        let switching = self.busy.contains(&Busy::SwitchAccount);
+        let rows = self.snapshot.accounts.clone().into_iter().map(|account| {
+            let is_active = account.pub_hex == active;
+            let key = account.pub_hex.clone();
+            h_flex()
+                .gap_4()
+                .py_2()
+                .items_center()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(div().w(px(120.)).font_medium().child(account.label.clone()))
+                .child(mono(format::short_hex(&account.pub_hex), cx).flex_1().text_color(cx.theme().muted_foreground))
+                .child(if is_active {
+                    Tag::secondary().small().child("Active").into_any_element()
+                } else {
+                    Button::new(SharedString::from(format!("use-{}", account.pub_hex)))
+                        .small()
+                        .label("Use")
+                        .disabled(switching)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let key = key.clone();
+                            this.run(Busy::SwitchAccount, window, cx, move |client| client.set_active(&key), |_, _| None);
+                        }))
+                        .into_any_element()
+                })
+        });
+        section("Accounts", Some("Orders and swaps use the active account."), v_flex().children(rows), cx)
     }
 }

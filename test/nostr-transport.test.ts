@@ -86,10 +86,10 @@ test("liveQuorum counts only peers we've actually HEARD FROM — presence alone 
 	const quiet = generateSecretKey(), talker = generateSecretKey();
 	t.onPresence(presence(quiet)); // announced, never spoke
 	t.onPresence(presence(talker));
-	assert.deepEqual(t.liveQuorumAddrs(), [], "an announce is not evidence of a live peer");
+	assert.deepEqual(t.livePeerAddrs(), [], "an announce is not evidence of a live peer");
 
 	t.onWire(wire(talker, { t: "hello", root: "r", heads: {} }));
-	assert.deepEqual(t.liveQuorumAddrs(), [getPublicKey(talker)], "a real frame FROM a peer is");
+	assert.deepEqual(t.livePeerAddrs(), [getPublicKey(talker)], "a real frame FROM a peer is");
 });
 
 test("a frame from an unannounced peer still connects (we don't need its presence first)", () => {
@@ -104,7 +104,7 @@ test("our own events are ignored (no self-connection, no echo loop)", () => {
 	const before = t.connectedPeerKeys().length;
 	// Forge an event that claims our pubkey by reusing our own identity path: presence for self.
 	assert.equal(before, 0);
-	assert.equal(t.liveQuorumAddrs().length, 0);
+	assert.equal(t.livePeerAddrs().length, 0);
 	assert.throws(() => t.dialPeer("not-a-pubkey"), /64-char hex/, "a malformed address is rejected outright");
 	t.dialPeer(t.nodeKeyHex); // self-dial is a no-op, never a self-peer
 	assert.equal(t.connectedPeerKeys().length, 0);
@@ -140,7 +140,7 @@ test("a peer mid-transfer counts as alive (chunks are frames too)", () => {
 	const parts = splitPayload(JSON.stringify({ t: "snapshot", blob: "s".repeat(60_000) }), MAX_CONTENT)!;
 	// only the FIRST chunk arrives — the transfer is still in flight
 	t.onWire(finalizeEvent({ kind: KIND_DIRECT, created_at: nowSec(), tags: [["d", NET], ["gc", "b", "0", String(parts.length)]], content: parts[0]! }, peer));
-	assert.deepEqual(t.liveQuorumAddrs(), [getPublicKey(peer)], "it must not age out while sending us a big snapshot");
+	assert.deepEqual(t.livePeerAddrs(), [getPublicKey(peer)], "it must not age out while sending us a big snapshot");
 });
 
 test("a message too large to chunk at all is reported LOUDLY, never silently dropped", () => {
@@ -166,20 +166,10 @@ test("the peer set is bounded, and pinned peers survive eviction", () => {
 test("diagnostics report the shape the daemon/UI expect", () => {
 	const { t } = mk();
 	const d = t.diagnostics();
-	for (const k of ["maxPeers", "bindings", "committeeLinked", "gossipIntervalSec", "relaysUp", "relaysTotal"]) {
+	for (const k of ["maxPeers", "bindings", "gossipIntervalSec", "relaysUp", "relaysTotal"]) {
 		assert.ok(k in d, `diagnostics.${k}`);
 	}
 	assert.equal(d.relaysTotal, DEFAULT_RELAYS.length, "defaults to the vetted relay list");
-	assert.equal(d.committeeLinked, 0);
-});
-
-test("committee links resolve through verified bindings only", () => {
-	const { t } = mk();
-	const sk = generateSecretKey();
-	const producer = generateKeyPair();
-	t.onPresence(presence(sk, producer));
-	t.connectCommittee([toHex(producer.publicKey), toHex(generateKeyPair().publicKey)]); // 2nd is unknown
-	assert.equal(t.diagnostics().committeeLinked, 1, "only the member we can actually address is linked");
 });
 
 // ── live round-trip (network-gated: GAVL_NET_TESTS=1) ──────────────────

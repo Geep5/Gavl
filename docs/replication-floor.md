@@ -16,7 +16,7 @@ instead of an implicit hope.
 - **Replication factor** — `GavlNode.replicationFactor(anchorId)` counts the **distinct** nodes
   (including self) holding a checkpoint, deduped by `peerKey` (stable wire identity) exactly like
   the adoption quorum, so one peer over many connections counts once. State survives the loss of
-  up to `replicationFactor − 1` holders between handoffs.
+  up to `replicationFactor − 1` holders between checkpoints.
 - **Under-replication signal** — when the latest checkpoint is held by fewer than
   `replicationTarget` distinct nodes, `onUnderReplicated` fires. The daemon logs a warning so an
   operator can bring up more archivers; a capable archiver can optionally pull-to-persist via
@@ -27,10 +27,6 @@ instead of an implicit hope.
 `GAVL_REPLICATION_TARGET` (default `1` = off). Set it to your intended archiver count — e.g. `3`
 to be warned whenever the latest finalized state is one outage away from being held by only two
 nodes. Pair with `GAVL_PERSIST=all` on the archiver set so holders survive their own restarts.
-
-Align the target with custody: set `replicationTarget ≥` the custody committee size `n`, so the
-same nodes that must be online for signing also guarantee state survival. The single operational
-rule then becomes: **keep ≥ n archiver nodes active.**
 
 ## Where it lives
 

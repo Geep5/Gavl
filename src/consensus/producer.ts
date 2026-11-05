@@ -86,19 +86,14 @@ export class Producer {
 	 *    HEARTBEAT — one anchor every `heartbeatMs` — so a trickle of weight keeps
 	 *    accruing (fresh-node bootstrap safety) without burning compute on empty
 	 *    anchors. A new action makes the ledger heads advance → back to BUSY.
-	 *  - BOOTSTRAP: an optional `bootstrapping()` predicate forces BUSY even when idle.
-	 *    Before the first committee exists, the genesis ceremony can't run until the chain
-	 *    reaches its first epoch boundary — but with no writes to bury, plain IDLE would
-	 *    crawl there one empty anchor per `heartbeatMs` (~32 min at 16 anchors × 120s).
-	 *    While `bootstrapping()` is true we sprint at busyPaceMs to reach genesis; it flips
-	 *    false the moment the fund key is published, reverting to IDLE so an up network never
-	 *    burns compute. (The VDF cost still self-paces each anchor — this is a yield, not a spin.)
+	 *  - PEER PACE: whenever `hasPeers()` is true, a busy run never mints faster than
+	 *    `peerPaceMs` per anchor (≥ gossip latency), so competing farmers interleave.
 	 *
 	 * `finalityDepth` is the depth at which we consider activity buried (matches the
 	 * chain's sticky-finality lock). Online nodes are already safe via that lock;
 	 * the heartbeat is purely for long-range/bootstrap weight.
 	 */
-	async runAdaptive(opts: { until: () => boolean; finalityDepth: number; busyPaceMs?: number; bootstrapPaceMs?: number; heartbeatMs?: number; bootstrapping?: () => boolean; hasPeers?: () => boolean }): Promise<void> {
+	async runAdaptive(opts: { until: () => boolean; finalityDepth: number; busyPaceMs?: number; peerPaceMs?: number; heartbeatMs?: number; hasPeers?: () => boolean }): Promise<void> {
 		this.active = true;
 		const heartbeatMs = opts.heartbeatMs ?? 120_000;
 		let lastAnchorAt = 0;
@@ -107,25 +102,18 @@ export class Producer {
 			const heads = this.node.ledger.heads();
 			const caughtUp = chain ? chain.headsCovered(heads, opts.finalityDepth) : true;
 
-			// Busy if there are unfinalized writes to bury, OR we're still bootstrapping (no committee
-			// yet) and must sprint empty anchors to the genesis epoch boundary instead of crawling at
-			// the idle heartbeat.
-			if (!caughtUp || opts.bootstrapping?.()) {
+			// Busy if there are unfinalized writes to bury.
+			if (!caughtUp) {
 				// Busy: bury outstanding writes as fast as the cooldown allows.
 				await this.produceOne();
 				lastAnchorAt = this.tick();
 				// Whenever there are PEERS, don't mint faster than the mesh gossips a height. Fork choice is
 				// heaviest-chain winner-take-all: a farmer that outruns gossip builds a private run that gets
 				// orphaned WHOLE, so the losing producers vanish from the canonical chain (the 3-node real-PoST
-				// `producers`-collapse). bootstrapPaceMs (≥ gossip latency) caps the rate so producers interleave
-				// on one chain. The floor holds the WHOLE time peers exist, NOT just during bootstrap: the
-				// difficulty retarget ramps GRADUALLY, so right after the committee forms the difficulty is still
-				// at its bootstrap (fast) level — lift the floor then and the node mints far faster than gossip
-				// and the chain RE-SPLITS post-committee (producers 3→1, observed live). The floor stops binding
-				// once the retarget slows anchors past it (toward targetSecPerAnchor), so a converged,
-				// up-to-difficulty network is unaffected.
-				const withPeers = opts.bootstrapping?.() || (opts.hasPeers?.() ?? false);
-				const pace = withPeers ? Math.max(opts.busyPaceMs ?? 0, opts.bootstrapPaceMs ?? 0) : (opts.busyPaceMs ?? 0);
+				// `producers`-collapse). peerPaceMs (≥ gossip latency) caps the rate so producers interleave
+				// on one chain. The floor stops binding once the difficulty retarget slows anchors past it
+				// (toward targetSecPerAnchor), so a converged, up-to-difficulty network is unaffected.
+				const pace = opts.hasPeers?.() ? Math.max(opts.busyPaceMs ?? 0, opts.peerPaceMs ?? 0) : (opts.busyPaceMs ?? 0);
 				if (pace > 0) await this.sleep(pace);
 			} else {
 				// Idle: only mine when a heartbeat interval has elapsed.

@@ -10,9 +10,7 @@ pub enum Health {
     Disabled,
     /// Mesh joined but no peer connected.
     NoPeers,
-    /// Peers present, but fewer than the committee needs to start producing.
-    Lobby { have: u32, need: u32 },
-    /// Enough peers; waiting for the first block past genesis.
+    /// Peers present; waiting for the first block past genesis.
     Starting,
     /// The chain is advancing.
     Live,
@@ -24,8 +22,7 @@ pub struct Summary {
     pub detail: String,
 }
 
-/// `min_committee` is the live quorum the daemon's lobby waits for before farming.
-pub fn summarize(consensus: Option<&Consensus>, min_committee: u32) -> Summary {
+pub fn summarize(consensus: Option<&Consensus>) -> Summary {
     let Some(c) = consensus else {
         return Summary {
             health: Health::Offline,
@@ -47,13 +44,6 @@ pub fn summarize(consensus: Option<&Consensus>, min_committee: u32) -> Summary {
             health: Health::NoPeers,
             title: "No peers".into(),
             detail: format!("Waiting for other nodes on this network. Block {height}."),
-        };
-    }
-    if height == 0 && nodes < min_committee {
-        return Summary {
-            health: Health::Lobby { have: nodes, need: min_committee },
-            title: format!("Waiting for {} more node{}", min_committee - nodes, plural(min_committee - nodes)),
-            detail: format!("{nodes} of {min_committee} nodes online. Blocks start once all {min_committee} are connected."),
         };
     }
     if height == 0 {
