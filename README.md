@@ -254,9 +254,10 @@ Key env vars: `GAVL_VDF=chia|hash` · `GAVL_SPACE=chiapos|standin`
 [`docs/replication-floor.md`](docs/replication-floor.md)).
 
 Swap chains (`src/chains/esplora.ts`): `GAVL_BTC_NET` / `GAVL_LTC_NET` = `mainnet|testnet|regtest`
-(default `testnet`; mainnet is never selected implicitly) · `GAVL_BTC_ESPLORA_URL` /
+(default `testnet`; mainnet is never selected implicitly; for Bitcoin `testnet` means **testnet4** —
+testnet3 is not supported) · `GAVL_BTC_ESPLORA_URL` /
 `GAVL_LTC_ESPLORA_URL` = comma-separated Esplora REST bases, tried in order (defaults:
-mempool.space + blockstream.info for BTC, litecoinspace.org for LTC; **regtest has no default and
+mempool.space + blockstream.info `/testnet4` for BTC, litecoinspace.org for LTC; **regtest has no default and
 needs an override**).
 
 Real PoST needs the `setup:chia` venv; choosing `GAVL_VDF=chia` without it throws (never a silent

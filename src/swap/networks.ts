@@ -7,8 +7,8 @@
  *
  * Bitcoin Core v32.1, src/kernel/chainparams.cpp
  *   mainnet  L176 PUBKEY_ADDRESS 0, L177 SCRIPT_ADDRESS 5, L178 SECRET_KEY 128, L182 bech32_hrp "bc",   L128 nPowTargetSpacing 10*60
- *   testnet  L296 PUBKEY_ADDRESS 111, L297 SCRIPT_ADDRESS 196, L298 SECRET_KEY 239, L302 bech32_hrp "tb", L258 nPowTargetSpacing 10*60
- *            (testnet4 L409-415 and signet L564-570 use the same prefixes and "tb")
+ *   testnet  = TESTNET4 (CTestNet4Params): L409 PUBKEY_ADDRESS 111, L410 SCRIPT_ADDRESS 196, L411 SECRET_KEY 239, L415 bech32_hrp "tb",
+ *            L364 nPowTargetSpacing 10*60 — the same prefixes as testnet3 (L296-302) and signet (L564-570)
  *   regtest  L672 PUBKEY_ADDRESS 111, L673 SCRIPT_ADDRESS 196, L674 SECRET_KEY 239, L678 bech32_hrp "bcrt", L605 nPowTargetSpacing 10*60
  * Bitcoin Core v32.1, src/policy/policy.h
  *   L68 DUST_RELAY_TX_FEE 3000 sat/kvB, L70 DEFAULT_MIN_RELAY_TX_FEE 100 sat/kvB

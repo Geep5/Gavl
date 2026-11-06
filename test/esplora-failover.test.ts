@@ -70,7 +70,7 @@ test("all endpoints dead → one descriptive error naming them", async () => {
 	await assert.rejects(() => es.getTx(TX.txid), /all endpoints failed/);
 });
 
-test("GAVL_{BTC,LTC}_NET: regtest/mainnet explicit, anything else is testnet", () => {
+test("GAVL_{BTC,LTC}_NET: regtest/mainnet explicit, anything else (incl. unset) is testnet (testnet4 for bitcoin)", () => {
 	for (const chain of ["bitcoin", "litecoin"] as const) {
 		assert.equal(netFromEnv(chain, "regtest"), "regtest");
 		assert.equal(netFromEnv(chain, "mainnet"), "mainnet");
@@ -83,6 +83,8 @@ test("per-chain defaults: litecoin talks to litecoinspace, bitcoin to mempool.sp
 	assert.deepEqual(DEFAULT_BASES.litecoin.mainnet, ["https://litecoinspace.org/api"]);
 	assert.deepEqual(DEFAULT_BASES.litecoin.testnet, ["https://litecoinspace.org/testnet/api"]);
 	assert.equal(DEFAULT_BASES.bitcoin.mainnet[0], "https://mempool.space/api");
+	assert.deepEqual(DEFAULT_BASES.bitcoin.testnet, ["https://mempool.space/testnet4/api", "https://blockstream.info/testnet4/api"], "bitcoin testnet is testnet4");
+	assert.equal(new Esplora().net, "testnet");
 	const ltc = new Esplora({ chain: "litecoin" });
 	assert.equal(ltc.chain, "litecoin");
 	assert.equal(ltc.net, "testnet");

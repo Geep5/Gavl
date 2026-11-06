@@ -14,6 +14,8 @@
  */
 
 export type Chain = "bitcoin" | "litecoin";
+/** `testnet` is the chain's public test network: Bitcoin TESTNET4 (BIP94; testnet3 is not
+ *  supported), Litecoin testnet. */
 export type Net = "mainnet" | "testnet" | "regtest";
 
 const NET_ENV: Record<Chain, string> = { bitcoin: "GAVL_BTC_NET", litecoin: "GAVL_LTC_NET" };
@@ -43,7 +45,8 @@ export function esploraBasesFromEnv(chain: Chain, v: string | undefined = proces
 export const DEFAULT_BASES: Record<Chain, Record<Net, string[]>> = {
 	bitcoin: {
 		mainnet: ["https://mempool.space/api", "https://blockstream.info/api"],
-		testnet: ["https://mempool.space/testnet/api", "https://blockstream.info/testnet/api"],
+		// testnet4 (genesis 00000000da84f2ba…); blockstream serves it under /testnet4 as well
+		testnet: ["https://mempool.space/testnet4/api", "https://blockstream.info/testnet4/api"],
 		regtest: [], // local chain only — needs GAVL_BTC_ESPLORA_URL
 	},
 	litecoin: {

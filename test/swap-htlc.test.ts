@@ -157,6 +157,25 @@ describe("networks", () => {
 		assert.equal(NETWORKS.litecoin.mainnet.blockSeconds, 150);
 	});
 
+	test("bitcoin testnet = testnet4 (CTestNet4Params: tb / 111 / 196 / 239): addresses round-trip", () => {
+		const t4 = NETWORKS.bitcoin.testnet.btc;
+		assert.deepEqual({ ...t4 }, { bech32: "tb", pubKeyHash: 111, scriptHash: 196, wif: 239 });
+		const pub = secp256k1.getPublicKey(hexToBytes("d4".repeat(32)));
+		const script = (addr: string) => {
+			const decoded = btc.Address(t4).decode(addr);
+			return btc.OutScript.encode(decoded as Parameters<typeof btc.OutScript.encode>[0]);
+		};
+		for (const p of [btc.p2wpkh(pub, t4), btc.p2pkh(pub, t4), btc.p2sh(btc.p2wpkh(pub, t4), t4), btc.p2tr(pub.slice(1), undefined, t4)]) {
+			assert.deepEqual(script(p.address!), p.script, p.address);
+		}
+		assert.match(btc.p2wpkh(pub, t4).address!, /^tb1q/);
+		assert.match(btc.p2pkh(pub, t4).address!, /^[mn]/);
+		assert.match(btc.p2sh(btc.p2wpkh(pub, t4), t4).address!, /^2/);
+		// BIP173 vector (witness v0 keyhash 751e76e8…), valid on testnet4 (same hrp)
+		assert.equal(bytesToHex(script("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx")), "0014751e76e8199196d454941c45d1b3a323f1433bd6");
+		assert.equal(NETWORKS.bitcoin.testnet.blockSeconds, 600);
+	});
+
 	test("dustThreshold follows Core's GetDustThreshold at each chain's dust relay fee", () => {
 		const pub = secp256k1.getPublicKey(hexToBytes("d4".repeat(32)));
 		const scripts = {
